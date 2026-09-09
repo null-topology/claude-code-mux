@@ -528,6 +528,8 @@ async fn handle_socket(
     }
 }
 
+// tungstenite::Error is large by clippy's measure; boxing it in a test helper buys nothing.
+#[allow(clippy::result_large_err)]
 async fn emit_completion(
     websocket: &mut WebSocketStream<TcpStream>,
     response_id: &str,
