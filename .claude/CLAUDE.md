@@ -59,9 +59,11 @@ in tests).
 
 `cargo` is not on the non-interactive shell PATH. The rustup shims live in
 `/opt/homebrew/opt/rustup/bin` (stable, rustc 1.94.x); prepend that directory
-to `PATH` before running cargo. `just`, `checkle`, `cargo-release`, `nix` and
-`bun` are not installed, so run the underlying cargo commands directly instead
-of the `justfile` recipes.
+to `PATH` before running cargo. `just`, `checkle` and `cargo-release` are not
+installed, so run the underlying cargo commands directly instead of the
+`justfile` recipes. There is no Nix build: it fetched crates from crates.io
+inside the sandbox and was removed; install is `cargo install --git` or the
+prebuilt release binaries.
 
 ## Commands
 
