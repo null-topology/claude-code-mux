@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 #
-# claude-codex installation script
-# Usage: curl -fsSL https://raw.githubusercontent.com/fcakyon/claude-code-with-codex/main/scripts/install.sh | bash
+# claude-code-mux installation script
+# Usage: curl -fsSL https://raw.githubusercontent.com/null-topology/claude-code-mux/main/scripts/install.sh | bash
 #
 # Environment variables:
-#   CLAUDE_CODEX_VERSION      - Pin a specific version (e.g., v0.1.0)
-#   CLAUDE_CODEX_INSTALL_DIR  - Override install directory (default: /usr/local/bin or ~/.local/bin)
+#   CLAUDE_CODE_MUX_VERSION      - Pin a specific version (e.g., v0.1.0)
+#   CLAUDE_CODE_MUX_INSTALL_DIR  - Override install directory (default: /usr/local/bin or ~/.local/bin)
 #
 # Examples:
-#   CLAUDE_CODEX_VERSION=v0.1.0 bash install.sh
-#   CLAUDE_CODEX_INSTALL_DIR=/opt/bin bash install.sh
+#   CLAUDE_CODE_MUX_VERSION=v0.1.0 bash install.sh
+#   CLAUDE_CODE_MUX_INSTALL_DIR=/opt/bin bash install.sh
 #
 
 set -e
 
-BIN_NAME="claude-codex"
-REPO="fcakyon/claude-code-with-codex"
+BIN_NAME="claude-code-mux"
+REPO="null-topology/claude-code-mux"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -38,7 +38,7 @@ detect_platform() {
 		log_error "Unsupported operating system: $(uname -s)"
 		echo ""
 		echo "${BIN_NAME} supports macOS and Linux."
-		echo "For other platforms, build from source with Bun:"
+		echo "For other platforms, build from source with Rust:"
 		echo "  git clone https://github.com/${REPO}"
 		echo ""
 		exit 1
@@ -52,7 +52,7 @@ detect_platform() {
 		log_error "Unsupported architecture: $(uname -m)"
 		echo ""
 		echo "${BIN_NAME} prebuilt binaries are available for amd64 and arm64."
-		echo "For other architectures, build from source with Bun:"
+		echo "For other architectures, build from source with Rust:"
 		echo "  git clone https://github.com/${REPO}"
 		echo ""
 		exit 1
@@ -70,7 +70,7 @@ install_from_release() {
 	tmp_dir=$(mktemp -d)
 	trap 'rm -rf "$tmp_dir"' EXIT
 
-	local version="${CLAUDE_CODEX_VERSION:-}"
+	local version="${CLAUDE_CODE_MUX_VERSION:-}"
 
 	if [ -z "$version" ]; then
 		log_info "Fetching latest release..."
@@ -93,7 +93,7 @@ install_from_release() {
 			echo ""
 			echo "This might be due to network issues or GitHub API rate limits."
 			echo "You can specify a version manually:"
-			echo "  CLAUDE_CODEX_VERSION=v0.1.0 bash install.sh"
+			echo "  CLAUDE_CODE_MUX_VERSION=v0.1.0 bash install.sh"
 			echo ""
 			exit 1
 		fi
@@ -166,7 +166,7 @@ install_from_release() {
 		exit 1
 	fi
 
-	local install_dir="${CLAUDE_CODEX_INSTALL_DIR:-}"
+	local install_dir="${CLAUDE_CODE_MUX_INSTALL_DIR:-}"
 	if [ -z "$install_dir" ]; then
 		if [[ -w /usr/local/bin ]]; then
 			install_dir="/usr/local/bin"

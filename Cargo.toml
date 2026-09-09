@@ -1,12 +1,12 @@
 [package]
-name = "claude-codex"
-version = "0.3.1"
-description = "Run Claude Code on your Claude and ChatGPT subscriptions at once, routed per model name"
+name = "claude-code-mux"
+version = "0.4.0"
+description = "Local multiplexer that runs Claude Code on several subscriptions and providers at once, routed per model name"
 edition = "2024"
 authors = ["Claude Code Proxy contributors"]
 license = "MIT"
-repository = "https://github.com/fcakyon/claude-code-with-codex"
-homepage = "https://github.com/fcakyon/claude-code-with-codex"
+repository = "https://github.com/null-topology/claude-code-mux"
+homepage = "https://github.com/null-topology/claude-code-mux"
 readme = "README.md"
 keywords = ["claude-code", "codex", "openai", "anthropic", "gpt"]
 categories = ["command-line-utilities", "development-tools"]

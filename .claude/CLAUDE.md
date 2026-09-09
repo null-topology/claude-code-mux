@@ -21,13 +21,18 @@ freely mid-conversation.
 
 ## Fork, upstream, and the trap between them
 
-This is a fork of `raine/claude-code-proxy`. Three remotes are configured:
+This is a fork of `fcakyon/claude-code-with-codex`, itself a fork of
+`raine/claude-code-proxy`. Four remotes are configured:
 
 | remote | repository | role |
 | --- | --- | --- |
-| `origin` | `fcakyon/claude-code-with-codex` | this fork; crate `claude-codex` on crates.io |
-| `upstream` | `raine/claude-code-proxy` | the original; crate `claude-code-proxy` |
-| `mine` | `null-topology/claude-code-proxy` | fork of upstream that holds branches for upstream pull requests |
+| `origin` | `null-topology/claude-code-mux` | this repository; pushes and `v*` tags go here |
+| `fcakyon` | `fcakyon/claude-code-with-codex` | the parent fork; crate `claude-codex` on crates.io; fetch only |
+| `upstream` | `raine/claude-code-proxy` | the original; crate `claude-code-proxy`; fetch only |
+| `mine` | `null-topology/claude-code-proxy` | GitHub fork of upstream that holds branches for upstream pull requests; leave untouched until they merge |
+
+`origin` is a plain repository, not a GitHub fork: GitHub allows one fork per
+network per account and `mine` already occupies that slot.
 
 Only this fork has `src/providers/anthropic/` and `AliasProvider::Anthropic`.
 Upstream has no passthrough at all: its registry routes `claude-*` to another
@@ -41,7 +46,7 @@ Other differences when moving code between the two:
   browser/device/PKCE login under `codex/auth/`, and an Astro docs site. In
   this fork Codex sign-in is `codex login` from the Codex CLI.
 - Crate names differ in imports and test helpers: `claude_codex::` vs
-  `claude_code_proxy::`, `Command::cargo_bin("claude-codex")` vs
+  `claude_code_proxy::`, `Command::cargo_bin("claude-code-mux")` vs
   `Command::cargo_bin("claude-code-proxy")`. Ported test files need that edit.
 - Never copy one `Cargo.lock` over the other.
 
@@ -93,8 +98,8 @@ needs no secrets. crates.io publishing is separate.
 Running a build without touching an installed one:
 
 ```sh
-./target/release/claude-codex serve --port 18766 --no-monitor
-CCP_TRAFFIC_LOG=1 ./target/release/claude-codex serve --port 18766 --no-monitor
+./target/release/claude-code-mux serve --port 18766 --no-monitor
+CCP_TRAFFIC_LOG=1 ./target/release/claude-code-mux serve --port 18766 --no-monitor
 ```
 
 ## Architecture
@@ -201,9 +206,9 @@ and a 429 on the WebSocket handshake.
 
 ## Naming and distribution
 
-The crate, the installed command, and the library target are all `claude-codex`
-(`claude_codex` for the library). The crates.io package is `claude-codex`. The
-GitHub repository stays `claude-code-with-codex`.
+The crate, the installed command, the library target (`claude_code_mux`), and
+the GitHub repository are all `claude-code-mux`. Releases are `v*` tags with
+prebuilt binaries; nothing is published to crates.io.
 
 Some strings deliberately keep the old `claude-code-proxy` name because they are
 compatibility contracts, not the user-facing name. Do not rename them:

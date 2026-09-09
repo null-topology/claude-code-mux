@@ -48,7 +48,7 @@ install:
 
 # Install debug binary globally via symlink
 install-dev:
-    cargo build && ln -sf $(pwd)/target/debug/claude-codex ~/.cargo/bin/claude-codex
+    cargo build && ln -sf $(pwd)/target/debug/claude-code-mux ~/.cargo/bin/claude-code-mux
 
 # Run the application
 run *ARGS:

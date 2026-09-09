@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
-use claude_codex::{
+use claude_code_mux::{
     config, logging,
     monitor::MonitorHandle,
     paths,
@@ -14,9 +14,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "claude-codex",
+    name = "claude-code-mux",
     version = VERSION,
-    about = "Anthropic-compatible proxy for Claude Code provider backends",
+    about = "Local multiplexer that runs Claude Code on several subscriptions and providers at once",
     disable_version_flag = true
 )]
 struct Cli {
@@ -72,7 +72,7 @@ enum Commands {
 enum ProviderGroup {
     Auth {
         #[command(subcommand)]
-        command: claude_codex::provider::AuthCommand,
+        command: claude_code_mux::provider::AuthCommand,
     },
 }
 
@@ -80,7 +80,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.version_flag {
-        println!("claude-codex {}", VERSION);
+        println!("claude-code-mux {}", VERSION);
         return Ok(());
     }
 
@@ -91,7 +91,7 @@ fn main() -> Result<()> {
 
     match commands {
         Commands::Version => {
-            println!("claude-codex {}", VERSION);
+            println!("claude-code-mux {}", VERSION);
             Ok(())
         }
         Commands::Serve { port, no_monitor } => {
@@ -190,28 +190,28 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
     let handlers = provider.cli();
     match command {
         ProviderGroup::Auth { command } => match command {
-            claude_codex::provider::AuthCommand::Login => {
+            claude_code_mux::provider::AuthCommand::Login => {
                 if let Err(err) = handlers.login() {
                     eprintln!("{err}");
                     std::process::exit(2);
                 }
                 Ok(())
             }
-            claude_codex::provider::AuthCommand::Device => {
+            claude_code_mux::provider::AuthCommand::Device => {
                 if let Err(err) = handlers.device() {
                     eprintln!("{err}");
                     std::process::exit(2);
                 }
                 Ok(())
             }
-            claude_codex::provider::AuthCommand::Status => {
+            claude_code_mux::provider::AuthCommand::Status => {
                 if let Err(err) = handlers.status() {
                     println!("{err}");
                     std::process::exit(1);
                 }
                 Ok(())
             }
-            claude_codex::provider::AuthCommand::Logout => {
+            claude_code_mux::provider::AuthCommand::Logout => {
                 handlers.logout()?;
                 Ok(())
             }
@@ -252,7 +252,7 @@ fn compact_cursor_list(models: &[String]) -> String {
     if !dynamic.is_empty() {
         out.push_str(", example: cursor:gpt-5.5");
     }
-    out.push_str(" run `claude-codex models --full` for all aliases");
+    out.push_str(" run `claude-code-mux models --full` for all aliases");
     out
 }
 
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn demo_command_parses_without_server_options() {
-        let cli = Cli::try_parse_from(["claude-codex", "demo"]).unwrap();
+        let cli = Cli::try_parse_from(["claude-code-mux", "demo"]).unwrap();
 
         assert!(matches!(cli.command, Some(Commands::Demo)));
     }

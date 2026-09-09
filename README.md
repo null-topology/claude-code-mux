@@ -1,13 +1,19 @@
-# claude-code-with-codex
+# claude-code-mux
 
-[![CI](https://github.com/fcakyon/claude-code-with-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/fcakyon/claude-code-with-codex/actions/workflows/ci.yml)
+[![CI](https://github.com/null-topology/claude-code-mux/actions/workflows/ci.yml/badge.svg)](https://github.com/null-topology/claude-code-mux/actions/workflows/ci.yml)
 
 Run Claude Code on your **Claude subscription and your ChatGPT (Codex)
 subscription at the same time**, and switch between them mid-conversation.
 
+This is a fork of
+[fcakyon/claude-code-with-codex](https://github.com/fcakyon/claude-code-with-codex),
+itself a fork of
+[raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). See
+[Credits](#credits) for what each layer contributed.
+
 <img src="https://github.com/fcakyon/claude-code-with-codex/releases/download/v0.3.0/claude-codex-demo.gif" alt="Claude Code running through the proxy" />
 
-`claude-codex` is a small local proxy. Claude Code already speaks the Anthropic
+`claude-code-mux` is a small local proxy. Claude Code already speaks the Anthropic
 Messages API, so the proxy speaks it too and sends each request where the model
 name says:
 
@@ -37,25 +43,25 @@ Code's own usage warnings and limit messages working for both.
 
 ## Quickstart
 
-**1. Install `claude-codex`.**
+**1. Install `claude-code-mux`.**
 
 Prebuilt binary for macOS and Linux:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fcakyon/claude-code-with-codex/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/null-topology/claude-code-mux/main/scripts/install.sh | bash
 ```
 
 Or build from source with Rust:
 
 ```sh
-cargo install --git https://github.com/fcakyon/claude-code-with-codex --locked
+cargo install --git https://github.com/null-topology/claude-code-mux --locked
 ```
 
 **2. Check the Codex login.** The proxy reads the Codex CLI's own credentials
 and has no login of its own.
 
 ```sh
-claude-codex codex auth status
+claude-code-mux codex auth status
 ```
 
 Run `codex login` if no valid account is found.
@@ -76,11 +82,11 @@ Do **not** set `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. See
 **4. Start the proxy** and leave it running:
 
 ```sh
-claude-codex serve
+claude-code-mux serve
 ```
 
 It listens on `127.0.0.1:18765` and shows a live monitor when run in a
-terminal. `claude-codex serve --no-monitor` gives a plain server for a service
+terminal. `claude-code-mux serve --no-monitor` gives a plain server for a service
 manager or a background job.
 
 **5. Restart Claude Code** and pick a model:
@@ -112,7 +118,7 @@ Two suffixes are understood on any id:
   The proxy strips it before talking to Codex.
 
 Claude models keep their normal names: `claude-opus-5`, `claude-sonnet-5`,
-`opus`, `sonnet`, and so on. `claude-codex models` prints every id the proxy
+`opus`, `sonnet`, and so on. `claude-code-mux models` prints every id the proxy
 accepts.
 
 Any of these works with `/model` inside Claude Code, with `--model` on the
@@ -237,7 +243,7 @@ here that value is hours.
 
 ```mermaid
 flowchart LR
-    CC[Claude Code / Agent SDK] -->|Anthropic Messages API| P[claude-codex]
+    CC[Claude Code / Agent SDK] -->|Anthropic Messages API| P[claude-code-mux]
     P -->|claude-*: bytes forwarded verbatim| A[api.anthropic.com]
     P -->|gpt-*: translated to Responses API| X[Codex backend]
     P -->|kimi-*, grok-*, cursor:*| O[other backends]
@@ -298,7 +304,7 @@ captures, and error dumps go to `~/.local/state/claude-code-proxy`.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `PORT` | `18765` | Listening port. `claude-codex serve --port N` overrides it. |
+| `PORT` | `18765` | Listening port. `claude-code-mux serve --port N` overrides it. |
 | `CCP_BIND_ADDRESS` | `127.0.0.1` | Listening address. |
 | `CCP_CODEX_AUTH_FILE` | `~/.codex/auth.json` | Where the Codex CLI keeps its login. |
 | `CCP_CODEX_TRANSPORT` | `websocket` | `websocket`, `http`, or `auto`. |
@@ -318,17 +324,17 @@ captures, and error dumps go to `~/.local/state/claude-code-proxy`.
 
 | Command | What it does |
 | --- | --- |
-| `claude-codex serve [--port N] [--no-monitor]` | Run the proxy. Default command. |
-| `claude-codex models [--full]` | List accepted model ids per backend. |
-| `claude-codex codex auth status` | Show the Codex CLI login the proxy will use. |
-| `claude-codex kimi\|grok\|cursor auth login\|status\|logout` | Manage the other backends' logins. |
-| `claude-codex --version` | Print the version. |
+| `claude-code-mux serve [--port N] [--no-monitor]` | Run the proxy. Default command. |
+| `claude-code-mux models [--full]` | List accepted model ids per backend. |
+| `claude-code-mux codex auth status` | Show the Codex CLI login the proxy will use. |
+| `claude-code-mux kimi\|grok\|cursor auth login\|status\|logout` | Manage the other backends' logins. |
+| `claude-code-mux --version` | Print the version. |
 
 ## Other backends
 
 The same proxy also routes to **Kimi**, **Grok**, and **Cursor** models, each
-with its own login. Run `claude-codex models` for their ids and
-`claude-codex <backend> auth status` to check a login. These backends keep the
+with its own login. Run `claude-code-mux models` for their ids and
+`claude-code-mux <backend> auth status` to check a login. These backends keep the
 behavior of the upstream project this is based on.
 
 ## Limitations

@@ -1,3 +1,24 @@
+## v0.4.0 (2026-09-09)
+
+First release under the `claude-code-mux` name, continuing
+`fcakyon/claude-code-with-codex` 0.3.1. Entries below v0.4.0 are the upstream
+`raine/claude-code-proxy` history this fork was built on.
+
+- The crate, binary, and repository are renamed to `claude-code-mux`. On-disk
+  config and state directories, the keychain service, and the Codex originator
+  keep their previous names so existing logins keep working.
+- A spent Codex window is reported to the client once, with the reset time,
+  instead of being retried until the proxy gives up; Claude Code shows its
+  native session-limit message and the Agent SDK receives a `RateLimitEvent`.
+- Codex quota readings are forwarded as the `anthropic-ratelimit-unified-*`
+  headers Claude Code reads, so its usage warning works on Codex models.
+  `CCP_CODEX_QUOTA_WARN_AT` sets the warning threshold.
+- `/v1/models` no longer repeats the Claude models Claude Code already knows
+  and lists Codex through a curated catalog with picker labels and
+  descriptions. `gpt-6-astra` is accepted.
+- README documents the `modelPicker` setup for Claude Code, the Agent SDK,
+  and the authentication modes that keep rate-limit events working.
+
 ## v0.1.32 (2026-08-03)
 
 - Kimi subagents and multimodal messages with mixed text and images work instead

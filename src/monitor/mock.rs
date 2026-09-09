@@ -81,7 +81,7 @@ fn mock_state_for_tick(
         Duration::from_secs(14),
         RequestStatus::Streaming,
     );
-    streaming.project = Some("claude-codex".to_string());
+    streaming.project = Some("claude-code-mux".to_string());
     streaming.provider = Some("codex".to_string());
     streaming.model = Some("claude-sonnet-4-6 → gpt-5.6-sol".to_string());
     streaming.effort = Some("high".to_string());
@@ -95,7 +95,7 @@ fn mock_state_for_tick(
     streaming.input_tokens = Some(12_480);
     streaming.output_tokens = Some(420);
     streaming.traffic_capture_path = Some(PathBuf::from(
-        "/tmp/claude-codex-demo/traffic/req-active-codex",
+        "/tmp/claude-code-mux-demo/traffic/req-active-codex",
     ));
     let simulated_elapsed = Duration::from_millis(tick.saturating_mul(TICK_MILLIS));
     streaming.started_at = now - Duration::from_secs(14) - simulated_elapsed;
@@ -189,7 +189,7 @@ fn mock_state_for_tick(
         RequestStatus::Completed,
         Some(200),
     );
-    success.project = Some("claude-codex".to_string());
+    success.project = Some("claude-code-mux".to_string());
     success.provider = Some("codex".to_string());
     success.model = Some("claude-sonnet-4-6 → gpt-5.6-terra".to_string());
     success.effort = Some("xhigh".to_string());
@@ -200,7 +200,7 @@ fn mock_state_for_tick(
     success.input_tokens = Some(125_600);
     success.output_tokens = Some(832);
     success.traffic_capture_path = Some(PathBuf::from(
-        "/tmp/claude-codex-demo/traffic/req-complete-codex",
+        "/tmp/claude-code-mux-demo/traffic/req-complete-codex",
     ));
     recent.push_back(success);
 
@@ -222,7 +222,7 @@ fn mock_state_for_tick(
     unavailable.input_tokens = Some(8_900);
     unavailable.error = Some("upstream connection closed before response headers".to_string());
     unavailable.traffic_capture_path = Some(PathBuf::from(
-        "/tmp/claude-codex-demo/errors/req-failed-kimi.json",
+        "/tmp/claude-code-mux-demo/errors/req-failed-kimi.json",
     ));
     recent.push_back(unavailable);
 

@@ -4,10 +4,10 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
-use claude_codex::providers::codex::compaction::clear_all_compactions_for_tests;
-use claude_codex::providers::codex::continuation::clear_all_continuations_for_tests;
-use claude_codex::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
-use claude_codex::{
+use claude_code_mux::providers::codex::compaction::clear_all_compactions_for_tests;
+use claude_code_mux::providers::codex::continuation::clear_all_continuations_for_tests;
+use claude_code_mux::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
+use claude_code_mux::{
     registry::Registry,
     server::{app, app_with_options},
 };
@@ -989,14 +989,14 @@ struct ZeroRetryDelayGuard;
 
 impl ZeroRetryDelayGuard {
     fn enable() -> Self {
-        claude_codex::retry::set_zero_retry_delay_for_tests(true);
+        claude_code_mux::retry::set_zero_retry_delay_for_tests(true);
         ZeroRetryDelayGuard
     }
 }
 
 impl Drop for ZeroRetryDelayGuard {
     fn drop(&mut self) {
-        claude_codex::retry::set_zero_retry_delay_for_tests(false);
+        claude_code_mux::retry::set_zero_retry_delay_for_tests(false);
     }
 }
 
