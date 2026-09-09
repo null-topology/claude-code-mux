@@ -322,10 +322,7 @@ mod tests {
             headers["anthropic-ratelimit-unified-representative-claim"],
             "seven_day"
         );
-        assert_eq!(
-            headers["anthropic-ratelimit-unified-reset"],
-            "1789466238"
-        );
+        assert_eq!(headers["anthropic-ratelimit-unified-reset"], "1789466238");
 
         let five = headers_of(&event(80.0, 10.0));
         assert_eq!(

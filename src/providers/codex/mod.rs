@@ -1127,7 +1127,7 @@ fn remaining_live_stream_response(
             match item {
                 Ok(payload) => {
                     rate_limits::observe_event(&payload);
-        append_upstream_sse_payload(&mut upstream_sse_body, &payload);
+                    append_upstream_sse_payload(&mut upstream_sse_body, &payload);
                     let (chunk, terminal) = match translate_live_stream_payload(
                         &mut translator,
                         &payload,

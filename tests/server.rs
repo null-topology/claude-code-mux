@@ -1356,6 +1356,7 @@ async fn models_endpoint_lists_supported_models() {
     assert!(!data.is_empty());
     let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&"gpt-5.6-sol"));
+    assert!(ids.contains(&"kimi-for-coding"));
     for entry in data {
         assert_eq!(entry["type"], "model");
         assert!(entry["display_name"].as_str().is_some());
@@ -1366,22 +1367,42 @@ async fn models_endpoint_lists_supported_models() {
 }
 
 #[tokio::test]
-async fn models_endpoint_includes_claude_prefixed_aliases_for_discovery() {
-    // Claude Code's gateway model discovery ignores ids that don't start with
-    // "claude" or "anthropic", so the alias entries are what make
-    // CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 useful at all.
+async fn models_endpoint_advertises_codex_catalog_without_anthropic_group() {
+    // Codex is advertised through its curated catalog with a picker-style label
+    // and description on each row. The Anthropic passthrough group is not
+    // advertised at all: Claude Code already lists its own models, and
+    // repeating them here only duplicated the picker.
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, value) = get_models(app, "/v1/models?limit=1000").await;
 
     assert_eq!(status, StatusCode::OK);
-    let ids: Vec<&str> = value["data"]
-        .as_array()
-        .unwrap()
+    let data = value["data"].as_array().unwrap();
+    let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+    let astra = data
         .iter()
-        .map(|m| m["id"].as_str().unwrap())
-        .collect();
-    assert!(ids.iter().any(|id| id.starts_with("claude-")));
-    assert!(ids.contains(&"claude-opus-5"));
+        .find(|m| m["id"] == "gpt-6-astra")
+        .expect("astra advertised");
+    assert_eq!(astra["display_name"], "Astra");
+    assert!(
+        astra["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("GPT-6 Astra")
+    );
+
+    assert!(ids.contains(&"gpt-5.6-sol"));
+    assert!(ids.contains(&"gpt-5.5"));
+    assert!(
+        !ids.contains(&"gpt-5.6-sol-fast"),
+        "fast variants stay routable but are not advertised"
+    );
+    assert!(
+        !ids.contains(&"claude-opus-5"),
+        "anthropic group is not advertised"
+    );
+    assert!(!ids.contains(&"opus"));
+    assert!(!ids.iter().any(|id| id.starts_with("claude-")));
 }
 
 #[tokio::test]

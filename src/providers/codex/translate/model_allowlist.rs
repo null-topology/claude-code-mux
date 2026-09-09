@@ -14,6 +14,7 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
+    "gpt-6-astra",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -117,7 +118,10 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
 }
 
 pub fn uses_responses_lite(model: &str) -> bool {
-    matches!(model, "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra")
+    matches!(
+        model,
+        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra"
+    )
 }
 
 /// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
@@ -208,6 +212,13 @@ mod tests {
         assert!(assert_allowed_model("gpt-5.6-sol").is_ok());
         assert!(assert_allowed_model("gpt-5.6-terra").is_ok());
         assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
+        assert!(assert_allowed_model("gpt-6-astra").is_ok());
+    }
+
+    #[test]
+    fn astra_uses_responses_lite() {
+        assert!(uses_responses_lite("gpt-6-astra"));
+        assert!(!uses_responses_lite("gpt-5.5"));
     }
 
     #[test]

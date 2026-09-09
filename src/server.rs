@@ -319,19 +319,39 @@ async fn handler_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModelsQuery>,
 ) -> Json<serde_json::Value> {
-    let mut data: Vec<Value> = state
-        .registry
-        .all_supported_models()
-        .into_iter()
-        .map(|(model, provider)| {
-            json!({
-                "type": "model",
-                "object": "model",
-                "id": model,
-                "display_name": format!("{model} ({provider})"),
-            })
-        })
-        .collect();
+    // Claude Code already knows its own models, so the Anthropic passthrough group is
+    // not advertised: listing it again only duplicates the built-in picker entries.
+    // Codex is advertised through its curated catalog with picker-style labels and
+    // descriptions. Other backends are listed by their bare ids.
+    let mut data: Vec<Value> = Vec::new();
+    for provider in state.registry.list_provider_names() {
+        match provider.as_str() {
+            "anthropic" => {}
+            "codex" => data.extend(crate::registry::CODEX_CATALOG.iter().map(|entry| {
+                json!({
+                    "type": "model",
+                    "object": "model",
+                    "id": entry.slug,
+                    "display_name": entry.label,
+                    "description": entry.description,
+                })
+            })),
+            _ => data.extend(
+                state
+                    .registry
+                    .supported_models_for(&provider)
+                    .into_iter()
+                    .map(|model| {
+                        json!({
+                            "type": "model",
+                            "object": "model",
+                            "id": model,
+                            "display_name": format!("{model} ({provider})"),
+                        })
+                    }),
+            ),
+        }
+    }
     let has_more = query.limit.is_some_and(|limit| data.len() > limit);
     if let Some(limit) = query.limit {
         data.truncate(limit);

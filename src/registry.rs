@@ -47,6 +47,57 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
+    "gpt-6-astra",
+];
+
+/// One entry of the codex model catalog advertised on `/v1/models`.
+///
+/// `label` and `description` follow the style of Claude Code's built-in picker
+/// rows so a client that renders them (a `modelPicker` row in Claude Code's
+/// settings, or any UI reading `display_name`/`description`) reads the same
+/// way as the built-in lineup. The id is the bare codex slug: Claude Code's
+/// gateway discovery would drop it, but that discovery needs a non-OAuth
+/// credential on the client, which also silences the native rate-limit events,
+/// so it is not the mechanism this proxy targets.
+#[derive(Debug, Clone, Copy)]
+pub struct CodexCatalogEntry {
+    /// The id sent to Codex and advertised on `/v1/models`.
+    pub slug: &'static str,
+    /// Short picker label, in the style of Claude Code's built-in entries.
+    pub label: &'static str,
+    /// One-line picker description; Claude Code truncates at 100 characters.
+    pub description: &'static str,
+}
+
+/// Codex models offered to clients. Order is picker order. Models Codex still
+/// accepts but no longer lists (see `~/.codex/models_cache.json`) are deliberately
+/// left out; they remain routable by their bare id.
+pub const CODEX_CATALOG: &[CodexCatalogEntry] = &[
+    CodexCatalogEntry {
+        slug: "gpt-6-astra",
+        label: "Astra",
+        description: "GPT-6 Astra · Most capable for complex, demanding work",
+    },
+    CodexCatalogEntry {
+        slug: "gpt-5.6-sol",
+        label: "Sol",
+        description: "GPT-5.6 Sol · Reliable agentic workhorse for everyday tasks",
+    },
+    CodexCatalogEntry {
+        slug: "gpt-5.6-terra",
+        label: "Terra",
+        description: "GPT-5.6 Terra · Balanced agentic coding for everyday work",
+    },
+    CodexCatalogEntry {
+        slug: "gpt-5.6-luna",
+        label: "Luna",
+        description: "GPT-5.6 Luna · Fast and affordable agentic coding",
+    },
+    CodexCatalogEntry {
+        slug: "gpt-5.5",
+        label: "GPT-5.5",
+        description: "GPT-5.5 · Proven previous-generation model for coding and general work",
+    },
 ];
 
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
@@ -357,6 +408,18 @@ mod tests {
     fn normalize_model_trims_hint() {
         assert_eq!(normalize_incoming_model("gpt-5.4-fast[1m]"), "gpt-5.4-fast");
         assert_eq!(normalize_incoming_model("gpt-5.4-fast"), "gpt-5.4-fast");
+    }
+
+    #[test]
+    fn codex_catalog_entries_route_to_codex() {
+        let registry = Registry::new(AliasProvider::Anthropic);
+        for entry in CODEX_CATALOG {
+            assert!(CODEX_MODELS.contains(&entry.slug), "{}", entry.slug);
+            let p = registry.provider_for_model(entry.slug, None);
+            assert_eq!(p.expect("provider").name(), "codex", "{}", entry.slug);
+            // Claude Code truncates picker descriptions at 100 characters.
+            assert!(entry.description.chars().count() <= 100, "{}", entry.slug);
+        }
     }
 
     #[test]

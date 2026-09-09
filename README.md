@@ -1,152 +1,374 @@
 # claude-code-with-codex
 
-[![crates.io](https://img.shields.io/crates/v/claude-codex.svg)](https://crates.io/crates/claude-codex)
 [![CI](https://github.com/fcakyon/claude-code-with-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/fcakyon/claude-code-with-codex/actions/workflows/ci.yml)
 
-Use Claude Code with your **Claude subscription and your ChatGPT (Codex)
+Run Claude Code on your **Claude subscription and your ChatGPT (Codex)
 subscription at the same time**, and switch between them mid-conversation.
 
 <img src="https://github.com/fcakyon/claude-code-with-codex/releases/download/v0.3.0/claude-codex-demo.gif" alt="Claude Code running through the proxy" />
 
-It runs as a tiny local proxy. Claude Code already speaks the Anthropic API, so
-the proxy sits in front of it and sends each request to the right place based on
-the model name:
+`claude-codex` is a small local proxy. Claude Code already speaks the Anthropic
+Messages API, so the proxy speaks it too and sends each request where the model
+name says:
 
-- Ask for a **Claude** model and it uses your **Claude subscription** (the login
-  Claude Code already has). Nothing is translated and no API key is needed.
-- Ask for a **`gpt-5.6-*`** model and it uses your **ChatGPT subscription**
-  through the Codex login.
+- A **Claude** model goes to Anthropic untouched, on the login Claude Code
+  already has. Nothing is translated, no API key is involved, and the proxy
+  stores no Claude credentials.
+- A **Codex** model (`gpt-6-astra`, `gpt-5.6-sol`, ...) is translated to the
+  OpenAI Responses API and sent on the ChatGPT login of the Codex CLI.
 
-So you can keep Opus on your Claude plan for hard work and run the fast slot on
-your ChatGPT plan, in the same session, and flip between them whenever you want.
+So Opus can stay on your Claude plan for the hard parts while a Codex model
+runs the everyday turns on your ChatGPT plan, in one session, with Claude
+Code's own usage warnings and limit messages working for both.
 
-[Quickstart](#quickstart) · [Switching models](#switching-models) ·
+[Quickstart](#quickstart) · [Picking a model](#picking-a-model) ·
+[Claude Agent SDK](#claude-agent-sdk) · [Rate limits](#rate-limits) ·
 [How it works](#how-it-works) · [Configuration](#configuration) ·
-[Other backends](#other-backends) · [Limitations](#limitations)
+[Other backends](#other-backends) · [Limitations](#limitations) ·
+[Development](#development)
 
 ## What you need
 
-- **Claude Code** installed and signed in with a **Claude Pro or Max** plan.
-- A **ChatGPT Plus, Pro, or Team** plan and the **Codex CLI** signed in.
-- **Rust** only if you install from crates.io or source. The prebuilt binary needs nothing.
+- **Claude Code** 2.1.261 or newer (for the `modelPicker` setting), signed in
+  with a Claude Pro or Max plan.
+- A **ChatGPT Plus, Pro, or Team** plan and the **Codex CLI** signed in
+  (`codex login`).
+- **Rust** only if you install from source. The prebuilt binary needs nothing.
 
 ## Quickstart
 
-**1. Install `claude-codex`** using a prebuilt binary:
+**1. Install `claude-codex`.**
 
-Prebuilt binary, no Rust needed (macOS and Linux):
+Prebuilt binary for macOS and Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/fcakyon/claude-code-with-codex/main/scripts/install.sh | bash
 ```
 
-Or install from crates.io if you have Rust:
+Or build from source with Rust:
 
 ```sh
-cargo install claude-codex --locked
+cargo install --git https://github.com/fcakyon/claude-code-with-codex --locked
 ```
 
-**2. Check your Codex CLI login:**
+**2. Check the Codex login.** The proxy reads the Codex CLI's own credentials
+and has no login of its own.
 
 ```sh
 claude-codex codex auth status
 ```
 
-Run `codex login` first if no valid account is found.
+Run `codex login` if no valid account is found.
 
-**3. Point Claude Code at the router** in `~/.claude/settings.json`:
+**3. Point Claude Code at the proxy** in `~/.claude/settings.json`:
 
 ```json
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "http://localhost:18765"
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:18765"
   }
 }
 ```
 
-**4. Start the router** and leave it running:
+Do **not** set `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. See
+[Claude authentication](#claude-authentication) for why.
+
+**4. Start the proxy** and leave it running:
 
 ```sh
 claude-codex serve
 ```
 
-**5. Restart Claude Code.**
+It listens on `127.0.0.1:18765` and shows a live monitor when run in a
+terminal. `claude-codex serve --no-monitor` gives a plain server for a service
+manager or a background job.
 
-Claude Code now discovers the models exposed by the router. Switch directly:
+**5. Restart Claude Code** and pick a model:
 
 ```text
-/model gpt-5.6-sol[1m]
+/model gpt-5.6-sol
 /model claude-opus-5
 ```
 
-The `[1m]` suffix enables Claude Code's larger-context mode. The router removes
-the suffix before sending the model name to Codex.
+## Picking a model
 
-## Switching models
+### Model ids
 
-- **Inside Claude Code.** Run `/model gpt-5.6-sol[1m]` for Codex or
-  `/model claude-opus-5` for Claude.
-- **For one new session.** Set `ANTHROPIC_MODEL` when launching Claude Code.
-- **List what is available.** `claude-codex models`.
+Codex models are addressed by their Codex id. The proxy offers this catalog:
 
-Reasoning is carried across a switch. When you move a conversation from one plan
-to the other, the earlier turn's thinking is kept and shown to the next model as
-plain tagged text, so context is not lost.
+| id | label | what Codex says about it |
+| --- | --- | --- |
+| `gpt-6-astra` | Astra | Most capable model for complex, demanding work |
+| `gpt-5.6-sol` | Sol | Reliable agentic workhorse for everyday tasks |
+| `gpt-5.6-terra` | Terra | Balanced agentic coding model for everyday work |
+| `gpt-5.6-luna` | Luna | Fast and affordable agentic coding model |
+| `gpt-5.5` | GPT-5.5 | Proven previous-generation model for coding and general work |
+
+Two suffixes are understood on any id:
+
+- `-fast` (for example `gpt-5.6-sol-fast`) requests Codex's priority service
+  tier for that model.
+- `[1m]` (for example `gpt-5.6-sol[1m]`) is Claude Code's large-context marker.
+  The proxy strips it before talking to Codex.
+
+Claude models keep their normal names: `claude-opus-5`, `claude-sonnet-5`,
+`opus`, `sonnet`, and so on. `claude-codex models` prints every id the proxy
+accepts.
+
+Any of these works with `/model` inside Claude Code, with `--model` on the
+command line, and with `ANTHROPIC_MODEL` to fix one model for a whole session.
+
+### Rows in the `/model` picker
+
+Claude Code's `/model` picker lists its built-in Claude models. Codex models
+are not in that list, so out of the box you type their ids. To pick them by
+arrow key like the built-in rows, add a `modelPicker` block to
+`~/.claude/settings.json`:
+
+```json
+{
+  "modelPicker": {
+    "options": [
+      {
+        "model": "gpt-6-astra",
+        "label": "Astra",
+        "description": "GPT-6 Astra · Most capable for complex, demanding work",
+        "behavesAs": "claude-opus-5"
+      },
+      {
+        "model": "gpt-5.6-sol",
+        "label": "Sol",
+        "description": "GPT-5.6 Sol · Reliable agentic workhorse for everyday tasks",
+        "behavesAs": "claude-sonnet-5"
+      },
+      {
+        "model": "gpt-5.6-terra",
+        "label": "Terra",
+        "description": "GPT-5.6 Terra · Balanced agentic coding for everyday work",
+        "behavesAs": "claude-sonnet-5"
+      },
+      {
+        "model": "gpt-5.6-luna",
+        "label": "Luna",
+        "description": "GPT-5.6 Luna · Fast and affordable agentic coding",
+        "behavesAs": "claude-haiku-4-5"
+      },
+      {
+        "model": "gpt-5.5",
+        "label": "GPT-5.5",
+        "description": "GPT-5.5 · Proven previous-generation model for coding and general work",
+        "behavesAs": "claude-sonnet-5"
+      }
+    ]
+  }
+}
+```
+
+The rows appear after the built-in lineup. Each field does one thing:
+
+- `model` is sent to the proxy verbatim, so it must be an id from the table
+  above.
+- `label` and `description` are only what the picker shows.
+- `behavesAs` names a Claude model whose client-side defaults (prompt profile,
+  context window assumption, effort handling) Claude Code applies to the row.
+  Without it Claude Code treats the model as unknown, assumes a 200k window,
+  and prints a warning on every start. It does not change the label or the
+  id sent.
+
+`modelPicker` is honored from user settings, managed settings, and the
+`--settings` flag, not from a project checkout. Setting
+`"replaceBuiltInOptions": true` next to `options` hides the built-in lineup and
+shows only these rows.
+
+### Why not gateway model discovery
+
+Claude Code can also fetch `/v1/models` from a gateway
+(`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`), and the proxy serves that
+endpoint with the catalog above. It is not the recommended path: discovery
+only runs when `ANTHROPIC_AUTH_TOKEN`, an API key, or an `apiKeyHelper` is
+configured, and any of those moves Claude Code off the subscription path, where
+the native rate-limit events stop arriving for every model. `modelPicker` keeps
+the subscription path intact.
+
+## Claude Agent SDK
+
+The SDK drives the same Claude Code binary, so the proxy works there without
+changes. Point it at the proxy and name a model:
+
+```python
+from claude_agent_sdk import ClaudeAgentOptions, query
+
+options = ClaudeAgentOptions(
+    model="gpt-5.6-sol",
+    env={"ANTHROPIC_BASE_URL": "http://127.0.0.1:18765", "ANTHROPIC_API_KEY": ""},
+)
+
+async for message in query(prompt="Summarize this repository.", options=options):
+    print(message)
+```
+
+Blank `ANTHROPIC_API_KEY` in the `env` if the surrounding environment carries
+one. With a non-empty key the SDK takes the API-billing path and the
+`RateLimitEvent` described below is never emitted. Authentication stays the
+same as for the terminal: the Claude Code login on the machine, or
+`CLAUDE_CODE_OAUTH_TOKEN` in the environment.
+
+## Rate limits
+
+Codex reports its quota inside the stream, and the proxy translates it into the
+`anthropic-ratelimit-unified-*` headers Claude Code already reads. The effect
+is that Codex models behave like a Claude subscription:
+
+- **Healthy window.** The 5-hour and 7-day utilization arrive on every
+  response. Claude Code's usage warning works, and an SDK caller receives a
+  `RateLimitEvent` with `status='allowed'` or `'allowed_warning'` and the
+  utilization figures.
+- **Spent window.** Codex refuses with `usage_limit_reached` and a reset time.
+  The proxy answers once, without retrying, with `status='rejected'` and the
+  reset time. Claude Code shows its own
+  "You've hit your session limit · resets 1:07pm" message and an SDK caller
+  gets `RateLimitEvent` with `resets_at`. Before this the proxy burned every
+  retry first and the client saw a bare 429 minutes later.
+
+`Retry-After` is deliberately not sent: clients sleep for its full value, and
+here that value is hours.
 
 ## How it works
 
-Claude Code sends normal Anthropic API requests to the proxy. The proxy reads
-the model name and routes:
+```mermaid
+flowchart LR
+    CC[Claude Code / Agent SDK] -->|Anthropic Messages API| P[claude-codex]
+    P -->|claude-*: bytes forwarded verbatim| A[api.anthropic.com]
+    P -->|gpt-*: translated to Responses API| X[Codex backend]
+    P -->|kimi-*, grok-*, cursor:*| O[other backends]
+    K[~/.codex/auth.json] -. ChatGPT token .-> P
+```
 
-- **Claude models** are relayed straight to `api.anthropic.com`, untouched,
-  reusing the subscription token Claude Code already sends. The request body is
-  forwarded as-is so Anthropic's prompt caching keeps working. The proxy stores
-  no Claude credentials.
-- **Codex models** are translated to the OpenAI Responses API and sent with the
-  ChatGPT login from the Codex CLI's `~/.codex/auth.json`. The proxy refreshes
-  that token when needed and writes it back so the Codex CLI keeps working.
-
-An unknown model name returns a clear 400 that lists the ids you can use.
+- **Routing** is by model name only. `claude-*` ids and the `opus`, `sonnet`,
+  `haiku`, `fable` aliases go to Anthropic. Any other id must match a backend's
+  catalog exactly; an unknown id returns a 400 that lists the accepted ids.
+- **The Claude route is a byte-exact passthrough.** The proxy forwards the
+  request body and headers as received, including whatever authorization
+  Claude Code attached, and streams the reply back. Because the bytes are
+  unchanged, Anthropic's prompt caching keeps working.
+- **The Codex route** maps the Messages API onto the Responses API over a
+  WebSocket per conversation, keeps `previous_response_id` state per Claude
+  Code session and subagent, and reads the ChatGPT login from the Codex CLI's
+  `~/.codex/auth.json`. When the token is refreshed it is written back so the
+  Codex CLI keeps working.
+- **Reasoning survives a switch.** A `thinking` block produced by one backend
+  cannot be replayed to the other natively, so the proxy rewrites it as tagged
+  text before sending the history on. Context is not lost when you move a
+  conversation from one plan to the other.
 
 ## Configuration
 
-Only `ANTHROPIC_BASE_URL` is required in Claude Code's user settings. Restart
-Claude Code after changing it so `/model` discovers the router's model list.
+### Claude Code side
 
-| Variable                                   | What it does                                                     |
-| ------------------------------------------ | ---------------------------------------------------------------- |
-| `ANTHROPIC_BASE_URL`                       | Point Claude Code at the proxy, e.g. `http://localhost:18765`.   |
-| `ANTHROPIC_DEFAULT_OPUS_MODEL`             | Optionally remap the Opus alias.                                 |
-| `ANTHROPIC_DEFAULT_SONNET_MODEL`           | Optionally remap the Sonnet alias.                               |
-| `ANTHROPIC_MODEL`                          | Optionally force one model for the whole session.                |
-| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | Set to `1` to skip Claude Code's non-essential background calls. |
+Only `ANTHROPIC_BASE_URL` is required. Restart Claude Code after changing it.
 
-Do not set `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`. Either one overrides
-the Claude subscription login and the Claude route returns 401.
+| Variable | What it does |
+| --- | --- |
+| `ANTHROPIC_BASE_URL` | Point Claude Code at the proxy, e.g. `http://127.0.0.1:18765`. |
+| `ANTHROPIC_MODEL` | Force one model for the whole session. |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL`, `..._SONNET_MODEL`, `..._HAIKU_MODEL` | Remap a built-in picker row, e.g. `ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra` sends the Sonnet slot to Codex. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude login for environments without an interactive `claude login`. Passed through to Anthropic unchanged. |
+| `ENABLE_TOOL_SEARCH` | Claude Code disables lazy tool loading behind a non-Anthropic base URL. Set to `true`: the proxy forwards the tool references, and requests shrink considerably. |
 
-The proxy listens on `127.0.0.1:18765` by default. Change it with
-`PORT=11435 claude-codex serve`, and match `ANTHROPIC_BASE_URL`.
+### Claude authentication
 
-Alias remapping is optional. For example,
-`ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra` makes `/model sonnet` use Codex.
+The Claude route relies on Claude Code sending its subscription login. That
+only happens when no explicit key is configured:
+
+| set on the client | Claude route | rate-limit events |
+| --- | --- | --- |
+| nothing, or `CLAUDE_CODE_OAUTH_TOKEN` | works on the subscription | delivered for Claude and Codex |
+| `ANTHROPIC_API_KEY` | 401 unless the key is a real API key, then API billing | not delivered |
+| `ANTHROPIC_AUTH_TOKEN` | works if it holds the OAuth token | not delivered, claude.ai connectors disabled |
+
+The proxy never inspects or replaces the authorization it receives on the
+Claude route.
+
+### Proxy side
+
+Settings are read from `CCP_*` environment variables first, then from
+`config.json` in the config directory, then defaults. The config directory is
+`~/.config/claude-code-proxy` (`CCP_CONFIG_DIR` overrides it); logs, traffic
+captures, and error dumps go to `~/.local/state/claude-code-proxy`.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `PORT` | `18765` | Listening port. `claude-codex serve --port N` overrides it. |
+| `CCP_BIND_ADDRESS` | `127.0.0.1` | Listening address. |
+| `CCP_CODEX_AUTH_FILE` | `~/.codex/auth.json` | Where the Codex CLI keeps its login. |
+| `CCP_CODEX_TRANSPORT` | `websocket` | `websocket`, `http`, or `auto`. |
+| `CCP_CODEX_EFFORT` | unset | Reasoning effort sent to Codex, e.g. `high`. |
+| `CCP_CODEX_SERVICE_TIER` | unset | Service tier for every Codex request. `-fast` ids request `priority` per call. |
+| `CCP_CODEX_REASONING_SUMMARY` | unset | Reasoning summary mode requested from Codex, e.g. `auto`. |
+| `CCP_CODEX_MODEL` | unset | Send this Codex model regardless of what the client asked for. |
+| `CCP_CODEX_QUOTA_WARN_AT` | `0.9` session, `0.75` weekly | Utilization above which a window is reported as past its warning threshold. One value lowers both. |
+| `CCP_CODEX_SERVER_COMPACTION` | off | Let Codex compact long histories server-side. |
+| `CCP_CODEX_RESPONSES_API` | off | Also expose `/v1/responses` and `/v1/chat/completions` for OpenAI-style clients. |
+| `CCP_AUTO_REVIEW_MODEL` | `gpt-5.6-luna` | Model for Claude Code's background security classifier when the session runs on Codex. |
+| `CCP_ALIAS_PROVIDER` | `anthropic` | Backend for the Claude aliases. Leave it alone unless you want `opus` to stop meaning Claude. |
+| `CCP_LOG_VERBOSE` | off | Keep full string fields in `proxy.log`. |
+| `CCP_TRAFFIC_LOG` | off | Capture every request and event under the state directory. Contains prompts and file contents; delete after use. |
+
+### Commands
+
+| Command | What it does |
+| --- | --- |
+| `claude-codex serve [--port N] [--no-monitor]` | Run the proxy. Default command. |
+| `claude-codex models [--full]` | List accepted model ids per backend. |
+| `claude-codex codex auth status` | Show the Codex CLI login the proxy will use. |
+| `claude-codex kimi\|grok\|cursor auth login\|status\|logout` | Manage the other backends' logins. |
+| `claude-codex --version` | Print the version. |
 
 ## Other backends
 
-The same proxy can also route to **Kimi**, **Grok**, and **Cursor** models, each
-with its own login. Run `claude-codex models` to see every id, and
-`claude-codex <backend> auth status` to check a login. These backends keep
-the behavior of the upstream project this is based on.
+The same proxy also routes to **Kimi**, **Grok**, and **Cursor** models, each
+with its own login. Run `claude-codex models` for their ids and
+`claude-codex <backend> auth status` to check a login. These backends keep the
+behavior of the upstream project this is based on.
 
 ## Limitations
 
-- Switching plans in the middle of an active tool call (for example pressing Esc
-  during a tool use, then switching and continuing) can fail, because the next
-  model cannot verify reasoning that came from the other plan. Starting the next
-  step fresh avoids it.
+- Switching plans in the middle of an active tool call (for example pressing
+  Esc during a tool use, then switching and continuing) can fail, because the
+  next model cannot verify reasoning that came from the other plan. Starting
+  the next step fresh avoids it.
+- Codex rate limits are handled on the WebSocket transport, which is the
+  default. The HTTP transport still retries a spent window.
+- Codex models are not in Claude Code's built-in catalog, so without a
+  `modelPicker` row Claude Code assumes a 200k context window for them.
+
+## Development
+
+```sh
+cargo build
+cargo test -- --test-threads=1        # some config tests share process env
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo run -- serve --no-monitor --port 19000
+scripts/debug-proxy                   # isolated instance with traffic capture
+```
+
+`just check` runs the same checks through `checkle` when both are installed;
+CI runs `just check-ci`. Pushing a `vX.Y.Z` tag builds prebuilt binaries for
+macOS, Linux, and Windows through `.github/workflows/release.yml`.
+
+Layout: `src/server.rs` is the axum router and request dispatch,
+`src/registry.rs` maps model ids to backends, `src/providers/anthropic/` is the
+passthrough, `src/providers/codex/` the Responses API translator, and
+`src/providers/translate_shared.rs` holds what the translators share, including
+the reasoning tags.
 
 ## Credits
 
 Built on [`raine/claude-code-proxy`](https://github.com/raine/claude-code-proxy),
-which provides the Codex, Kimi, Grok, and Cursor backends. This fork adds using
-your Claude subscription as a backend alongside Codex, reasoning that survives a
-mid-conversation switch, and reading the Codex login from the Codex CLI.
+which provides the Codex, Kimi, Grok, and Cursor backends, and on
+[`fcakyon/claude-code-with-codex`](https://github.com/fcakyon/claude-code-with-codex),
+which added the Claude subscription passthrough, reasoning that survives a
+mid-conversation switch, and reading the Codex login from the Codex CLI. This
+fork adds Codex rate limits reported the way Claude Code expects, the curated
+Codex catalog, and the picker setup above.

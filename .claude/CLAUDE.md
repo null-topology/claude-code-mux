@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for Claude Code and other AI tools working on this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this is
 
@@ -8,32 +8,159 @@ A small local proxy that lets Claude Code talk to more than one backend at once,
 chosen per request by the model name. Claude Code already speaks the Anthropic
 Messages API, so the proxy speaks it too and forwards or translates each request:
 
-- `claude-*` models go to Anthropic as a transparent passthrough that reuses
-  Claude Code's own subscription login. No API key, no translation.
-- `gpt-5.6-*` (and the other codex ids) go to the Codex backend using the
-  ChatGPT subscription that the Codex CLI already logged in.
-- `kimi-*`, `grok-*`, and `cursor*` ids go to their own translators.
+- `claude-*` models (and the `opus`/`sonnet`/`haiku`/`fable` aliases) go to
+  Anthropic as a transparent passthrough that reuses Claude Code's own
+  subscription login. No API key, no translation.
+- `gpt-5.6-*` and the other codex ids go to the Codex backend using the ChatGPT
+  subscription that the Codex CLI already logged in.
+- `kimi-*`, `grok-*`, and `cursor:*` ids go to their own translators.
 
 The headline use is running the opus slot on a Claude subscription and the
 sonnet slot on a ChatGPT/Codex subscription in the same session, switching
 freely mid-conversation.
 
-This is a fork of `raine/claude-code-proxy`. The dual Claude plus Codex routing,
-the reasoning-across-switch handling, and the Codex-CLI credential model are the
-changes made on top of it.
+## Fork, upstream, and the trap between them
+
+This is a fork of `raine/claude-code-proxy`. Three remotes are configured:
+
+| remote | repository | role |
+| --- | --- | --- |
+| `origin` | `fcakyon/claude-code-with-codex` | this fork; crate `claude-codex` on crates.io |
+| `upstream` | `raine/claude-code-proxy` | the original; crate `claude-code-proxy` |
+| `mine` | `null-topology/claude-code-proxy` | fork of upstream that holds branches for upstream pull requests |
+
+Only this fork has `src/providers/anthropic/` and `AliasProvider::Anthropic`.
+Upstream has no passthrough at all: its registry routes `claude-*` to another
+backend (codex by default). A "Claude through the proxy" test against an
+upstream build silently goes to Codex. If a Claude-route test ever returns a
+Codex-looking answer or a Codex rate limit, check which build is running first.
+
+Other differences when moving code between the two:
+
+- Upstream additionally has `src/providers/opencode/`, its own Codex
+  browser/device/PKCE login under `codex/auth/`, and an Astro docs site. In
+  this fork Codex sign-in is `codex login` from the Codex CLI.
+- Crate names differ in imports and test helpers: `claude_codex::` vs
+  `claude_code_proxy::`, `Command::cargo_bin("claude-codex")` vs
+  `Command::cargo_bin("claude-code-proxy")`. Ported test files need that edit.
+- Never copy one `Cargo.lock` over the other.
+
+The fork's `CHANGELOG.md` top entry records the last upstream release that was
+integrated. `AGENTS.md` at the repo root lists the fork practices (stay close
+to upstream, keep Claude aliases on Anthropic, Codex CLI auth, toy credentials
+in tests).
+
+## Toolchain on this machine
+
+`cargo` is not on the non-interactive shell PATH. The rustup shims live in
+`/opt/homebrew/opt/rustup/bin` (stable, rustc 1.94.x); prepend that directory
+to `PATH` before running cargo. `just`, `checkle`, `cargo-release`, `nix` and
+`bun` are not installed, so run the underlying cargo commands directly instead
+of the `justfile` recipes.
+
+## Commands
+
+```sh
+export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+cargo build
+cargo test -- --test-threads=1                                 # full suite
+cargo test --test server -- --test-threads=1                   # one integration binary (tests/server.rs)
+cargo test --test smoke_cutover websocket -- --test-threads=1  # tests whose name contains a substring
+cargo test --lib providers::codex::rate_limits                 # unit tests in src/, by module path
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo run -- serve --no-monitor --port 19000                   # plain server, no TUI
+cargo run -- models --full
+scripts/debug-proxy                                            # isolated instance: random port, verbose log, traffic capture, temp state dir
+```
+
+Run tests single-threaded. A few config tests mutate process-wide environment
+variables and race under the parallel runner; `tests/smoke_cutover.rs` also
+serializes its env-mutating tests with a file-local `env_lock()`. This is
+pre-existing and unrelated to product behavior.
+
+CI (`.github/workflows/ci.yml`) runs `just check-ci`, which is `checkle run all`
+(`cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo build
+--all`, `cargo test --all`) and then fails if the checks left uncommitted
+changes. The pre-commit hook (`just install-hooks`) runs `checkle pre-commit`.
+
+Release: `just release` bumps a patch version with cargo-release and skips
+publish; pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which
+tests with `--test-threads=1`, builds prebuilt binaries for six targets, and
+verifies `--version` matches the tag. It uses the default `GITHUB_TOKEN` and
+needs no secrets. crates.io publishing is separate.
+
+Running a build without touching an installed one:
+
+```sh
+./target/release/claude-codex serve --port 18766 --no-monitor
+CCP_TRAFFIC_LOG=1 ./target/release/claude-codex serve --port 18766 --no-monitor
+```
 
 ## Architecture
 
-- `src/registry.rs` picks a provider for each request. `claude-*` and the opus
-  and sonnet aliases resolve to the Anthropic passthrough; other ids match a
-  backend exactly; an unknown id returns a 400 that lists the supported ids.
-- `src/providers/anthropic/mod.rs` is the passthrough. It relays the original
-  body and headers to `api.anthropic.com` and streams the reply back. It holds
-  no Anthropic credentials.
-- `src/providers/codex/*` translates the Anthropic Messages API to the OpenAI
-  Responses API and back.
-- `src/providers/translate_shared.rs` holds types and helpers shared by the
-  translators, including the reasoning-tag helpers.
+Request path:
+
+1. `src/main.rs`: clap CLI. `serve` is the default command and opens the
+   ratatui monitor when stdout is a TTY; `--no-monitor` gives a plain server.
+   Other commands: `models [--full]`, `<provider> auth {login,device,status,logout}`,
+   hidden `demo`.
+2. `src/server.rs`: axum router. Always `/healthz`, `/v1/messages`,
+   `/v1/messages/count_tokens`, `/v1/models`. Optional OpenAI-compatible
+   surfaces gated by `AppFeatures`: `/v1/responses` and `/v1/chat/completions`
+   (`CCP_CODEX_RESPONSES_API`), `/v1/images/*` (`CCP_CODEX_IMAGES_API`),
+   `/v1/audio/transcriptions` (`CCP_CODEX_TRANSCRIPTIONS_API`).
+   `dispatch_request` handles the Anthropic routes: read the body, normalize
+   the model (strip `[1m]`), look up the session by `x-claude-code-session-id`,
+   pick a provider via the registry, apply the auto-review override (Claude
+   Code's non-streaming, tool-free security classifier is rerouted to
+   `CCP_AUTO_REVIEW_MODEL`, default `gpt-5.6-luna` on codex), then call the
+   provider and record log, monitor and traffic capture.
+3. `src/registry.rs`: model to provider. `ANTHROPIC_STYLE_ALIASES` and any
+   `claude-*` id go to the alias provider (`CCP_ALIAS_PROVIDER`, default
+   anthropic); `cursor:` prefixes go to cursor; anything else must match a
+   provider's model list exactly; unknown ids return 400 listing the catalog.
+   The `CODEX_MODELS`, `KIMI_MODELS`, `GROK_MODELS` lists here are duplicated
+   in each provider's `translate/model_allowlist.rs`. Keep them in sync.
+4. `src/provider.rs`: the `Provider` trait, `RequestContext` (request id,
+   session, traffic, monitor, and `Passthrough` with the raw bytes and headers
+   for byte-exact relays), `ProviderError`, `CliHandlers`.
+5. `src/providers/<name>/`: one directory per backend with the same shape:
+   `auth/`, `client.rs`, `translate/` (`request.rs` Anthropic to native,
+   `stream.rs` and `reducer.rs` native events to typed events,
+   `accumulate.rs` for non-streaming, `model_allowlist.rs`), and
+   `count_tokens.rs` (local estimate, no upstream call).
+   `translate_shared.rs` holds the shared `ContentBlock` model and the
+   `REASONING_OPEN` / `REASONING_CLOSE` tags used when replaying reasoning
+   across backends.
+   - `anthropic/`: transparent reverse proxy to `api.anthropic.com`. Forwards
+     the `Passthrough` bytes verbatim; the only rewrite is turning a
+     signature-less `thinking` block into tagged text. Holds no credentials.
+   - `codex/`: by far the largest. Maps Anthropic Messages onto the OpenAI
+     Responses API. Transport defaults to WebSocket (`CCP_CODEX_TRANSPORT` =
+     `http|websocket|auto`) with a per-conversation pool in `websocket.rs`.
+     `continuation.rs` keeps `previous_response_id` state keyed by
+     `ConversationIdentity` (session plus agent headers) so subagents do not
+     clobber each other; `compaction.rs` does server-side compaction;
+     `events.rs` classifies stream failures and recognises the
+     `usage_limit_reached` error; `rate_limits.rs` keeps the newest
+     `codex.rate_limits` reading and publishes it as
+     `anthropic-ratelimit-unified-*` headers (see below). Auth reads the Codex
+     CLI's `~/.codex/auth.json` (`CCP_CODEX_AUTH_FILE` overrides the path).
+   - `kimi/`, `grok/`: Chat Completions / Responses translators with their own
+     OAuth. `cursor/`: Connect protocol over protobuf.
+6. Cross-cutting: `session.rs` (in-memory sessions, 30 min idle TTL, provider
+   affinity), `request_identity.rs` (Claude Code session and agent headers),
+   `retry.rs` (backoff on 429 and 5xx), `monitor.rs` + `tui.rs`, `traffic.rs`
+   (`CCP_TRAFFIC_LOG=1` writes full captures under the state dir),
+   `logging.rs` (JSONL `proxy.log`, redacts known keys), `paths.rs` (config
+   dir `~/.config/claude-code-proxy`, state dir
+   `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy`, `CCP_CONFIG_DIR`
+   overrides only the config dir), `config.rs` (precedence: `CCP_*` env, then
+   `config.json` in the config dir, then default).
+
+All conversation state (sessions, continuations, compaction, WebSocket pool)
+lives in process-wide statics. A restart clears it.
 
 ## Invariants to preserve
 
@@ -48,19 +175,38 @@ changes made on top of it.
   `REASONING_OPEN` and `REASONING_CLOSE` tags via `wrap_reasoning`. Keep this
   deterministic so the rewritten prefix is byte-stable turn to turn.
 - Codex credentials come only from the Codex CLI's `~/.codex/auth.json`. The
-  proxy has no Codex login of its own. Token refresh writes back to that file so
-  the Codex CLI keeps working (OpenAI rotates the refresh token on use).
+  proxy has no Codex login of its own and must never delete that file. Token
+  refresh writes back to it so the Codex CLI keeps working (OpenAI rotates the
+  refresh token on use).
+
+## Codex rate limits
+
+Codex ends a stream with an `error` event of type `usage_limit_reached` when a
+window is spent, and emits a `codex.rate_limits` event during healthy streams.
+The live WebSocket path answers a spent window once, without retrying, with
+`x-should-retry: false` plus `anthropic-ratelimit-unified-status: rejected`,
+`-reset` and `-representative-claim`. `Retry-After` is deliberately not sent
+because clients sleep for its full value, which here is hours. Healthy
+readings become `-5h-utilization` / `-5h-reset` / `-7d-*`, and a window past
+its threshold (`CCP_CODEX_QUOTA_WARN_AT`, defaults 0.9 session / 0.75 weekly)
+adds `-surpassed-threshold`; readings whose reset time has passed are dropped.
+
+Field-name trap: the wire format says `reset_at` / `reset_after_seconds`, while
+Codex CLI session logs reserialise the same data as `resets_at` /
+`resets_in_seconds`. Both spellings are read. If quota headers ever stop
+appearing, compare against a fresh traffic capture before anything else.
+
+Not covered: the buffered HTTP path (`client.rs`, `first_retryable_failure`)
+and a 429 on the WebSocket handshake.
 
 ## Naming and distribution
 
 The crate, the installed command, and the library target are all `claude-codex`
-(`claude_codex` for the library, derived automatically from the package name).
-The crates.io package is `claude-codex`. The GitHub repository stays
-`claude-code-with-codex`.
+(`claude_codex` for the library). The crates.io package is `claude-codex`. The
+GitHub repository stays `claude-code-with-codex`.
 
 Some strings deliberately keep the old `claude-code-proxy` name because they are
-compatibility contracts, not the user-facing name. Do not rename them in a
-future cleanup:
+compatibility contracts, not the user-facing name. Do not rename them:
 
 - The on-disk config and data directory and the macOS Keychain service, in
   `paths.rs`, `providers/kimi/auth`, and `providers/cursor/auth.rs`. Renaming
@@ -69,32 +215,77 @@ future cleanup:
 - The Codex `ORIGINATOR` and `User-Agent` in `providers/codex`. These go to the
   ChatGPT backend, so keep them stable to avoid changing what the server sees.
 
-Two install paths ship. crates.io via `cargo install claude-codex`, and prebuilt
-binaries from the `v*`-tag release workflow in `.github/workflows/release.yml`.
-That workflow uses the default `GITHUB_TOKEN` and needs no secrets or Homebrew
-tap.
+## Tests
 
-## Build and test
+- Integration tests in `tests/` drive `server::app*` with tower `oneshot` and
+  in-process mock upstreams. `smoke_cutover.rs` starts mock Codex HTTP and
+  WebSocket servers and a mock Kimi server; `codex_auth.rs` and `cli.rs` run
+  the binary through `assert_cmd` with `CCP_CONFIG_DIR` and
+  `CCP_CODEX_AUTH_FILE` pointing at temp dirs. Tests use toy credentials only.
+- The static registries expose reset helpers: `clear_all_continuations_for_tests`,
+  `clear_all_compactions_for_tests`, `clear_codex_websocket_pool_for_tests`,
+  `retry::set_zero_retry_delay_for_tests`. Call them at the start of a test
+  that depends on clean state.
+- Unit tests sit next to the code under `#[cfg(test)]` in most modules.
+- Fixtures: `tests/fixtures/anthropic-message.json`, `tests/fixtures/sse-basic.txt`.
+- A unit test that mirrors a wire format can pass while being wrong about the
+  format. Verify stream-shape changes end to end against a real capture.
 
-- `cargo build`
-- `cargo test -- --test-threads=1`. Run tests single-threaded. A few config
-  tests mutate process-wide environment variables and race under the default
-  parallel runner. This is pre-existing and unrelated to product behavior.
-- `just check` runs format, clippy, and tests together where the toolchain has
-  clippy installed.
+## Adding a Codex model
+
+Four places plus one test line; the `-fast` variant appears on its own because
+`fast_model_aliases()` derives `<model>-fast` for every allowed model:
+
+- `src/providers/codex/translate/model_allowlist.rs` → `ALLOWED_MODELS` and
+  `uses_responses_lite`
+- `src/registry.rs` → `CODEX_MODELS` (routing) and `CODEX_CATALOG` (what
+  `/v1/models` advertises, with picker label and description)
+- the `assert_allowed_model` test
+- the `modelPicker` example in `README.md`
+
+`/v1/models` deliberately omits the Anthropic group: Claude Code lists its own
+models, and repeating them duplicated the picker.
+
+## How Codex models get into Claude Code's picker
+
+Verified against Claude Code 2.1.266 by reading the binary and by live runs:
+
+- `modelPicker` in user settings (`options[]` of `model`, `label`,
+  `description`, `behavesAs`) is the supported way. Rows use bare ids, need no
+  credential, and keep the subscription path. Present since 2.1.261.
+- Gateway discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` fetching
+  `/v1/models`) runs only with `ANTHROPIC_AUTH_TOKEN`, `apiKeyHelper`, or an
+  API key, keeps only ids matching `/(claude|anthropic)/i`, and any of those
+  credentials makes Claude Code drop the `RateLimitEvent` for every route and
+  disable claude.ai connectors. Do not build on it.
+- The bootstrap call that carries Anthropic's own extra picker rows goes
+  straight to `api.anthropic.com`, never through `ANTHROPIC_BASE_URL`.
+- Env-only alternatives exist but are narrower: `ANTHROPIC_DEFAULT_*_MODEL`
+  remaps a built-in row (with `..._MODEL_DESCRIPTION` for its subtitle), and
+  `ANTHROPIC_CUSTOM_MODEL_OPTION` (+ `_NAME`, `_DESCRIPTION`) adds one row.
+
+`~/.codex/models_cache.json` is the authoritative inventory of what Codex
+currently serves, including `visibility` and `use_responses_lite` per model.
 
 ## Gotchas
 
 - In the dual setup, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` must be
   unset. Claude Code forwards its subscription login for `claude-*` only when no
   explicit token is present. Setting either one sends that value instead and the
-  Anthropic route returns 401.
+  Anthropic route returns 401. A non-empty `ANTHROPIC_API_KEY` also puts Claude
+  Code on the API-billing path, where it ignores the structured rate-limit
+  headers entirely.
+- Claude Code disables lazy tool loading when `ANTHROPIC_BASE_URL` is not a
+  first-party host. `ENABLE_TOOL_SEARCH=true` restores it; this proxy forwards
+  the `tool_reference` blocks, so the flag is safe to set.
 - Claude Code's web search is a client-side `WebSearch` function tool. The
   hosted `web_search_20250305` tool only appears inside an isolated, history-free
-  inner call that Claude Code makes to run the search, so its reconstructed
-  `server_tool_use` and `web_search_tool_result` blocks never enter the outer
-  transcript. The passthrough logs `hosted_web_search_in_history` if that ever
-  changes, which would mean this assumption needs rechecking.
+  inner call, so its `server_tool_use` and `web_search_tool_result` blocks never
+  enter the outer transcript. The passthrough logs `hosted_web_search_in_history`
+  if that ever changes, which would mean this assumption needs rechecking.
+- `MODEL_ALIASES` in the codex allowlist still maps Claude alias names to codex
+  models. That only matters when `CCP_ALIAS_PROVIDER=codex`; the default keeps
+  Claude names on Anthropic.
 
 ## Known limitation
 
@@ -104,8 +295,27 @@ can fail. Anthropic requires a leading signed `thinking` block in that position
 and no valid signature can be produced for reasoning that came from another
 backend. This is rare and not worked around.
 
+## Sensitive data
+
+Traffic captures and the `errors/` directory under the state dir contain
+prompts, tool input, tool output and file contents in the clear. Keep them
+local, never paste them into an issue, and delete them after a debugging
+session. Never print or commit `auth.json` contents, tokens or account ids.
+
 ## Style
 
 Match the surrounding code. `reqwest` is built without gzip or brotli so bodies
 are never auto-decompressed, and with rustls so no OS keychain is touched. Keep
-new code in the same shape as the module it lives in.
+new code in the same shape as the module it lives in. Stay close to upstream
+and avoid style-only divergence so ports in either direction stay cheap.
+
+## Where the rest is
+
+- `.claude/precompact/` holds session handoffs: what happened, what is open,
+  and what misled. Read the newest one at the start of a session.
+- `.claude/probes/sdk_limit_probe.py` is an SDK-level rate-limit probe:
+  `uv run --with claude-agent-sdk --no-project python .claude/probes/sdk_limit_probe.py`
+  with `PROBE_BASE_URL` and `PROBE_MODEL` set.
+- Upstream documentation is published at https://claude-code-proxy.raine.dev/
+  (with `/llms.txt`); it describes configuration, the HTTP API, and file
+  locations that this fork shares.
