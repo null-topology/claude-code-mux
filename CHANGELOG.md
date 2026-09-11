@@ -1,3 +1,17 @@
+## Unreleased
+
+- Claude Code's background-agent status line no longer costs a model call. While
+  a subagent runs, Claude Code resends that subagent's whole context every half
+  minute for a three-word progress label; in a measured capture those requests
+  were a quarter of all Codex traffic, tens of thousands of tokens each. The
+  proxy now recognises the prompt and answers it from the transcript, on every
+  route, since a setup may have no Anthropic subscription at all.
+  `CCP_AGENT_SUMMARY=upstream` sends them to a model again, and then to the
+  provider's junior model at the lowest effort rather than to the subagent's
+  own: `claude-sonnet-5` on Anthropic, because Haiku's 200k window would leave a
+  long-running subagent without a label, and `gpt-5.6-luna` on Codex.
+  `CCP_AGENT_SUMMARY_MODEL` overrides both.
+
 ## v0.6.0 (2026-09-11)
 
 - The monitor shows the prompt cache: cache reads and writes next to the

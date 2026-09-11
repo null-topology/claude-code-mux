@@ -41,6 +41,8 @@ struct FileConfig {
     pub alias_provider: Option<String>,
     #[serde(rename = "autoReviewModel")]
     pub auto_review_model: Option<String>,
+    #[serde(rename = "agentSummary")]
+    pub agent_summary: Option<String>,
     pub log: Option<FileLog>,
     pub kimi: Option<KimiConfig>,
     pub codex: Option<CodexConfig>,
@@ -722,6 +724,34 @@ pub fn codex_model() -> Option<String> {
         return codex.model;
     }
     None
+}
+
+/// Whether the proxy answers Claude Code's background-agent status line itself
+/// instead of paying a model for it. `upstream` sends those requests on as
+/// before; anything else, including no setting, keeps them local.
+/// An explicit model for status labels, overriding the per-provider choice.
+pub fn agent_summary_model() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    env.get("CCP_AGENT_SUMMARY_MODEL")
+        .filter(|raw| !raw.is_empty())
+        .cloned()
+}
+
+pub fn agent_summary_local() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    let configured = env
+        .get("CCP_AGENT_SUMMARY")
+        .filter(|raw| !raw.is_empty())
+        .cloned()
+        .or_else(|| {
+            read_file_config(&paths::config_dir())
+                .and_then(|file| file.agent_summary)
+                .filter(|value| !value.is_empty())
+        });
+    !matches!(
+        configured.as_deref().map(str::trim),
+        Some("upstream") | Some("model") | Some("remote")
+    )
 }
 
 pub fn auto_review_model() -> Option<String> {

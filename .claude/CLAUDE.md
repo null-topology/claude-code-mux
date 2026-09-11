@@ -240,6 +240,32 @@ Explicit cache controls (`prompt_cache_breakpoint`, `prompt_cache_retention`)
 are rejected by the subscription backend for GPT-5.6 models (openai/codex
 #35300, #39397).
 
+## What the Codex subscription actually meters
+
+Measured 2026-09-12 on a `prolite` plan: `GET /backend-api/wham/usage` reports
+one window, `rate_limit.primary_window` with `limit_window_seconds: 604800`, so
+the allowance is weekly (the `codex.rate_limits` stream event had shown a
+5h/weekly pair earlier; do not assume the shape, read it). Over one evening
+58M input tokens, of which only 2M uncached, and 181k output tokens moved that
+window from 16% to 69%: roughly 1M input tokens per percent. A probe of 156k
+cached plus 78k uncached tokens moved it by less than the 1% resolution, which
+rules out metering by uncached tokens alone.
+
+Consequences for this proxy: prompt-cache hits save latency, not allowance;
+output and reasoning are negligible next to input; what costs is context size
+times request count. So the levers are fewer requests and smaller contexts,
+not cache tuning. `src/agent_summary.rs` is the first of those: Claude Code
+asks a running subagent's own model for a three-word progress label every half
+minute, resending the subagent's whole context, which was a quarter of all
+captured Codex requests. The proxy answers it from the transcript on any route;
+`CCP_AGENT_SUMMARY=upstream` sends it to the provider's junior model at
+`effort: low` instead, never to the subagent's own. That model must still hold
+the subagent's context, which is why Anthropic's is `claude-sonnet-5` and not
+Haiku (200k would drop the label on a long subagent) and Codex's is
+`gpt-5.6-luna`; a provider without an entry in `summary_model_for` keeps the
+request's model. Detection is the prompt text, `SUMMARY_PROMPT_MARKER`: these
+requests otherwise look like a normal subagent turn, with its tools and history.
+
 ## Invariants to preserve
 
 - The Anthropic passthrough must stay byte-exact for normal traffic. The only
