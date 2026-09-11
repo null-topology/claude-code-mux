@@ -1,10 +1,22 @@
 ## Unreleased
 
-- Each conversation gets its own prompt cache on the Codex backend. Claude Code
-  gives a subagent its parent's session id, so until now a session and all its
-  subagents shared one `prompt_cache_key` and one routing bucket upstream, where
-  busy sessions lose cache hits to overflow routing. Subagents now send a
-  derived id of their own.
+- Each conversation gets its own prompt cache scope on the Codex backend.
+  Claude Code gives a subagent its parent's session id, so a session and all of
+  its subagents sent one `prompt_cache_key` and one set of routing headers,
+  putting unrelated prompts under one cache accounting key and one affinity.
+  A subagent now derives an id of its own, the way the Codex CLI keeps one id
+  per conversation.
+- Claude Code's background-agent status line no longer costs a model call. While
+  a subagent runs, Claude Code resends that subagent's whole context every half
+  minute for a three-word progress label; in a measured capture those requests
+  were a quarter of all Codex traffic, tens of thousands of tokens each. The
+  proxy now recognises the prompt and answers it from the transcript, on every
+  route, since a setup may have no Anthropic subscription at all.
+  `CCP_AGENT_SUMMARY=upstream` sends them to a model again, and then to the
+  provider's junior model at the lowest effort rather than to the subagent's
+  own: `claude-sonnet-5` on Anthropic, because Haiku's 200k window would leave a
+  long-running subagent without a label, and `gpt-5.6-luna` on Codex.
+  `CCP_AGENT_SUMMARY_MODEL` overrides both.
 
 ## v0.6.0 (2026-09-11)
 

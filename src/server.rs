@@ -1591,6 +1591,54 @@ async fn dispatch_request(
         monitor.conversation_resolved(&req_id, monitor_conversation_label(identity, &body));
     }
 
+    // Claude Code asks a running subagent's own model for a three-word progress
+    // label every half minute, resending that subagent's whole context each
+    // time. Answer it here: the label is in the transcript already, and on a
+    // subscription every one of those requests is billed as a full context.
+    let agent_summary = !count_tokens && crate::agent_summary::is_agent_summary_request(&body);
+    if agent_summary && !crate::config::agent_summary_local() {
+        // Kept for the case where a label really must come from a model: the
+        // provider's junior model at the lowest effort, never the subagent's.
+        let provider = state
+            .registry
+            .provider_for_model(body.model.as_deref().unwrap_or_default(), None);
+        let summary_model = crate::config::agent_summary_model().or_else(|| {
+            provider
+                .as_ref()
+                .and_then(|provider| crate::agent_summary::summary_model_for(provider.name()))
+                .map(str::to_string)
+        });
+        if let Some(summary_model) = summary_model {
+            crate::agent_summary::apply_summary_route(&mut body, &summary_model);
+            log.info(
+                "agent_summary_routed",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".to_string(), json!(&req_id)),
+                    ("model".to_string(), json!(&summary_model)),
+                ])),
+            );
+        }
+    }
+    if agent_summary && crate::config::agent_summary_local() {
+        let text = crate::agent_summary::summary_text(&body);
+        let (response, output_tokens) = crate::agent_summary::local_response(&body, &text);
+        if let Some(monitor) = state.monitor.as_ref() {
+            if let Some(model) = body.model.as_deref() {
+                monitor.provider_selected(&req_id, "local", model, None);
+            }
+            monitor.request_completed(&req_id, 200, Some(0), Some(output_tokens));
+        }
+        log.info(
+            "agent_summary_answered_locally",
+            Some(serde_json::Map::from_iter([
+                ("reqId".to_string(), json!(&req_id)),
+                ("model".to_string(), json!(&body.model)),
+                ("outputTokens".to_string(), json!(output_tokens)),
+            ])),
+        );
+        return response;
+    }
+
     let model = match body.model.as_deref() {
         Some(model) => model,
         None => {
