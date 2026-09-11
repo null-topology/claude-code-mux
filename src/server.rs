@@ -308,61 +308,94 @@ async fn healthz() -> Json<serde_json::Value> {
 #[derive(serde::Deserialize)]
 struct ModelsQuery {
     limit: Option<usize>,
+    provider: Option<String>,
 }
 
-/// Anthropic-shaped model listing so Claude Code's gateway model discovery
-/// (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) finds the proxy's models.
-/// Claude Code only adds entries whose id starts with `claude` or `anthropic`,
-/// so the Anthropic-style aliases are what surface in its `/model` picker;
-/// raw provider ids are still listed for other Anthropic-compatible clients.
+/// Anthropic-shaped model listing, one row per model with a `provider` field,
+/// plus a top-level `providers` block saying where each group's rows came from
+/// and whether the backend answered.
+///
+/// A provider that holds a login asks its backend on every call, so the rows
+/// are what that login may use right now, not a list compiled into the proxy.
+/// Codex is the one that does today; kimi, grok and cursor still advertise
+/// their bundled lists and say so (`source: bundled`). Anthropic is reported
+/// with no rows: the proxy forwards the caller's credential and holds none,
+/// and Claude Code lists its own models. Claude Code's gateway discovery reads
+/// only `data[]` (keeping ids that contain `claude` or `anthropic`), which is
+/// why the provider block lives beside it and no marker row goes inside it.
+///
+/// `?provider=<name>` narrows the answer to one provider and asks only that
+/// backend; when that provider cannot list, the request fails with 502 so a
+/// consumer never mistakes an empty answer for "no models".
 async fn handler_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModelsQuery>,
-) -> Json<serde_json::Value> {
-    // Claude Code already knows its own models, so the Anthropic passthrough group is
-    // not advertised: listing it again only duplicates the built-in picker entries.
-    // Codex is advertised through its curated catalog with picker-style labels and
-    // descriptions. Other backends are listed by their bare ids.
-    let mut data: Vec<Value> = Vec::new();
-    for provider in state.registry.list_provider_names() {
-        match provider.as_str() {
-            "anthropic" => {}
-            "codex" => data.extend(crate::registry::CODEX_CATALOG.iter().map(|entry| {
-                json!({
-                    "type": "model",
-                    "object": "model",
-                    "id": entry.slug,
-                    "display_name": entry.label,
-                    "description": entry.description,
-                })
-            })),
-            _ => data.extend(
-                state
-                    .registry
-                    .supported_models_for(&provider)
-                    .into_iter()
-                    .map(|model| {
-                        json!({
-                            "type": "model",
-                            "object": "model",
-                            "id": model,
-                            "display_name": format!("{model} ({provider})"),
-                        })
-                    }),
-            ),
+) -> Response {
+    let names = state.registry.list_provider_names();
+    let selected: Vec<String> = match query.provider.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => {
+            if !names.iter().any(|known| known == name) {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!(
+                        "Unknown provider \"{name}\". Providers: {}.",
+                        names.join(", ")
+                    ),
+                );
+            }
+            vec![name.to_string()]
         }
+        _ => names,
+    };
+
+    let mut data: Vec<Value> = Vec::new();
+    let mut providers: Vec<Value> = Vec::new();
+    for name in &selected {
+        let Some(provider) = state.registry.provider(name) else {
+            continue;
+        };
+        let listing = provider.list_models().await;
+        if query.provider.is_some() && !listing.is_ok() {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                format!(
+                    "{} model listing unavailable ({}): {}",
+                    listing.provider,
+                    listing.status,
+                    listing.detail.as_deref().unwrap_or("no detail")
+                ),
+            );
+        }
+        for mut row in listing.models {
+            if let Some(object) = row.as_object_mut() {
+                object.insert("provider".to_string(), json!(listing.provider));
+            }
+            data.push(row);
+        }
+        providers.push(json!({
+            "provider": listing.provider,
+            "auth": listing.auth.as_str(),
+            "source": listing.source.as_str(),
+            "status": listing.status,
+            "detail": listing.detail,
+            "fetched_at": listing.fetched_at,
+        }));
     }
+
     let has_more = query.limit.is_some_and(|limit| data.len() > limit);
     if let Some(limit) = query.limit {
         data.truncate(limit);
     }
-    Json(json!({
+    axum::response::IntoResponse::into_response(Json(json!({
         "object": "list",
         "data": data,
         "has_more": has_more,
         "first_id": data.first().and_then(|entry| entry.get("id")).cloned(),
         "last_id": data.last().and_then(|entry| entry.get("id")).cloned(),
-    }))
+        "providers": providers,
+    })))
 }
 
 async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {

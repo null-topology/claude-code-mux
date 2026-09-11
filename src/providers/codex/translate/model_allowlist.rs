@@ -38,8 +38,27 @@ pub struct ResolvedModel {
     pub service_tier: Option<ServiceTier>,
 }
 
+/// Every model the codex route accepts as a base id: the compiled-in list plus
+/// whatever the backend named in its last successful listing (see
+/// `providers::codex::models`), sorted and deduplicated.
+pub fn known_models() -> Vec<String> {
+    let mut models: Vec<String> = ALLOWED_MODELS.iter().map(|m| (*m).to_string()).collect();
+    models.extend(super::super::models::discovered_slugs());
+    models.sort_unstable();
+    models.dedup();
+    models
+}
+
+/// Whether `model` is a base id the codex route accepts.
+pub fn is_known_model(model: &str) -> bool {
+    ALLOWED_MODELS.contains(&model) || super::super::models::is_discovered_model(model)
+}
+
 fn fast_model_aliases() -> HashSet<String> {
-    ALLOWED_MODELS.iter().map(|m| format!("{m}-fast")).collect()
+    known_models()
+        .into_iter()
+        .map(|m| format!("{m}-fast"))
+        .collect()
 }
 
 fn resolve_fast_model_alias(model: &str) -> ResolvedModel {
@@ -108,7 +127,7 @@ impl std::fmt::Display for ModelNotAllowedError {
 }
 
 pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
-    if ALLOWED_MODELS.contains(&model) {
+    if is_known_model(model) {
         Ok(())
     } else {
         Err(ModelNotAllowedError {
@@ -117,7 +136,13 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
     }
 }
 
+/// Whether a model runs on the Responses Lite lane. The backend's own flag
+/// from the last listing wins; the compiled-in answer covers the models known
+/// before any listing was fetched.
 pub fn uses_responses_lite(model: &str) -> bool {
+    if let Some(flag) = super::super::models::discovered_uses_responses_lite(model) {
+        return flag;
+    }
     matches!(
         model,
         "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra"
@@ -137,7 +162,7 @@ pub fn full_lane_web_search_model(model: &str) -> &str {
 }
 
 pub fn is_valid_model_for_codex(model: &str) -> bool {
-    if ALLOWED_MODELS.contains(&model) {
+    if is_known_model(model) {
         return true;
     }
     let fast_set = fast_model_aliases();

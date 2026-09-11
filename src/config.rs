@@ -56,6 +56,8 @@ struct CodexConfig {
     pub originator: Option<String>,
     #[serde(rename = "userAgent")]
     pub user_agent: Option<String>,
+    #[serde(rename = "clientVersion")]
+    pub client_version: Option<String>,
     #[serde(rename = "previousResponseId")]
     pub previous_response_id: Option<bool>,
     #[serde(rename = "serverCompaction")]
@@ -545,6 +547,27 @@ pub fn codex_user_agent(default: &str) -> String {
         return ua;
     }
     default.to_string()
+}
+
+/// `client_version` for the Codex model listing call, when configured.
+/// `CCP_CODEX_CLIENT_VERSION`, then `codex.clientVersion` in `config.json`.
+pub fn codex_client_version() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_CLIENT_VERSION") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(val) = codex.client_version
+        && !val.trim().is_empty()
+    {
+        return Some(val.trim().to_string());
+    }
+    None
 }
 
 pub fn codex_previous_response_id() -> bool {

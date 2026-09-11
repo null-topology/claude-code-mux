@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::MessagesRequest;
 use crate::logging::create_logger;
-use crate::provider::{CliHandlers, Provider, RequestContext};
+use crate::provider::{CliHandlers, ModelListing, Provider, RequestContext};
 use crate::providers::translate_shared::wrap_reasoning;
 use crate::registry::ANTHROPIC_STYLE_ALIASES;
 
@@ -275,6 +275,17 @@ impl Provider for AnthropicProvider {
 
     fn cli(&self) -> &'static dyn CliHandlers {
         &ANTHROPIC_CLI
+    }
+
+    /// The proxy holds no Anthropic credential, so it cannot ask what this
+    /// login may use, and Claude Code already lists its own models; repeating
+    /// them here only duplicated the picker. The provider is reported, its
+    /// rows are not.
+    async fn list_models(&self) -> ModelListing {
+        ModelListing::client_side(
+            "anthropic",
+            "credentials are forwarded from the client; models are routed, not listed",
+        )
     }
 
     async fn handle_messages(&self, _body: MessagesRequest, ctx: RequestContext) -> Response {

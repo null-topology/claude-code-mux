@@ -50,56 +50,6 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
     "gpt-6-astra",
 ];
 
-/// One entry of the codex model catalog advertised on `/v1/models`.
-///
-/// `label` and `description` follow the style of Claude Code's built-in picker
-/// rows so a client that renders them (a `modelPicker` row in Claude Code's
-/// settings, or any UI reading `display_name`/`description`) reads the same
-/// way as the built-in lineup. The id is the bare codex slug: Claude Code's
-/// gateway discovery would drop it, but that discovery needs a non-OAuth
-/// credential on the client, which also silences the native rate-limit events,
-/// so it is not the mechanism this proxy targets.
-#[derive(Debug, Clone, Copy)]
-pub struct CodexCatalogEntry {
-    /// The id sent to Codex and advertised on `/v1/models`.
-    pub slug: &'static str,
-    /// Short picker label, in the style of Claude Code's built-in entries.
-    pub label: &'static str,
-    /// One-line picker description; Claude Code truncates at 100 characters.
-    pub description: &'static str,
-}
-
-/// Codex models offered to clients. Order is picker order. Models Codex still
-/// accepts but no longer lists (see `~/.codex/models_cache.json`) are deliberately
-/// left out; they remain routable by their bare id.
-pub const CODEX_CATALOG: &[CodexCatalogEntry] = &[
-    CodexCatalogEntry {
-        slug: "gpt-6-astra",
-        label: "Astra",
-        description: "GPT-6 Astra · Most capable for complex, demanding work",
-    },
-    CodexCatalogEntry {
-        slug: "gpt-5.6-sol",
-        label: "Sol",
-        description: "GPT-5.6 Sol · Reliable agentic workhorse for everyday tasks",
-    },
-    CodexCatalogEntry {
-        slug: "gpt-5.6-terra",
-        label: "Terra",
-        description: "GPT-5.6 Terra · Balanced agentic coding for everyday work",
-    },
-    CodexCatalogEntry {
-        slug: "gpt-5.6-luna",
-        label: "Luna",
-        description: "GPT-5.6 Luna · Fast and affordable agentic coding",
-    },
-    CodexCatalogEntry {
-        slug: "gpt-5.5",
-        label: "GPT-5.5",
-        description: "GPT-5.5 · Proven previous-generation model for coding and general work",
-    },
-];
-
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
 pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5"];
 
@@ -244,6 +194,12 @@ impl Registry {
             if models.iter().any(|candidate| candidate == &normalized) {
                 return self.handlers.get(name).cloned();
             }
+        }
+
+        // A model the Codex backend named in its last listing routes to codex
+        // even when this build's compiled-in list predates it.
+        if is_discovered_codex_model(&normalized) {
+            return self.handlers.get("codex").cloned();
         }
 
         None
@@ -391,6 +347,14 @@ fn expand_codex_models() -> Vec<String> {
     out
 }
 
+fn is_discovered_codex_model(model: &str) -> bool {
+    use crate::providers::codex::models::is_discovered_model;
+    if is_discovered_model(model) {
+        return true;
+    }
+    model.strip_suffix("-fast").is_some_and(is_discovered_model)
+}
+
 fn build_cursor_models() -> Vec<String> {
     let mut out: Vec<String> = CURSOR_LEGACY_MODELS
         .iter()
@@ -411,15 +375,21 @@ mod tests {
     }
 
     #[test]
-    fn codex_catalog_entries_route_to_codex() {
+    fn discovered_codex_model_routes_to_codex_including_fast_variant() {
+        use crate::providers::codex::models::{
+            clear_discovered_models_for_tests, remember_for_tests,
+        };
         let registry = Registry::new(AliasProvider::Anthropic);
-        for entry in CODEX_CATALOG {
-            assert!(CODEX_MODELS.contains(&entry.slug), "{}", entry.slug);
-            let p = registry.provider_for_model(entry.slug, None);
-            assert_eq!(p.expect("provider").name(), "codex", "{}", entry.slug);
-            // Claude Code truncates picker descriptions at 100 characters.
-            assert!(entry.description.chars().count() <= 100, "{}", entry.slug);
-        }
+        clear_discovered_models_for_tests();
+        assert!(registry.provider_for_model("gpt-7-test", None).is_none());
+
+        remember_for_tests(&["gpt-7-test"]);
+        let p = registry.provider_for_model("gpt-7-test", None);
+        assert_eq!(p.expect("provider").name(), "codex");
+        let p = registry.provider_for_model("gpt-7-test-fast[1m]", None);
+        assert_eq!(p.expect("provider").name(), "codex");
+        clear_discovered_models_for_tests();
+        assert!(registry.provider_for_model("gpt-7-test", None).is_none());
     }
 
     #[test]

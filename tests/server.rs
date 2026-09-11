@@ -1348,67 +1348,161 @@ async fn get_models(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     (status, value)
 }
 
-#[tokio::test]
-async fn models_endpoint_lists_supported_models() {
-    let app = app(Arc::new(Registry::with_default_alias()));
-    let (status, value) = get_models(app, "/v1/models").await;
+/// Point the codex provider at a credential file that does not exist for the
+/// duration of a test, so `/v1/models` reports codex as unauthorized instead
+/// of reading the developer's real Codex login and calling the backend.
+struct NoCodexAuth {
+    previous: Option<std::ffi::OsString>,
+    _dir: tempfile::TempDir,
+}
 
-    assert_eq!(status, StatusCode::OK);
-    let data = value["data"].as_array().unwrap();
-    assert!(!data.is_empty());
-    let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
-    assert!(ids.contains(&"gpt-5.6-sol"));
-    assert!(ids.contains(&"kimi-for-coding"));
-    for entry in data {
-        assert_eq!(entry["type"], "model");
-        assert!(entry["display_name"].as_str().is_some());
+impl NoCodexAuth {
+    fn install() -> Self {
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::var_os("CCP_CODEX_AUTH_FILE");
+        unsafe {
+            std::env::set_var("CCP_CODEX_AUTH_FILE", dir.path().join("missing-auth.json"));
+        }
+        Self {
+            previous,
+            _dir: dir,
+        }
     }
-    assert_eq!(value["has_more"], json!(false));
-    assert_eq!(value["first_id"], data[0]["id"]);
-    assert_eq!(value["last_id"], data[data.len() - 1]["id"]);
+}
+
+impl Drop for NoCodexAuth {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("CCP_CODEX_AUTH_FILE", value),
+                None => std::env::remove_var("CCP_CODEX_AUTH_FILE"),
+            }
+        }
+    }
+}
+
+fn provider_entry<'a>(value: &'a Value, name: &str) -> &'a Value {
+    value["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["provider"] == name)
+        .unwrap_or_else(|| panic!("provider {name} missing from {value}"))
 }
 
 #[tokio::test]
-async fn models_endpoint_advertises_codex_catalog_without_anthropic_group() {
-    // Codex is advertised through its curated catalog with a picker-style label
-    // and description on each row. The Anthropic passthrough group is not
-    // advertised at all: Claude Code already lists its own models, and
-    // repeating them here only duplicated the picker.
+async fn models_endpoint_tags_rows_and_describes_every_provider() {
+    let _no_codex = NoCodexAuth::install();
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, value) = get_models(app, "/v1/models?limit=1000").await;
 
     assert_eq!(status, StatusCode::OK);
     let data = value["data"].as_array().unwrap();
-    let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert!(!data.is_empty());
+    for entry in data {
+        assert_eq!(entry["type"], "model");
+        assert!(entry["display_name"].as_str().is_some());
+        assert!(entry["provider"].as_str().is_some(), "{entry}");
+    }
+    assert_eq!(value["has_more"], json!(false));
+    assert_eq!(value["first_id"], data[0]["id"]);
+    assert_eq!(value["last_id"], data[data.len() - 1]["id"]);
 
-    let astra = data
+    // Backends without a listing call advertise their compiled-in lists and
+    // say so; the rows keep the `<id> (<provider>)` display tag.
+    let kimi_row = data
         .iter()
-        .find(|m| m["id"] == "gpt-6-astra")
-        .expect("astra advertised");
-    assert_eq!(astra["display_name"], "Astra");
+        .find(|m| m["id"] == "kimi-for-coding")
+        .expect("kimi advertised");
+    assert_eq!(kimi_row["provider"], "kimi");
+    assert_eq!(kimi_row["display_name"], "kimi-for-coding (kimi)");
+    let kimi = provider_entry(&value, "kimi");
+    assert_eq!(kimi["auth"], "proxy");
+    assert_eq!(kimi["source"], "bundled");
+    assert_eq!(kimi["status"], "ok");
+    assert_eq!(provider_entry(&value, "grok")["source"], "bundled");
+    assert_eq!(provider_entry(&value, "cursor")["source"], "bundled");
+
+    // Codex lists only what its backend answers; with no credentials it
+    // answers nothing and says why.
+    let codex = provider_entry(&value, "codex");
+    assert_eq!(codex["auth"], "proxy");
+    assert_eq!(codex["source"], "none");
+    assert_eq!(codex["status"], "unauthorized");
     assert!(
-        astra["description"]
+        codex["detail"]
             .as_str()
             .unwrap()
-            .starts_with("GPT-6 Astra")
+            .contains("No Codex credentials")
     );
+    assert!(codex["fetched_at"].is_null());
+    assert!(!data.iter().any(|m| m["provider"] == "codex"));
 
-    assert!(ids.contains(&"gpt-5.6-sol"));
-    assert!(ids.contains(&"gpt-5.5"));
-    assert!(
-        !ids.contains(&"gpt-5.6-sol-fast"),
-        "fast variants stay routable but are not advertised"
-    );
-    assert!(
-        !ids.contains(&"claude-opus-5"),
-        "anthropic group is not advertised"
-    );
+    // The Anthropic passthrough holds no credential and Claude Code lists its
+    // own models, so the provider is described and its rows are not emitted.
+    // No id may contain "claude" or "anthropic": Claude Code's gateway
+    // discovery would turn it into a picker row.
+    let anthropic = provider_entry(&value, "anthropic");
+    assert_eq!(anthropic["auth"], "client");
+    assert_eq!(anthropic["source"], "none");
+    assert_eq!(anthropic["status"], "not_listed");
+    assert!(anthropic["detail"].as_str().unwrap().contains("client"));
+    let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
     assert!(!ids.contains(&"opus"));
-    assert!(!ids.iter().any(|id| id.starts_with("claude-")));
+    assert!(
+        !ids.iter()
+            .any(|id| id.to_ascii_lowercase().contains("claude")
+                || id.to_ascii_lowercase().contains("anthropic"))
+    );
+}
+
+#[tokio::test]
+async fn models_endpoint_provider_filter_narrows_rows_and_provider_block() {
+    let _no_codex = NoCodexAuth::install();
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let (status, value) = get_models(app, "/v1/models?provider=kimi").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let data = value["data"].as_array().unwrap();
+    assert!(!data.is_empty());
+    assert!(data.iter().all(|m| m["provider"] == "kimi"));
+    assert_eq!(value["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(value["providers"][0]["provider"], "kimi");
+}
+
+#[tokio::test]
+async fn models_endpoint_provider_filter_rejects_unknown_provider() {
+    let _no_codex = NoCodexAuth::install();
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let (status, value) = get_models(app, "/v1/models?provider=nope").await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["error"]["type"], "invalid_request_error");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("Unknown provider \"nope\""));
+    assert!(message.contains("codex"));
+}
+
+#[tokio::test]
+async fn models_endpoint_provider_filter_fails_hard_when_listing_unavailable() {
+    let _no_codex = NoCodexAuth::install();
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let (status, value) = get_models(app, "/v1/models?provider=codex").await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], "api_error");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("codex model listing unavailable (unauthorized)")
+    );
 }
 
 #[tokio::test]
 async fn models_endpoint_respects_limit() {
+    let _no_codex = NoCodexAuth::install();
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, value) = get_models(app, "/v1/models?limit=2").await;
 
@@ -1421,6 +1515,7 @@ async fn models_endpoint_respects_limit() {
 
 #[tokio::test]
 async fn models_endpoint_tolerates_unknown_query_params() {
+    let _no_codex = NoCodexAuth::install();
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, _) = get_models(app, "/v1/models?limit=1000&after_id=x").await;
     assert_eq!(status, StatusCode::OK);
