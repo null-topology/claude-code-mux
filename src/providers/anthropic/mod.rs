@@ -8,15 +8,19 @@
 //! api.anthropic.com and stream the response straight back. The proxy holds zero
 //! Anthropic credentials and never touches the cache-keyed request prefix.
 
+use std::task::Poll;
+
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
+use futures_util::Stream;
 use serde_json::Value;
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::MessagesRequest;
 use crate::logging::create_logger;
+use crate::monitor::{MonitorHandle, UsageReport, usage_report_from_anthropic_body};
 use crate::provider::{CliHandlers, ModelListing, Provider, RequestContext};
 use crate::providers::translate_shared::wrap_reasoning;
 use crate::registry::ANTHROPIC_STYLE_ALIASES;
@@ -240,7 +244,33 @@ impl AnthropicProvider {
                     }
                     out_headers.append(name.clone(), value.clone());
                 }
-                let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+                let body_kind = ObservedBody::from_content_type(
+                    upstream
+                        .headers()
+                        .get(axum::http::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                );
+                let body = match (monitor, body_kind) {
+                    (Some(monitor), Some(kind)) => {
+                        let mut observer = UsageObserver::new(monitor, req_id, kind);
+                        let mut inner = Box::pin(upstream.bytes_stream());
+                        Body::from_stream(futures_util::stream::poll_fn(move |cx| {
+                            match Stream::poll_next(inner.as_mut(), cx) {
+                                Poll::Ready(Some(Ok(bytes))) => {
+                                    observer.observe(&bytes);
+                                    Poll::Ready(Some(Ok(bytes)))
+                                }
+                                Poll::Ready(None) => {
+                                    observer.finish();
+                                    Poll::Ready(None)
+                                }
+                                other => other,
+                            }
+                        }))
+                    }
+                    _ => Body::from_stream(upstream.bytes_stream()),
+                };
+                let mut response = Response::new(body);
                 *response.status_mut() = status;
                 *response.headers_mut() = out_headers;
                 response
@@ -257,6 +287,104 @@ impl AnthropicProvider {
 impl Default for AnthropicProvider {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Largest JSON body or single SSE line the usage observer keeps in memory.
+const MAX_OBSERVED_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservedBody {
+    EventStream,
+    Json,
+}
+
+impl ObservedBody {
+    fn from_content_type(content_type: Option<&str>) -> Option<Self> {
+        let content_type = content_type?.to_ascii_lowercase();
+        if content_type.starts_with("text/event-stream") {
+            Some(Self::EventStream)
+        } else if content_type.starts_with("application/json") {
+            Some(Self::Json)
+        } else {
+            None
+        }
+    }
+}
+
+/// Reads token usage out of a relayed response for the monitor. The bytes go
+/// to the client untouched; the observer only looks at them: SSE events are
+/// parsed line by line as they pass, a JSON body is kept up to a limit and
+/// parsed once the stream ends. Anthropic's `message_start` carries the exact
+/// prompt counts, so a cache miss is visible as soon as the stream starts.
+struct UsageObserver {
+    monitor: MonitorHandle,
+    req_id: String,
+    kind: ObservedBody,
+    pending: Vec<u8>,
+    overflow: bool,
+    finished: bool,
+}
+
+impl UsageObserver {
+    fn new(monitor: MonitorHandle, req_id: String, kind: ObservedBody) -> Self {
+        Self {
+            monitor,
+            req_id,
+            kind,
+            pending: Vec::new(),
+            overflow: false,
+            finished: false,
+        }
+    }
+
+    fn observe(&mut self, chunk: &[u8]) {
+        match self.kind {
+            ObservedBody::EventStream => {
+                self.pending.extend_from_slice(chunk);
+                let mut report = UsageReport::default();
+                while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+                    let line: Vec<u8> = self.pending.drain(..=end).collect();
+                    let line = line.trim_ascii();
+                    if let Some(data) = line.strip_prefix(b"data:")
+                        && let Ok(event) = serde_json::from_slice::<Value>(data.trim_ascii())
+                    {
+                        report.add_event(&event, true);
+                    }
+                }
+                if self.pending.len() > MAX_OBSERVED_BYTES {
+                    self.pending = Vec::new();
+                }
+                self.monitor
+                    .stream_progress_usage(&self.req_id, chunk.len() as u64, 1, report);
+            }
+            ObservedBody::Json => {
+                if self.overflow {
+                    return;
+                }
+                if self.pending.len().saturating_add(chunk.len()) > MAX_OBSERVED_BYTES {
+                    self.overflow = true;
+                    self.pending = Vec::new();
+                } else {
+                    self.pending.extend_from_slice(chunk);
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        if std::mem::replace(&mut self.finished, true) {
+            return;
+        }
+        if self.kind != ObservedBody::Json || self.overflow || self.pending.is_empty() {
+            return;
+        }
+        if let Ok(body) = serde_json::from_slice::<Value>(&self.pending) {
+            let report = usage_report_from_anthropic_body(&body);
+            if !report.is_empty() {
+                self.monitor.usage_reported(&self.req_id, report);
+            }
+        }
     }
 }
 
@@ -450,5 +578,87 @@ mod tests {
     #[test]
     fn non_json_body_is_forwarded_verbatim() {
         assert!(sanitize_anthropic_request(b"not json", "req5").is_none());
+    }
+
+    fn observed_monitor(request_id: &str, endpoint: crate::monitor::EndpointKind) -> MonitorHandle {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(request_id, Some("s1".to_string()), None, endpoint);
+        monitor.provider_selected(request_id, "anthropic", "claude-opus-5", None);
+        // The response is handed to the client before its body is read.
+        monitor.request_completed(request_id, 200, None, None);
+        monitor
+    }
+
+    #[test]
+    fn usage_observer_reads_anthropic_stream_usage_across_split_chunks() {
+        let monitor = observed_monitor("r1", crate::monitor::EndpointKind::Messages);
+        let mut observer =
+            UsageObserver::new(monitor.clone(), "r1".to_string(), ObservedBody::EventStream);
+        let stream = concat!(
+            "event: message_start\r\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2,",
+            "\"cache_read_input_tokens\":10126,\"cache_creation_input_tokens\":22405,",
+            "\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":22405},",
+            "\"output_tokens\":3}}}\r\n\r\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":120}}\n\n",
+        )
+        .as_bytes();
+        let mut relayed = Vec::new();
+        for chunk in stream.chunks(37) {
+            observer.observe(chunk);
+            relayed.extend_from_slice(chunk);
+        }
+        observer.finish();
+        assert_eq!(relayed, stream);
+
+        let state = monitor.snapshot();
+        let request = &state.recent[0];
+        assert_eq!(request.input_tokens, Some(2));
+        assert_eq!(request.cache.read_tokens, Some(10_126));
+        assert_eq!(request.cache.write_tokens, Some(22_405));
+        assert_eq!(request.output_tokens, Some(120));
+        assert_eq!(
+            request.cache.ttl,
+            Some(std::time::Duration::from_secs(60 * 60))
+        );
+        assert!(request.cache.evaluated());
+        assert!(request.stream_chunks > 0);
+        let session = &state.sessions[0];
+        assert_eq!(session.input_tokens, 2);
+        assert_eq!(session.cache_read_tokens, 10_126);
+        assert_eq!(session.cache_write_tokens, 22_405);
+        assert_eq!(session.output_tokens, 120);
+    }
+
+    #[test]
+    fn usage_observer_reads_json_bodies_when_the_stream_ends() {
+        let monitor = observed_monitor("count", crate::monitor::EndpointKind::CountTokens);
+        let mut observer =
+            UsageObserver::new(monitor.clone(), "count".to_string(), ObservedBody::Json);
+        observer.observe(b"{\"input_tok");
+        observer.observe(b"ens\": 4242}");
+        observer.finish();
+        observer.finish();
+
+        let state = monitor.snapshot();
+        assert_eq!(state.recent[0].input_tokens, Some(4_242));
+        assert_eq!(state.sessions[0].input_tokens, 0);
+    }
+
+    #[test]
+    fn observed_body_kind_follows_content_type() {
+        assert_eq!(
+            ObservedBody::from_content_type(Some("text/event-stream; charset=utf-8")),
+            Some(ObservedBody::EventStream)
+        );
+        assert_eq!(
+            ObservedBody::from_content_type(Some("application/json")),
+            Some(ObservedBody::Json)
+        );
+        assert_eq!(ObservedBody::from_content_type(Some("text/html")), None);
+        assert_eq!(ObservedBody::from_content_type(None), None);
     }
 }

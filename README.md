@@ -304,6 +304,62 @@ is that Codex models behave like a Claude subscription:
 `Retry-After` is deliberately not sent: clients sleep for its full value, and
 here that value is hours.
 
+## Prompt cache in the monitor
+
+Both backends cache the growing prefix of a conversation, and a cached token
+costs a fraction of a fresh one. The monitor shows how much of each prompt came
+from the cache and when it did not, for Claude models (read from the relayed
+response without changing it) and for Codex models.
+
+- **In** is the part of the prompt the backend processed at full price, as
+  Anthropic reports `input_tokens`. Cache reads and cache writes are counted
+  separately; the prompt size is the sum of the three.
+- **Hit** is the share of the prompt served from the cache.
+- **Ctx** is the prompt size of the session's latest main-conversation request,
+  with the peak in the session detail. Every request re-reads the whole
+  context, so a large context is paid for on every turn even when fully
+  cached, and a cache miss on it reprocesses all of it. The session detail
+  also shows how long that context's cache should stay warm.
+- **Miss** counts the requests whose cache read fell short of what the
+  previous request of the same conversation and model left behind, with the
+  tokens that were processed again. See below for what counts.
+
+A request is compared with the previous request of its conversation on the
+same model. The expected cached prefix is the smaller of the two prompts, and
+a shortfall counts as a miss once it reaches 1024 tokens and either a tenth of
+that prefix or 20k tokens. Some requests are not compared:
+
+- Subagents have their own conversations.
+- Requests without client tools are side calls: session titles, the auto-mode
+  classifier, Claude Code's isolated web search call. They do not extend the
+  transcript, so they are counted but not compared.
+- A prompt that shrank was rewritten by the client, for example by compaction.
+  It starts a new baseline.
+- A request sent before the previous response began could not read that
+  response's cache.
+- A Claude conversation that has never read or written cache is below the
+  model's minimum cacheable length.
+
+Each miss is labelled with the time since the previous request of its
+conversation:
+
+- `expired`: the gap exceeded the cache lifetime. Claude Code writes Claude
+  caches with a one-hour lifetime, and the monitor takes the lifetime from the
+  response. Codex prefixes are documented to live at least 30 minutes after
+  their last use.
+- `within ttl`: the prefix should still have been alive. On Claude this means
+  the prompt changed. On Codex it can also be the backend serving the request
+  from a machine without the cache. On the ChatGPT backend, identical
+  gpt-5.6-sol requests were served from the cache after 11, 21 and 35 minutes,
+  and after 45 minutes when read again at 20. Re-sends after 2, 6, 29 and 61
+  minutes were not.
+
+Switching a conversation to another model is not labelled as a miss. The new
+model starts its own cache, so its first request processes the whole context.
+
+`count_tokens` requests are local estimates of a prompt the real request counts
+again, so they are shown per request but left out of the session totals.
+
 ## How it works
 
 ```mermaid

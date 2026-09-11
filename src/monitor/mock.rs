@@ -5,8 +5,8 @@ use std::{
 };
 
 use super::{
-    ActiveRequest, CompletedRequest, EndpointKind, MonitorState, RequestStatus, SessionUsage,
-    session_summaries,
+    ActiveRequest, CacheMiss, CacheMissCause, CompletedRequest, EndpointKind, MonitorState,
+    RequestCache, RequestStatus, SessionCacheStats, SessionUsage, session_summaries,
 };
 
 const TICK_MILLIS: u64 = 250;
@@ -93,6 +93,8 @@ fn mock_state_for_tick(
     streaming.streamed_bytes = 18_432;
     streaming.stream_chunks = 96;
     streaming.input_tokens = Some(12_480);
+    streaming.cache.read_tokens = Some(118_000);
+    streaming.cache.write_tokens = Some(0);
     streaming.output_tokens = Some(420);
     streaming.traffic_capture_path = Some(PathBuf::from(
         "/tmp/claude-code-mux-demo/traffic/req-active-codex",
@@ -197,7 +199,18 @@ fn mock_state_for_tick(
     success.generation_initial_output_tokens = 32;
     success.streamed_bytes = 24_576;
     success.stream_chunks = 142;
-    success.input_tokens = Some(125_600);
+    // A request that came back after a long pause and rebuilt its prefix.
+    success.input_tokens = Some(121_900);
+    success.cache.read_tokens = Some(3_700);
+    success.cache.write_tokens = Some(0);
+    success.cache.ttl = Some(Duration::from_secs(30 * 60));
+    success.cache.miss = Some(CacheMiss {
+        missed_tokens: 118_200,
+        expected_tokens: 121_900,
+        gap: Duration::from_secs(34 * 60),
+        ttl: Some(Duration::from_secs(30 * 60)),
+        cause: CacheMissCause::Expired,
+    });
     success.output_tokens = Some(832);
     success.traffic_capture_path = Some(PathBuf::from(
         "/tmp/claude-code-mux-demo/traffic/req-complete-codex",
@@ -350,25 +363,59 @@ fn mock_state_for_tick(
 
     add_simulated_requests(now, instant_now, tick, &mut active, &mut recent);
     let mut session_usage = HashMap::<Option<String>, SessionUsage>::new();
+    let mut session_cache = HashMap::<Option<String>, SessionCacheStats>::new();
+    let mut add_usage = |session_id: &Option<String>,
+                         input: Option<u64>,
+                         output: Option<u64>,
+                         cache: &RequestCache| {
+        let usage = session_usage.entry(session_id.clone()).or_default();
+        usage.input_tokens = usage.input_tokens.saturating_add(input.unwrap_or(0));
+        usage.output_tokens = usage.output_tokens.saturating_add(output.unwrap_or(0));
+        usage.cache_read_tokens = usage
+            .cache_read_tokens
+            .saturating_add(cache.read_tokens.unwrap_or(0));
+        usage.cache_write_tokens = usage
+            .cache_write_tokens
+            .saturating_add(cache.write_tokens.unwrap_or(0));
+    };
     for request in &recent {
-        let usage = session_usage.entry(request.session_id.clone()).or_default();
-        usage.input_tokens = usage
-            .input_tokens
-            .saturating_add(request.input_tokens.unwrap_or(0));
-        usage.output_tokens = usage
-            .output_tokens
-            .saturating_add(request.output_tokens.unwrap_or(0));
+        add_usage(
+            &request.session_id,
+            request.input_tokens,
+            request.output_tokens,
+            &request.cache,
+        );
     }
     for request in &active {
-        let usage = session_usage.entry(request.session_id.clone()).or_default();
-        usage.input_tokens = usage
-            .input_tokens
-            .saturating_add(request.input_tokens.unwrap_or(0));
-        usage.output_tokens = usage
-            .output_tokens
-            .saturating_add(request.output_tokens.unwrap_or(0));
+        add_usage(
+            &request.session_id,
+            request.input_tokens,
+            request.output_tokens,
+            &request.cache,
+        );
     }
-    let sessions = session_summaries(&active, &recent, &session_usage, output_buckets);
+    for request in &recent {
+        let prompt = request.prompt_tokens().unwrap_or(0);
+        let stats = session_cache.entry(request.session_id.clone()).or_default();
+        if prompt >= stats.context_tokens {
+            stats.context_tokens = prompt;
+            stats.context_started_at = Some(request.started_at);
+            stats.context_ttl = request.cache.ttl;
+        }
+        stats.peak_context_tokens = stats.peak_context_tokens.max(prompt);
+        if let Some(miss) = request.cache.miss {
+            stats.miss_count += 1;
+            stats.missed_tokens = stats.missed_tokens.saturating_add(miss.missed_tokens);
+            stats.last_miss = Some((request.started_at, miss));
+        }
+    }
+    let sessions = session_summaries(
+        &active,
+        &recent,
+        &session_usage,
+        &session_cache,
+        output_buckets,
+    );
     MonitorState {
         started_at,
         sessions,
@@ -659,6 +706,7 @@ fn active_request(
     ActiveRequest {
         request_id: request_id.to_string(),
         session_id: session_id.map(str::to_string),
+        conversation: None,
         session_seq,
         project: None,
         provider: None,
@@ -677,6 +725,7 @@ fn active_request(
         stream_chunks: 0,
         input_tokens: None,
         output_tokens: None,
+        cache: RequestCache::default(),
         error: None,
         traffic_capture_path: None,
     }
@@ -698,6 +747,7 @@ fn completed_request(
     CompletedRequest {
         request_id: request_id.to_string(),
         session_id: session_id.map(str::to_string),
+        conversation: None,
         session_seq,
         project: None,
         provider: None,
@@ -718,6 +768,7 @@ fn completed_request(
         stream_chunks: 0,
         input_tokens: None,
         output_tokens: None,
+        cache: RequestCache::default(),
         error: None,
         traffic_capture_path: None,
     }

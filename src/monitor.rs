@@ -6,8 +6,14 @@ use std::{
 };
 
 mod mock;
+mod usage;
 
 pub use mock::{MockMonitor, mock_state};
+pub use usage::{
+    CacheMiss, CacheMissCause, UsageFields, UsageReport, caches_implicitly, default_cache_ttl,
+    detect_cache_miss, usage_report_from_anthropic_body, usage_report_from_anthropic_sse,
+};
+use usage::{ClosedFields, UsageDelta, add_signed, apply_closing, apply_opening};
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
 pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
@@ -99,17 +105,21 @@ pub enum MonitorEvent {
         request_id: String,
         path: PathBuf,
     },
+    /// Which conversation of the session the request belongs to: `main`, or
+    /// the Claude Code agent id of a subagent.
+    ConversationResolved {
+        request_id: String,
+        conversation: String,
+    },
     StreamProgress {
         request_id: String,
         bytes: u64,
         chunks: u64,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
+        usage: UsageReport,
     },
     UsageUpdated {
         request_id: String,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
+        usage: UsageReport,
     },
     RequestCompleted {
         request_id: String,
@@ -128,10 +138,52 @@ pub enum MonitorEvent {
     },
 }
 
+/// Cache usage of one request, next to its input and output counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestCache {
+    pub read_tokens: Option<u64>,
+    pub write_tokens: Option<u64>,
+    /// Set when the request's final cache read fell well short of the previous
+    /// prompt in its conversation lane.
+    pub miss: Option<CacheMiss>,
+    /// Lifetime of the cache entries the request wrote, when the response said.
+    pub ttl: Option<Duration>,
+    closed: ClosedFields,
+    evaluated: bool,
+}
+
+impl RequestCache {
+    /// Whether the request has been compared with the previous one of its lane.
+    pub fn evaluated(&self) -> bool {
+        self.evaluated
+    }
+}
+
+/// Prompt size of a request: uncached input plus cache reads and writes.
+fn prompt_tokens(input_tokens: Option<u64>, cache: &RequestCache) -> Option<u64> {
+    if input_tokens.is_none() && cache.read_tokens.is_none() && cache.write_tokens.is_none() {
+        return None;
+    }
+    Some(
+        input_tokens
+            .unwrap_or(0)
+            .saturating_add(cache.read_tokens.unwrap_or(0))
+            .saturating_add(cache.write_tokens.unwrap_or(0)),
+    )
+}
+
+/// Share of the prompt served from cache.
+fn cache_hit_ratio(input_tokens: Option<u64>, cache: &RequestCache) -> Option<f64> {
+    let prompt = prompt_tokens(input_tokens, cache)?;
+    let read = cache.read_tokens?;
+    (prompt > 0).then(|| read as f64 / prompt as f64)
+}
+
 #[derive(Debug, Clone)]
 pub struct ActiveRequest {
     pub request_id: String,
     pub session_id: Option<String>,
+    pub conversation: Option<String>,
     pub session_seq: Option<u64>,
     pub project: Option<String>,
     pub provider: Option<String>,
@@ -150,6 +202,7 @@ pub struct ActiveRequest {
     pub stream_chunks: u64,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cache: RequestCache,
     pub error: Option<String>,
     pub traffic_capture_path: Option<PathBuf>,
 }
@@ -157,6 +210,14 @@ pub struct ActiveRequest {
 impl ActiveRequest {
     pub fn elapsed(&self) -> Duration {
         self.started_instant.elapsed()
+    }
+
+    pub fn prompt_tokens(&self) -> Option<u64> {
+        prompt_tokens(self.input_tokens, &self.cache)
+    }
+
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        cache_hit_ratio(self.input_tokens, &self.cache)
     }
 
     pub fn rate(&self) -> Throughput {
@@ -174,6 +235,7 @@ impl ActiveRequest {
 pub struct CompletedRequest {
     pub request_id: String,
     pub session_id: Option<String>,
+    pub conversation: Option<String>,
     pub session_seq: Option<u64>,
     pub project: Option<String>,
     pub provider: Option<String>,
@@ -194,11 +256,20 @@ pub struct CompletedRequest {
     pub stream_chunks: u64,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cache: RequestCache,
     pub error: Option<String>,
     pub traffic_capture_path: Option<PathBuf>,
 }
 
 impl CompletedRequest {
+    pub fn prompt_tokens(&self) -> Option<u64> {
+        prompt_tokens(self.input_tokens, &self.cache)
+    }
+
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        cache_hit_ratio(self.input_tokens, &self.cache)
+    }
+
     pub fn rate(&self) -> Throughput {
         throughput(
             self.output_tokens
@@ -251,15 +322,65 @@ pub struct SessionSummary {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub last_seen: SystemTime,
+    /// Uncached input tokens; `count_tokens` estimates are not counted.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache: SessionCacheStats,
     pub output_token_samples: Vec<(SystemTime, u64)>,
     rate_output_tokens: u64,
     pub generation_duration: Duration,
     pub last_status: String,
 }
 
+/// Cache behaviour of a session, kept for its whole life rather than the
+/// recent-request window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionCacheStats {
+    pub miss_count: u64,
+    pub missed_tokens: u64,
+    pub last_miss: Option<(SystemTime, CacheMiss)>,
+    /// Prompt size of the latest main-conversation request.
+    pub context_tokens: u64,
+    pub peak_context_tokens: u64,
+    /// When that request started and the cache lifetime of its lane: together
+    /// they say how long its prefix should stay readable.
+    pub context_started_at: Option<SystemTime>,
+    pub context_ttl: Option<Duration>,
+}
+
+impl SessionCacheStats {
+    /// Time left before the main conversation's cached prefix expires, or how
+    /// long ago it expired, as of `now`.
+    pub fn context_cache_expiry(&self, now: SystemTime) -> Option<CacheExpiry> {
+        let started_at = self.context_started_at?;
+        let ttl = self.context_ttl?;
+        let idle = now.duration_since(started_at).unwrap_or(Duration::ZERO);
+        Some(match ttl.checked_sub(idle) {
+            Some(left) if !left.is_zero() => CacheExpiry::WarmFor(left),
+            _ => CacheExpiry::ExpiredAgo(idle.saturating_sub(ttl)),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheExpiry {
+    WarmFor(Duration),
+    ExpiredAgo(Duration),
+}
+
 impl SessionSummary {
+    /// Share of all prompt tokens served from cache.
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        let prompt = self
+            .input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens);
+        (prompt > 0 && (self.cache_read_tokens > 0 || self.cache_write_tokens > 0))
+            .then(|| self.cache_read_tokens as f64 / prompt as f64)
+    }
+
     pub fn rate(&self) -> Throughput {
         throughput(
             Some(self.rate_output_tokens).filter(|tokens| *tokens > 0),
@@ -282,7 +403,9 @@ struct MonitorStore {
     active: HashMap<String, ActiveRequest>,
     recent: VecDeque<CompletedRequest>,
     session_usage: HashMap<Option<String>, SessionUsage>,
+    session_cache: HashMap<Option<String>, SessionCacheStats>,
     session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
+    lanes: HashMap<LaneKey, LaneState>,
     recent_limit: usize,
 }
 
@@ -290,6 +413,93 @@ struct MonitorStore {
 struct SessionUsage {
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+}
+
+/// Appended to a conversation label for requests without client tools. They
+/// are side calls that do not extend the transcript, so consecutive ones share
+/// little beyond the system prompt and are not judged for cache misses.
+pub const SIDE_CONVERSATION_SUFFIX: &str = "/side";
+
+/// One conversation's stream of requests to one model: the unit a prompt cache
+/// builds up in. Subagents and side requests get their own lanes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LaneKey {
+    session_id: Option<String>,
+    conversation: Option<String>,
+    provider: String,
+    model: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LaneState {
+    prompt_tokens: u64,
+    started_at: SystemTime,
+    /// When the request's response began. A cache entry becomes readable only
+    /// then, so a request sent earlier could not have used it.
+    readable_from: SystemTime,
+    ttl: Option<Duration>,
+    /// Whether any request of the lane has read or written cache.
+    reported_cache: bool,
+}
+
+/// Usage of one request as the store tracks it.
+struct UsageTarget<'a> {
+    input_tokens: &'a mut Option<u64>,
+    output_tokens: &'a mut Option<u64>,
+    cache: &'a mut RequestCache,
+}
+
+impl UsageTarget<'_> {
+    fn apply(&mut self, report: &UsageReport) -> UsageDelta {
+        let cache = &mut *self.cache;
+        let mut delta = UsageDelta::default();
+        delta.input += apply_opening(
+            self.input_tokens,
+            cache.closed.input,
+            report.opening.input_tokens,
+        );
+        delta.cache_read += apply_opening(
+            &mut cache.read_tokens,
+            cache.closed.cache_read,
+            report.opening.cache_read_tokens,
+        );
+        delta.cache_write += apply_opening(
+            &mut cache.write_tokens,
+            cache.closed.cache_write,
+            report.opening.cache_write_tokens,
+        );
+        delta.output += apply_opening(
+            self.output_tokens,
+            cache.closed.output,
+            report.opening.output_tokens,
+        );
+        delta.input += apply_closing(
+            self.input_tokens,
+            &mut cache.closed.input,
+            report.closing.input_tokens,
+        );
+        delta.cache_read += apply_closing(
+            &mut cache.read_tokens,
+            &mut cache.closed.cache_read,
+            report.closing.cache_read_tokens,
+        );
+        delta.cache_write += apply_closing(
+            &mut cache.write_tokens,
+            &mut cache.closed.cache_write,
+            report.closing.cache_write_tokens,
+        );
+        delta.output += apply_closing(
+            self.output_tokens,
+            &mut cache.closed.output,
+            report.closing.output_tokens,
+        );
+        if report.cache_ttl.is_some() {
+            cache.ttl = report.cache_ttl;
+        }
+        delta
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -311,7 +521,9 @@ impl MonitorHandle {
                 active: HashMap::new(),
                 recent: VecDeque::new(),
                 session_usage: HashMap::new(),
+                session_cache: HashMap::new(),
                 session_output_buckets: HashMap::new(),
+                lanes: HashMap::new(),
                 recent_limit,
             })),
         }
@@ -411,6 +623,19 @@ impl MonitorHandle {
         });
     }
 
+    pub fn conversation_resolved(
+        &self,
+        request_id: impl Into<String>,
+        conversation: impl Into<String>,
+    ) {
+        self.publish(MonitorEvent::ConversationResolved {
+            request_id: request_id.into(),
+            conversation: conversation.into(),
+        });
+    }
+
+    /// Stream progress with input and output counts that only ever raise the
+    /// request's totals.
     pub fn stream_progress(
         &self,
         request_id: impl Into<String>,
@@ -419,25 +644,48 @@ impl MonitorHandle {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
     ) {
+        self.stream_progress_usage(
+            request_id,
+            bytes,
+            chunks,
+            UsageReport::opening(input_tokens, output_tokens),
+        );
+    }
+
+    /// Stream progress with a full usage report, whose closing values replace
+    /// earlier estimates.
+    pub fn stream_progress_usage(
+        &self,
+        request_id: impl Into<String>,
+        bytes: u64,
+        chunks: u64,
+        usage: UsageReport,
+    ) {
         self.publish(MonitorEvent::StreamProgress {
             request_id: request_id.into(),
             bytes,
             chunks,
-            input_tokens,
-            output_tokens,
+            usage,
         });
     }
 
+    /// Input and output counts that only ever raise the request's totals.
     pub fn usage_updated(
         &self,
         request_id: impl Into<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
     ) {
+        self.usage_reported(
+            request_id,
+            UsageReport::opening(input_tokens, output_tokens),
+        );
+    }
+
+    pub fn usage_reported(&self, request_id: impl Into<String>, usage: UsageReport) {
         self.publish(MonitorEvent::UsageUpdated {
             request_id: request_id.into(),
-            input_tokens,
-            output_tokens,
+            usage,
         });
     }
 
@@ -491,6 +739,7 @@ impl MonitorStore {
                     ActiveRequest {
                         request_id,
                         session_id,
+                        conversation: None,
                         session_seq,
                         project: None,
                         provider: None,
@@ -509,6 +758,7 @@ impl MonitorStore {
                         stream_chunks: 0,
                         input_tokens: None,
                         output_tokens: None,
+                        cache: RequestCache::default(),
                         error: None,
                         traffic_capture_path: None,
                     },
@@ -576,13 +826,21 @@ impl MonitorStore {
                     active.traffic_capture_path = Some(path);
                 }
             }
+            MonitorEvent::ConversationResolved {
+                request_id,
+                conversation,
+            } => {
+                if let Some(active) = self.active.get_mut(&request_id) {
+                    active.conversation = Some(conversation);
+                }
+            }
             MonitorEvent::StreamProgress {
                 request_id,
                 bytes,
                 chunks,
-                input_tokens,
-                output_tokens,
+                usage,
             } => {
+                let output_seen = usage.closing.output_tokens.or(usage.opening.output_tokens);
                 let mut usage_update = None;
                 let mut history_update = None;
                 if let Some(active) = self.active.get_mut(&request_id) {
@@ -591,7 +849,7 @@ impl MonitorStore {
                         active.generation_started_at = Some(SystemTime::now());
                         active.generation_started_instant = Some(Instant::now());
                         active.generation_initial_output_tokens =
-                            output_tokens.or(active.output_tokens).unwrap_or(0);
+                            output_seen.or(active.output_tokens).unwrap_or(0);
                     } else {
                         active.generation_finished_at = Some(SystemTime::now());
                         active.generation_duration = active
@@ -600,9 +858,13 @@ impl MonitorStore {
                     }
                     active.streamed_bytes = active.streamed_bytes.saturating_add(bytes);
                     active.stream_chunks = active.stream_chunks.saturating_add(chunks);
-                    let input_delta = update_token_count(&mut active.input_tokens, input_tokens);
-                    let output_delta = update_token_count(&mut active.output_tokens, output_tokens);
-                    usage_update = Some((active.session_id.clone(), input_delta, output_delta));
+                    let delta = UsageTarget {
+                        input_tokens: &mut active.input_tokens,
+                        output_tokens: &mut active.output_tokens,
+                        cache: &mut active.cache,
+                    }
+                    .apply(&usage);
+                    usage_update = Some((active.session_id.clone(), active.endpoint, delta));
                 } else if let Some(completed) = self
                     .recent
                     .iter_mut()
@@ -614,75 +876,84 @@ impl MonitorStore {
                     }
                     completed.streamed_bytes = completed.streamed_bytes.saturating_add(bytes);
                     completed.stream_chunks = completed.stream_chunks.saturating_add(chunks);
-                    let input_delta = update_token_count(&mut completed.input_tokens, input_tokens);
-                    let output_delta =
-                        update_token_count(&mut completed.output_tokens, output_tokens);
-                    usage_update = Some((completed.session_id.clone(), input_delta, output_delta));
-                    if output_delta > 0 {
+                    let delta = UsageTarget {
+                        input_tokens: &mut completed.input_tokens,
+                        output_tokens: &mut completed.output_tokens,
+                        cache: &mut completed.cache,
+                    }
+                    .apply(&usage);
+                    usage_update = Some((completed.session_id.clone(), completed.endpoint, delta));
+                    if delta.output > 0 {
                         history_update = Some((
                             completed.session_id.clone(),
                             completed
                                 .generation_finished_at
                                 .unwrap_or(completed.finished_at),
-                            output_delta,
+                            delta.output.unsigned_abs(),
                         ));
                     }
                 }
-                if let Some((session_id, input_delta, output_delta)) = usage_update {
-                    self.record_session_usage(session_id, input_delta, output_delta);
+                if let Some((session_id, endpoint, delta)) = usage_update {
+                    self.record_session_usage(session_id, endpoint, delta);
                 }
                 if let Some((session_id, timestamp, tokens)) = history_update {
                     self.record_session_output(session_id, timestamp, tokens);
                 }
+                self.evaluate_cache(&request_id);
             }
-            MonitorEvent::UsageUpdated {
-                request_id,
-                input_tokens,
-                output_tokens,
-            } => {
+            MonitorEvent::UsageUpdated { request_id, usage } => {
+                let output_seen = usage.closing.output_tokens.or(usage.opening.output_tokens);
                 let mut usage_update = None;
                 let mut history_update = None;
                 if let Some(active) = self.active.get_mut(&request_id) {
-                    if output_tokens.is_some()
+                    if output_seen.is_some()
                         && let Some(started) = active.generation_started_instant
                     {
                         active.generation_finished_at = Some(SystemTime::now());
                         active.generation_duration = Some(started.elapsed());
                     }
-                    let input_delta = update_token_count(&mut active.input_tokens, input_tokens);
-                    let output_delta = update_token_count(&mut active.output_tokens, output_tokens);
-                    usage_update = Some((active.session_id.clone(), input_delta, output_delta));
+                    let delta = UsageTarget {
+                        input_tokens: &mut active.input_tokens,
+                        output_tokens: &mut active.output_tokens,
+                        cache: &mut active.cache,
+                    }
+                    .apply(&usage);
+                    usage_update = Some((active.session_id.clone(), active.endpoint, delta));
                 } else if let Some(completed) = self
                     .recent
                     .iter_mut()
                     .find(|request| request.request_id == request_id)
                 {
-                    if output_tokens.is_some()
+                    if output_seen.is_some()
                         && let Some(started) = completed.generation_started_instant
                     {
                         completed.generation_finished_at = Some(SystemTime::now());
                         completed.generation_duration = Some(started.elapsed());
                     }
-                    let input_delta = update_token_count(&mut completed.input_tokens, input_tokens);
-                    let output_delta =
-                        update_token_count(&mut completed.output_tokens, output_tokens);
-                    usage_update = Some((completed.session_id.clone(), input_delta, output_delta));
-                    if output_delta > 0 {
+                    let delta = UsageTarget {
+                        input_tokens: &mut completed.input_tokens,
+                        output_tokens: &mut completed.output_tokens,
+                        cache: &mut completed.cache,
+                    }
+                    .apply(&usage);
+                    usage_update = Some((completed.session_id.clone(), completed.endpoint, delta));
+                    if delta.output > 0 {
                         history_update = Some((
                             completed.session_id.clone(),
                             completed
                                 .generation_finished_at
                                 .unwrap_or(completed.finished_at),
-                            output_delta,
+                            delta.output.unsigned_abs(),
                         ));
                     }
                 }
-                if let Some((session_id, input_delta, output_delta)) = usage_update {
-                    self.record_session_usage(session_id, input_delta, output_delta);
+                if let Some((session_id, endpoint, delta)) = usage_update {
+                    self.record_session_usage(session_id, endpoint, delta);
                 }
                 if let Some((session_id, timestamp, tokens)) = history_update {
                     self.record_session_output(session_id, timestamp, tokens);
                 }
+                self.evaluate_cache(&request_id);
             }
             MonitorEvent::RequestCompleted {
                 request_id,
@@ -762,6 +1033,7 @@ impl MonitorStore {
             .unwrap_or_else(|| ActiveRequest {
                 request_id: request_id.to_string(),
                 session_id: None,
+                conversation: None,
                 session_seq: None,
                 project: None,
                 provider: None,
@@ -780,6 +1052,7 @@ impl MonitorStore {
                 stream_chunks: 0,
                 input_tokens: None,
                 output_tokens: None,
+                cache: RequestCache::default(),
                 error: None,
                 traffic_capture_path: None,
             });
@@ -789,12 +1062,17 @@ impl MonitorStore {
             active.generation_finished_at = Some(SystemTime::now());
             active.generation_duration = Some(started.elapsed());
         }
-        let input_delta = update_token_count(&mut active.input_tokens, input_tokens);
-        let output_delta = update_token_count(&mut active.output_tokens, output_tokens);
-        self.record_session_usage(active.session_id.clone(), input_delta, output_delta);
+        let delta = UsageTarget {
+            input_tokens: &mut active.input_tokens,
+            output_tokens: &mut active.output_tokens,
+            cache: &mut active.cache,
+        }
+        .apply(&UsageReport::opening(input_tokens, output_tokens));
+        self.record_session_usage(active.session_id.clone(), active.endpoint, delta);
         let completed = CompletedRequest {
             request_id: active.request_id,
             session_id: active.session_id,
+            conversation: active.conversation,
             session_seq: active.session_seq,
             project: active.project,
             provider: active.provider,
@@ -815,6 +1093,7 @@ impl MonitorStore {
             stream_chunks: active.stream_chunks,
             input_tokens: active.input_tokens,
             output_tokens: active.output_tokens,
+            cache: active.cache,
             error: error.or(active.error),
             traffic_capture_path: active.traffic_capture_path,
         };
@@ -831,17 +1110,178 @@ impl MonitorStore {
         while self.recent.len() > self.recent_limit {
             self.recent.pop_back();
         }
+        self.evaluate_cache(request_id);
     }
 
+    /// Add a request's usage change to its session. `count_tokens` requests are
+    /// local estimates of a prompt that the real request counts again, so they
+    /// stay out of the session totals.
     fn record_session_usage(
         &mut self,
         session_id: Option<String>,
-        input_tokens: u64,
-        output_tokens: u64,
+        endpoint: EndpointKind,
+        delta: UsageDelta,
     ) {
+        if endpoint == EndpointKind::CountTokens || delta.is_zero() {
+            return;
+        }
         let usage = self.session_usage.entry(session_id).or_default();
-        usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
-        usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
+        usage.input_tokens = add_signed(usage.input_tokens, delta.input);
+        usage.output_tokens = add_signed(usage.output_tokens, delta.output);
+        usage.cache_read_tokens = add_signed(usage.cache_read_tokens, delta.cache_read);
+        usage.cache_write_tokens = add_signed(usage.cache_write_tokens, delta.cache_write);
+    }
+
+    /// Once a request's cache read is final, compare it with the previous
+    /// request of its lane, record a miss, and make it the lane's new baseline.
+    fn evaluate_cache(&mut self, request_id: &str) {
+        let (key, prompt, cache, started_at, response_started_at) = {
+            let request = if let Some(active) = self.active.get(request_id) {
+                (
+                    &active.session_id,
+                    &active.conversation,
+                    &active.provider,
+                    &active.model,
+                    active.input_tokens,
+                    active.cache,
+                    active.started_at,
+                    active.generation_started_at,
+                    active.endpoint,
+                )
+            } else if let Some(completed) = self
+                .recent
+                .iter()
+                .find(|request| request.request_id == request_id)
+            {
+                (
+                    &completed.session_id,
+                    &completed.conversation,
+                    &completed.provider,
+                    &completed.model,
+                    completed.input_tokens,
+                    completed.cache,
+                    completed.started_at,
+                    completed.generation_started_at,
+                    completed.endpoint,
+                )
+            } else {
+                return;
+            };
+            let (
+                session_id,
+                conversation,
+                provider,
+                model,
+                input,
+                cache,
+                started_at,
+                response,
+                endpoint,
+            ) = request;
+            if cache.evaluated || !cache.closed.cache_read || endpoint == EndpointKind::CountTokens
+            {
+                return;
+            }
+            let (Some(provider), Some(model)) = (provider.clone(), model.clone()) else {
+                return;
+            };
+            (
+                LaneKey {
+                    session_id: session_id.clone(),
+                    conversation: conversation.clone(),
+                    provider,
+                    model,
+                },
+                prompt_tokens(input, &cache).unwrap_or(0),
+                cache,
+                started_at,
+                response,
+            )
+        };
+        let cache_read = cache.read_tokens.unwrap_or(0);
+        let reported_cache = cache_read > 0 || cache.write_tokens.unwrap_or(0) > 0;
+
+        let previous = self.lanes.get(&key).copied();
+        // A request that started before the lane's baseline finished late; it
+        // neither judges nor replaces the newer baseline.
+        let superseded = previous.is_some_and(|lane| started_at < lane.started_at);
+        let side = key
+            .conversation
+            .as_deref()
+            .is_some_and(|name| name.ends_with(SIDE_CONVERSATION_SUFFIX));
+        let judged = !superseded && !side;
+        let miss = previous.filter(|_| judged).and_then(|lane| {
+            // It was sent before the previous response began, so the entries
+            // that response wrote were not readable yet.
+            if started_at < lane.readable_from {
+                return None;
+            }
+            // A lane that has never shown cache activity may be below the
+            // provider's minimum cacheable length. Codex reports no writes, so
+            // its first miss would look the same; it caches without being asked.
+            if !reported_cache && !lane.reported_cache && !caches_implicitly(&key.provider) {
+                return None;
+            }
+            let gap = started_at
+                .duration_since(lane.started_at)
+                .unwrap_or(Duration::ZERO);
+            // The previous request's entries decide whether this one could
+            // still read them.
+            let ttl = lane.ttl.or(cache.ttl).or(default_cache_ttl(&key.provider));
+            detect_cache_miss(lane.prompt_tokens, prompt, cache_read, gap, ttl)
+        });
+        if !superseded {
+            self.lanes.insert(
+                key.clone(),
+                LaneState {
+                    prompt_tokens: prompt,
+                    started_at,
+                    readable_from: response_started_at.unwrap_or_else(SystemTime::now),
+                    ttl: cache.ttl.or(previous.and_then(|lane| lane.ttl)),
+                    reported_cache: reported_cache
+                        || previous.is_some_and(|lane| lane.reported_cache),
+                },
+            );
+        }
+
+        let stats = self
+            .session_cache
+            .entry(key.session_id.clone())
+            .or_default();
+        if !superseded
+            && key
+                .conversation
+                .as_deref()
+                .is_none_or(|name| name == "main")
+        {
+            stats.context_tokens = prompt;
+            stats.peak_context_tokens = stats.peak_context_tokens.max(prompt);
+            stats.context_started_at = Some(started_at);
+            stats.context_ttl = self
+                .lanes
+                .get(&key)
+                .and_then(|lane| lane.ttl)
+                .or(default_cache_ttl(&key.provider));
+        }
+        if let Some(miss) = miss {
+            stats.miss_count = stats.miss_count.saturating_add(1);
+            stats.missed_tokens = stats.missed_tokens.saturating_add(miss.missed_tokens);
+            stats.last_miss = Some((started_at, miss));
+        }
+
+        let cache = if let Some(active) = self.active.get_mut(request_id) {
+            &mut active.cache
+        } else if let Some(completed) = self
+            .recent
+            .iter_mut()
+            .find(|request| request.request_id == request_id)
+        {
+            &mut completed.cache
+        } else {
+            return;
+        };
+        cache.evaluated = true;
+        cache.miss = miss;
     }
 
     fn record_session_output(
@@ -865,6 +1305,7 @@ impl MonitorStore {
             &active,
             &self.recent,
             &self.session_usage,
+            &self.session_cache,
             &self.session_output_buckets,
         );
         MonitorState {
@@ -880,6 +1321,7 @@ fn session_summaries(
     active: &[ActiveRequest],
     recent: &VecDeque<CompletedRequest>,
     session_usage: &HashMap<Option<String>, SessionUsage>,
+    session_cache: &HashMap<Option<String>, SessionCacheStats>,
     session_output_buckets: &HashMap<Option<String>, Vec<(u64, u64)>>,
 ) -> Vec<SessionSummary> {
     let mut sessions: HashMap<Option<String>, SessionSummary> = HashMap::new();
@@ -898,6 +1340,9 @@ fn session_summaries(
                 last_seen: request.finished_at,
                 input_tokens: 0,
                 output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cache: SessionCacheStats::default(),
                 output_token_samples: Vec::new(),
                 rate_output_tokens: 0,
                 generation_duration: Duration::ZERO,
@@ -942,6 +1387,9 @@ fn session_summaries(
                 last_seen: request.started_at,
                 input_tokens: 0,
                 output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cache: SessionCacheStats::default(),
                 output_token_samples: Vec::new(),
                 rate_output_tokens: 0,
                 generation_duration: Duration::ZERO,
@@ -973,6 +1421,11 @@ fn session_summaries(
         if let Some(usage) = session_usage.get(session_id) {
             session.input_tokens = usage.input_tokens;
             session.output_tokens = usage.output_tokens;
+            session.cache_read_tokens = usage.cache_read_tokens;
+            session.cache_write_tokens = usage.cache_write_tokens;
+        }
+        if let Some(stats) = session_cache.get(session_id) {
+            session.cache = *stats;
         }
         if let Some(buckets) = session_output_buckets.get(session_id) {
             session.output_token_samples = buckets
@@ -997,17 +1450,6 @@ fn session_token_bucket(timestamp: SystemTime) -> u64 {
 
 fn session_token_bucket_start(bucket: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(bucket.saturating_mul(SESSION_TOKEN_BUCKET_SECS))
-}
-
-fn update_token_count(current: &mut Option<u64>, incoming: Option<u64>) -> u64 {
-    let Some(incoming) = incoming else {
-        return 0;
-    };
-    let previous = current.unwrap_or(0);
-    if incoming > previous || current.is_none() {
-        *current = Some(incoming);
-    }
-    incoming.saturating_sub(previous)
 }
 
 fn max_system_time(left: SystemTime, right: SystemTime) -> SystemTime {
@@ -1294,6 +1736,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         CompletedRequest {
             request_id: request_id.to_string(),
             session_id: Some(session_id.to_string()),
+            conversation: None,
             session_seq: None,
             project: None,
             provider: Some("codex".to_string()),
@@ -1315,6 +1758,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             stream_chunks: 0,
             input_tokens: None,
             output_tokens: Some(output_tokens),
+            cache: RequestCache::default(),
             error: None,
             traffic_capture_path: None,
         }
@@ -1331,7 +1775,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
                 .output_tokens
                 .saturating_add(request.output_tokens.unwrap_or(0));
         }
-        session_summaries(&[], recent, &usage, &HashMap::new())
+        session_summaries(&[], recent, &usage, &HashMap::new(), &HashMap::new())
     }
 
     #[test]
@@ -1625,5 +2069,326 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
 
         assert_eq!(first, vec!["session-a", "session-b"]);
         assert_eq!(second, first);
+    }
+
+    fn closing_usage(input: u64, read: u64, write: u64, output: u64) -> UsageReport {
+        UsageReport {
+            closing: UsageFields {
+                input_tokens: Some(input),
+                cache_read_tokens: Some(read),
+                cache_write_tokens: Some(write),
+                output_tokens: Some(output),
+            },
+            ..UsageReport::default()
+        }
+    }
+
+    fn start_codex_request(monitor: &MonitorHandle, request_id: &str, conversation: &str) {
+        monitor.request_started(
+            request_id,
+            Some("s1".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.conversation_resolved(request_id, conversation);
+        monitor.provider_selected(request_id, "codex", "gpt-5.6-sol", None);
+    }
+
+    fn recent_by_id<'a>(state: &'a MonitorState, request_id: &str) -> &'a CompletedRequest {
+        state
+            .recent
+            .iter()
+            .find(|request| request.request_id == request_id)
+            .expect("request in recent list")
+    }
+
+    #[test]
+    fn translated_stream_estimate_is_replaced_by_final_usage() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "main");
+        // The live path hands the response to the client before the stream ends.
+        monitor.request_completed("r1", 200, None, None);
+        monitor.stream_progress_usage(
+            "r1",
+            200,
+            1,
+            usage_report_from_anthropic_sse(
+                br#"data: {"type":"message_start","message":{"usage":{"input_tokens":31066,"output_tokens":0}}}
+"#,
+            ),
+        );
+        let estimate = monitor.snapshot();
+        assert_eq!(estimate.recent[0].input_tokens, Some(31_066));
+        assert_eq!(estimate.sessions[0].input_tokens, 31_066);
+
+        monitor.stream_progress_usage(
+            "r1",
+            300,
+            1,
+            usage_report_from_anthropic_sse(
+                br#"data: {"type":"message_delta","usage":{"input_tokens":2906,"cache_read_input_tokens":28160,"cache_creation_input_tokens":0,"output_tokens":117}}
+"#,
+            ),
+        );
+        let state = monitor.snapshot();
+        let request = &state.recent[0];
+        assert_eq!(request.input_tokens, Some(2_906));
+        assert_eq!(request.cache.read_tokens, Some(28_160));
+        assert_eq!(request.cache.write_tokens, Some(0));
+        assert_eq!(request.output_tokens, Some(117));
+        assert_eq!(request.prompt_tokens(), Some(31_066));
+        let ratio = request.cache_hit_ratio().unwrap();
+        assert!((ratio - 28_160.0 / 31_066.0).abs() < 1e-9);
+
+        let session = &state.sessions[0];
+        assert_eq!(session.input_tokens, 2_906);
+        assert_eq!(session.cache_read_tokens, 28_160);
+        assert_eq!(session.cache_write_tokens, 0);
+        assert_eq!(session.output_tokens, 117);
+        assert_eq!(session.cache.context_tokens, 31_066);
+
+        // A late opening value cannot undo the final count.
+        monitor.stream_progress("r1", 10, 1, Some(40_000), Some(1));
+        let late = monitor.snapshot();
+        assert_eq!(late.recent[0].input_tokens, Some(2_906));
+        assert_eq!(late.sessions[0].input_tokens, 2_906);
+    }
+
+    #[test]
+    fn count_tokens_estimates_stay_out_of_session_totals() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "count",
+            Some("s1".to_string()),
+            None,
+            EndpointKind::CountTokens,
+        );
+        monitor.provider_selected("count", "codex", "gpt-5.6-sol", None);
+        monitor.usage_updated("count", Some(40_000), None);
+        monitor.request_completed("count", 200, None, None);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(100, 0, 0, 10));
+        monitor.request_completed("r1", 200, None, None);
+
+        let state = monitor.snapshot();
+        assert_eq!(recent_by_id(&state, "count").input_tokens, Some(40_000));
+        assert!(!recent_by_id(&state, "count").cache.evaluated());
+        assert_eq!(state.sessions[0].input_tokens, 100);
+        assert_eq!(state.sessions[0].output_tokens, 10);
+    }
+
+    #[test]
+    fn cache_misses_are_judged_within_a_conversation_lane() {
+        let monitor = MonitorHandle::new(20);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+
+        start_codex_request(&monitor, "r2", "main");
+        monitor.usage_reported("r2", closing_usage(900, 30_000, 0, 50));
+        monitor.request_completed("r2", 200, None, None);
+
+        // A subagent in the same session builds its own cache; its first
+        // request is not compared with the main thread.
+        start_codex_request(&monitor, "a1", "agent-1");
+        monitor.usage_reported("a1", closing_usage(5_000, 0, 0, 20));
+        monitor.request_completed("a1", 200, None, None);
+
+        // The main thread comes back and nothing of its prefix is cached.
+        start_codex_request(&monitor, "r3", "main");
+        monitor.usage_reported("r3", closing_usage(31_000, 0, 0, 40));
+        monitor.request_completed("r3", 200, None, None);
+
+        let state = monitor.snapshot();
+        assert!(recent_by_id(&state, "r1").cache.miss.is_none());
+        assert!(recent_by_id(&state, "r1").cache.evaluated());
+        assert!(recent_by_id(&state, "r2").cache.miss.is_none());
+        assert!(recent_by_id(&state, "a1").cache.miss.is_none());
+        let miss = recent_by_id(&state, "r3").cache.miss.expect("miss");
+        assert_eq!(miss.expected_tokens, 30_900);
+        assert_eq!(miss.missed_tokens, 30_900);
+        assert_eq!(miss.cause, CacheMissCause::WithinTtl);
+        assert_eq!(miss.ttl, Some(usage::CODEX_CACHE_TTL));
+
+        let session = &state.sessions[0];
+        assert_eq!(session.cache.miss_count, 1);
+        assert_eq!(session.cache.missed_tokens, 30_900);
+        assert_eq!(session.cache.context_tokens, 31_000);
+        assert_eq!(session.cache.peak_context_tokens, 31_000);
+        assert_eq!(session.cache.last_miss.map(|(_, miss)| miss), Some(miss));
+    }
+
+    #[test]
+    fn idle_gap_beyond_the_reported_ttl_is_an_expiry() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.provider_selected("r1", "anthropic", "claude-opus-5", None);
+        if let Ok(mut store) = monitor.store.lock()
+            && let Some(active) = store.active.get_mut("r1")
+        {
+            active.started_at = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        }
+        monitor.usage_reported(
+            "r1",
+            UsageReport {
+                cache_ttl: Some(Duration::from_secs(60 * 60)),
+                ..closing_usage(2, 0, 40_000, 10)
+            },
+        );
+        monitor.request_completed("r1", 200, None, None);
+
+        monitor.request_started("r2", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.provider_selected("r2", "anthropic", "claude-opus-5", None);
+        monitor.usage_reported("r2", closing_usage(3, 0, 40_100, 10));
+        monitor.request_completed("r2", 200, None, None);
+
+        let state = monitor.snapshot();
+        let miss = recent_by_id(&state, "r2").cache.miss.expect("miss");
+        assert_eq!(miss.cause, CacheMissCause::Expired);
+        assert_eq!(miss.ttl, Some(Duration::from_secs(60 * 60)));
+        assert!(miss.gap >= Duration::from_secs(2 * 60 * 60 - 5));
+        assert_eq!(state.sessions[0].cache_write_tokens, 80_100);
+        assert_eq!(state.sessions[0].cache_hit_ratio(), Some(0.0));
+        assert_eq!(
+            state.sessions[0].cache.context_ttl,
+            Some(Duration::from_secs(60 * 60))
+        );
+    }
+
+    fn start_anthropic_request(monitor: &MonitorHandle, request_id: &str, model: &str) {
+        monitor.request_started(
+            request_id,
+            Some("s1".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.conversation_resolved(request_id, "main");
+        monitor.provider_selected(request_id, "anthropic", model, None);
+    }
+
+    fn backdate(monitor: &MonitorHandle, request_id: &str, ago: Duration) {
+        if let Ok(mut store) = monitor.store.lock()
+            && let Some(active) = store.active.get_mut(request_id)
+        {
+            active.started_at = SystemTime::now() - ago;
+        }
+    }
+
+    #[test]
+    fn side_calls_are_not_judged_and_leave_the_context_alone() {
+        let monitor = MonitorHandle::new(20);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(40_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+
+        // Two isolated web search calls on the same model: different queries
+        // behind a short shared system prompt.
+        for id in ["w1", "w2"] {
+            start_codex_request(&monitor, id, "main/side");
+            monitor.usage_reported(id, closing_usage(3_000, 0, 0, 20));
+            monitor.request_completed(id, 200, None, None);
+        }
+
+        let state = monitor.snapshot();
+        assert!(recent_by_id(&state, "w2").cache.evaluated());
+        assert!(recent_by_id(&state, "w2").cache.miss.is_none());
+        assert_eq!(state.sessions[0].cache.miss_count, 0);
+        assert_eq!(state.sessions[0].cache.context_tokens, 40_000);
+    }
+
+    #[test]
+    fn a_request_sent_before_the_previous_response_began_is_not_a_miss() {
+        let monitor = MonitorHandle::new(20);
+        start_anthropic_request(&monitor, "r1", "claude-opus-5");
+        backdate(&monitor, "r1", Duration::from_secs(20));
+        start_anthropic_request(&monitor, "r2", "claude-opus-5");
+        backdate(&monitor, "r2", Duration::from_secs(10));
+        // r1's response begins after r2 was sent, so r2 could not read what
+        // r1 wrote and writes the same prefix again.
+        monitor.stream_progress_usage("r1", 100, 1, closing_usage(2, 0, 30_000, 1));
+        monitor.request_completed("r1", 200, None, None);
+        monitor.stream_progress_usage("r2", 100, 1, closing_usage(2, 0, 30_000, 1));
+        monitor.request_completed("r2", 200, None, None);
+
+        let state = monitor.snapshot();
+        assert!(recent_by_id(&state, "r2").cache.evaluated());
+        assert!(recent_by_id(&state, "r2").cache.miss.is_none());
+    }
+
+    #[test]
+    fn an_older_request_finishing_late_keeps_the_newer_baseline() {
+        let monitor = MonitorHandle::new(20);
+        start_codex_request(&monitor, "r1", "main");
+        backdate(&monitor, "r1", Duration::from_secs(20));
+        start_codex_request(&monitor, "r2", "main");
+        backdate(&monitor, "r2", Duration::from_secs(10));
+        monitor.usage_reported("r2", closing_usage(40_000, 0, 0, 10));
+        monitor.request_completed("r2", 200, None, None);
+        monitor.usage_reported("r1", closing_usage(50_000, 0, 0, 10));
+        monitor.request_completed("r1", 200, None, None);
+        assert_eq!(monitor.snapshot().sessions[0].cache.context_tokens, 40_000);
+
+        // Against r2's 40k this request read everything it could; against
+        // r1's 50k it would have missed 10k.
+        start_codex_request(&monitor, "r3", "main");
+        monitor.usage_reported("r3", closing_usage(20_000, 40_000, 0, 10));
+        monitor.request_completed("r3", 200, None, None);
+
+        let state = monitor.snapshot();
+        assert!(recent_by_id(&state, "r1").cache.miss.is_none());
+        assert!(recent_by_id(&state, "r3").cache.miss.is_none());
+        assert_eq!(state.sessions[0].cache.miss_count, 0);
+        assert_eq!(state.sessions[0].cache.context_tokens, 60_000);
+    }
+
+    #[test]
+    fn a_lane_that_never_cached_is_judged_only_where_caching_is_implicit() {
+        let monitor = MonitorHandle::new(20);
+        // A short Anthropic prompt below the model's minimum cacheable length.
+        for id in ["h1", "h2"] {
+            start_anthropic_request(&monitor, id, "claude-haiku-4-5");
+            monitor.usage_reported(id, closing_usage(3_000, 0, 0, 10));
+            monitor.request_completed(id, 200, None, None);
+        }
+        // Codex never reports writes, so a zero read after a first request of
+        // the same prefix is a miss.
+        for id in ["c1", "c2"] {
+            start_codex_request(&monitor, id, "main");
+            monitor.usage_reported(id, closing_usage(3_000, 0, 0, 10));
+            monitor.request_completed(id, 200, None, None);
+        }
+
+        let state = monitor.snapshot();
+        assert!(recent_by_id(&state, "h2").cache.evaluated());
+        assert!(recent_by_id(&state, "h2").cache.miss.is_none());
+        assert_eq!(
+            recent_by_id(&state, "c2")
+                .cache
+                .miss
+                .map(|miss| miss.missed_tokens),
+            Some(3_000)
+        );
+    }
+
+    #[test]
+    fn context_cache_expiry_counts_down_from_the_latest_main_request() {
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let stats = SessionCacheStats {
+            context_started_at: Some(started),
+            context_ttl: Some(Duration::from_secs(3600)),
+            ..SessionCacheStats::default()
+        };
+        assert_eq!(
+            stats.context_cache_expiry(started + Duration::from_secs(600)),
+            Some(CacheExpiry::WarmFor(Duration::from_secs(3000)))
+        );
+        assert_eq!(
+            stats.context_cache_expiry(started + Duration::from_secs(7200)),
+            Some(CacheExpiry::ExpiredAgo(Duration::from_secs(3600)))
+        );
+        assert_eq!(
+            SessionCacheStats::default().context_cache_expiry(started),
+            None
+        );
     }
 }

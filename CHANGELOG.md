@@ -1,3 +1,18 @@
+## Unreleased
+
+- The monitor shows the prompt cache: cache reads and writes next to the
+  uncached input, the hit rate per request and per session, the session's
+  context size with how long its cache stays warm, and cache misses with the
+  tokens reprocessed and whether the cache had expired or was lost while it
+  should have been alive. Misses are judged per conversation and model, so
+  subagents, side calls such as titles and web search, compaction and
+  overlapping requests do not show up as misses.
+- Claude models report their token usage to the monitor, read from the
+  relayed response without changing it.
+- Codex token counts in the monitor end at the backend's figures instead of
+  the estimate of the whole prompt sent when the stream starts, and
+  `count_tokens` estimates no longer add to session totals.
+
 ## v0.5.0 (2026-09-11)
 
 - `/v1/models` and `claude-code-mux models` list Codex models from the Codex

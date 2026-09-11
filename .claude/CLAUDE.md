@@ -179,6 +179,67 @@ Request path:
 All conversation state (sessions, continuations, compaction, WebSocket pool)
 lives in process-wide statics. A restart clears it.
 
+## Monitor token accounting
+
+Usage is tracked in the Anthropic shape: `input_tokens` is uncached, cache
+read and cache write are separate (`RequestCache` on each request), and the
+prompt size is their sum. Providers report usage in one of two ways:
+
+- Legacy `stream_progress(input, output)` / `usage_updated(input, output)` /
+  `request_completed(input, output)` values only ever raise a count. Upstream
+  added that rule (a369bd3) to ignore stale updates; kimi, grok and cursor
+  still use it.
+- `stream_progress_usage` / `usage_reported` carry a `UsageReport`
+  (`src/monitor/usage.rs`). Its `opening` values raise a count until a
+  `closing` value arrives, which replaces it. The Codex translator's
+  `message_start` input is an estimate of the whole prompt (upstream #86 keeps
+  it on the wire for Claude Code's live counters), so the Codex provider parses
+  SSE with `usage_report_from_anthropic_sse`, which treats `message_start` as
+  opening and `message_delta` as closing. The Anthropic passthrough wraps the
+  relayed body in `UsageObserver` (bytes untouched) and treats
+  `message_start` prompt counts as closing, because Anthropic's are exact.
+
+Session totals apply signed deltas and skip `count_tokens` requests. Cache
+misses are judged per lane (session, conversation from
+`MonitorEvent::ConversationResolved`, provider, model) in
+`MonitorStore::evaluate_cache` once a request's cache read is closed.
+`detect_cache_miss` takes the expected prefix as min(previous prompt, this
+prompt) and counts a shortfall of at least clamp(10% of it, 1024, 20k); a
+prompt that shrank by more than 1024 tokens is a client rewrite (compaction,
+clear, rewind) and only resets the baseline. The cause is `expired` when the
+start-to-start gap exceeds the lifetime of the previous request's entries
+(Anthropic `cache_creation.ephemeral_1h/5m`, else 5m; Codex 30m), `within ttl`
+otherwise. The store skips judging:
+
+- side lanes: `server::monitor_conversation_label` appends `/side` when a
+  request has no tool with `input_schema` (titles, the auto-mode classifier,
+  the isolated web search call carrying only the hosted `web_search_*` tool).
+  Without this, web search calls on the main model reset the main lane's
+  baseline and set the context size to a few thousand tokens;
+- a request that started before the lane baseline's response began
+  (`readable_from`), since Anthropic entries are readable only from then;
+- a request that started before the baseline itself (it finished late; it
+  also must not replace the baseline or the session's context size);
+- a lane with no cache read or write so far, unless `caches_implicitly`
+  (Codex never reports writes).
+
+A model switch is not labelled: the new model's lane has no baseline. Doing it
+reliably needs the previous request of the same conversation and a guard for
+side calls on other models. Do not switch cursor to the report API: it sends
+`cache_read_input_tokens: 0` always and would produce false misses.
+
+On the ChatGPT Codex backend the `session_id` header drives cache affinity:
+byte-identical requests repeated 5 seconds apart hit the cache 4 times out of 4
+with it and 1 time out of 4 without it (measured 2026-09-11). Even with it,
+some re-sends miss at random. With gpt-5.6-sol, re-sends missed after 2, 6,
+29 and 61 minutes and hit after 11, 20, 21 and 35 minutes, and after 45
+minutes when read again at 20. With gpt-5.5 they hit at 6, 11, 21 and 35
+minutes. A single Codex miss inside the lifetime
+is not proof that the prompt changed.
+Explicit cache controls (`prompt_cache_breakpoint`, `prompt_cache_retention`)
+are rejected by the subscription backend for GPT-5.6 models (openai/codex
+#35300, #39397).
+
 ## Invariants to preserve
 
 - The Anthropic passthrough must stay byte-exact for normal traffic. The only

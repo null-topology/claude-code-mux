@@ -29,7 +29,7 @@ use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
-use crate::monitor::usage_from_anthropic_sse;
+use crate::monitor::{usage_report_from_anthropic_body, usage_report_from_anthropic_sse};
 use crate::provider::{
     CliHandlers, ListingAuth, ListingSource, ModelListing, Provider, RequestContext,
 };
@@ -444,13 +444,11 @@ impl CodexProvider {
                 }
             };
             if let Some(monitor) = ctx.monitor.as_ref() {
-                let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-                monitor.stream_progress(
+                monitor.stream_progress_usage(
                     &ctx.req_id,
                     sse_bytes.len() as u64,
                     count_sse_events(&sse_bytes),
-                    input_tokens,
-                    output_tokens,
+                    usage_report_from_anthropic_sse(&sse_bytes),
                 );
             }
             update_continuation_from_upstream(
@@ -478,12 +476,8 @@ impl CodexProvider {
             ) {
                 Ok(json) => {
                     if let Some(monitor) = ctx.monitor.as_ref() {
-                        monitor.usage_updated(
-                            &ctx.req_id,
-                            json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
-                            json.pointer("/usage/output_tokens")
-                                .and_then(|v| v.as_u64()),
-                        );
+                        monitor
+                            .usage_reported(&ctx.req_id, usage_report_from_anthropic_body(&json));
                     }
                     update_continuation_from_upstream(
                         ctx.session_id.as_deref(),
@@ -1079,13 +1073,11 @@ fn record_live_stream_downstream_capture(ctx: &RequestContext, chunk: &[u8]) {
 
 fn record_live_stream_progress(ctx: &RequestContext, chunk: &[u8]) {
     if let Some(monitor) = ctx.monitor.as_ref() {
-        let (input_tokens, output_tokens) = usage_from_anthropic_sse(chunk);
-        monitor.stream_progress(
+        monitor.stream_progress_usage(
             &ctx.req_id,
             chunk.len() as u64,
             count_sse_events(chunk),
-            input_tokens,
-            output_tokens,
+            usage_report_from_anthropic_sse(chunk),
         );
     }
 }
