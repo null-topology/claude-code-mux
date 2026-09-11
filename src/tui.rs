@@ -2,9 +2,9 @@ mod layout;
 
 use layout::{
     CODE_WIDTH, COUNT_WIDTH, ColumnSpec, DURATION_WIDTH, EFFORT_WIDTH, ENDPOINT_WIDTH, ERROR_WIDTH,
-    ID_WIDTH, LayoutTier, MODEL_MEDIUM_WIDTH, MODEL_NARROW_WIDTH, MODEL_WIDE_WIDTH,
-    PROJECT_MEDIUM_WIDTH, PROJECT_WIDE_WIDTH, PROVIDER_WIDTH, RATE_WIDTH, STATUS_WIDTH, TIME_WIDTH,
-    TOKEN_WIDTH,
+    HIT_WIDTH, ID_WIDTH, LayoutTier, MISS_WIDTH, MODEL_MEDIUM_WIDTH, MODEL_NARROW_WIDTH,
+    MODEL_WIDE_WIDTH, PROJECT_MEDIUM_WIDTH, PROJECT_WIDE_WIDTH, PROVIDER_WIDTH, RATE_WIDTH,
+    STATUS_WIDTH, TIME_WIDTH, TOKEN_WIDTH,
 };
 
 use std::{
@@ -52,7 +52,7 @@ const YELLOW: Color = Color::Rgb(220, 200, 100);
 const BLUE: Color = Color::Rgb(120, 170, 230);
 const PURPLE: Color = Color::Rgb(190, 140, 240);
 const DIM: Color = Color::Rgb(100, 104, 114);
-const SESSION_SPARKLINE_MIN_WIDTH: u16 = 170;
+const SESSION_SPARKLINE_MIN_WIDTH: u16 = 190;
 const SESSION_SPARKLINE_MAX_TOKENS: u64 = 4_000;
 
 pub struct MonitorUiConfig<'a> {
@@ -616,6 +616,128 @@ fn http_status_color(status: Option<u16>) -> Color {
     }
 }
 
+fn hit_label(ratio: Option<f64>) -> String {
+    ratio
+        .map(|ratio| format!("{:.0}%", ratio * 100.0))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn hit_color(ratio: Option<f64>) -> Color {
+    match ratio {
+        None => DIM,
+        Some(ratio) if ratio >= 0.8 => GREEN,
+        Some(ratio) if ratio >= 0.5 => YELLOW,
+        Some(_) => RED,
+    }
+}
+
+fn hit_cell(ratio: Option<f64>) -> Cell<'static> {
+    Cell::from(
+        Line::from(Span::styled(
+            hit_label(ratio),
+            Style::default().fg(hit_color(ratio)),
+        ))
+        .alignment(Alignment::Right),
+    )
+}
+
+/// Missed tokens of one request, red when there was a miss.
+fn request_miss_cell(request: &CompletedRequest) -> Cell<'static> {
+    let (value, color) = match request.cache.miss {
+        Some(miss) => (compact_tokens(miss.missed_tokens), RED),
+        None => ("-".to_string(), DIM),
+    };
+    Cell::from(
+        Line::from(Span::styled(value, Style::default().fg(color))).alignment(Alignment::Right),
+    )
+}
+
+/// Miss count and missed tokens of a session, as `count/tokens`.
+fn session_miss_cell(session: &SessionSummary) -> Cell<'static> {
+    let (value, color) = if session.cache.miss_count == 0 {
+        ("-".to_string(), DIM)
+    } else {
+        (
+            format!(
+                "{}/{}",
+                session.cache.miss_count,
+                compact_tokens(session.cache.missed_tokens)
+            ),
+            RED,
+        )
+    };
+    Cell::from(
+        Line::from(Span::styled(value, Style::default().fg(color))).alignment(Alignment::Right),
+    )
+}
+
+/// Why a cache miss happened: the cause and the idle gap against the cache
+/// lifetime.
+fn cache_miss_cause(miss: &crate::monitor::CacheMiss) -> String {
+    let ttl = match miss.ttl {
+        Some(ttl) if miss.cause == crate::monitor::CacheMissCause::Expired => {
+            format!(" > ttl {}", format_duration(ttl))
+        }
+        Some(ttl) => format!(" (ttl {})", format_duration(ttl)),
+        None => String::new(),
+    };
+    format!(
+        "{} · idle {}{}",
+        miss.cause.label(),
+        format_duration(miss.gap),
+        ttl
+    )
+}
+
+/// One line describing a cache miss: how much, why, and the idle gap.
+fn cache_miss_summary(miss: &crate::monitor::CacheMiss) -> String {
+    format!(
+        "{} of {} · {}",
+        compact_tokens(miss.missed_tokens),
+        compact_tokens(miss.expected_tokens),
+        cache_miss_cause(miss)
+    )
+}
+
+/// How long the main conversation's cached prefix should stay readable, going
+/// by its provider's cache lifetime.
+fn context_cache_expiry_label(
+    stats: &crate::monitor::SessionCacheStats,
+    now: SystemTime,
+) -> String {
+    let Some(ttl) = stats.context_ttl else {
+        return String::new();
+    };
+    match stats.context_cache_expiry(now) {
+        Some(crate::monitor::CacheExpiry::WarmFor(left)) => format!(
+            " · cache warm {} more (ttl {})",
+            format_duration(left),
+            format_duration(ttl)
+        ),
+        Some(crate::monitor::CacheExpiry::ExpiredAgo(ago)) => format!(
+            " · cache expired {} ago (ttl {})",
+            format_duration(ago),
+            format_duration(ttl)
+        ),
+        None => String::new(),
+    }
+}
+
+/// The recent table already shows the missed tokens in its own column, so
+/// the details cell carries only the cause.
+fn recent_details_cell(request: &CompletedRequest) -> Cell<'static> {
+    if let Some(error) = request.error.as_deref().filter(|error| !error.is_empty()) {
+        return detail_cell(error);
+    }
+    match request.cache.miss {
+        Some(miss) => Cell::from(Span::styled(
+            format!("cache miss · {}", cache_miss_cause(&miss)),
+            Style::default().fg(RED),
+        )),
+        None => detail_cell(""),
+    }
+}
+
 fn rate_cell(value: String) -> Cell<'static> {
     let color = if value.contains("tok/s") {
         TEAL
@@ -767,6 +889,9 @@ enum SessionColumn {
     Model,
     Target,
     Effort,
+    Context,
+    Hit,
+    Misses,
     Input,
     Output,
     Rate,
@@ -787,13 +912,33 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
             ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDE_WIDTH),
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
+            ColumnSpec::fixed(C::Context, "Ctx", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Hit, "Hit", Alignment::Right, HIT_WIDTH),
+            ColumnSpec::fixed(C::Misses, "Miss", Alignment::Right, MISS_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
             ColumnSpec::flex(C::Activity, "Tokens/10s · 4k", Alignment::Left, 1),
             ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
         ],
-        (LayoutTier::Expanded | LayoutTier::Wide, _) => vec![
+        (LayoutTier::Wide, false) => vec![
+            ColumnSpec::fixed(C::Marker, "", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Id, "ID", Alignment::Left, ID_WIDTH),
+            ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_WIDE_WIDTH),
+            ColumnSpec::fixed(C::Counts, "A/R/F", Alignment::Right, 7),
+            ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
+            ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_NARROW_WIDTH),
+            ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
+            ColumnSpec::fixed(C::Context, "Ctx", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Hit, "Hit", Alignment::Right, HIT_WIDTH),
+            ColumnSpec::fixed(C::Misses, "Miss", Alignment::Right, MISS_WIDTH),
+            ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::flex(C::Activity, "Tokens/10s", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Status, "Status", Alignment::Left, STATUS_WIDTH),
+        ],
+        (LayoutTier::Expanded, _) => vec![
             ColumnSpec::fixed(C::Marker, "", Alignment::Left, 1),
             ColumnSpec::fixed(C::Id, "ID", Alignment::Left, ID_WIDTH),
             ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_MEDIUM_WIDTH),
@@ -888,6 +1033,13 @@ fn render_sessions(
                         target_cell(session.provider.as_deref(), session.model.as_deref(), width)
                     }
                     SessionColumn::Effort => text_cell(session.effort.as_deref().unwrap_or("-")),
+                    SessionColumn::Context => number_cell(if session.cache.context_tokens == 0 {
+                        "-".to_string()
+                    } else {
+                        compact_tokens(session.cache.context_tokens)
+                    }),
+                    SessionColumn::Hit => hit_cell(session.cache_hit_ratio()),
+                    SessionColumn::Misses => session_miss_cell(session),
                     SessionColumn::Input => number_cell(compact_tokens(session.input_tokens)),
                     SessionColumn::Output => number_cell(compact_tokens(session.output_tokens)),
                     SessionColumn::Rate => rate_cell(session.rate().label()),
@@ -1058,6 +1210,8 @@ enum RecentColumn {
     Endpoint,
     Latency,
     Rate,
+    Hit,
+    Miss,
     Input,
     Output,
     Details,
@@ -1074,10 +1228,11 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
             ColumnSpec::fixed(C::Session, "Session", Alignment::Left, ID_WIDTH),
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
             ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_WIDE_WIDTH),
-            ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Endpoint, "Endpoint", Alignment::Left, ENDPOINT_WIDTH),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Hit, "Hit", Alignment::Right, HIT_WIDTH),
+            ColumnSpec::fixed(C::Miss, "Miss", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::flex(C::Details, "Details", Alignment::Left, 1),
@@ -1092,6 +1247,8 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Hit, "Hit", Alignment::Right, HIT_WIDTH),
+            ColumnSpec::fixed(C::Miss, "Miss", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Error, "!", Alignment::Right, ERROR_WIDTH),
@@ -1104,6 +1261,8 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
             ColumnSpec::fixed(C::Effort, "Effort", Alignment::Left, EFFORT_WIDTH),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Hit, "Hit", Alignment::Right, HIT_WIDTH),
+            ColumnSpec::fixed(C::Miss, "Miss", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Error, "!", Alignment::Right, ERROR_WIDTH),
@@ -1115,6 +1274,7 @@ fn recent_columns(tier: LayoutTier) -> Vec<ColumnSpec<RecentColumn>> {
             ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
             ColumnSpec::fixed(C::Latency, "Latency", Alignment::Right, DURATION_WIDTH),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
+            ColumnSpec::fixed(C::Hit, "Hit", Alignment::Right, HIT_WIDTH),
             ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
             ColumnSpec::fixed(C::Error, "!", Alignment::Right, ERROR_WIDTH),
@@ -1185,9 +1345,11 @@ fn render_recent(
                     RecentColumn::Endpoint => muted_cell(request.endpoint.label()),
                     RecentColumn::Latency => number_cell(format_duration(request.latency)),
                     RecentColumn::Rate => rate_cell(request.rate().label()),
+                    RecentColumn::Hit => hit_cell(request.cache_hit_ratio()),
+                    RecentColumn::Miss => request_miss_cell(request),
                     RecentColumn::Input => number_cell(token_value(request.input_tokens)),
                     RecentColumn::Output => number_cell(token_value(request.output_tokens)),
-                    RecentColumn::Details => detail_cell(request.error.as_deref().unwrap_or("")),
+                    RecentColumn::Details => recent_details_cell(request),
                     RecentColumn::Error => detail_cell(error_indicator(request)),
                 }
             })
@@ -1330,23 +1492,63 @@ fn render_session_detail(
             detail_line("model", session.model.as_deref().unwrap_or("-"), DIM_WHITE),
             detail_line("effort", session.effort.as_deref().unwrap_or("-"), YELLOW),
             detail_line(
-                "input tokens",
-                compact_tokens(session.input_tokens),
-                DIM_WHITE,
-            ),
-            detail_line(
-                "output tokens",
-                compact_tokens(session.output_tokens),
-                DIM_WHITE,
-            ),
-            detail_line(
-                "total tokens",
+                "tokens",
                 format!(
-                    "{}/{}",
+                    "{} in · {} read · {} write · {} out",
                     compact_tokens(session.input_tokens),
+                    compact_tokens(session.cache_read_tokens),
+                    compact_tokens(session.cache_write_tokens),
                     compact_tokens(session.output_tokens)
                 ),
                 DIM_WHITE,
+            ),
+            detail_line(
+                "cache",
+                if session.cache.miss_count == 0 {
+                    format!("{} hit · no misses", hit_label(session.cache_hit_ratio()))
+                } else {
+                    format!(
+                        "{} hit · {} {} · {} tokens reprocessed",
+                        hit_label(session.cache_hit_ratio()),
+                        session.cache.miss_count,
+                        if session.cache.miss_count == 1 {
+                            "miss"
+                        } else {
+                            "misses"
+                        },
+                        compact_tokens(session.cache.missed_tokens)
+                    )
+                },
+                if session.cache.miss_count == 0 {
+                    hit_color(session.cache_hit_ratio())
+                } else {
+                    RED
+                },
+            ),
+            detail_line(
+                "context",
+                format!(
+                    "{} now · {} peak{}",
+                    compact_tokens(session.cache.context_tokens),
+                    compact_tokens(session.cache.peak_context_tokens),
+                    context_cache_expiry_label(&session.cache, SystemTime::now())
+                ),
+                DIM_WHITE,
+            ),
+            detail_line(
+                "last miss",
+                session
+                    .cache
+                    .last_miss
+                    .map(|(at, miss)| {
+                        format!("{} · {}", format_system_time(at), cache_miss_summary(&miss))
+                    })
+                    .unwrap_or_else(|| "-".to_string()),
+                if session.cache.last_miss.is_some() {
+                    RED
+                } else {
+                    DIM
+                },
             ),
             detail_line("rate", session.rate().label(), TEAL),
             detail_line(
@@ -1380,7 +1582,14 @@ fn render_request_detail(
             detail_line("request", request.request_id.clone(), WHITE),
             detail_line(
                 "session",
-                display_session_id(request.session_id.as_deref()),
+                match request.conversation.as_deref() {
+                    Some(conversation) => format!(
+                        "{} · {}",
+                        display_session_id(request.session_id.as_deref()),
+                        conversation
+                    ),
+                    None => display_session_id(request.session_id.as_deref()).to_string(),
+                },
                 TEAL,
             ),
             detail_line(
@@ -1416,20 +1625,43 @@ fn render_request_detail(
             detail_line("effort", request.effort.as_deref().unwrap_or("-"), YELLOW),
             detail_line("latency", format_duration(request.latency), DIM_WHITE),
             detail_line("rate", request.rate().label(), TEAL),
-            detail_line("input tokens", token_value(request.input_tokens), DIM_WHITE),
             detail_line(
-                "output tokens",
-                token_value(request.output_tokens),
+                "tokens",
+                format!(
+                    "{} prompt · {} in · {} read · {} write · {} out",
+                    token_value(request.prompt_tokens()),
+                    token_value(request.input_tokens),
+                    token_value(request.cache.read_tokens),
+                    token_value(request.cache.write_tokens),
+                    token_value(request.output_tokens)
+                ),
                 DIM_WHITE,
             ),
             detail_line(
-                "stream bytes",
-                request.streamed_bytes.to_string(),
-                DIM_WHITE,
+                "cache",
+                match (request.cache.miss, request.cache.evaluated()) {
+                    (Some(miss), _) => format!(
+                        "{} hit · miss {}",
+                        hit_label(request.cache_hit_ratio()),
+                        cache_miss_summary(&miss)
+                    ),
+                    (None, true) => {
+                        format!("{} hit · no miss", hit_label(request.cache_hit_ratio()))
+                    }
+                    (None, false) => hit_label(request.cache_hit_ratio()),
+                },
+                if request.cache.miss.is_some() {
+                    RED
+                } else {
+                    hit_color(request.cache_hit_ratio())
+                },
             ),
             detail_line(
-                "stream chunks",
-                request.stream_chunks.to_string(),
+                "stream",
+                format!(
+                    "{} bytes · {} chunks",
+                    request.streamed_bytes, request.stream_chunks
+                ),
                 DIM_WHITE,
             ),
         ];
@@ -1870,7 +2102,13 @@ mod tests {
         assert!(fixed_budget(&session_columns(LayoutTier::Narrow, false)) <= 76);
         assert!(fixed_budget(&session_columns(LayoutTier::Medium, false)) <= 88);
         assert!(fixed_budget(&session_columns(LayoutTier::Expanded, false)) <= 118);
-        assert!(fixed_budget(&session_columns(LayoutTier::Wide, true)) <= 168);
+        // The short sparkline header must still fit at the first wide width.
+        assert!(fixed_budget(&session_columns(LayoutTier::Wide, false)) <= 152 - 10);
+        // The full sparkline header must fit where the full sparkline starts.
+        assert!(
+            fixed_budget(&session_columns(LayoutTier::Wide, true))
+                <= SESSION_SPARKLINE_MIN_WIDTH - 2 - "Tokens/10s · 4k".chars().count() as u16
+        );
 
         assert!(fixed_budget(&active_columns(LayoutTier::Emergency)) <= 75);
         assert!(fixed_budget(&active_columns(LayoutTier::Narrow)) <= 76);
@@ -2225,6 +2463,67 @@ mod tests {
         let active_text = buffer_text(&active);
         assert!(active_text.contains("⠋compacting"), "{active_text}");
         assert_eq!(status_color("compacting"), PURPLE);
+    }
+
+    #[test]
+    fn cache_columns_show_hit_rate_context_and_misses() {
+        let state = mock_state();
+        let session_index = state
+            .sessions
+            .iter()
+            .position(|session| {
+                session.session_id.as_deref() == Some("57c7c914-ada4-4f40-9672-985f950fbb66")
+            })
+            .unwrap();
+
+        let sessions = buffer_text(&draw(170, 12, |frame| {
+            render_sessions(frame, frame.area(), &state.sessions, session_index, true)
+        }));
+        for header in ["Ctx", "Hit", "Miss"] {
+            assert!(sessions.contains(header), "{sessions}");
+        }
+        assert!(sessions.contains("1/118.2k"), "{sessions}");
+
+        let recent = buffer_text(&draw(154, 12, |frame| {
+            render_recent(frame, frame.area(), &state.recent, 0, true)
+        }));
+        for header in ["Hit", "Miss"] {
+            assert!(recent.contains(header), "{recent}");
+        }
+        assert!(recent.contains("118.2k"), "{recent}");
+        let roomy_recent = buffer_text(&draw(200, 12, |frame| {
+            render_recent(frame, frame.area(), &state.recent, 0, true)
+        }));
+        assert!(
+            roomy_recent.contains("cache miss · expired · idle 34m00s > ttl 30m00s"),
+            "{roomy_recent}"
+        );
+
+        let request = state
+            .recent
+            .iter()
+            .position(|request| request.request_id == "req-complete-codex")
+            .unwrap();
+        let detail = buffer_text(&draw(140, 24, |frame| {
+            render_request_detail(frame, frame.area(), &state, request)
+        }));
+        assert!(
+            detail.contains("125.6k prompt · 121.9k in · 3.7k read · 0 write · 832 out"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("3% hit · miss 118.2k of 121.9k"),
+            "{detail}"
+        );
+
+        let session_detail = buffer_text(&draw(140, 20, |frame| {
+            render_session_detail(frame, frame.area(), &state, session_index)
+        }));
+        assert!(
+            session_detail.contains("1 miss · 118.2k tokens reprocessed"),
+            "{session_detail}"
+        );
+        assert!(session_detail.contains("context"), "{session_detail}");
     }
 
     #[test]

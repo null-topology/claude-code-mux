@@ -59,6 +59,31 @@ struct AutoReviewRoute {
     override_model: String,
 }
 
+/// The conversation lane the monitor tracks prompt caching in. Subagents share
+/// the session id, so each agent gets its own lane. A request without client
+/// tools is one of Claude Code's side calls (a title, the auto-mode classifier,
+/// the isolated web search call with only the hosted search tool): it does not
+/// extend the transcript, so it goes to a side lane that is not judged for misses.
+fn monitor_conversation_label(
+    identity: &ConversationIdentity,
+    body: &crate::anthropic::schema::MessagesRequest,
+) -> String {
+    let base = match identity {
+        ConversationIdentity::Main(_) => "main",
+        ConversationIdentity::Agent(_, agent_id) => agent_id.as_str(),
+    };
+    let has_client_tools = body
+        .extra
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| tools.iter().any(|tool| tool.get("input_schema").is_some()));
+    if has_client_tools {
+        base.to_string()
+    } else {
+        format!("{base}{}", crate::monitor::SIDE_CONVERSATION_SUFFIX)
+    }
+}
+
 fn is_claude_auto_review_request(body: &crate::anthropic::schema::MessagesRequest) -> bool {
     if body.stream {
         return false;
@@ -1560,6 +1585,11 @@ async fn dispatch_request(
     {
         monitor.project_resolved(&req_id, project);
     }
+    if let Some(identity) = conversation_identity.as_ref()
+        && let Some(monitor) = state.monitor.as_ref()
+    {
+        monitor.conversation_resolved(&req_id, monitor_conversation_label(identity, &body));
+    }
 
     let model = match body.model.as_deref() {
         Some(model) => model,
@@ -2212,11 +2242,38 @@ fn _unused(session_state: Option<&SessionState>) {
 
 #[cfg(test)]
 mod auto_review_tests {
-    use super::{apply_auto_review_model, headers_to_record, is_claude_auto_review_request};
+    use super::{
+        apply_auto_review_model, headers_to_record, is_claude_auto_review_request,
+        monitor_conversation_label,
+    };
     use crate::anthropic::schema::MessagesRequest;
-    use crate::request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER};
+    use crate::request_identity::{
+        CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, ConversationIdentity,
+    };
     use http::{HeaderMap, HeaderValue};
     use serde_json::json;
+
+    #[test]
+    fn requests_without_client_tools_go_to_the_side_lane() {
+        let main = ConversationIdentity::Main("s1".to_string());
+        let agent = ConversationIdentity::Agent("s1".to_string(), "agent-7".to_string());
+        let turn = request(
+            "You are Claude Code.",
+            true,
+            json!([{"name": "Bash", "input_schema": {"type": "object"}}]),
+        );
+        let web_search = request(
+            "You are Claude Code.",
+            true,
+            json!([{"type": "web_search_20250305", "name": "web_search"}]),
+        );
+        let title = request("You are Claude Code.", false, json!([]));
+
+        assert_eq!(monitor_conversation_label(&main, &turn), "main");
+        assert_eq!(monitor_conversation_label(&agent, &turn), "agent-7");
+        assert_eq!(monitor_conversation_label(&main, &web_search), "main/side");
+        assert_eq!(monitor_conversation_label(&agent, &title), "agent-7/side");
+    }
 
     fn request(system: &str, stream: bool, tools: serde_json::Value) -> MessagesRequest {
         serde_json::from_value(json!({
