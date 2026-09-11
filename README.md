@@ -344,7 +344,7 @@ Only `ANTHROPIC_BASE_URL` is required. Restart Claude Code after changing it.
 | `ANTHROPIC_MODEL` | Force one model for the whole session. |
 | `ANTHROPIC_DEFAULT_OPUS_MODEL`, `..._SONNET_MODEL`, `..._HAIKU_MODEL` | Remap a built-in picker row, e.g. `ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra` sends the Sonnet slot to Codex. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Claude login for environments without an interactive `claude login`. Passed through to Anthropic unchanged. |
-| `ENABLE_TOOL_SEARCH` | Claude Code disables lazy tool loading behind a non-Anthropic base URL. Set to `true`: the proxy forwards the tool references, and requests shrink considerably. |
+| `ENABLE_TOOL_SEARCH` | Claude Code disables lazy tool loading behind a non-Anthropic base URL. Set to `true`: requests shrink considerably. Claude models get the tool references untouched; on Codex models loading a tool uses the backend's own tool search, so the cached prompt prefix survives the load. |
 
 ### Claude authentication
 
