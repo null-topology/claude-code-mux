@@ -350,8 +350,9 @@ conversation:
 - `within ttl`: the prefix should still have been alive. On Claude this means
   the prompt changed. On Codex it can also be the backend serving the request
   from a machine without the cache. On the ChatGPT backend, identical
-  gpt-5.6-sol requests were served from the cache after 11, 21, 35 and 45
-  minutes, while re-sends after 2, 6 and 29 minutes were not.
+  gpt-5.6-sol requests were served from the cache after 11, 21 and 35 minutes,
+  and after 45 minutes when read again at 20. Re-sends after 2, 6, 29 and 61
+  minutes were not.
 
 Switching a conversation to another model is not labelled as a miss. The new
 model starts its own cache, so its first request processes the whole context.

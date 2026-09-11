@@ -27,10 +27,11 @@ pub const ANTHROPIC_DEFAULT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 /// OpenAI documents GPT-5.6 and later prefixes as eligible for reuse for at
 /// least 30 minutes after their last write or read, possibly longer, and
 /// GPT-5.5 prefixes for about 30 minutes. Measured on the ChatGPT Codex backend
-/// (2026-09-11): gpt-5.6-sol prefixes were served after 11, 21, 35 and 45
-/// minutes, while re-sends after 2, 6 and 29 minutes missed; gpt-5.5 hit at
-/// every point from 6 to 35 minutes. A miss inside this window is therefore not
-/// proof of a changed prefix, and one past it is not proof of expiry.
+/// (2026-09-11): gpt-5.6-sol prefixes were served after 11, 21 and 35 minutes
+/// and after 45 minutes when read again at 20, while re-sends after 2, 6, 29
+/// and 61 minutes missed; gpt-5.5 hit at every point from 6 to 35 minutes. A
+/// miss inside this window is therefore not proof of a changed prefix, and one
+/// past it is not proof of expiry.
 pub const CODEX_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// A shortfall below this many tokens is rounding and the uncached tail, not a

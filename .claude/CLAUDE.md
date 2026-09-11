@@ -231,9 +231,10 @@ side calls on other models. Do not switch cursor to the report API: it sends
 On the ChatGPT Codex backend the `session_id` header drives cache affinity:
 byte-identical requests repeated 5 seconds apart hit the cache 4 times out of 4
 with it and 1 time out of 4 without it (measured 2026-09-11). Even with it,
-some re-sends miss at random. With gpt-5.6-sol, re-sends missed after 2, 6
-and 29 minutes and hit after 11, 20, 21, 35 and 45 minutes. With gpt-5.5
-they hit at 6, 11, 21 and 35 minutes. A single Codex miss inside the lifetime
+some re-sends miss at random. With gpt-5.6-sol, re-sends missed after 2, 6,
+29 and 61 minutes and hit after 11, 20, 21 and 35 minutes, and after 45
+minutes when read again at 20. With gpt-5.5 they hit at 6, 11, 21 and 35
+minutes. A single Codex miss inside the lifetime
 is not proof that the prompt changed.
 Explicit cache controls (`prompt_cache_breakpoint`, `prompt_cache_retention`)
 are rejected by the subscription backend for GPT-5.6 models (openai/codex
