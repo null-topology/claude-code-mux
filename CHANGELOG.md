@@ -1,4 +1,4 @@
-## Unreleased
+## v0.6.0 (2026-09-11)
 
 - The monitor shows the prompt cache: cache reads and writes next to the
   uncached input, the hit rate per request and per session, the session's
