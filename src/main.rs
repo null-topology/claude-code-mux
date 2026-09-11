@@ -4,6 +4,7 @@ use claude_code_mux::{
     config, logging,
     monitor::MonitorHandle,
     paths,
+    provider::{ListingAuth, ListingSource},
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
     server::{self, ServerConfig},
     tui::{self, MonitorExit, MonitorUiConfig},
@@ -158,7 +159,11 @@ fn main() -> Result<()> {
             tui::run_mock_monitor(config::port(), &registry)
         }
         Commands::Models { full } => {
-            print_models(&Registry::with_default_alias(), full);
+            let registry = Registry::with_default_alias();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(print_live_models(&registry, full));
             Ok(())
         }
         Commands::Codex { command } => run_provider_cli("codex", command),
@@ -219,6 +224,7 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
     }
 }
 
+/// The compiled-in lists, for the serve banner: no backend is asked at start.
 fn print_models(registry: &Registry, full: bool) {
     let grouped = registry.grouped_models();
     for provider in ["codex", "kimi", "grok", "cursor"] {
@@ -229,6 +235,49 @@ fn print_models(registry: &Registry, full: bool) {
             println!("{provider}: {}", models.join(", "));
         } else {
             println!("{provider}: {}", compact_cursor_list(models));
+        }
+    }
+}
+
+/// `models`: what each backend lists right now, on the proxy's own login,
+/// the same answer `GET /v1/models` gives. A provider whose backend did not
+/// answer is printed with the reason instead of a compiled-in list.
+async fn print_live_models(registry: &Registry, full: bool) {
+    for name in ["codex", "kimi", "grok", "cursor", "anthropic"] {
+        let Some(provider) = registry.provider(name) else {
+            continue;
+        };
+        let listing = provider.list_models().await;
+        if listing.auth == ListingAuth::Client {
+            println!(
+                "{name}: {}",
+                listing.detail.as_deref().unwrap_or("not listed")
+            );
+            continue;
+        }
+        if !listing.is_ok() {
+            println!(
+                "{name}: unavailable ({}: {})",
+                listing.status,
+                listing.detail.as_deref().unwrap_or("no detail")
+            );
+            continue;
+        }
+        let ids: Vec<String> = listing
+            .models
+            .iter()
+            .filter_map(|row| row.get("id").and_then(|id| id.as_str()))
+            .map(str::to_string)
+            .collect();
+        let source = match listing.source {
+            ListingSource::Upstream => "upstream",
+            ListingSource::Bundled => "bundled list, not verified",
+            ListingSource::None => "none",
+        };
+        if full || name != "cursor" {
+            println!("{name}: {} [{source}]", ids.join(", "));
+        } else {
+            println!("{name}: {} [{source}]", compact_cursor_list(&ids));
         }
     }
 }

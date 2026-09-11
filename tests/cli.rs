@@ -17,16 +17,29 @@ fn version_aliases_print_expected_version() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// `models` asks each backend that holds a login, so tests point the codex
+/// provider at a missing credential file: no network, and the line reports
+/// why nothing was listed.
+fn no_codex_auth(cmd: &mut Command, temp: &TempDir) {
+    cmd.env("CCP_CODEX_AUTH_FILE", temp.path().join("missing-auth.json"));
+    cmd.env("CCP_CONFIG_DIR", temp.path());
+}
+
 #[test]
 fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
     let mut cmd = Command::cargo_bin("claude-code-mux")?;
+    no_codex_auth(&mut cmd, &temp);
     cmd.arg("models");
     let out = String::from_utf8(cmd.output()?.stdout)?;
-    assert!(out.contains("codex:"));
-    assert!(out.contains("kimi:"));
-    assert!(out.contains("cursor:"));
+    assert!(out.contains("codex: unavailable (unauthorized:"), "{out}");
+    assert!(out.contains("kimi:"), "{out}");
+    assert!(out.contains("[bundled list, not verified]"), "{out}");
+    assert!(out.contains("cursor:"), "{out}");
+    assert!(out.contains("anthropic:"), "{out}");
 
     let mut cmd = Command::cargo_bin("claude-code-mux")?;
+    no_codex_auth(&mut cmd, &temp);
     cmd.args(["models", "--full"]);
     cmd.output()?;
     Ok(())
@@ -89,7 +102,9 @@ fn provider_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::E
 
 #[test]
 fn models_output_is_stable_order() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
     let mut cmd = Command::cargo_bin("claude-code-mux")?;
+    no_codex_auth(&mut cmd, &temp);
     cmd.args(["models", "--full"]);
     let output = cmd.output()?;
     let out = String::from_utf8(output.stdout)?;

@@ -19,7 +19,7 @@ use crate::traffic::{
 
 use super::client::{CodexError, CodexHttpClient};
 use super::translate::model_allowlist::{
-    ALLOWED_MODELS, MODEL_ALIASES, assert_allowed_model, full_lane_web_search_model,
+    MODEL_ALIASES, assert_allowed_model, full_lane_web_search_model, is_known_model, known_models,
     uses_responses_lite,
 };
 
@@ -102,7 +102,7 @@ pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
             format!(
                 "Model '{requested}' resolves to unsupported model '{}'. Supported: {}",
                 error.model,
-                ALLOWED_MODELS.join(", ")
+                known_models().join(", ")
             ),
             Some("model"),
             Some("model_not_supported"),
@@ -141,7 +141,7 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
 
 fn resolve_native_model(requested: &str) -> (String, bool) {
     let (requested, priority) = match requested.strip_suffix("-fast") {
-        Some(base) if ALLOWED_MODELS.contains(&base) => (base, true),
+        Some(base) if is_known_model(base) => (base, true),
         _ => (requested, false),
     };
     let model = MODEL_ALIASES
