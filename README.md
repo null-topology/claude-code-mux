@@ -345,6 +345,15 @@ Only `ANTHROPIC_BASE_URL` is required. Restart Claude Code after changing it.
 | `ANTHROPIC_DEFAULT_OPUS_MODEL`, `..._SONNET_MODEL`, `..._HAIKU_MODEL` | Remap a built-in picker row, e.g. `ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra` sends the Sonnet slot to Codex. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Claude login for environments without an interactive `claude login`. Passed through to Anthropic unchanged. |
 | `ENABLE_TOOL_SEARCH` | Claude Code disables lazy tool loading behind a non-Anthropic base URL. Set to `true`: the proxy forwards the tool references, and requests shrink considerably. |
+| `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` | Behind a non-Anthropic base URL Claude Code budgets every Claude model at 200k tokens, even the ones its catalog marks as native 1M, and auto-compacts against that. Set to `1`: the passthrough is byte-exact, so the built-in rows keep their 1M window through the proxy. |
+
+Context window for Codex rows: Claude Code assumes 200k for a model id it does
+not know. Append `[1m]` to the id in a `modelPicker` row (`gpt-6-astra[1m]`)
+and Claude Code budgets 1M; the proxy strips the suffix before talking to
+Codex. What the Codex backend actually enforces is in `/v1/models`
+(`context_window`, `max_context_window` per model), and a request past it is
+answered with a context-overflow error that the proxy turns into a compaction
+request.
 
 ### Claude authentication
 
