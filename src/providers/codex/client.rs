@@ -767,6 +767,13 @@ impl CodexHttpClient {
         &self.auth_manager
     }
 
+    /// The models this login may use, straight from the backend.
+    pub async fn list_models(
+        &self,
+    ) -> Result<super::models::ModelInventory, super::models::ModelsError> {
+        super::models::fetch_models(&self.client, &self.auth_manager, &self.base_url).await
+    }
+
     pub fn body_idle_timeout_ms(&self) -> u64 {
         self.body_idle_timeout_ms
     }

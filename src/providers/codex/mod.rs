@@ -6,6 +6,7 @@ pub mod continuation;
 pub mod count_tokens;
 pub(crate) mod events;
 pub mod images;
+pub mod models;
 pub mod native;
 pub(crate) mod rate_limits;
 pub mod request_summary;
@@ -29,7 +30,9 @@ use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
-use crate::provider::{CliHandlers, Provider, RequestContext};
+use crate::provider::{
+    CliHandlers, ListingAuth, ListingSource, ModelListing, Provider, RequestContext,
+};
 use crate::registry;
 use crate::request_identity::ConversationIdentity;
 use crate::retry::{compute_backoff_delay, sleep};
@@ -524,6 +527,34 @@ impl Provider for CodexProvider {
 
     fn cli(&self) -> &'static dyn CliHandlers {
         &CODEX_CLI
+    }
+
+    async fn list_models(&self) -> ModelListing {
+        match self.client.list_models().await {
+            Ok(inventory) => ModelListing {
+                provider: "codex",
+                auth: ListingAuth::Proxy,
+                source: ListingSource::Upstream,
+                status: "ok",
+                detail: None,
+                fetched_at: Some(inventory.fetched_at),
+                models: inventory
+                    .models
+                    .iter()
+                    .map(models::UpstreamModel::to_listing_row)
+                    .collect(),
+            },
+            Err(error) => {
+                create_logger("codex").warn(
+                    "codex model listing unavailable",
+                    Some(serde_json::Map::from_iter([
+                        ("status".to_string(), serde_json::json!(error.status())),
+                        ("detail".to_string(), serde_json::json!(error.detail())),
+                    ])),
+                );
+                ModelListing::unavailable("codex", error.status(), error.detail().to_string())
+            }
+        }
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
