@@ -154,7 +154,7 @@ arrow key like the built-in rows, add a `modelPicker` block to
         "model": "gpt-5.6-luna",
         "label": "Luna",
         "description": "GPT-5.6 Luna · Fast and affordable agentic coding",
-        "behavesAs": "claude-haiku-4-5"
+        "behavesAs": "claude-sonnet-5"
       },
       {
         "model": "gpt-5.5",
@@ -173,10 +173,18 @@ The rows appear after the built-in lineup. Each field does one thing:
   above.
 - `label` and `description` are only what the picker shows.
 - `behavesAs` names a Claude model whose client-side defaults (prompt profile,
-  context window assumption, effort handling) Claude Code applies to the row.
-  Without it Claude Code treats the model as unknown, assumes a 200k window,
-  and prints a warning on every start. It does not change the label or the
-  id sent.
+  context window, effort handling) Claude Code applies to the row. Without it
+  Claude Code treats the model as unknown, assumes a 200k window, and prints a
+  warning on every start. It does not change the label or the id sent. The
+  row inherits that model's window, so a 1M model here (`claude-opus-5`,
+  `claude-sonnet-5`) gives the row 1M, while `claude-haiku-4-5` caps it at
+  200k. Behind the proxy that 1M only takes effect with
+  `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` set (see
+  [Claude Code side](#claude-code-side)).
+
+Do not put `[1m]` in a row's `model`: Claude Code 2.1.268 silently drops such
+rows from the picker. The suffix still works on an id typed with `/model` or
+passed to `--model`.
 
 `modelPicker` is honored from user settings, managed settings, and the
 `--settings` flag, not from a project checkout. Setting
@@ -345,14 +353,24 @@ Only `ANTHROPIC_BASE_URL` is required. Restart Claude Code after changing it.
 | `ANTHROPIC_DEFAULT_OPUS_MODEL`, `..._SONNET_MODEL`, `..._HAIKU_MODEL` | Remap a built-in picker row, e.g. `ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra` sends the Sonnet slot to Codex. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Claude login for environments without an interactive `claude login`. Passed through to Anthropic unchanged. |
 | `ENABLE_TOOL_SEARCH` | Claude Code disables lazy tool loading behind a non-Anthropic base URL. Set to `true`: the proxy forwards the tool references, and requests shrink considerably. |
-| `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` | Behind a non-Anthropic base URL Claude Code budgets every Claude model at 200k tokens, even the ones its catalog marks as native 1M, and auto-compacts against that. Set to `1`: the passthrough is byte-exact, so the built-in rows keep their 1M window through the proxy. |
+| `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` | Behind a non-Anthropic base URL Claude Code budgets every model at 200k tokens, even the ones its catalog marks as native 1M, and auto-compacts against that. Set to `1`: the passthrough is byte-exact, so the built-in rows keep their 1M window through the proxy, and `modelPicker` rows get the window of their `behavesAs` model. |
 
-Context window for Codex rows: Claude Code assumes 200k for a model id it does
-not know. Append `[1m]` to the id in a `modelPicker` row (`gpt-6-astra[1m]`)
-and Claude Code budgets 1M; the proxy strips the suffix before talking to
-Codex. What the Codex backend actually enforces is in `/v1/models`
-(`context_window`, `max_context_window` per model), and a request past it is
-answered with a context-overflow error that the proxy turns into a compaction
+Context window: Claude Code computes it on the client, per model id. Measured
+with `claude -p --model <id> "/context"` through the proxy on Claude Code
+2.1.268:
+
+| model | without the flag | with the flag |
+| --- | --- | --- |
+| `fable`, `sonnet` | 200k | 1M |
+| `opus[1m]` | 1M | 1M |
+| `haiku` | 200k | 200k |
+| Codex row with `behavesAs` `claude-opus-5` or `claude-sonnet-5` | 200k | 1M |
+| Codex row with `behavesAs` `claude-haiku-4-5` | 200k | 200k |
+
+This is the budget Claude Code keeps before auto-compacting, not what the
+backend accepts. For Codex, the backend's own limits are in `/v1/models`
+(`context_window`, `max_context_window` per model); a request past them comes
+back as a context-overflow error that the proxy turns into a compaction
 request.
 
 ### Claude authentication
