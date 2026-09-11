@@ -123,15 +123,25 @@ Request path:
    Code's non-streaming, tool-free security classifier is rerouted to
    `CCP_AUTO_REVIEW_MODEL`, default `gpt-5.6-luna` on codex), then call the
    provider and record log, monitor and traffic capture.
+   `handler_models` (`/v1/models`) calls `Provider::list_models` on every
+   registered provider (or the one named by `?provider=`), tags each row with
+   `provider`, and adds a top-level `providers[]` block with `auth`, `source`,
+   `status`, `detail`, `fetched_at` per provider. The filtered form fails with
+   502 when that provider cannot list; the aggregate form is always 200.
 3. `src/registry.rs`: model to provider. `ANTHROPIC_STYLE_ALIASES` and any
    `claude-*` id go to the alias provider (`CCP_ALIAS_PROVIDER`, default
    anthropic); `cursor:` prefixes go to cursor; anything else must match a
-   provider's model list exactly; unknown ids return 400 listing the catalog.
+   provider's model list exactly, or be a slug the Codex backend named in its
+   last successful listing (`providers::codex::models::is_discovered_model`,
+   `-fast` included); unknown ids return 400 listing the catalog.
    The `CODEX_MODELS`, `KIMI_MODELS`, `GROK_MODELS` lists here are duplicated
    in each provider's `translate/model_allowlist.rs`. Keep them in sync.
 4. `src/provider.rs`: the `Provider` trait, `RequestContext` (request id,
    session, traffic, monitor, and `Passthrough` with the raw bytes and headers
-   for byte-exact relays), `ProviderError`, `CliHandlers`.
+   for byte-exact relays), `ProviderError`, `CliHandlers`, and `ModelListing`
+   (what `list_models` returns; the default impl advertises `supported_models()`
+   as `source: bundled`, anthropic overrides to `auth: client` with no rows,
+   codex overrides to ask its backend).
 5. `src/providers/<name>/`: one directory per backend with the same shape:
    `auth/`, `client.rs`, `translate/` (`request.rs` Anthropic to native,
    `stream.rs` and `reducer.rs` native events to typed events,
@@ -238,20 +248,36 @@ compatibility contracts, not the user-facing name. Do not rename them:
 - A unit test that mirrors a wire format can pass while being wrong about the
   format. Verify stream-shape changes end to end against a real capture.
 
-## Adding a Codex model
+## Codex model inventory
 
-Four places plus one test line; the `-fast` variant appears on its own because
-`fast_model_aliases()` derives `<model>-fast` for every allowed model:
+`/v1/models` and the `models` command do not read a compiled-in Codex list.
+`providers/codex/models.rs` calls `GET {api root}/models?client_version=X` on
+the Codex CLI's bearer (the completions URL with `/responses` replaced by
+`/models`), forwards the entries as the backend sent them, and remembers the
+slugs so routing and `assert_allowed_model` accept them; `use_responses_lite`
+from the listing overrides the compiled-in lane table. Nothing is cached
+across calls or restarts, deliberately: a consumer that reads the listing as
+the truth about available models must see changes, not a stale fallback.
 
-- `src/providers/codex/translate/model_allowlist.rs` → `ALLOWED_MODELS` and
-  `uses_responses_lite`
-- `src/registry.rs` → `CODEX_MODELS` (routing) and `CODEX_CATALOG` (what
-  `/v1/models` advertises, with picker label and description)
-- the `assert_allowed_model` test
-- the `modelPicker` example in `README.md`
+Verified live 2026-09-11: the call answers 200 with the proxy's own
+`originator`, with or without `ChatGPT-Account-Id`, and while the weekly
+window is at 100% (`/backend-api/wham/usage` reported `limit_reached`); it
+answers 400 without `client_version`. The version comes from
+`CCP_CODEX_CLIENT_VERSION`, else the Codex CLI's `models_cache.json` next to
+`auth.json`, else `CODEX_CLIENT_VERSION` in `auth/constants.rs`.
 
-`/v1/models` deliberately omits the Anthropic group: Claude Code lists its own
-models, and repeating them duplicated the picker.
+The compiled-in `CODEX_MODELS` / `ALLOWED_MODELS` lists still exist for
+routing before the first listing and for the OpenAI-compatible surfaces'
+error text. They are no longer what `/v1/models` advertises. Adding a model
+there is optional; when done, keep `src/registry.rs` and
+`src/providers/codex/translate/model_allowlist.rs` in sync and update the
+`assert_allowed_model` test.
+
+`/v1/models` deliberately emits no Anthropic rows: the proxy holds no
+Anthropic credential, and Claude Code lists its own models. The anthropic
+entry in `providers[]` says so (`auth: client`). No id in `data[]` may contain
+`claude` or `anthropic`, because Claude Code's gateway discovery keeps such
+ids as picker rows.
 
 ## How Codex models get into Claude Code's picker
 

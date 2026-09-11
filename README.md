@@ -100,15 +100,12 @@ manager or a background job.
 
 ### Model ids
 
-Codex models are addressed by their Codex id. The proxy offers this catalog:
-
-| id | label | what Codex says about it |
-| --- | --- | --- |
-| `gpt-6-astra` | Astra | Most capable model for complex, demanding work |
-| `gpt-5.6-sol` | Sol | Reliable agentic workhorse for everyday tasks |
-| `gpt-5.6-terra` | Terra | Balanced agentic coding model for everyday work |
-| `gpt-5.6-luna` | Luna | Fast and affordable agentic coding model |
-| `gpt-5.5` | GPT-5.5 | Proven previous-generation model for coding and general work |
+Codex models are addressed by their Codex id, for example `gpt-6-astra`,
+`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, or `gpt-5.5`. The proxy does
+not keep that list itself: `claude-code-mux models` and `GET /v1/models` ask
+the Codex backend which models your ChatGPT login may use and print exactly
+that, so a model Codex starts serving is available without a proxy release
+(see [Listing models](#listing-models)).
 
 Two suffixes are understood on any id:
 
@@ -190,11 +187,79 @@ shows only these rows.
 
 Claude Code can also fetch `/v1/models` from a gateway
 (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`), and the proxy serves that
-endpoint with the catalog above. It is not the recommended path: discovery
-only runs when `ANTHROPIC_AUTH_TOKEN`, an API key, or an `apiKeyHelper` is
-configured, and any of those moves Claude Code off the subscription path, where
-the native rate-limit events stop arriving for every model. `modelPicker` keeps
-the subscription path intact.
+endpoint. It is not the recommended path: discovery only runs when
+`ANTHROPIC_AUTH_TOKEN`, an API key, or an `apiKeyHelper` is configured, and
+any of those moves Claude Code off the subscription path, where the native
+rate-limit events stop arriving for every model. `modelPicker` keeps the
+subscription path intact.
+
+### Listing models
+
+`GET /v1/models` answers with what each backend can list right now, not with a
+list compiled into the proxy. A backend the proxy holds a login for is asked
+on every call; today that is Codex, whose backend has a metadata call that
+returns the models the logged-in ChatGPT account may use. It spends no
+completion quota and still answers while a usage window is spent, so the
+listing is checkable under a rate limit.
+
+Every row carries a `provider` field, and a top-level `providers` block says
+where each group's rows came from:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"type": "model", "object": "model", "id": "gpt-6-astra", "provider": "codex",
+     "display_name": "…", "description": "…", "visibility": "list",
+     "supported_in_api": true, "use_responses_lite": true,
+     "context_window": 272000, "max_context_window": 872000,
+     "default_reasoning_level": "medium",
+     "supported_reasoning_levels": [{"effort": "low", "description": "…"}, …],
+     "input_modalities": ["text", "image"]},
+    {"type": "model", "object": "model", "id": "kimi-for-coding", "provider": "kimi",
+     "display_name": "kimi-for-coding (kimi)"}
+  ],
+  "has_more": false, "first_id": "gpt-6-astra", "last_id": "…",
+  "providers": [
+    {"provider": "anthropic", "auth": "client", "source": "none", "status": "not_listed",
+     "detail": "credentials are forwarded from the client; models are routed, not listed",
+     "fetched_at": null},
+    {"provider": "codex", "auth": "proxy", "source": "upstream", "status": "ok",
+     "detail": null, "fetched_at": "2026-09-11T10:00:00Z"},
+    {"provider": "kimi", "auth": "proxy", "source": "bundled", "status": "ok", …}
+  ]
+}
+```
+
+- `auth` is `proxy` when the proxy stores the login, `client` when the caller
+  sends its own credential on every request (the Anthropic passthrough).
+- `source` is `upstream` when the backend answered, `bundled` when the rows
+  are a list compiled into this build and nothing was verified (kimi, grok,
+  cursor), `none` when no rows are produced.
+- `status` is `ok`, `unauthorized` (no login on this machine, or the backend
+  refused it), `unreachable` (transport error, timeout, 5xx), or `not_listed`.
+
+Codex rows are the backend's own entries, hidden models included; the fields
+above are forwarded as the backend sent them, so a consumer decides what to
+show. Anthropic is described but has no rows: the proxy holds no Anthropic
+credential and Claude Code already lists its own models. No id in `data`
+contains `claude` or `anthropic`, which is what keeps Claude Code's gateway
+discovery from turning a marker into a picker row.
+
+`GET /v1/models?provider=codex` asks one backend only. When that backend cannot
+list, the request fails with 502 and the reason, so a consumer never mistakes
+an empty answer for "no models". Without the filter the answer is always 200
+and the failure is in the `providers` block.
+
+A model the backend listed routes to codex from then on, `-fast` variant
+included, even if this build did not know it. Nothing is cached across
+restarts: every call is a fresh answer from the backend.
+
+The listing call requires a `client_version` query parameter. The proxy sends
+the version recorded in the Codex CLI's `~/.codex/models_cache.json` when that
+file exists next to `auth.json`, else a compiled-in default;
+`CCP_CODEX_CLIENT_VERSION` (or `codex.clientVersion` in `config.json`)
+overrides both.
 
 ## Claude Agent SDK
 
@@ -307,6 +372,7 @@ captures, and error dumps go to `~/.local/state/claude-code-proxy`.
 | `PORT` | `18765` | Listening port. `claude-code-mux serve --port N` overrides it. |
 | `CCP_BIND_ADDRESS` | `127.0.0.1` | Listening address. |
 | `CCP_CODEX_AUTH_FILE` | `~/.codex/auth.json` | Where the Codex CLI keeps its login. |
+| `CCP_CODEX_CLIENT_VERSION` | from `~/.codex/models_cache.json`, else built-in | `client_version` sent on the Codex model listing call. |
 | `CCP_CODEX_TRANSPORT` | `websocket` | `websocket`, `http`, or `auto`. |
 | `CCP_CODEX_EFFORT` | unset | Reasoning effort sent to Codex, e.g. `high`. |
 | `CCP_CODEX_SERVICE_TIER` | unset | Service tier for every Codex request. `-fast` ids request `priority` per call. |
@@ -325,7 +391,7 @@ captures, and error dumps go to `~/.local/state/claude-code-proxy`.
 | Command | What it does |
 | --- | --- |
 | `claude-code-mux serve [--port N] [--no-monitor]` | Run the proxy. Default command. |
-| `claude-code-mux models [--full]` | List accepted model ids per backend. |
+| `claude-code-mux models [--full]` | List model ids per backend: what Codex lists for your login right now, the bundled lists for the others. |
 | `claude-code-mux codex auth status` | Show the Codex CLI login the proxy will use. |
 | `claude-code-mux kimi\|grok\|cursor auth login\|status\|logout` | Manage the other backends' logins. |
 | `claude-code-mux --version` | Print the version. |

@@ -1,3 +1,22 @@
+## Unreleased
+
+- `/v1/models` and `claude-code-mux models` list Codex models from the Codex
+  backend's own inventory, on the Codex CLI login, instead of a list compiled
+  into the proxy. The call spends no completion quota and answers while a
+  usage window is spent. Every row carries a `provider` field and a top-level
+  `providers` block reports, per backend, whether the proxy holds the login
+  (`auth`), where the rows came from (`source`: `upstream`, `bundled`, or
+  `none`), and whether the backend answered (`status`). `?provider=<name>`
+  narrows the answer to one backend and fails with 502 when it cannot list.
+- A model the Codex backend lists routes to codex without a proxy release,
+  `-fast` variant included, and its Responses Lite lane follows the backend's
+  flag.
+- The Anthropic passthrough is reported in `providers` as `auth: client` with
+  no rows; the curated Codex catalog with picker labels is gone.
+- `CCP_CODEX_CLIENT_VERSION` (or `codex.clientVersion` in `config.json`) sets
+  the `client_version` the listing call requires; by default it is read from
+  the Codex CLI's `models_cache.json`.
+
 ## v0.4.0 (2026-09-09)
 
 First release under the `claude-code-mux` name, continuing
