@@ -1,4 +1,4 @@
-## Unreleased
+## v0.5.0 (2026-09-11)
 
 - `/v1/models` and `claude-code-mux models` list Codex models from the Codex
   backend's own inventory, on the Codex CLI login, instead of a list compiled
