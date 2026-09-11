@@ -94,10 +94,23 @@ fn default_user_agent(use_responses_lite: bool) -> String {
     }
 }
 
+/// A `prompt_cache_key` fit to repeat in a header. The Anthropic route derives
+/// the key from the conversation, but `/v1/responses` relays whatever the
+/// client sent, which may be empty or carry bytes no header accepts; such a key
+/// still rides in the body while the headers fall back to the session.
+fn is_routing_id(scope: &str) -> bool {
+    !scope.is_empty() && scope.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+}
+
+/// `cache_scope` is the request's `prompt_cache_key`: the conversation the
+/// prompt cache belongs to. It also drives the routing headers below, so a
+/// subagent keeps its own cache affinity instead of sharing the main thread's.
+/// Callers without a translated body pass `None` and fall back to the session.
 pub fn build_codex_headers(
     auth: &StoredAuth,
     ctx: &RequestContext,
     use_responses_lite: bool,
+    cache_scope: Option<&str>,
 ) -> Result<http::HeaderMap, CodexError> {
     let mut headers = http::HeaderMap::new();
     headers.insert(
@@ -139,7 +152,10 @@ pub fn build_codex_headers(
             header_value("ChatGPT-Account-Id", account_id)?,
         );
     }
-    if let Some(ref session_id) = ctx.session_id {
+    if let Some(session_id) = cache_scope
+        .filter(|scope| is_routing_id(scope))
+        .or(ctx.session_id.as_deref())
+    {
         headers.insert("session_id", header_value("session_id", session_id)?);
         headers.insert(
             "x-client-request-id",
@@ -166,8 +182,9 @@ pub fn build_native_codex_headers(
     ctx: &RequestContext,
     use_responses_lite: bool,
     stream: bool,
+    cache_scope: Option<&str>,
 ) -> Result<http::HeaderMap, CodexError> {
-    let mut headers = build_codex_headers(auth, ctx, use_responses_lite)?;
+    let mut headers = build_codex_headers(auth, ctx, use_responses_lite, cache_scope)?;
     headers.insert(
         http::header::ACCEPT,
         header_value(
@@ -186,7 +203,7 @@ pub fn build_codex_search_headers(
     auth: &StoredAuth,
     ctx: &RequestContext,
 ) -> Result<http::HeaderMap, CodexError> {
-    let mut headers = build_codex_headers(auth, ctx, false)?;
+    let mut headers = build_codex_headers(auth, ctx, false, None)?;
     headers.insert(
         http::header::ACCEPT,
         header_value("accept", "application/json")?,
@@ -376,6 +393,9 @@ struct HttpEventStreamState {
     auth_refresh_attempted: bool,
     use_responses_lite: bool,
     retries: u32,
+    /// `prompt_cache_key` of the request, so a retry keeps the same cache
+    /// scope and routing headers as the first attempt.
+    cache_scope: Option<String>,
 }
 
 impl HttpSseDecoder {
@@ -977,7 +997,11 @@ impl CodexHttpClient {
 
         loop {
             let started_at = Instant::now();
-            let headers = build_native_codex_headers(&auth, ctx, use_responses_lite, stream)?;
+            // This surface relays a client's own Responses request: its
+            // `prompt_cache_key` is whatever that client chose and stays in the
+            // body, while the routing headers keep the session, which is the
+            // shape the backend expects there.
+            let headers = build_native_codex_headers(&auth, ctx, use_responses_lite, stream, None)?;
             if let Some(traffic) = ctx.traffic.as_deref() {
                 write_codex_http_request_capture(traffic, &self.base_url, &headers, &body_json);
             }
@@ -1158,6 +1182,7 @@ impl CodexHttpClient {
                     ctx,
                     use_responses_lite,
                     &mut auth_refresh_attempted,
+                    body.prompt_cache_key.as_deref(),
                 )
                 .await
             {
@@ -1186,6 +1211,7 @@ impl CodexHttpClient {
                 auth_refresh_attempted,
                 use_responses_lite,
                 retries,
+                cache_scope: body.prompt_cache_key.clone(),
             },
             ctx.clone(),
         ))
@@ -1208,10 +1234,11 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         use_responses_lite: bool,
         auth_refresh_attempted: &mut bool,
+        cache_scope: Option<&str>,
     ) -> Result<(reqwest::Response, Instant), CodexError> {
         loop {
             let (resp, started_at) = self
-                .start_post_http(auth, body_json, ctx, use_responses_lite)
+                .start_post_http(auth, body_json, ctx, use_responses_lite, cache_scope)
                 .await?;
 
             if resp.status().as_u16() == 401 && !*auth_refresh_attempted {
@@ -1304,6 +1331,7 @@ impl CodexHttpClient {
             mut auth_refresh_attempted,
             use_responses_lite,
             mut retries,
+            cache_scope,
         } = state;
         let client = self.clone();
         let body_idle_timeout_ms = self.body_idle_timeout_ms;
@@ -1544,6 +1572,7 @@ impl CodexHttpClient {
                             &ctx,
                             use_responses_lite,
                             &mut auth_refresh_attempted,
+                            cache_scope.as_deref(),
                         ) => result
                     };
                     match next_attempt {
@@ -1607,13 +1636,23 @@ impl CodexHttpClient {
                         retry_after: None,
                         origin: CodexErrorOrigin::Http,
                     })?;
-                    self.attempt_post_http(&auth, &body_json, ctx, body.client_metadata.is_some())
-                        .await
-                        .map(|response| OwnerAwareCodexResponse::new(response, None))
+                    self.attempt_post_http(
+                        &auth,
+                        &body_json,
+                        ctx,
+                        body.client_metadata.is_some(),
+                        body.prompt_cache_key.as_deref(),
+                    )
+                    .await
+                    .map(|response| OwnerAwareCodexResponse::new(response, None))
                 }
                 CodexTransport::WebSocket => {
-                    let ws_headers =
-                        build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
+                    let ws_headers = build_codex_headers(
+                        &auth,
+                        ctx,
+                        body.client_metadata.is_some(),
+                        body.prompt_cache_key.as_deref(),
+                    )?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(
                         body,
@@ -1637,8 +1676,12 @@ impl CodexHttpClient {
                     .await
                 }
                 CodexTransport::Auto => {
-                    let ws_headers =
-                        build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
+                    let ws_headers = build_codex_headers(
+                        &auth,
+                        ctx,
+                        body.client_metadata.is_some(),
+                        body.prompt_cache_key.as_deref(),
+                    )?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(
                         body,
@@ -1691,6 +1734,7 @@ impl CodexHttpClient {
                                 &body_json,
                                 ctx,
                                 body.client_metadata.is_some(),
+                                body.prompt_cache_key.as_deref(),
                             )
                             .await
                             .map(|response| OwnerAwareCodexResponse::new(response, None))
@@ -1996,8 +2040,12 @@ impl CodexHttpClient {
 
         'attempt: loop {
             socket_id_publisher.publish(None);
-            let ws_headers = match build_codex_headers(&auth, &ctx, body.client_metadata.is_some())
-            {
+            let ws_headers = match build_codex_headers(
+                &auth,
+                &ctx,
+                body.client_metadata.is_some(),
+                body.prompt_cache_key.as_deref(),
+            ) {
                 Ok(headers) => super::websocket::codex_websocket_headers(&headers),
                 Err(err) => {
                     if tx.send(Err(err)).await.is_err() {
@@ -2209,9 +2257,10 @@ impl CodexHttpClient {
         body_json: &str,
         ctx: &RequestContext,
         use_responses_lite: bool,
+        cache_scope: Option<&str>,
     ) -> Result<CodexResponse, CodexError> {
         let (resp, started_at) = self
-            .start_post_http(auth, body_json, ctx, use_responses_lite)
+            .start_post_http(auth, body_json, ctx, use_responses_lite, cache_scope)
             .await?;
         self.collect_http_response(resp, started_at, ctx).await
     }
@@ -2222,9 +2271,10 @@ impl CodexHttpClient {
         body_json: &str,
         ctx: &RequestContext,
         use_responses_lite: bool,
+        cache_scope: Option<&str>,
     ) -> Result<(reqwest::Response, Instant), CodexError> {
         let url = &self.base_url;
-        let headers = build_codex_headers(auth, ctx, use_responses_lite)?;
+        let headers = build_codex_headers(auth, ctx, use_responses_lite, cache_scope)?;
 
         if let Some(traffic) = ctx.traffic.as_deref() {
             write_codex_http_request_capture(traffic, url, &headers, body_json);
@@ -4743,6 +4793,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_transport_routes_on_the_conversation_scope() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request[..read]).to_ascii_lowercase()
+        });
+
+        let mut ctx = http_test_context();
+        ctx.session_id = Some("parent-session".to_string());
+        http_test_client(format!("http://{addr}/responses"), 80)
+            .attempt_post_http(&http_test_auth(), "{}", &ctx, false, Some("agent-scope"))
+            .await
+            .expect("request should reach the mock upstream");
+        let request = server.await.unwrap();
+
+        assert!(request.contains("session_id: agent-scope"), "{request}");
+        assert!(
+            request.contains("x-client-request-id: agent-scope"),
+            "{request}"
+        );
+        assert!(
+            request.contains("x-codex-window-id: agent-scope:0"),
+            "{request}"
+        );
+        assert!(!request.contains("parent-session"), "{request}");
+    }
+
+    #[tokio::test]
     async fn active_http_body_can_exceed_header_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4766,7 +4851,7 @@ mod tests {
         });
 
         let response = http_test_client(format!("http://{addr}/responses"), 80)
-            .attempt_post_http(&http_test_auth(), "{}", &http_test_context(), false)
+            .attempt_post_http(&http_test_auth(), "{}", &http_test_context(), false, None)
             .await
             .expect("active body should not hit a whole-request timeout");
         server.await.unwrap();
@@ -4790,7 +4875,7 @@ mod tests {
         });
 
         let result = http_test_client(format!("http://{addr}/responses"), 30)
-            .attempt_post_http(&http_test_auth(), "{}", &http_test_context(), false)
+            .attempt_post_http(&http_test_auth(), "{}", &http_test_context(), false, None)
             .await;
         server.await.unwrap();
         let error = result.err().expect("stalled body should time out");
@@ -4814,7 +4899,7 @@ mod tests {
         });
 
         let result = http_test_client(format!("http://{addr}/responses"), 100)
-            .attempt_post_http(&http_test_auth(), "{}", &http_test_context(), false)
+            .attempt_post_http(&http_test_auth(), "{}", &http_test_context(), false, None)
             .await;
         server.await.unwrap();
         let error = result.err().expect("truncated body should fail");
@@ -4981,12 +5066,25 @@ mod tests {
             monitor: None,
             passthrough: None,
         };
-        let headers = build_codex_headers(&auth, &ctx, false).unwrap();
+        let headers = build_codex_headers(&auth, &ctx, false, None).unwrap();
         assert_eq!(
             headers.get("openai-beta").unwrap(),
             "responses=experimental"
         );
         assert_eq!(headers.get("session_id").unwrap(), "s");
+        // A conversation scope (a subagent's) wins over the session id, so its
+        // prompt cache gets its own routing bucket upstream.
+        let scoped = build_codex_headers(&auth, &ctx, false, Some("agent-scope")).unwrap();
+        assert_eq!(scoped.get("session_id").unwrap(), "agent-scope");
+        assert_eq!(scoped.get("x-client-request-id").unwrap(), "agent-scope");
+        assert_eq!(scoped.get("x-codex-window-id").unwrap(), "agent-scope:0");
+        // A key from an OpenAI-compatible client is not header material; it
+        // stays in the body and the headers keep the session.
+        for unusable in ["", "conv\n1", "ключ"] {
+            let relayed = build_codex_headers(&auth, &ctx, false, Some(unusable)).unwrap();
+            assert_eq!(relayed.get("session_id").unwrap(), "s", "key={unusable:?}");
+            assert_eq!(relayed.get("x-codex-window-id").unwrap(), "s:0");
+        }
         assert_eq!(
             headers.get("x-codex-beta-features").unwrap(),
             "remote_compaction_v2"
@@ -5010,7 +5108,7 @@ mod tests {
             monitor: None,
             passthrough: None,
         };
-        let headers = build_codex_headers(&auth, &ctx, true).unwrap();
+        let headers = build_codex_headers(&auth, &ctx, true, None).unwrap();
         assert_eq!(
             headers
                 .get("x-openai-internal-codex-responses-lite")
@@ -5038,7 +5136,7 @@ mod tests {
             monitor: None,
             passthrough: None,
         };
-        let headers = build_codex_headers(&auth, &ctx, false).unwrap();
+        let headers = build_codex_headers(&auth, &ctx, false, None).unwrap();
         assert!(headers.get("session_id").is_none());
         assert!(headers.get("x-client-request-id").is_none());
     }
@@ -5060,7 +5158,7 @@ mod tests {
             monitor: None,
             passthrough: None,
         };
-        let err = build_codex_headers(&auth, &ctx, false).unwrap_err();
+        let err = build_codex_headers(&auth, &ctx, false, None).unwrap_err();
         assert_eq!(err.status, 500);
         assert!(err.message.contains("session_id"));
     }
@@ -5155,7 +5253,7 @@ mod tests {
             monitor: None,
             passthrough: None,
         };
-        let result = build_codex_headers(&auth, &ctx, false);
+        let result = build_codex_headers(&auth, &ctx, false, None);
         assert!(
             result.is_ok(),
             "empty access should still produce valid Bearer header"

@@ -256,6 +256,10 @@ pub struct ResponsesWebSearchFilters {
 }
 
 pub struct TranslateOptions {
+    /// What the backend keys its prompt cache on: the conversation's cache
+    /// scope (`ConversationIdentity::cache_scope`), which is the session id for
+    /// a main thread and a derived id for a subagent. It becomes
+    /// `prompt_cache_key` and the routing headers of the upstream request.
     pub session_id: Option<String>,
     pub service_tier: Option<ServiceTier>,
     pub model: String,

@@ -30,7 +30,34 @@ impl ConversationIdentity {
             _ => None,
         }
     }
+
+    /// The value a backend should key its prompt cache on for this
+    /// conversation. Claude Code gives a subagent its parent's session id, so
+    /// using that id alone would make every subagent share the main thread's
+    /// cache key and its routing affinity, even though their prompts share
+    /// nothing beyond the account. Subagents get their own derived id instead;
+    /// it is stable across restarts, and shaped like the session id the Codex
+    /// CLI sends, because the backend sees it as a session.
+    pub fn cache_scope(&self) -> String {
+        match self {
+            Self::Main(session_id) => session_id.clone(),
+            // A newline separates the two ids unambiguously: a header value
+            // carrying one would have been rejected before it got here, while
+            // a printable separator such as `:` is legal inside both ids and
+            // would let one pair hash to another's scope.
+            Self::Agent(session_id, agent_id) => uuid::Uuid::new_v5(
+                &CONVERSATION_CACHE_NAMESPACE,
+                format!("{session_id}\n{agent_id}").as_bytes(),
+            )
+            .to_string(),
+        }
+    }
 }
+
+/// Fixed namespace for `cache_scope`; any constant uuid works, and changing it
+/// would only cost every live subagent one cold prompt cache.
+const CONVERSATION_CACHE_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x5b2f_9f3d_7c41_4f0a_9d6e_1c8b_3a57_e204);
 
 #[derive(Debug)]
 enum ParsedHeader<'a> {
@@ -323,6 +350,34 @@ mod tests {
                 "field={field}"
             );
         }
+    }
+
+    #[test]
+    fn cache_scope_separates_subagents_from_their_session() {
+        let session = "cb5ad1b6-9a1f-4b3f-9a1a-7c2f0b4f9f11";
+        let main = ConversationIdentity::Main(session.to_string());
+        let agent = ConversationIdentity::Agent(session.to_string(), "agent-a".to_string());
+        let sibling = ConversationIdentity::Agent(session.to_string(), "agent-b".to_string());
+
+        assert_eq!(main.cache_scope(), session);
+        assert_ne!(agent.cache_scope(), session);
+        assert_ne!(agent.cache_scope(), sibling.cache_scope());
+        // Pinned: a change here costs every live subagent its warm cache, so it
+        // must be a deliberate edit and not a refactor's side effect.
+        assert_eq!(agent.cache_scope(), "165a4260-2539-50f7-9e64-a70576f844ee");
+
+        // `:` is legal inside both ids, so the separator must not be one: these
+        // two pairs would otherwise share a cache and a routing bucket.
+        let left = ConversationIdentity::Agent("a:b".to_string(), "c".to_string());
+        let right = ConversationIdentity::Agent("a".to_string(), "b:c".to_string());
+        assert_ne!(left.cache_scope(), right.cache_scope());
+
+        // The same agent id under another session is a different conversation.
+        let other_session = ConversationIdentity::Agent(
+            "6f3d3b53-2a9e-4c2c-9a3a-b1a63f1a51d2".to_string(),
+            "agent-a".to_string(),
+        );
+        assert_ne!(agent.cache_scope(), other_session.cache_scope());
     }
 
     #[test]

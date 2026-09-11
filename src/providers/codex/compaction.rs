@@ -1,3 +1,11 @@
+//! Server-side compaction state.
+//!
+//! Keyed by the Claude Code session id, unlike the prompt cache, which is keyed
+//! per conversation (`ConversationIdentity::cache_scope`). A session and its
+//! subagents therefore share one compaction slot while holding separate caches;
+//! the summary-text match in `apply_compaction_replay` is what keeps a replay
+//! from landing on the wrong conversation.
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};

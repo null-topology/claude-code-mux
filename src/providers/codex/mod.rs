@@ -198,10 +198,18 @@ impl CodexProvider {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
 
+        // Subagents arrive with their parent's session id and their own agent
+        // header; give each conversation its own cache scope so they do not
+        // share one prompt cache key and one routing bucket upstream.
+        let cache_scope = conversation_identity
+            .as_ref()
+            .map(ConversationIdentity::cache_scope)
+            .or_else(|| ctx.session_id.clone());
+
         let mut translated = match translate_request(
             &body,
             TranslateOptions {
-                session_id: ctx.session_id.clone(),
+                session_id: cache_scope.clone(),
                 service_tier: resolved.service_tier.clone(),
                 model: resolved.model.clone(),
                 use_responses_lite,
@@ -304,6 +312,9 @@ impl CodexProvider {
                     "previousResponseIdEnabled".to_string(),
                     serde_json::json!(previous_response_id_enabled),
                 ),
+                // The conversation the prompt cache belongs to; a subagent's
+                // differs from its session, so captures need the mapping.
+                ("cacheScope".to_string(), serde_json::json!(&cache_scope)),
                 (
                     "hasPreviousResponseId".to_string(),
                     serde_json::json!(continuation.candidate().previous_response_id.is_some()),
