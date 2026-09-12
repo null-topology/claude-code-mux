@@ -1,6 +1,11 @@
 use ratatui::{layout::Alignment, layout::Constraint};
 
 pub const ID_WIDTH: u16 = 8;
+/// The Sessions table nests conversations under their session, so its first
+/// column carries an indent, a tree glyph and an agent id rather than a bare
+/// session id. Only the two widest tiers use it; below those the space belongs
+/// to the columns that carry numbers.
+pub const SESSION_TREE_ID_WIDTH: u16 = 16;
 pub const TIME_WIDTH: u16 = 8;
 pub const CODE_WIDTH: u16 = 4;
 pub const COUNT_WIDTH: u16 = 3;

@@ -13,6 +13,9 @@ use crate::providers::translate_shared::{
 
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
 use super::reasoning_signature::decode_reasoning_signature;
+use super::tool_search::{
+    self, CLAUDE_CODE_TOOL_SEARCH_NAME, TOOL_SEARCH_EXECUTION, TOOL_SEARCH_STATUS, ToolSearchPlan,
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -161,6 +164,25 @@ pub enum ResponsesInputItem {
         call_id: String,
         output: ResponsesFunctionCallOutput,
     },
+    /// A replayed search for deferred tools (Claude Code's `ToolSearch` call).
+    #[serde(rename = "tool_search_call")]
+    ToolSearchCall {
+        #[serde(default)]
+        call_id: String,
+        execution: String,
+        status: String,
+        arguments: Value,
+    },
+    /// The tools a search loaded, carried at the point of the search so the
+    /// tools head stays unchanged.
+    #[serde(rename = "tool_search_output")]
+    ToolSearchOutput {
+        #[serde(default)]
+        call_id: String,
+        status: String,
+        execution: String,
+        tools: Vec<Value>,
+    },
     #[serde(rename = "reasoning")]
     Reasoning {
         id: String,
@@ -223,6 +245,7 @@ pub enum ResponsesContentPart {
 pub enum ResponsesTool {
     Function(ResponsesFunctionTool),
     WebSearch(ResponsesWebSearchTool),
+    ToolSearch(ResponsesToolSearchTool),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +258,20 @@ pub struct ResponsesFunctionTool {
     pub parameters: Value,
     #[serde(default)]
     pub strict: bool,
+    /// Set only on tools delivered by a `tool_search_output` item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
+}
+
+/// The backend's native deferred-tool search, executed by the client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesToolSearchTool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub execution: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parameters: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -460,8 +497,9 @@ fn translate_request_inner(
 ) -> Result<ResponsesRequest, anyhow::Error> {
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
-    let input = build_input(req);
-    let tools = read_tools(req)?;
+    let tool_search_plan = tool_search::plan(req);
+    let input = build_input(req, tool_search_plan.as_ref());
+    let tools = read_tools(req, tool_search_plan.as_ref())?;
     let tool_choice = map_tool_choice(req)?;
     let parallel_tool_calls = parallel_tool_calls(req).unwrap_or(true);
 
@@ -496,6 +534,11 @@ fn translate_request_inner(
             "ws_request_header_x_openai_internal_codex_responses_lite".to_string(),
             "true".to_string(),
         )]));
+        // The lite lane hard-requires this: the backend answers a lite request
+        // that sets it to `true` with 400 `unsupported_value`
+        // ("X-OpenAI-Internal-Codex-Responses-Lite requires
+        // `parallel_tool_calls` to be false"). Escaping the restriction means
+        // leaving the lane, which is what `codex.fullLane` does.
         out.parallel_tool_calls = false;
 
         let mut prefix = Vec::new();
@@ -620,7 +663,10 @@ fn read_output_format(req: &MessagesRequest) -> Option<ResponsesTextFormat> {
     }
 }
 
-fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyhow::Error> {
+fn read_tools(
+    req: &MessagesRequest,
+    tool_search_plan: Option<&ToolSearchPlan>,
+) -> Result<Option<Vec<ResponsesTool>>, anyhow::Error> {
     let Some(tools) = req.extra.get("tools") else {
         return Ok(None);
     };
@@ -630,6 +676,15 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
     };
     let mut out = Vec::new();
     for tool in tools_arr {
+        if let Some(plan) = tool_search_plan {
+            if tool_search::is_claude_code_tool_search(tool) {
+                out.push(ResponsesTool::ToolSearch(tool_search_spec(tool)));
+                continue;
+            }
+            if !plan.keeps_in_head(tool) {
+                continue;
+            }
+        }
         let tool_type = tool
             .get("type")
             .and_then(|v| v.as_str())
@@ -664,28 +719,7 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
                 filters: if has_filters { Some(filters) } else { None },
             }));
         } else {
-            let name = tool
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let description = tool
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let parameters = tool
-                .get("input_schema")
-                .cloned()
-                .unwrap_or(serde_json::json!({}));
-            let description = codex_tool_description(&name, description);
-            let parameters = codex_tool_parameters(&name, parameters);
-            out.push(ResponsesTool::Function(ResponsesFunctionTool {
-                kind: "function".to_string(),
-                name,
-                description,
-                parameters,
-                strict: false,
-            }));
+            out.push(ResponsesTool::Function(function_tool(tool)));
         }
     }
     if out.is_empty() {
@@ -693,6 +727,57 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
     } else {
         Ok(Some(out))
     }
+}
+
+fn function_tool(tool: &Value) -> ResponsesFunctionTool {
+    let name = tool
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let description = tool
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let parameters = tool
+        .get("input_schema")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let description = codex_tool_description(&name, description);
+    let parameters = codex_tool_parameters(&name, parameters);
+    ResponsesFunctionTool {
+        kind: "function".to_string(),
+        name,
+        description,
+        parameters,
+        strict: false,
+        defer_loading: None,
+    }
+}
+
+/// Claude Code's `ToolSearch` function as the backend's client-executed
+/// `tool_search`: same description, same parameters, so the model's
+/// arguments are exactly what `ToolSearch` accepts.
+fn tool_search_spec(tool: &Value) -> ResponsesToolSearchTool {
+    ResponsesToolSearchTool {
+        kind: "tool_search".to_string(),
+        execution: TOOL_SEARCH_EXECUTION.to_string(),
+        description: tool
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        parameters: tool
+            .get("input_schema")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"type": "object"})),
+    }
+}
+
+/// A deferred tool as delivered inside `tool_search_output`.
+fn loaded_tool_spec(tool: &Value) -> Value {
+    let mut spec = function_tool(tool);
+    spec.defer_loading = Some(true);
+    serde_json::to_value(spec).unwrap_or(Value::Null)
 }
 
 fn codex_tool_description(name: &str, description: Option<String>) -> Option<String> {
@@ -792,7 +877,10 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
     }
 }
 
-fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
+fn build_input(
+    req: &MessagesRequest,
+    tool_search_plan: Option<&ToolSearchPlan>,
+) -> Vec<ResponsesInputItem> {
     let mut out: Vec<ResponsesInputItem> = Vec::new();
     let mut read_tool_uses_with_offset = HashSet::new();
 
@@ -822,6 +910,23 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                                     role: "user".to_string(),
                                     content: std::mem::take(&mut parts),
                                 });
+                            }
+                            if let Some(plan) = tool_search_plan
+                                && plan.is_tool_search_call(tool_use_id)
+                            {
+                                // Text-only results (nothing found, an error) load no
+                                // tools; the search output then carries none.
+                                out.push(ResponsesInputItem::ToolSearchOutput {
+                                    call_id: tool_use_id.clone(),
+                                    status: TOOL_SEARCH_STATUS.to_string(),
+                                    execution: TOOL_SEARCH_EXECUTION.to_string(),
+                                    tools: plan
+                                        .referenced_deferred_tools(content)
+                                        .into_iter()
+                                        .map(loaded_tool_spec)
+                                        .collect(),
+                                });
+                                continue;
                             }
                             let mut rendered = render_tool_result(content);
                             if is_error.unwrap_or(false) {
@@ -888,6 +993,19 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
                         ContentBlock::Text { text } => {
                             text_parts
                                 .push(ResponsesContentPart::OutputText { text: text.clone() });
+                        }
+                        ContentBlock::ToolUse { id, name, input }
+                            if name == CLAUDE_CODE_TOOL_SEARCH_NAME
+                                && tool_search_plan
+                                    .is_some_and(|plan| plan.is_tool_search_call(id)) =>
+                        {
+                            flush_text(&mut out, &mut text_parts);
+                            out.push(ResponsesInputItem::ToolSearchCall {
+                                call_id: id.clone(),
+                                execution: TOOL_SEARCH_EXECUTION.to_string(),
+                                status: TOOL_SEARCH_STATUS.to_string(),
+                                arguments: input.clone(),
+                            });
                         }
                         ContentBlock::ToolUse { id, name, input } => {
                             flush_text(&mut out, &mut text_parts);
@@ -2384,5 +2502,259 @@ mod tests {
             out.input.get(reasoning_index + 1),
             Some(ResponsesInputItem::Message { role, .. }) if role == "assistant"
         ));
+    }
+
+    /// Claude Code's tools around a deferred tool load: `ToolSearch`, the
+    /// deferred placeholder, and after the load the loaded tool, which Claude
+    /// Code inserts in name order with `defer_loading` still set.
+    fn claude_code_tools(with_loaded_tool: bool) -> Value {
+        let mut tools = vec![
+            json!({
+                "name": "Read",
+                "description": "Read a file.",
+                "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}
+            }),
+            json!({
+                "name": "ToolSearch",
+                "description": "Fetches full schema definitions for deferred tools.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}, "max_results": {"type": "number"}},
+                    "required": ["query", "max_results"]
+                }
+            }),
+            json!({
+                "name": "DeferredToolPlaceholder",
+                "description": "Reserved placeholder that keeps deferred tool loading active; never call this tool.",
+                "defer_loading": true,
+                "input_schema": {"type": "object", "properties": {}}
+            }),
+        ];
+        if with_loaded_tool {
+            tools.insert(
+                0,
+                json!({
+                    "name": "CronList",
+                    "description": "List scheduled jobs.",
+                    "defer_loading": true,
+                    "input_schema": {"type": "object", "properties": {}}
+                }),
+            );
+        }
+        Value::Array(tools)
+    }
+
+    fn tool_search_request(after_load: bool, search_result: Value) -> MessagesRequest {
+        let mut messages =
+            vec![json!({"role": "user", "content": "How many cron jobs are scheduled?"})];
+        if after_load {
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call_search", "name": "ToolSearch",
+                 "input": {"query": "select:CronList", "max_results": 1}}
+            ]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_search", "content": search_result}
+            ]}));
+        }
+        serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "system": [{"type": "text", "text": "You are a coding agent."}],
+            "messages": messages,
+            "tools": claude_code_tools(after_load),
+        }))
+        .unwrap()
+    }
+
+    fn cron_reference() -> Value {
+        json!([{"type": "tool_reference", "tool_name": "CronList"}])
+    }
+
+    fn lane_opts(use_responses_lite: bool) -> TranslateOptions {
+        TranslateOptions {
+            session_id: Some("s".into()),
+            service_tier: None,
+            model: "gpt-5.6-sol".to_string(),
+            use_responses_lite,
+        }
+    }
+
+    fn items_json(out: &ResponsesRequest) -> Vec<Value> {
+        out.input
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn tool_search_keeps_lite_tools_head_identical_across_a_load() {
+        let before =
+            translate_request(&tool_search_request(false, Value::Null), lane_opts(true)).unwrap();
+        let after = translate_request(
+            &tool_search_request(true, cron_reference()),
+            lane_opts(true),
+        )
+        .unwrap();
+        let before_items = items_json(&before);
+        let after_items = items_json(&after);
+
+        // The additional_tools head and the instructions do not change, so the
+        // prompt prefix cached for the first request still matches.
+        assert_eq!(before_items[0], after_items[0]);
+        assert_eq!(before_items[1], after_items[1]);
+
+        let head = before_items[0]["tools"].as_array().unwrap();
+        let kinds: Vec<(&str, Option<&str>)> = head
+            .iter()
+            .map(|tool| (tool["type"].as_str().unwrap(), tool["name"].as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("function", Some("Read")),
+                ("tool_search", None),
+                ("function", Some("DeferredToolPlaceholder")),
+            ]
+        );
+        assert_eq!(head[1]["execution"], "client");
+        assert_eq!(
+            head[1]["description"],
+            "Fetches full schema definitions for deferred tools."
+        );
+        assert!(head[1]["parameters"]["properties"]["query"].is_object());
+        assert!(head.iter().all(|tool| tool.get("defer_loading").is_none()));
+
+        let tail = &after_items[before_items.len()..];
+        assert_eq!(
+            tail[0],
+            json!({
+                "type": "tool_search_call",
+                "call_id": "call_search",
+                "execution": "client",
+                "status": "completed",
+                "arguments": {"max_results": 1, "query": "select:CronList"}
+            })
+        );
+        assert_eq!(tail[1]["type"], "tool_search_output");
+        assert_eq!(tail[1]["call_id"], "call_search");
+        assert_eq!(tail[1]["status"], "completed");
+        assert_eq!(tail[1]["execution"], "client");
+        assert_eq!(
+            tail[1]["tools"],
+            json!([{
+                "type": "function",
+                "name": "CronList",
+                "description": "List scheduled jobs.",
+                "parameters": {"type": "object", "properties": {}},
+                "strict": false,
+                "defer_loading": true
+            }])
+        );
+        assert_eq!(tail.len(), 2);
+
+        let serialized = serde_json::to_string(&after).unwrap();
+        assert!(!serialized.contains("unsupported content block omitted"));
+        assert!(!serialized.contains("\"name\":\"ToolSearch\""));
+    }
+
+    #[test]
+    fn tool_search_keeps_full_lane_tools_identical_across_a_load() {
+        let before =
+            translate_request(&tool_search_request(false, Value::Null), lane_opts(false)).unwrap();
+        let after = translate_request(
+            &tool_search_request(true, cron_reference()),
+            lane_opts(false),
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&before.tools).unwrap(),
+            serde_json::to_value(&after.tools).unwrap()
+        );
+        assert_eq!(before.instructions, after.instructions);
+        let types: Vec<String> = items_json(&after)
+            .iter()
+            .map(|item| item["type"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            types,
+            vec!["message", "tool_search_call", "tool_search_output"]
+        );
+    }
+
+    #[test]
+    fn tool_search_result_without_references_loads_no_tools() {
+        let req = tool_search_request(
+            true,
+            json!([{"type": "text", "text": "No matching deferred tools found"}]),
+        );
+        let out = translate_request(&req, lane_opts(true)).unwrap();
+        let items = items_json(&out);
+        let output = items
+            .iter()
+            .find(|item| item["type"] == "tool_search_output")
+            .expect("search output");
+        assert_eq!(output["tools"], json!([]));
+
+        // Nothing was loaded, so the deferred tool Claude Code still lists stays
+        // callable from the head.
+        let head_names: Vec<&str> = items[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(head_names.contains(&"CronList"));
+    }
+
+    #[test]
+    fn deferred_tool_without_a_search_in_history_stays_in_head() {
+        // After a compaction Claude Code keeps the loaded tool in `tools` but the
+        // search that loaded it is no longer in the history.
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "Summary of earlier work. Continue."}],
+            "tools": claude_code_tools(true),
+        }))
+        .unwrap();
+        let out = translate_request(&req, lane_opts(true)).unwrap();
+        let items = items_json(&out);
+        let cron = items[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "CronList")
+            .expect("CronList in head");
+        assert!(cron.get("defer_loading").is_none());
+    }
+
+    #[test]
+    fn without_tool_search_tool_deferred_loading_translates_as_before() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_search", "name": "ToolSearch", "input": {"query": "cron"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_search", "content": cron_reference()}
+                ]}
+            ],
+            "tools": [
+                {"name": "CronList", "defer_loading": true, "input_schema": {"type": "object"}}
+            ],
+        }))
+        .unwrap();
+        let out = translate_request(&req, lane_opts(false)).unwrap();
+        let items = items_json(&out);
+        assert_eq!(items[1]["type"], "function_call");
+        assert_eq!(items[1]["name"], "ToolSearch");
+        assert_eq!(items[2]["type"], "function_call_output");
+        assert_eq!(
+            items[2]["output"],
+            "[unsupported content block omitted: tool_reference]"
+        );
+        let tools = serde_json::to_value(&out.tools).unwrap();
+        assert_eq!(tools[0]["name"], "CronList");
     }
 }

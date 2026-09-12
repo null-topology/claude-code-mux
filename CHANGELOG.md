@@ -1,10 +1,44 @@
-## Unreleased
+## v0.7.0 (2026-09-12)
 
-- Each conversation gets its own prompt cache on the Codex backend. Claude Code
-  gives a subagent its parent's session id, so until now a session and all its
-  subagents shared one `prompt_cache_key` and one routing bucket upstream, where
-  busy sessions lose cache hits to overflow routing. Subagents now send a
-  derived id of their own.
+- Codex models answer with several tool calls at once again. Codex marks the
+  gpt-5.6 family and `gpt-6-astra` for the Responses Lite lane, which rejects
+  `parallel_tool_calls: true`, so a model served through it answered at most one
+  tool call per turn and Claude Code's batched tool use turned into one request
+  per call, each carrying the whole conversation. The proxy now uses the full
+  Responses lane for them. `CCP_CODEX_FULL_LANE=0` (or `codex.fullLane: false`)
+  restores the previous behaviour.
+- The Sessions view groups requests into conversations, with the main thread,
+  nested subagents and side calls shown as a tree. Each conversation has its
+  own model, context and cache figures.
+- Each conversation gets its own prompt cache scope on the Codex backend.
+  Claude Code gives a subagent its parent's session id, so a session and all of
+  its subagents sent one `prompt_cache_key` and one set of routing headers,
+  putting unrelated prompts under one cache accounting key and one affinity.
+  A subagent now derives an id of its own, the way the Codex CLI keeps one id
+  per conversation.
+- Claude Code's background-agent status line no longer costs a model call. While
+  a subagent runs, Claude Code resends that subagent's whole context every half
+  minute for a three-word progress label; in a measured capture those requests
+  were a quarter of all Codex traffic, tens of thousands of tokens each. The
+  proxy now recognises the prompt and answers it from the transcript, on every
+  route, since a setup may have no Anthropic subscription at all.
+  `CCP_AGENT_SUMMARY=upstream` sends them to a model again, and then to the
+  provider's junior model at the lowest effort rather than to the subagent's
+  own: `claude-sonnet-5` on Anthropic, because Haiku's 200k window would leave a
+  long-running subagent without a label, and `gpt-5.6-luna` on Codex.
+  `CCP_AGENT_SUMMARY_MODEL` overrides both. Known limitation of this release:
+  that request is recognised by its instruction text, so a request that merely
+  quotes those instructions can be answered with a progress label instead of
+  being routed. Auto mode's security classifier sends the action it reviews as
+  text and can be taken for one, leaving that action unevaluated. A narrower
+  detector is a separate change.
+- Loading a deferred tool on a Codex model no longer throws away the prompt
+  cache. Claude Code's `ToolSearch` is sent to Codex as the backend's own
+  client-executed tool search: the loaded tool's schema travels in a
+  `tool_search_output` item at the point of the search, and the tools list at
+  the start of the prompt stays unchanged. Before, the loaded tool was added
+  to that list, so the request right after every load was served with no
+  cached tokens. The `tool_reference` placeholder text is gone as well.
 
 ## v0.6.0 (2026-09-11)
 

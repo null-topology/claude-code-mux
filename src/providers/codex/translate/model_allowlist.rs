@@ -136,11 +136,41 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
     }
 }
 
-/// Whether a model runs on the Responses Lite lane. The backend's own flag
-/// from the last listing wins; the compiled-in answer covers the models known
-/// before any listing was fetched.
+/// Whether a model runs on the Responses Lite lane. `codex.fullLane` /
+/// `CCP_CODEX_FULL_LANE` decides first and is on by default, so normally
+/// nothing does. With it off, the backend's own flag from the last listing
+/// wins, and the compiled-in answer covers the models known before any listing
+/// was fetched.
 pub fn uses_responses_lite(model: &str) -> bool {
-    if let Some(flag) = super::super::models::discovered_uses_responses_lite(model) {
+    uses_responses_lite_with_full_lane(
+        model,
+        super::super::models::discovered_uses_responses_lite(model),
+        config::codex_full_lane(),
+    )
+}
+
+/// The lite lane requires `parallel_tool_calls: false`; the backend answers a
+/// lite request that sets it to `true` with 400 `unsupported_value`. A model
+/// served through it therefore answers with at most one tool call per turn, so
+/// Claude Code's parallel `tool_use` batching becomes one full-context request
+/// per call. The full lane has no such restriction, which is why the opt-in
+/// exists.
+///
+/// The override applies to every model, `gpt-5.6-luna` included. Measured
+/// 2026-09-12 against the live backend: luna, sol, terra and astra each answered
+/// 200 on the full lane with top-level `tools` and `parallel_tool_calls: true`.
+/// The older claim that the full lane resolves luna to a `-free` variant and
+/// returns 404 did not reproduce; [`full_lane_web_search_model`] still acts on
+/// it and has not been retested.
+fn uses_responses_lite_with_full_lane(
+    model: &str,
+    discovered: Option<bool>,
+    full_lane: bool,
+) -> bool {
+    if full_lane {
+        return false;
+    }
+    if let Some(flag) = discovered {
         return flag;
     }
     matches!(
@@ -241,9 +271,51 @@ mod tests {
     }
 
     #[test]
-    fn astra_uses_responses_lite() {
-        assert!(uses_responses_lite("gpt-6-astra"));
-        assert!(!uses_responses_lite("gpt-5.5"));
+    fn astra_uses_responses_lite_when_the_full_lane_is_off() {
+        assert!(uses_responses_lite_with_full_lane(
+            "gpt-6-astra",
+            None,
+            false
+        ));
+        assert!(!uses_responses_lite_with_full_lane("gpt-5.5", None, false));
+    }
+
+    #[test]
+    fn lane_follows_the_backend_flag_before_the_compiled_in_list() {
+        assert!(uses_responses_lite_with_full_lane(
+            "gpt-5.5",
+            Some(true),
+            false
+        ));
+        assert!(!uses_responses_lite_with_full_lane(
+            "gpt-6-astra",
+            Some(false),
+            false
+        ));
+        for model in [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+        ] {
+            assert!(uses_responses_lite_with_full_lane(model, None, false));
+        }
+        for model in ["gpt-5.3-codex", "gpt-5.4", "gpt-5.5"] {
+            assert!(!uses_responses_lite_with_full_lane(model, None, false));
+        }
+    }
+
+    #[test]
+    fn full_lane_overrides_the_backend_flag_for_every_model() {
+        for model in [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+        ] {
+            assert!(!uses_responses_lite_with_full_lane(model, None, true));
+            assert!(!uses_responses_lite_with_full_lane(model, Some(true), true));
+        }
     }
 
     #[test]

@@ -1514,6 +1514,57 @@ async fn models_endpoint_respects_limit() {
 }
 
 #[tokio::test]
+async fn agent_progress_label_is_answered_without_a_provider() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(IdentityCaptureProvider {
+        captured: captured.clone(),
+    }) as Arc<dyn Provider>;
+    let app = app(Arc::new(Registry::from_providers(
+        AliasProvider::Codex,
+        [provider],
+    )));
+    let body = json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64000,
+        "stream": false,
+        "messages": [
+            {"role": "user", "content": "do the work"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Read",
+                 "input": {"file_path": "/repo/src/server.rs"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "..."},
+                {"type": "text", "text": "Describe your most recent action in 3-5 words using present tense (-ing)."}
+            ]}
+        ]
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["content"][0]["text"], json!("Reading server.rs"));
+    assert_eq!(value["usage"]["input_tokens"], json!(0));
+    // The label never reaches a backend, which is the whole point: upstream it
+    // would cost the subagent's full context.
+    assert!(captured.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn models_endpoint_tolerates_unknown_query_params() {
     let _no_codex = NoCodexAuth::install();
     let app = app(Arc::new(Registry::with_default_alias()));

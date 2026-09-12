@@ -41,6 +41,8 @@ struct FileConfig {
     pub alias_provider: Option<String>,
     #[serde(rename = "autoReviewModel")]
     pub auto_review_model: Option<String>,
+    #[serde(rename = "agentSummary")]
+    pub agent_summary: Option<String>,
     pub log: Option<FileLog>,
     pub kimi: Option<KimiConfig>,
     pub codex: Option<CodexConfig>,
@@ -60,6 +62,8 @@ struct CodexConfig {
     pub client_version: Option<String>,
     #[serde(rename = "previousResponseId")]
     pub previous_response_id: Option<bool>,
+    #[serde(rename = "fullLane")]
+    pub full_lane: Option<bool>,
     #[serde(rename = "serverCompaction")]
     pub server_compaction: Option<bool>,
     #[serde(rename = "responsesApi")]
@@ -295,6 +299,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_SERVER_COMPACTION") {
         out.push("CCP_CODEX_SERVER_COMPACTION (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_FULL_LANE") {
+        out.push("CCP_CODEX_FULL_LANE (env)".to_string());
+    }
     if env
         .get("CCP_AUTO_REVIEW_MODEL")
         .is_some_and(|raw| !raw.is_empty())
@@ -334,6 +341,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if let Some(enabled) = codex.server_compaction {
                 out.push(format!("codex.serverCompaction: {enabled}"));
+            }
+            if let Some(enabled) = codex.full_lane {
+                out.push(format!("codex.fullLane: {enabled}"));
             }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
@@ -585,6 +595,33 @@ pub fn codex_previous_response_id() -> bool {
     false
 }
 
+/// Keep Codex models off the Responses Lite lane. Lite requires
+/// `parallel_tool_calls: false`, so a model served through it answers with at
+/// most one tool call per turn and Claude Code's batched tool use becomes one
+/// full-context request per call — the dominant cost on tool-heavy work.
+///
+/// On by default. This is the one place the proxy deliberately overrides the
+/// `use_responses_lite` flag the backend's own model listing reports; set it to
+/// `0` to go back to Lite.
+pub fn codex_full_lane() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    let config_dir = paths::config_dir();
+    if let Some(file) = read_file_config(&config_dir)
+        && let Some(codex) = file.codex
+        && let Some(enabled) = codex.full_lane
+    {
+        return enabled;
+    }
+    true
+}
+
 pub fn codex_server_compaction() -> bool {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION") {
@@ -722,6 +759,34 @@ pub fn codex_model() -> Option<String> {
         return codex.model;
     }
     None
+}
+
+/// Whether the proxy answers Claude Code's background-agent status line itself
+/// instead of paying a model for it. `upstream` sends those requests on as
+/// before; anything else, including no setting, keeps them local.
+/// An explicit model for status labels, overriding the per-provider choice.
+pub fn agent_summary_model() -> Option<String> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    env.get("CCP_AGENT_SUMMARY_MODEL")
+        .filter(|raw| !raw.is_empty())
+        .cloned()
+}
+
+pub fn agent_summary_local() -> bool {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    let configured = env
+        .get("CCP_AGENT_SUMMARY")
+        .filter(|raw| !raw.is_empty())
+        .cloned()
+        .or_else(|| {
+            read_file_config(&paths::config_dir())
+                .and_then(|file| file.agent_summary)
+                .filter(|value| !value.is_empty())
+        });
+    !matches!(
+        configured.as_deref().map(str::trim),
+        Some("upstream") | Some("model") | Some("remote")
+    )
 }
 
 pub fn auto_review_model() -> Option<String> {
@@ -870,6 +935,7 @@ mod tests {
             std::env::remove_var("CCP_LOG_STDERR");
             std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
             std::env::remove_var("CCP_CODEX_SERVER_COMPACTION");
+            std::env::remove_var("CCP_CODEX_FULL_LANE");
             std::env::remove_var("CCP_CODEX_RESPONSES_API");
             std::env::remove_var("CCP_CODEX_IMAGES_API");
             std::env::remove_var("CCP_CODEX_IMAGES_BASE_URL");
@@ -1194,5 +1260,27 @@ mod tests {
         assert!(codex_server_compaction());
         let _disabled_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "false");
         assert!(!codex_server_compaction());
+    }
+
+    #[test]
+    fn codex_full_lane_defaults_and_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(codex_full_lane());
+        {
+            let _disabled_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "off");
+            assert!(!codex_full_lane());
+        }
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"fullLane":false}}"#,
+        )
+        .unwrap();
+        assert!(!codex_full_lane());
+        let _enabled_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "true");
+        assert!(codex_full_lane());
     }
 }

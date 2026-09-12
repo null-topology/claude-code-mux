@@ -154,7 +154,7 @@ arrow key like the built-in rows, add a `modelPicker` block to
         "model": "gpt-5.6-luna",
         "label": "Luna",
         "description": "GPT-5.6 Luna · Fast and affordable agentic coding",
-        "behavesAs": "claude-haiku-4-5"
+        "behavesAs": "claude-sonnet-5"
       },
       {
         "model": "gpt-5.5",
@@ -173,10 +173,18 @@ The rows appear after the built-in lineup. Each field does one thing:
   above.
 - `label` and `description` are only what the picker shows.
 - `behavesAs` names a Claude model whose client-side defaults (prompt profile,
-  context window assumption, effort handling) Claude Code applies to the row.
-  Without it Claude Code treats the model as unknown, assumes a 200k window,
-  and prints a warning on every start. It does not change the label or the
-  id sent.
+  context window, effort handling) Claude Code applies to the row. Without it
+  Claude Code treats the model as unknown, assumes a 200k window, and prints a
+  warning on every start. It does not change the label or the id sent. The
+  row inherits that model's window, so a 1M model here (`claude-opus-5`,
+  `claude-sonnet-5`) gives the row 1M, while `claude-haiku-4-5` caps it at
+  200k. Behind the proxy that 1M only takes effect with
+  `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` set (see
+  [Claude Code side](#claude-code-side)).
+
+Do not put `[1m]` in a row's `model`: Claude Code 2.1.268 silently drops such
+rows from the picker. The suffix still works on an id typed with `/model` or
+passed to `--model`.
 
 `modelPicker` is honored from user settings, managed settings, and the
 `--settings` flag, not from a project checkout. Setting
@@ -400,7 +408,27 @@ Only `ANTHROPIC_BASE_URL` is required. Restart Claude Code after changing it.
 | `ANTHROPIC_MODEL` | Force one model for the whole session. |
 | `ANTHROPIC_DEFAULT_OPUS_MODEL`, `..._SONNET_MODEL`, `..._HAIKU_MODEL` | Remap a built-in picker row, e.g. `ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra` sends the Sonnet slot to Codex. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Claude login for environments without an interactive `claude login`. Passed through to Anthropic unchanged. |
-| `ENABLE_TOOL_SEARCH` | Claude Code disables lazy tool loading behind a non-Anthropic base URL. Set to `true`: the proxy forwards the tool references, and requests shrink considerably. |
+| `ENABLE_TOOL_SEARCH` | Claude Code disables lazy tool loading behind a non-Anthropic base URL. Set to `true`: requests shrink considerably. Claude models get the tool references untouched; on Codex models loading a tool uses the backend's own tool search, so the cached prompt prefix survives the load. |
+| `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` | Behind a non-Anthropic base URL Claude Code budgets every model at 200k tokens, even the ones its catalog marks as native 1M, and auto-compacts against that. Set to `1`: the passthrough is byte-exact, so the built-in rows keep their 1M window through the proxy, and `modelPicker` rows get the window of their `behavesAs` model. |
+
+Context window: Claude Code computes it on the client, per model id. Measured
+with `claude -p --model <id> "/context"` through the proxy on Claude Code
+2.1.268:
+
+| model | without the flag | with the flag |
+| --- | --- | --- |
+| `fable`, `sonnet` | 200k | 1M |
+| `opus[1m]` | 1M | 1M |
+| `haiku` | 200k | 200k |
+| Codex row with `behavesAs` `claude-opus-5` or `claude-sonnet-5` | 200k | 1M |
+| Codex row with `behavesAs` `claude-haiku-4-5` | 200k | 200k |
+
+This is the budget Claude Code uses before auto-compacting, not proof of what
+a backend endpoint accepts. The Codex inventory in `/v1/models` exposes
+`context_window` and `max_context_window` metadata per model, but whether a
+particular request is accepted has to be verified for its model and route. An
+upstream context-overflow error is surfaced to the client; any recovery
+depends on the configured client and proxy compaction behavior.
 
 ### Claude authentication
 
@@ -436,11 +464,27 @@ captures, and error dumps go to `~/.local/state/claude-code-proxy`.
 | `CCP_CODEX_MODEL` | unset | Send this Codex model regardless of what the client asked for. |
 | `CCP_CODEX_QUOTA_WARN_AT` | `0.9` session, `0.75` weekly | Utilization above which a window is reported as past its warning threshold. One value lowers both. |
 | `CCP_CODEX_SERVER_COMPACTION` | off | Let Codex compact long histories server-side. |
+| `CCP_CODEX_FULL_LANE` | on | Keep Codex models off the Responses Lite lane so they can answer with several tool calls at once. Set to `0` for Lite. |
 | `CCP_CODEX_RESPONSES_API` | off | Also expose `/v1/responses` and `/v1/chat/completions` for OpenAI-style clients. |
 | `CCP_AUTO_REVIEW_MODEL` | `gpt-5.6-luna` | Model for Claude Code's background security classifier when the session runs on Codex. |
 | `CCP_ALIAS_PROVIDER` | `anthropic` | Backend for the Claude aliases. Leave it alone unless you want `opus` to stop meaning Claude. |
 | `CCP_LOG_VERBOSE` | off | Keep full string fields in `proxy.log`. |
 | `CCP_TRAFFIC_LOG` | off | Capture every request and event under the state directory. Contains prompts and file contents; delete after use. |
+
+### Responses lanes and parallel tool calls
+
+Codex marks the gpt-5.6 family and `gpt-6-astra` for the Responses **Lite**
+lane in its model listing. That lane requires `parallel_tool_calls: false` — a
+Lite request that sets it to `true` is rejected with 400 `unsupported_value` —
+so a model on it answers with at most one tool call per turn. Claude Code
+normally batches several, three files read at once for instance, and behind Lite
+each of those becomes its own request carrying the whole conversation again.
+
+The proxy therefore uses the full Responses lane by default, where parallel tool
+calls work. `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra` and `gpt-6-astra`
+were each verified to answer there. This is the one place the proxy overrides
+what the backend's inventory says; `CCP_CODEX_FULL_LANE=0` (or
+`codex.fullLane: false`) puts the marked models back on Lite.
 
 ### Commands
 
@@ -469,6 +513,12 @@ behavior of the upstream project this is based on.
   default. The HTTP transport still retries a spent window.
 - Codex models are not in Claude Code's built-in catalog, so without a
   `modelPicker` row Claude Code assumes a 200k context window for them.
+- The proxy answers the progress label of a running subagent itself and
+  recognises that request by its instruction text. A different request that
+  merely quotes those instructions can be taken for one: Auto mode's security
+  classifier sends the action it reviews as text, so it can receive a progress
+  label instead of a verdict and leave that action unevaluated. This is a known
+  limitation of this release; a narrower detector is a separate change.
 
 ## Development
 

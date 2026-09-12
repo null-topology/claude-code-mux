@@ -531,11 +531,13 @@ mod tests {
             Some("stream_options")
         );
 
-        let mut lite = base();
-        lite["temperature"] = json!(0.2);
+        // Sampling controls are rejected only on the Responses Lite lane, and
+        // the full lane is the default, so a gpt-5.6 model takes them now.
+        let mut sampling = base();
+        sampling["temperature"] = json!(0.2);
         assert_eq!(
-            translate_request(lite).unwrap_err().code.as_deref(),
-            Some("unsupported_parameter")
+            translate_request(sampling).unwrap().upstream["temperature"],
+            0.2
         );
 
         let mut full = base();

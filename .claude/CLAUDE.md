@@ -251,6 +251,55 @@ Explicit cache controls (`prompt_cache_breakpoint`, `prompt_cache_retention`)
 are rejected by the subscription backend for GPT-5.6 models (openai/codex
 #35300, #39397).
 
+## What the Codex subscription actually meters
+
+Read the allowance window, never assume it. A `codex.rate_limits` event opens
+every healthy Codex stream and names its own windows, and
+`GET /backend-api/wham/usage` reports the same thing. Which slot holds which
+window varies by plan: a weekly window (`window_minutes: 10080`,
+`limit_window_seconds: 604800`) has been seen as `primary` with `secondary:
+null`, and a 5h/weekly pair has been seen too. Match on the window length, not
+on the slot. On the stream only the wire spelling `reset_at` /
+`reset_after_seconds` occurs; `resets_at` / `resets_in_seconds` is a Codex CLI
+log reserialization of the same data.
+
+What the meter counts, fitted over a capture corpus of roughly 680 requests
+against the integer `used_percent` readings that open each stream:
+
+- **Total input, with cached tokens billed rather than free.** A model in which
+  cached input costs nothing fits this corpus badly. How much cheaper a cached
+  token is than an uncached one is not pinned down: the corpus is uniformly
+  cached, so the two terms are barely separable and the fitted ratio spans from
+  a large discount to none at all. Treat the discount as unmeasured; separating
+  the terms needs traffic with a deliberately low hit rate.
+- **A per-model weight, which is the largest single factor.** Normalised on
+  `gpt-5.6-sol` = 1.00, `gpt-5.6-terra` fits near 0.7 and `gpt-6-astra` near
+  3.5-3.9. A fit that ignores this returns nonsense, so any further measurement
+  has to model it first.
+- **Output and reasoning were negligible in this corpus** beside input, a
+  fraction of a percent of the billed total and not separately resolvable.
+  That is what these captures show, not a guarantee about how the meter bills.
+
+For example, at one observed model mix a single percentage point of the weekly
+window cost on the order of 5-6M input tokens counted this way.
+
+So the cost tracks context size times request count times the model's weight.
+Which model to run stays the user's choice, and keeping a stable cached prefix
+is still a legitimate lever: this corpus prices neither a hit nor a miss, so
+nothing here says cache stability is worthless. The proxy preserves cache
+stability and avoids redundant model requests.
+`src/agent_summary.rs` addresses the latter: Claude Code
+asks a running subagent's own model for a three-word progress label every half
+minute, resending the subagent's whole context, which was a quarter of all
+captured Codex requests. The proxy answers it from the transcript on any route;
+`CCP_AGENT_SUMMARY=upstream` sends it to the provider's junior model at
+`effort: low` instead, never to the subagent's own. That model must still hold
+the subagent's context, which is why Anthropic's is `claude-sonnet-5` and not
+Haiku (200k would drop the label on a long subagent) and Codex's is
+`gpt-5.6-luna`; a provider without an entry in `summary_model_for` keeps the
+request's model. Detection is the prompt text, `SUMMARY_PROMPT_MARKER`: these
+requests otherwise look like a normal subagent turn, with its tools and history.
+
 ## Invariants to preserve
 
 - The Anthropic passthrough must stay byte-exact for normal traffic. The only
@@ -381,8 +430,19 @@ currently serves, including `visibility` and `use_responses_lite` per model.
   Code on the API-billing path, where it ignores the structured rate-limit
   headers entirely.
 - Claude Code disables lazy tool loading when `ANTHROPIC_BASE_URL` is not a
-  first-party host. `ENABLE_TOOL_SEARCH=true` restores it; this proxy forwards
-  the `tool_reference` blocks, so the flag is safe to set.
+  first-party host. `ENABLE_TOOL_SEARCH=true` restores it, and the flag is safe
+  to set on both routes. The Anthropic passthrough forwards the `tool_reference`
+  blocks untouched. The Codex route maps deferred loading onto the backend's
+  native tool search (`providers/codex/translate/tool_search.rs`): Claude Code's
+  `ToolSearch` becomes a client-executed `tool_search` tool, its call a
+  `tool_search_call`, its result a `tool_search_output` carrying the loaded
+  tools' specs, and deferred tools a search loaded stay out of the tools head.
+  Putting a loaded tool into the head instead changes the first bytes of the
+  prompt and costs a full prompt-cache miss on every load (measured: 0 cached
+  tokens on the request after a load, versus the whole prefix with the native
+  mapping). The mapping is derived from the request alone, so it is
+  byte-stable turn to turn; a deferred tool no search in the history names
+  (the placeholder, or a tool whose search was compacted away) stays in the head.
 - Claude Code's web search is a client-side `WebSearch` function tool. The
   hosted `web_search_20250305` tool only appears inside an isolated, history-free
   inner call, so its `server_tool_use` and `web_search_tool_result` blocks never
