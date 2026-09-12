@@ -148,7 +148,7 @@ impl CapturedRequest {
             .and_then(Value::as_str)
     }
 
-    fn assert_protocol_headers(&self, expected_session: Option<&str>) {
+    fn assert_transport_headers(&self) {
         assert_eq!(
             self.headers
                 .get(http::header::AUTHORIZATION)
@@ -173,6 +173,11 @@ impl CapturedRequest {
             "socket {} websocket protocol header",
             self.socket_ordinal
         );
+    }
+
+    /// The upstream sees one routing id per conversation: the session id for a
+    /// main thread, and the subagent's own derived scope for an agent.
+    fn assert_routing_session(&self, expected_session: Option<&str>) {
         assert_eq!(
             self.headers
                 .get("session_id")
@@ -187,6 +192,24 @@ impl CapturedRequest {
                 .and_then(|value| value.to_str().ok()),
             expected_session,
             "socket {} x-client-request-id header",
+            self.socket_ordinal
+        );
+        assert_eq!(
+            self.headers
+                .get("x-codex-window-id")
+                .and_then(|value| value.to_str().ok()),
+            expected_session
+                .map(|session| format!("{session}:0"))
+                .as_deref(),
+            "socket {} x-codex-window-id header",
+            self.socket_ordinal
+        );
+        // The body carries the same scope; the header is derived from it, so
+        // assert both halves rather than one through the other.
+        assert_eq!(
+            self.body["prompt_cache_key"].as_str(),
+            expected_session,
+            "socket {} prompt_cache_key",
             self.socket_ordinal
         );
     }
@@ -307,11 +330,19 @@ impl InstrumentedUpstream {
     }
 
     async fn next_any_request(&mut self, expected_session: Option<&str>) -> PendingRequest {
+        let pending = self.next_unattributed_request().await;
+        pending.captured.assert_routing_session(expected_session);
+        pending
+    }
+
+    /// For interleaved conversations, where the arrival order decides which
+    /// routing id to expect; the caller asserts it once the pair is sorted.
+    async fn next_unattributed_request(&mut self) -> PendingRequest {
         let pending = tokio::time::timeout(REQUEST_TIMEOUT, self.requests.recv())
             .await
             .expect("timed out waiting for response.create")
             .expect("mock upstream stopped before response.create");
-        pending.captured.assert_protocol_headers(expected_session);
+        pending.captured.assert_transport_headers();
         pending
     }
 
@@ -589,7 +620,11 @@ impl IdentityHeaders {
         }
         Self {
             values,
-            upstream_session: Some(session.to_string()),
+            // A subagent shares its parent's session id but gets its own
+            // prompt cache scope upstream.
+            upstream_session: Some(
+                ConversationIdentity::Agent(session.to_string(), agent.to_string()).cache_scope(),
+            ),
         }
     }
 
@@ -1318,6 +1353,12 @@ async fn auto_review_with_agent_headers_is_stateless() {
     let case = unique("auto-review");
     let session = tagged(&case, "session");
     let headers = IdentityHeaders::agent(&session, &tagged(&case, "agent-a"), None);
+    // The classifier is rerouted without a conversation identity, so upstream
+    // it keeps the session's cache scope instead of the agent's.
+    let review_headers = IdentityHeaders {
+        upstream_session: Some(session.clone()),
+        ..headers.clone()
+    };
     let a1 = tagged(&case, "a-1");
     let a_reply = tagged(&case, "a-reply");
     let review = tagged(&case, "review-command");
@@ -1347,7 +1388,7 @@ async fn auto_review_with_agent_headers_is_stateless() {
                 "messages": [{"role": "user", "content": review}],
                 "tools": []
             }),
-            headers.clone(),
+            review_headers.clone(),
             &review,
             &tagged(&case, "resp-review"),
             &tagged(&case, "review-reply"),
@@ -1751,6 +1792,8 @@ async fn cross_owner_completion_order_is_independent() {
     let session = tagged(&case, "session");
     let a_headers = IdentityHeaders::agent(&session, &tagged(&case, "agent-a"), None);
     let b_headers = IdentityHeaders::agent(&session, &tagged(&case, "agent-b"), None);
+    let a_scope = a_headers.upstream_session.clone();
+    let b_scope = b_headers.upstream_session.clone();
     let a1 = tagged(&case, "a-1");
     let b1 = tagged(&case, "b-1");
     let a1_reply = tagged(&case, "a-reply-1");
@@ -1766,9 +1809,15 @@ async fn cross_owner_completion_order_is_independent() {
         messages_body(false, vec![message("user", &b1)]),
         b_headers.clone(),
     );
-    let pending_one = harness.upstream.next_any_request(Some(&session)).await;
-    let pending_two = harness.upstream.next_any_request(Some(&session)).await;
+    let pending_one = harness.upstream.next_unattributed_request().await;
+    let pending_two = harness.upstream.next_unattributed_request().await;
     let (a1_pending, b1_pending) = pending_pair(pending_one, pending_two, &a1, &b1);
+    a1_pending
+        .captured
+        .assert_routing_session(a_scope.as_deref());
+    b1_pending
+        .captured
+        .assert_routing_session(b_scope.as_deref());
     assert_full_input(&a1_pending.captured, &[("user", &a1)]);
     assert_full_input(&b1_pending.captured, &[("user", &b1)]);
     assert_eq!(
@@ -1810,9 +1859,15 @@ async fn cross_owner_completion_order_is_independent() {
         ),
         b_headers.clone(),
     );
-    let pending_one = harness.upstream.next_any_request(Some(&session)).await;
-    let pending_two = harness.upstream.next_any_request(Some(&session)).await;
+    let pending_one = harness.upstream.next_unattributed_request().await;
+    let pending_two = harness.upstream.next_unattributed_request().await;
     let (a2_pending, b2_pending) = pending_pair(pending_one, pending_two, &a2, &b2);
+    a2_pending
+        .captured
+        .assert_routing_session(a_scope.as_deref());
+    b2_pending
+        .captured
+        .assert_routing_session(b_scope.as_deref());
     assert_delta_input(
         &a2_pending.captured,
         &a1_response,
@@ -1857,9 +1912,15 @@ async fn cross_owner_completion_order_is_independent() {
         ),
         b_headers,
     );
-    let pending_one = harness.upstream.next_any_request(Some(&session)).await;
-    let pending_two = harness.upstream.next_any_request(Some(&session)).await;
+    let pending_one = harness.upstream.next_unattributed_request().await;
+    let pending_two = harness.upstream.next_unattributed_request().await;
     let (a3_pending, b3_pending) = pending_pair(pending_one, pending_two, &a3, &b3);
+    a3_pending
+        .captured
+        .assert_routing_session(a_scope.as_deref());
+    b3_pending
+        .captured
+        .assert_routing_session(b_scope.as_deref());
     assert_delta_input(
         &a3_pending.captured,
         &a2_response,

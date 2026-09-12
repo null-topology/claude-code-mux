@@ -1,3 +1,11 @@
+## Unreleased
+
+- Each conversation gets its own prompt cache on the Codex backend. Claude Code
+  gives a subagent its parent's session id, so until now a session and all its
+  subagents shared one `prompt_cache_key` and one routing bucket upstream, where
+  busy sessions lose cache hits to overflow routing. Subagents now send a
+  derived id of their own.
+
 ## v0.6.0 (2026-09-11)
 
 - The monitor shows the prompt cache: cache reads and writes next to the

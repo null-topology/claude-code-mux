@@ -228,6 +228,17 @@ reliably needs the previous request of the same conversation and a guard for
 side calls on other models. Do not switch cursor to the report API: it sends
 `cache_read_input_tokens: 0` always and would produce false misses.
 
+What the Codex backend keys its prompt cache on is the request's
+`prompt_cache_key` plus the `session_id` header, and the proxy sends
+`ConversationIdentity::cache_scope()` in both: the session id for a main
+thread, a uuid v5 of session plus agent id for a subagent. Claude Code gives a
+subagent its parent's session id, so without this every subagent shared the
+main thread's key and its routing bucket, and OpenAI documents overflow routing
+above about 15 requests per minute on one key. `build_codex_headers` takes the
+scope from the translated body's `prompt_cache_key`, so every transport and
+retry path sends the same value; a request routed without a conversation
+identity (the auto-review classifier) falls back to the session id.
+
 On the ChatGPT Codex backend the `session_id` header drives cache affinity:
 byte-identical requests repeated 5 seconds apart hit the cache 4 times out of 4
 with it and 1 time out of 4 without it (measured 2026-09-11). Even with it,
