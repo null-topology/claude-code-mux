@@ -485,6 +485,12 @@ behavior of the upstream project this is based on.
   default. The HTTP transport still retries a spent window.
 - Codex models are not in Claude Code's built-in catalog, so without a
   `modelPicker` row Claude Code assumes a 200k context window for them.
+- The proxy answers the progress label of a running subagent itself and
+  recognises that request by its instruction text. A different request that
+  merely quotes those instructions can be taken for one: Auto mode's security
+  classifier sends the action it reviews as text, so it can receive a progress
+  label instead of a verdict and leave that action unevaluated. This is a known
+  limitation of this release; a narrower detector is a separate change.
 
 ## Development
 

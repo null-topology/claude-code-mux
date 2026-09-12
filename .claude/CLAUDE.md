@@ -266,25 +266,29 @@ log reserialization of the same data.
 What the meter counts, fitted over a capture corpus of roughly 680 requests
 against the integer `used_percent` readings that open each stream:
 
-- **Total input, with cached tokens billed substantially.** "Cached input is
-  free" is excluded by a wide margin. The weight of a cached token relative to
-  an uncached one lands between about 0.3 and 1.6, so a cache hit saves at most
-  a third of the cost and may save nothing at all. A corpus that is uniformly
-  cached cannot pin this down further; separating the two terms needs traffic
-  with a deliberately low hit rate.
+- **Total input, with cached tokens billed rather than free.** A model in which
+  cached input costs nothing fits this corpus badly. How much cheaper a cached
+  token is than an uncached one is not pinned down: the corpus is uniformly
+  cached, so the two terms are barely separable and the fitted ratio spans from
+  a large discount to none at all. Treat the discount as unmeasured; separating
+  the terms needs traffic with a deliberately low hit rate.
 - **A per-model weight, which is the largest single factor.** Normalised on
   `gpt-5.6-sol` = 1.00, `gpt-5.6-terra` fits near 0.7 and `gpt-6-astra` near
   3.5-3.9. A fit that ignores this returns nonsense, so any further measurement
   has to model it first.
-- **Output and reasoning are negligible** beside input, a fraction of a percent
-  of the billed total, and not separately resolvable.
+- **Output and reasoning were negligible in this corpus** beside input, a
+  fraction of a percent of the billed total and not separately resolvable.
+  That is what these captures show, not a guarantee about how the meter bills.
 
 For example, at one observed model mix a single percentage point of the weekly
 window cost on the order of 5-6M input tokens counted this way.
 
-So the cost is context size times request count times the model's weight, and
-the levers are fewer requests and cheaper models rather than cache tuning.
-`src/agent_summary.rs` is the first of those: Claude Code
+So the cost tracks context size times request count times the model's weight.
+Which model to run stays the user's choice, and keeping a stable cached prefix
+is still a legitimate lever: this corpus prices neither a hit nor a miss, so
+nothing here says cache stability is worthless. The proxy preserves cache
+stability and avoids redundant model requests.
+`src/agent_summary.rs` addresses the latter: Claude Code
 asks a running subagent's own model for a three-word progress label every half
 minute, resending the subagent's whole context, which was a quarter of all
 captured Codex requests. The proxy answers it from the transcript on any route;
