@@ -492,6 +492,11 @@ fn translate_request_inner(
             "ws_request_header_x_openai_internal_codex_responses_lite".to_string(),
             "true".to_string(),
         )]));
+        // The lite lane hard-requires this: the backend answers a lite request
+        // that sets it to `true` with 400 `unsupported_value`
+        // ("X-OpenAI-Internal-Codex-Responses-Lite requires
+        // `parallel_tool_calls` to be false"). Escaping the restriction means
+        // leaving the lane, which is what `codex.fullLane` does.
         out.parallel_tool_calls = false;
 
         let mut prefix = Vec::new();

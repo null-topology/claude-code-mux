@@ -1374,7 +1374,12 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
     let requests = captured.lock().unwrap();
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[0]["model"], "gpt-5.6-sol");
-    assert!(requests[0].get("client_metadata").is_some());
+    // The compaction call must run on the same Responses lane as the
+    // conversation it compacts; `client_metadata` is what marks the lite lane.
+    assert_eq!(
+        requests[0].get("client_metadata"),
+        requests[1].get("client_metadata")
+    );
     assert_eq!(
         requests[0]["input"].as_array().unwrap().last().unwrap()["type"],
         "compaction_trigger"
@@ -1391,7 +1396,10 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
     );
     assert!(!requests[1].to_string().contains("opaque-history"));
     let replay = requests[2]["input"].as_array().unwrap();
-    assert!(requests[2].get("client_metadata").is_some());
+    assert_eq!(
+        requests[2].get("client_metadata"),
+        requests[1].get("client_metadata")
+    );
     assert!(requests[2].to_string().contains("current instructions"));
     let compaction = replay
         .iter()

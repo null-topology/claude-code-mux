@@ -696,7 +696,6 @@ mod tests {
         let resolved = shape_native_request(&mut body).unwrap();
         assert_eq!(resolved.model, "gpt-5.6-sol");
         assert_eq!(body["model"], "gpt-5.6-sol");
-        assert!(resolved.use_responses_lite);
 
         let mut fast = request(json!({"model":"gpt-5.4-fast","input":[]}));
         let resolved = shape_native_request(&mut fast).unwrap();

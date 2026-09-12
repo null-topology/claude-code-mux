@@ -1371,10 +1371,10 @@ async fn auto_review_with_agent_headers_is_stateless() {
         .await;
 
     assert_full_input(&first, &[("user", &a1)]);
-    assert_full_input(
-        &classifier,
-        &[("developer", review_system), ("user", &review)],
-    );
+    // On the full Responses lane the system prompt stays in `instructions`
+    // instead of being moved into `input` as a developer message.
+    assert_full_input(&classifier, &[("user", &review)]);
+    assert_eq!(classifier.body["instructions"], review_system);
     assert_eq!(classifier.body["model"], "gpt-5.6-luna");
     assert_eq!(first.socket_ordinal, 1);
     assert_eq!(classifier.socket_ordinal, 2);

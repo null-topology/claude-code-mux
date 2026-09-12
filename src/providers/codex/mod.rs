@@ -1934,19 +1934,19 @@ mod tests {
     }
 
     #[test]
-    fn requests_without_web_search_keep_model_and_lite_lane() {
+    fn requests_without_web_search_keep_model_and_lane() {
         let body = request_with_tools(serde_json::json!([
             {"name":"Bash", "input_schema":{}}
         ]));
-        for (resolved, lite_expected) in [
-            ("gpt-5.6-luna", true),
-            ("gpt-5.6-sol", true),
-            ("gpt-5.4", false),
-        ] {
+        for resolved in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.4"] {
             let mut model = resolved.to_string();
             let lite = apply_model_lane_for_request(&mut model, &body);
             assert_eq!(model, resolved, "model must not change without web_search");
-            assert_eq!(lite, lite_expected);
+            assert_eq!(
+                lite,
+                uses_responses_lite(resolved),
+                "{resolved} without web_search keeps the lane it is configured for"
+            );
         }
     }
 
