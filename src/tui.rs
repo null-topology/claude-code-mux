@@ -4,7 +4,7 @@ use layout::{
     CODE_WIDTH, COUNT_WIDTH, ColumnSpec, DURATION_WIDTH, EFFORT_WIDTH, ENDPOINT_WIDTH, ERROR_WIDTH,
     HIT_WIDTH, ID_WIDTH, LayoutTier, MISS_WIDTH, MODEL_MEDIUM_WIDTH, MODEL_NARROW_WIDTH,
     MODEL_WIDE_WIDTH, PROJECT_MEDIUM_WIDTH, PROJECT_WIDE_WIDTH, PROVIDER_WIDTH, RATE_WIDTH,
-    STATUS_WIDTH, TIME_WIDTH, TOKEN_WIDTH,
+    SESSION_TREE_ID_WIDTH, STATUS_WIDTH, TIME_WIDTH, TOKEN_WIDTH,
 };
 
 use std::{
@@ -32,8 +32,9 @@ use tokio::sync::oneshot;
 
 use crate::{
     monitor::{
-        ActiveRequest, CompletedRequest, MockMonitor, MonitorHandle, MonitorState,
-        SESSION_TOKEN_BUCKET_SECS, SessionSummary,
+        ActiveRequest, CompletedRequest, ConversationSummary, MockMonitor, MonitorHandle,
+        MonitorState, SESSION_TOKEN_BUCKET_SECS, SIDE_CONVERSATION_SUFFIX, SessionCacheStats,
+        SessionSummary,
     },
     paths,
     registry::Registry,
@@ -134,7 +135,10 @@ fn run_monitor_events(
 ) -> Result<MonitorExit, anyhow::Error> {
     loop {
         let state = snapshot();
-        app.clamp_selection(state.sessions.len(), state.recent.len());
+        // Sessions and their conversations are one flat list of rows to
+        // navigate, so selection counts both.
+        let session_rows = session_row_count(&state.sessions);
+        app.clamp_selection(session_rows, state.recent.len());
         app.tick = app.tick.wrapping_add(1);
         terminal.draw(|frame| render(frame, app, &state))?;
         if app.shutdown_is_complete() {
@@ -162,14 +166,10 @@ fn run_monitor_events(
                     KeyCode::Char('?') => app.show_help = !app.show_help,
                     KeyCode::Char('b') => app.show_setup = !app.show_setup,
                     KeyCode::Tab => app.focus = app.focus.next(),
-                    KeyCode::Down => app.move_down(state.sessions.len(), state.recent.len(), true),
-                    KeyCode::Char('j') => {
-                        app.move_down(state.sessions.len(), state.recent.len(), false)
-                    }
-                    KeyCode::Up => app.move_up(state.sessions.len(), state.recent.len(), true),
-                    KeyCode::Char('k') => {
-                        app.move_up(state.sessions.len(), state.recent.len(), false)
-                    }
+                    KeyCode::Down => app.move_down(session_rows, state.recent.len(), true),
+                    KeyCode::Char('j') => app.move_down(session_rows, state.recent.len(), false),
+                    KeyCode::Up => app.move_up(session_rows, state.recent.len(), true),
+                    KeyCode::Char('k') => app.move_up(session_rows, state.recent.len(), false),
                     KeyCode::Right => app.focus = FocusPane::Recent,
                     KeyCode::Left => app.focus = FocusPane::Sessions,
                     KeyCode::Enter => {
@@ -294,22 +294,24 @@ impl MonitorApp {
         }
     }
 
-    fn clamp_selection(&mut self, sessions: usize, recent: usize) {
-        self.selected = self.selected.min(sessions.saturating_sub(1));
+    /// `session_rows` counts sessions and their conversations alike: the
+    /// Sessions pane selects over the rows it renders.
+    fn clamp_selection(&mut self, session_rows: usize, recent: usize) {
+        self.selected = self.selected.min(session_rows.saturating_sub(1));
         self.recent_selected = self.recent_selected.min(recent.saturating_sub(1));
     }
 
-    fn move_down(&mut self, sessions: usize, recent: usize, switch_panes: bool) {
+    fn move_down(&mut self, session_rows: usize, recent: usize, switch_panes: bool) {
         match self.focus {
             FocusPane::Sessions => {
-                if switch_panes && self.selected >= sessions.saturating_sub(1) && recent > 0 {
+                if switch_panes && self.selected >= session_rows.saturating_sub(1) && recent > 0 {
                     self.focus = FocusPane::Recent;
                     self.recent_selected = 0;
                 } else {
                     self.selected = self
                         .selected
                         .saturating_add(1)
-                        .min(sessions.saturating_sub(1));
+                        .min(session_rows.saturating_sub(1));
                 }
             }
             FocusPane::Recent => {
@@ -321,13 +323,13 @@ impl MonitorApp {
         }
     }
 
-    fn move_up(&mut self, sessions: usize, recent: usize, switch_panes: bool) {
+    fn move_up(&mut self, session_rows: usize, recent: usize, switch_panes: bool) {
         match self.focus {
             FocusPane::Sessions => self.selected = self.selected.saturating_sub(1),
             FocusPane::Recent => {
-                if switch_panes && self.recent_selected == 0 && sessions > 0 {
+                if switch_panes && self.recent_selected == 0 && session_rows > 0 {
                     self.focus = FocusPane::Sessions;
-                    self.selected = sessions.saturating_sub(1);
+                    self.selected = session_rows.saturating_sub(1);
                 } else {
                     self.recent_selected = self
                         .recent_selected
@@ -381,7 +383,13 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
 
     render_header(frame, root[0], app, state);
     match app.detail {
-        Some(DetailView::Session) => render_session_detail(frame, root[1], state, app.selected),
+        // A conversation row shows the detail of the session it belongs to.
+        Some(DetailView::Session) => render_session_detail(
+            frame,
+            root[1],
+            state,
+            selected_session_index(&state.sessions, app.selected),
+        ),
         Some(DetailView::Request) => {
             render_request_detail(frame, root[1], state, app.recent_selected)
         }
@@ -575,6 +583,26 @@ fn display_session_id(session_id: Option<&str>) -> &str {
     session_id
 }
 
+/// A conversation is labelled by the agent id Claude Code assigned it, which
+/// is as long as a session id is before [`display_session_id`] shortens it. Cut
+/// it the same way so a nested row still fits its column, and keep the `/side`
+/// suffix, which is what distinguishes a conversation from its own side calls.
+fn display_conversation_label(conversation: &str) -> String {
+    let (base, suffix) = match conversation.strip_suffix(SIDE_CONVERSATION_SUFFIX) {
+        Some(base) => (base, SIDE_CONVERSATION_SUFFIX),
+        None => (conversation, ""),
+    };
+    let shortened = match base.split_once('-') {
+        Some((first, _)) if uuid::Uuid::parse_str(base).is_ok() => first,
+        _ => &base[..base.len().min(SHORT_CONVERSATION_LEN)],
+    };
+    format!("{shortened}{suffix}")
+}
+
+/// How much of an agent id identifies it on screen. Claude Code's are 17 hex
+/// characters; the leading eight match what a shortened session id shows.
+const SHORT_CONVERSATION_LEN: usize = 8;
+
 fn number_cell(value: impl Into<String>) -> Cell<'static> {
     Cell::from(
         Line::from(Span::styled(value.into(), Style::default().fg(DIM_WHITE)))
@@ -652,16 +680,17 @@ fn request_miss_cell(request: &CompletedRequest) -> Cell<'static> {
     )
 }
 
-/// Miss count and missed tokens of a session, as `count/tokens`.
-fn session_miss_cell(session: &SessionSummary) -> Cell<'static> {
-    let (value, color) = if session.cache.miss_count == 0 {
+/// Miss count and missed tokens of a session or one of its conversations, as
+/// `count/tokens`.
+fn cache_miss_cell(cache: &SessionCacheStats) -> Cell<'static> {
+    let (value, color) = if cache.miss_count == 0 {
         ("-".to_string(), DIM)
     } else {
         (
             format!(
                 "{}/{}",
-                session.cache.miss_count,
-                compact_tokens(session.cache.missed_tokens)
+                cache.miss_count,
+                compact_tokens(cache.missed_tokens)
             ),
             RED,
         )
@@ -904,7 +933,7 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
     match (tier, show_full_sparkline) {
         (LayoutTier::Wide, true) => vec![
             ColumnSpec::fixed(C::Marker, "", Alignment::Left, 1),
-            ColumnSpec::fixed(C::Id, "ID", Alignment::Left, ID_WIDTH),
+            ColumnSpec::fixed(C::Id, "ID", Alignment::Left, SESSION_TREE_ID_WIDTH),
             ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_WIDE_WIDTH),
             ColumnSpec::fixed(C::Active, "A", Alignment::Right, COUNT_WIDTH),
             ColumnSpec::fixed(C::Requests, "R", Alignment::Right, COUNT_WIDTH),
@@ -923,7 +952,7 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
         ],
         (LayoutTier::Wide, false) => vec![
             ColumnSpec::fixed(C::Marker, "", Alignment::Left, 1),
-            ColumnSpec::fixed(C::Id, "ID", Alignment::Left, ID_WIDTH),
+            ColumnSpec::fixed(C::Id, "ID", Alignment::Left, SESSION_TREE_ID_WIDTH),
             ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_WIDE_WIDTH),
             ColumnSpec::fixed(C::Counts, "A/R/F", Alignment::Right, 7),
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
@@ -982,6 +1011,182 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
     }
 }
 
+/// One line of the Sessions table: a session, or one of its conversations
+/// nested under it. Selection walks this flattened list, so a row's index here
+/// is the index the table renders it at.
+#[derive(Clone, Copy)]
+enum SessionRow<'a> {
+    Session(&'a SessionSummary),
+    Conversation {
+        conversation: &'a ConversationSummary,
+        /// The last conversation of its level, which closes that branch.
+        last: bool,
+    },
+}
+
+/// Every session followed by its conversations, in display order: the
+/// depth-first walk the session summary already arranged them in.
+fn session_rows(sessions: &[SessionSummary]) -> Vec<SessionRow<'_>> {
+    sessions
+        .iter()
+        .flat_map(|session| {
+            std::iter::once(SessionRow::Session(session)).chain(
+                session
+                    .conversations
+                    .iter()
+                    .enumerate()
+                    .map(|(index, conversation)| SessionRow::Conversation {
+                        conversation,
+                        last: is_last_child(&session.conversations, index),
+                    }),
+            )
+        })
+        .collect()
+}
+
+/// Whether a conversation closes its level: the walk moves back up, or ends,
+/// before another row of the same depth appears.
+fn is_last_child(conversations: &[ConversationSummary], index: usize) -> bool {
+    let depth = conversations[index].depth;
+    conversations[index + 1..]
+        .iter()
+        .find(|conversation| conversation.depth <= depth)
+        .is_none_or(|conversation| conversation.depth < depth)
+}
+
+/// How many rows the Sessions table shows, which is what selection moves over.
+fn session_row_count(sessions: &[SessionSummary]) -> usize {
+    sessions
+        .iter()
+        .map(|session| 1 + session.conversations.len())
+        .sum()
+}
+
+/// The session a selected row belongs to: itself, or the parent of a
+/// conversation row.
+fn selected_session_index(sessions: &[SessionSummary], selected: usize) -> usize {
+    let mut row = 0;
+    for (index, session) in sessions.iter().enumerate() {
+        row += 1 + session.conversations.len();
+        if selected < row {
+            return index;
+        }
+    }
+    sessions.len().saturating_sub(1)
+}
+
+impl SessionRow<'_> {
+    /// The `ID` cell: a session id, or a conversation label behind a tree
+    /// glyph indented one step per level below the session row.
+    fn id_label(&self, width: usize) -> String {
+        match self {
+            Self::Session(session) => display_session_id(session.session_id.as_deref()).to_string(),
+            Self::Conversation { conversation, last } => ellipsize(
+                &format!(
+                    "{}{}{}",
+                    " ".repeat(conversation.depth),
+                    if *last { "└─" } else { "├─" },
+                    display_conversation_label(&conversation.conversation)
+                ),
+                width,
+            ),
+        }
+    }
+
+    /// Columns that describe the session as a whole stay on its own row.
+    fn project(&self) -> &str {
+        match self {
+            Self::Session(session) => session.project.as_deref().unwrap_or("-"),
+            Self::Conversation { .. } => "",
+        }
+    }
+
+    fn effort(&self) -> &str {
+        match self {
+            Self::Session(session) => session.effort.as_deref().unwrap_or("-"),
+            Self::Conversation { .. } => "",
+        }
+    }
+
+    fn rate_label(&self) -> String {
+        match self {
+            Self::Session(session) => session.rate().label(),
+            Self::Conversation { .. } => String::new(),
+        }
+    }
+
+    fn output_token_samples(&self) -> &[(SystemTime, u64)] {
+        match self {
+            Self::Session(session) => &session.output_token_samples,
+            Self::Conversation { .. } => &[],
+        }
+    }
+
+    fn counts(&self) -> (usize, usize, usize) {
+        match self {
+            Self::Session(session) => (
+                session.active_count,
+                session.request_count,
+                session.failure_count,
+            ),
+            Self::Conversation { conversation, .. } => (
+                conversation.active_count,
+                conversation.request_count,
+                conversation.failure_count,
+            ),
+        }
+    }
+
+    fn provider(&self) -> Option<&str> {
+        match self {
+            Self::Session(session) => session.provider.as_deref(),
+            Self::Conversation { conversation, .. } => conversation.provider.as_deref(),
+        }
+    }
+
+    fn model(&self) -> Option<&str> {
+        match self {
+            Self::Session(session) => session.model.as_deref(),
+            Self::Conversation { conversation, .. } => conversation.model.as_deref(),
+        }
+    }
+
+    fn cache(&self) -> &SessionCacheStats {
+        match self {
+            Self::Session(session) => &session.cache,
+            Self::Conversation { conversation, .. } => &conversation.cache,
+        }
+    }
+
+    fn cache_hit_ratio(&self) -> Option<f64> {
+        match self {
+            Self::Session(session) => session.cache_hit_ratio(),
+            Self::Conversation { conversation, .. } => conversation.cache_hit_ratio(),
+        }
+    }
+
+    fn input_tokens(&self) -> u64 {
+        match self {
+            Self::Session(session) => session.input_tokens,
+            Self::Conversation { conversation, .. } => conversation.input_tokens,
+        }
+    }
+
+    fn output_tokens(&self) -> u64 {
+        match self {
+            Self::Session(session) => session.output_tokens,
+            Self::Conversation { conversation, .. } => conversation.output_tokens,
+        }
+    }
+
+    fn last_status(&self) -> &str {
+        match self {
+            Self::Session(session) => &session.last_status,
+            Self::Conversation { conversation, .. } => &conversation.last_status,
+        }
+    }
+}
+
 fn render_sessions(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -999,65 +1204,61 @@ fn render_sessions(
     let columns = session_columns(tier, show_full_sparkline);
     let widths = column_constraints(&columns);
     let now = SystemTime::now();
-    let rows = sessions.iter().enumerate().map(|(index, session)| {
-        let cells = columns
-            .iter()
-            .enumerate()
-            .map(|(column_index, column)| {
-                let width = table_column_width(area, &widths, column_index);
-                match column.key {
-                    SessionColumn::Marker => {
-                        let marker = if focused && index == selected {
-                            ">"
+    let rows = session_rows(sessions)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let (active_count, request_count, failure_count) = row.counts();
+            let cells = columns
+                .iter()
+                .enumerate()
+                .map(|(column_index, column)| {
+                    let width = table_column_width(area, &widths, column_index);
+                    match column.key {
+                        SessionColumn::Marker => {
+                            let marker = if focused && index == selected {
+                                ">"
+                            } else {
+                                " "
+                            };
+                            Cell::from(Span::styled(marker, Style::default().fg(TEAL)))
+                        }
+                        SessionColumn::Id => text_cell(row.id_label(width)),
+                        SessionColumn::Project => text_cell(ellipsize(row.project(), width)),
+                        SessionColumn::Active => number_cell(active_count.to_string()),
+                        SessionColumn::Requests => number_cell(request_count.to_string()),
+                        SessionColumn::Failures => number_cell(failure_count.to_string()),
+                        SessionColumn::Counts => {
+                            number_cell(format!("{active_count}/{request_count}/{failure_count}"))
+                        }
+                        SessionColumn::Provider => provider_cell(row.provider()),
+                        SessionColumn::Model => model_cell(row.model(), width),
+                        SessionColumn::Target => target_cell(row.provider(), row.model(), width),
+                        SessionColumn::Effort => text_cell(row.effort()),
+                        SessionColumn::Context => number_cell(if row.cache().context_tokens == 0 {
+                            "-".to_string()
                         } else {
-                            " "
-                        };
-                        Cell::from(Span::styled(marker, Style::default().fg(TEAL)))
+                            compact_tokens(row.cache().context_tokens)
+                        }),
+                        SessionColumn::Hit => hit_cell(row.cache_hit_ratio()),
+                        SessionColumn::Misses => cache_miss_cell(row.cache()),
+                        SessionColumn::Input => number_cell(compact_tokens(row.input_tokens())),
+                        SessionColumn::Output => number_cell(compact_tokens(row.output_tokens())),
+                        SessionColumn::Rate => rate_cell(row.rate_label()),
+                        SessionColumn::Activity => {
+                            Cell::from(token_sparkline_line(row.output_token_samples(), width, now))
+                        }
+                        SessionColumn::Status => status_cell(row.last_status()),
                     }
-                    SessionColumn::Id => {
-                        text_cell(display_session_id(session.session_id.as_deref()))
-                    }
-                    SessionColumn::Project => {
-                        text_cell(ellipsize(session.project.as_deref().unwrap_or("-"), width))
-                    }
-                    SessionColumn::Active => number_cell(session.active_count.to_string()),
-                    SessionColumn::Requests => number_cell(session.request_count.to_string()),
-                    SessionColumn::Failures => number_cell(session.failure_count.to_string()),
-                    SessionColumn::Counts => number_cell(format!(
-                        "{}/{}/{}",
-                        session.active_count, session.request_count, session.failure_count
-                    )),
-                    SessionColumn::Provider => provider_cell(session.provider.as_deref()),
-                    SessionColumn::Model => model_cell(session.model.as_deref(), width),
-                    SessionColumn::Target => {
-                        target_cell(session.provider.as_deref(), session.model.as_deref(), width)
-                    }
-                    SessionColumn::Effort => text_cell(session.effort.as_deref().unwrap_or("-")),
-                    SessionColumn::Context => number_cell(if session.cache.context_tokens == 0 {
-                        "-".to_string()
-                    } else {
-                        compact_tokens(session.cache.context_tokens)
-                    }),
-                    SessionColumn::Hit => hit_cell(session.cache_hit_ratio()),
-                    SessionColumn::Misses => session_miss_cell(session),
-                    SessionColumn::Input => number_cell(compact_tokens(session.input_tokens)),
-                    SessionColumn::Output => number_cell(compact_tokens(session.output_tokens)),
-                    SessionColumn::Rate => rate_cell(session.rate().label()),
-                    SessionColumn::Activity => Cell::from(token_sparkline_line(
-                        &session.output_token_samples,
-                        width,
-                        now,
-                    )),
-                    SessionColumn::Status => status_cell(&session.last_status),
-                }
+                })
+                .collect::<Vec<_>>();
+            Row::new(cells).style(if index == selected {
+                Style::default().bg(SELECTED_BG)
+            } else {
+                Style::default().bg(PANEL_BG)
             })
-            .collect::<Vec<_>>();
-        Row::new(cells).style(if index == selected {
-            Style::default().bg(SELECTED_BG)
-        } else {
-            Style::default().bg(PANEL_BG)
         })
-    });
+        .collect::<Vec<_>>();
     let table = Table::new(rows, widths.clone())
         .header(column_header(&columns))
         .block(panel("Sessions", focused));
@@ -2297,6 +2498,21 @@ mod tests {
     }
 
     #[test]
+    fn display_conversation_label_shortens_agent_ids_and_keeps_side_calls() {
+        assert_eq!(display_conversation_label("main"), "main");
+        assert_eq!(display_conversation_label("main/side"), "main/side");
+        assert_eq!(display_conversation_label("a0c17aa4e68872d70"), "a0c17aa4");
+        assert_eq!(
+            display_conversation_label("a0c17aa4e68872d70/side"),
+            "a0c17aa4/side"
+        );
+        assert_eq!(
+            display_conversation_label("57c7c914-ada4-4f40-9672-985f950fbb66"),
+            "57c7c914"
+        );
+    }
+
+    #[test]
     fn display_session_id_handles_atypical_ids() {
         assert_eq!(display_session_id(Some("custom-session")), "custom-session");
         assert_eq!(display_session_id(Some("")), "no-session");
@@ -2579,6 +2795,76 @@ mod tests {
     }
 
     #[test]
+    fn sessions_table_nests_conversations_and_selects_the_row_it_marks() {
+        let monitor = MonitorHandle::new(10);
+        for (request_id, conversation, parent, provider, model) in [
+            ("request-main", "main", None, "codex", "gpt-5.6-sol"),
+            (
+                "request-agent",
+                "agent-7",
+                None,
+                "anthropic",
+                "claude-sonnet-5",
+            ),
+            (
+                "request-nested",
+                "agent-9",
+                Some("agent-7"),
+                "codex",
+                "gpt-5.6-luna",
+            ),
+            (
+                "request-label",
+                "agent-9/side",
+                Some("agent-7"),
+                "codex",
+                "gpt-5.6-luna",
+            ),
+        ] {
+            monitor.request_started(
+                request_id,
+                Some("sess-1".to_string()),
+                None,
+                EndpointKind::Messages,
+            );
+            monitor.project_resolved(request_id, "example-project");
+            monitor.conversation_resolved(request_id, conversation, parent.map(str::to_string));
+            monitor.provider_selected(request_id, provider, model, None);
+            monitor.request_completed(request_id, 200, Some(1_000), Some(50));
+        }
+        let state = monitor.snapshot();
+
+        // One session row, then its conversations depth first.
+        assert_eq!(session_row_count(&state.sessions), 5);
+        let rows = session_rows(&state.sessions);
+        assert!(matches!(rows[0], SessionRow::Session(_)));
+        let labels = rows[1..]
+            .iter()
+            .map(|row| row.id_label(40))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec!["├─main", "└─agent-7", " └─agent-9", "  └─agent-9/side"]
+        );
+        // Every conversation row answers for the session it hangs under.
+        for row in 1..5 {
+            assert_eq!(selected_session_index(&state.sessions, row), 0);
+        }
+
+        let sessions = buffer_text(&draw(170, 10, |frame| {
+            render_sessions(frame, frame.area(), &state.sessions, 4, true)
+        }));
+
+        assert!(sessions.contains("├─main"), "{sessions}");
+        assert!(sessions.contains(" └─agent-9"), "{sessions}");
+        // The marker sits on the row the selection index points at.
+        assert!(sessions.contains(">   └─agent-9/side"), "{sessions}");
+        assert!(sessions.contains("claude-sonnet-5"), "{sessions}");
+        assert_eq!(sessions.matches("example-project").count(), 1, "{sessions}");
+        assert_eq!(sessions.matches("sess-1").count(), 1, "{sessions}");
+    }
+
+    #[test]
     fn selected_rows_scroll_into_table_viewports() {
         let state = mock_state();
         let sessions = (0..12)
@@ -2588,8 +2874,10 @@ mod tests {
                 session
             })
             .collect::<Vec<_>>();
+        // The last session's own row, past the conversations of the ones above.
+        let last_session_row = session_row_count(&sessions[..11]);
         let session_buffer = draw(120, 6, |frame| {
-            render_sessions(frame, frame.area(), &sessions, 11, true)
+            render_sessions(frame, frame.area(), &sessions, last_session_row, true)
         });
         let session_text = buffer_text(&session_buffer);
         assert!(session_text.contains("row-0011"), "{session_text}");

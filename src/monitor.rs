@@ -106,10 +106,13 @@ pub enum MonitorEvent {
         path: PathBuf,
     },
     /// Which conversation of the session the request belongs to: `main`, or
-    /// the Claude Code agent id of a subagent.
+    /// the Claude Code agent id of a subagent. `parent` is the agent that
+    /// spawned it, when Claude Code says so, which nests subagents of
+    /// subagents under the one they came from.
     ConversationResolved {
         request_id: String,
         conversation: String,
+        parent: Option<String>,
     },
     StreamProgress {
         request_id: String,
@@ -184,6 +187,9 @@ pub struct ActiveRequest {
     pub request_id: String,
     pub session_id: Option<String>,
     pub conversation: Option<String>,
+    /// The conversation that spawned this one, from Claude Code's lineage
+    /// header.
+    pub conversation_parent: Option<String>,
     pub session_seq: Option<u64>,
     pub project: Option<String>,
     pub provider: Option<String>,
@@ -236,6 +242,9 @@ pub struct CompletedRequest {
     pub request_id: String,
     pub session_id: Option<String>,
     pub conversation: Option<String>,
+    /// The conversation that spawned this one, from Claude Code's lineage
+    /// header.
+    pub conversation_parent: Option<String>,
     pub session_seq: Option<u64>,
     pub project: Option<String>,
     pub provider: Option<String>,
@@ -332,6 +341,72 @@ pub struct SessionSummary {
     rate_output_tokens: u64,
     pub generation_duration: Duration,
     pub last_status: String,
+    /// The conversations this session is made of, in display order: a
+    /// depth-first walk of the spawn tree, `main` first and side lanes last
+    /// within a level. Their figures add up to the session's.
+    pub conversations: Vec<ConversationSummary>,
+}
+
+/// One conversation of a session: the main thread, a subagent, or a side lane.
+/// Every figure means what the session's does, counted for this lane alone.
+#[derive(Debug, Clone)]
+pub struct ConversationSummary {
+    /// `main`, the agent id of a subagent, or either with the side suffix.
+    pub conversation: String,
+    /// The conversation this one hangs under, once resolved within the
+    /// session: the agent that spawned it, or the conversation a side call was
+    /// made from. `None` for a conversation that hangs under the session row
+    /// itself, which is also where an unresolvable parent lands.
+    pub parent: Option<String>,
+    /// Levels below the session row, `0` for a conversation hanging under it.
+    pub depth: usize,
+    pub active_count: usize,
+    pub request_count: usize,
+    pub failure_count: usize,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache: SessionCacheStats,
+    pub last_status: String,
+}
+
+impl ConversationSummary {
+    fn new(conversation: &str) -> Self {
+        Self {
+            conversation: conversation.to_string(),
+            parent: None,
+            depth: 0,
+            active_count: 0,
+            request_count: 0,
+            failure_count: 0,
+            provider: None,
+            model: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cache: SessionCacheStats::default(),
+            last_status: "-".to_string(),
+        }
+    }
+
+    /// Share of this conversation's prompt tokens served from cache.
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        totals_cache_hit_ratio(
+            self.input_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+        )
+    }
+
+    /// Whether the conversation is one of Claude Code's side calls, which do
+    /// not extend a transcript.
+    pub fn is_side(&self) -> bool {
+        self.conversation.ends_with(SIDE_CONVERSATION_SUFFIX)
+    }
 }
 
 /// Cache behaviour of a session, kept for its whole life rather than the
@@ -370,15 +445,27 @@ pub enum CacheExpiry {
     ExpiredAgo(Duration),
 }
 
+/// Share of a set of accumulated prompt tokens that came from cache.
+fn totals_cache_hit_ratio(
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+) -> Option<f64> {
+    let prompt = input_tokens
+        .saturating_add(cache_read_tokens)
+        .saturating_add(cache_write_tokens);
+    (prompt > 0 && (cache_read_tokens > 0 || cache_write_tokens > 0))
+        .then(|| cache_read_tokens as f64 / prompt as f64)
+}
+
 impl SessionSummary {
     /// Share of all prompt tokens served from cache.
     pub fn cache_hit_ratio(&self) -> Option<f64> {
-        let prompt = self
-            .input_tokens
-            .saturating_add(self.cache_read_tokens)
-            .saturating_add(self.cache_write_tokens);
-        (prompt > 0 && (self.cache_read_tokens > 0 || self.cache_write_tokens > 0))
-            .then(|| self.cache_read_tokens as f64 / prompt as f64)
+        totals_cache_hit_ratio(
+            self.input_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+        )
     }
 
     pub fn rate(&self) -> Throughput {
@@ -404,6 +491,7 @@ struct MonitorStore {
     recent: VecDeque<CompletedRequest>,
     session_usage: HashMap<Option<String>, SessionUsage>,
     session_cache: HashMap<Option<String>, SessionCacheStats>,
+    conversations: HashMap<ConversationKey, ConversationState>,
     session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
     lanes: HashMap<LaneKey, LaneState>,
     recent_limit: usize,
@@ -415,6 +503,47 @@ struct SessionUsage {
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
+}
+
+fn add_usage_delta(usage: &mut SessionUsage, delta: UsageDelta) {
+    usage.input_tokens = add_signed(usage.input_tokens, delta.input);
+    usage.output_tokens = add_signed(usage.output_tokens, delta.output);
+    usage.cache_read_tokens = add_signed(usage.cache_read_tokens, delta.cache_read);
+    usage.cache_write_tokens = add_signed(usage.cache_write_tokens, delta.cache_write);
+}
+
+/// One conversation of one session, the unit a conversation row reports on. A
+/// request whose conversation is unknown counts for its session only.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ConversationKey {
+    session_id: Option<String>,
+    conversation: String,
+}
+
+#[derive(Debug, Default)]
+struct ConversationState {
+    usage: SessionUsage,
+    cache: SessionCacheStats,
+}
+
+/// Make a request the latest prompt of the totals it belongs to: the size the
+/// context column shows and the window its cached prefix lives in.
+fn note_context(
+    stats: &mut SessionCacheStats,
+    prompt: u64,
+    started_at: SystemTime,
+    ttl: Option<Duration>,
+) {
+    stats.context_tokens = prompt;
+    stats.peak_context_tokens = stats.peak_context_tokens.max(prompt);
+    stats.context_started_at = Some(started_at);
+    stats.context_ttl = ttl;
+}
+
+fn note_miss(stats: &mut SessionCacheStats, started_at: SystemTime, miss: CacheMiss) {
+    stats.miss_count = stats.miss_count.saturating_add(1);
+    stats.missed_tokens = stats.missed_tokens.saturating_add(miss.missed_tokens);
+    stats.last_miss = Some((started_at, miss));
 }
 
 /// Appended to a conversation label for requests without client tools. They
@@ -522,6 +651,7 @@ impl MonitorHandle {
                 recent: VecDeque::new(),
                 session_usage: HashMap::new(),
                 session_cache: HashMap::new(),
+                conversations: HashMap::new(),
                 session_output_buckets: HashMap::new(),
                 lanes: HashMap::new(),
                 recent_limit,
@@ -627,10 +757,12 @@ impl MonitorHandle {
         &self,
         request_id: impl Into<String>,
         conversation: impl Into<String>,
+        parent: Option<String>,
     ) {
         self.publish(MonitorEvent::ConversationResolved {
             request_id: request_id.into(),
             conversation: conversation.into(),
+            parent,
         });
     }
 
@@ -740,6 +872,7 @@ impl MonitorStore {
                         request_id,
                         session_id,
                         conversation: None,
+                        conversation_parent: None,
                         session_seq,
                         project: None,
                         provider: None,
@@ -829,9 +962,11 @@ impl MonitorStore {
             MonitorEvent::ConversationResolved {
                 request_id,
                 conversation,
+                parent,
             } => {
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.conversation = Some(conversation);
+                    active.conversation_parent = parent;
                 }
             }
             MonitorEvent::StreamProgress {
@@ -864,7 +999,12 @@ impl MonitorStore {
                         cache: &mut active.cache,
                     }
                     .apply(&usage);
-                    usage_update = Some((active.session_id.clone(), active.endpoint, delta));
+                    usage_update = Some((
+                        active.session_id.clone(),
+                        active.conversation.clone(),
+                        active.endpoint,
+                        delta,
+                    ));
                 } else if let Some(completed) = self
                     .recent
                     .iter_mut()
@@ -882,7 +1022,12 @@ impl MonitorStore {
                         cache: &mut completed.cache,
                     }
                     .apply(&usage);
-                    usage_update = Some((completed.session_id.clone(), completed.endpoint, delta));
+                    usage_update = Some((
+                        completed.session_id.clone(),
+                        completed.conversation.clone(),
+                        completed.endpoint,
+                        delta,
+                    ));
                     if delta.output > 0 {
                         history_update = Some((
                             completed.session_id.clone(),
@@ -893,8 +1038,8 @@ impl MonitorStore {
                         ));
                     }
                 }
-                if let Some((session_id, endpoint, delta)) = usage_update {
-                    self.record_session_usage(session_id, endpoint, delta);
+                if let Some((session_id, conversation, endpoint, delta)) = usage_update {
+                    self.record_session_usage(session_id, conversation, endpoint, delta);
                 }
                 if let Some((session_id, timestamp, tokens)) = history_update {
                     self.record_session_output(session_id, timestamp, tokens);
@@ -918,7 +1063,12 @@ impl MonitorStore {
                         cache: &mut active.cache,
                     }
                     .apply(&usage);
-                    usage_update = Some((active.session_id.clone(), active.endpoint, delta));
+                    usage_update = Some((
+                        active.session_id.clone(),
+                        active.conversation.clone(),
+                        active.endpoint,
+                        delta,
+                    ));
                 } else if let Some(completed) = self
                     .recent
                     .iter_mut()
@@ -936,7 +1086,12 @@ impl MonitorStore {
                         cache: &mut completed.cache,
                     }
                     .apply(&usage);
-                    usage_update = Some((completed.session_id.clone(), completed.endpoint, delta));
+                    usage_update = Some((
+                        completed.session_id.clone(),
+                        completed.conversation.clone(),
+                        completed.endpoint,
+                        delta,
+                    ));
                     if delta.output > 0 {
                         history_update = Some((
                             completed.session_id.clone(),
@@ -947,8 +1102,8 @@ impl MonitorStore {
                         ));
                     }
                 }
-                if let Some((session_id, endpoint, delta)) = usage_update {
-                    self.record_session_usage(session_id, endpoint, delta);
+                if let Some((session_id, conversation, endpoint, delta)) = usage_update {
+                    self.record_session_usage(session_id, conversation, endpoint, delta);
                 }
                 if let Some((session_id, timestamp, tokens)) = history_update {
                     self.record_session_output(session_id, timestamp, tokens);
@@ -1034,6 +1189,7 @@ impl MonitorStore {
                 request_id: request_id.to_string(),
                 session_id: None,
                 conversation: None,
+                conversation_parent: None,
                 session_seq: None,
                 project: None,
                 provider: None,
@@ -1068,11 +1224,17 @@ impl MonitorStore {
             cache: &mut active.cache,
         }
         .apply(&UsageReport::opening(input_tokens, output_tokens));
-        self.record_session_usage(active.session_id.clone(), active.endpoint, delta);
+        self.record_session_usage(
+            active.session_id.clone(),
+            active.conversation.clone(),
+            active.endpoint,
+            delta,
+        );
         let completed = CompletedRequest {
             request_id: active.request_id,
             session_id: active.session_id,
             conversation: active.conversation,
+            conversation_parent: active.conversation_parent,
             session_seq: active.session_seq,
             project: active.project,
             provider: active.provider,
@@ -1113,23 +1275,33 @@ impl MonitorStore {
         self.evaluate_cache(request_id);
     }
 
-    /// Add a request's usage change to its session. `count_tokens` requests are
-    /// local estimates of a prompt that the real request counts again, so they
-    /// stay out of the session totals.
+    /// Add a request's usage change to its session and to its conversation
+    /// within that session. `count_tokens` requests are local estimates of a
+    /// prompt that the real request counts again, so they stay out of both.
     fn record_session_usage(
         &mut self,
         session_id: Option<String>,
+        conversation: Option<String>,
         endpoint: EndpointKind,
         delta: UsageDelta,
     ) {
         if endpoint == EndpointKind::CountTokens || delta.is_zero() {
             return;
         }
-        let usage = self.session_usage.entry(session_id).or_default();
-        usage.input_tokens = add_signed(usage.input_tokens, delta.input);
-        usage.output_tokens = add_signed(usage.output_tokens, delta.output);
-        usage.cache_read_tokens = add_signed(usage.cache_read_tokens, delta.cache_read);
-        usage.cache_write_tokens = add_signed(usage.cache_write_tokens, delta.cache_write);
+        add_usage_delta(
+            self.session_usage.entry(session_id.clone()).or_default(),
+            delta,
+        );
+        if let Some(conversation) = conversation {
+            let state = self
+                .conversations
+                .entry(ConversationKey {
+                    session_id,
+                    conversation,
+                })
+                .or_default();
+            add_usage_delta(&mut state.usage, delta);
+        }
     }
 
     /// Once a request's cache read is final, compare it with the previous
@@ -1244,29 +1416,43 @@ impl MonitorStore {
             );
         }
 
+        let context_ttl = self
+            .lanes
+            .get(&key)
+            .and_then(|lane| lane.ttl)
+            .or(default_cache_ttl(&key.provider));
         let stats = self
             .session_cache
             .entry(key.session_id.clone())
             .or_default();
+        // A session shows the main thread's context; a conversation shows its
+        // own, side lanes included.
         if !superseded
             && key
                 .conversation
                 .as_deref()
                 .is_none_or(|name| name == "main")
         {
-            stats.context_tokens = prompt;
-            stats.peak_context_tokens = stats.peak_context_tokens.max(prompt);
-            stats.context_started_at = Some(started_at);
-            stats.context_ttl = self
-                .lanes
-                .get(&key)
-                .and_then(|lane| lane.ttl)
-                .or(default_cache_ttl(&key.provider));
+            note_context(stats, prompt, started_at, context_ttl);
         }
         if let Some(miss) = miss {
-            stats.miss_count = stats.miss_count.saturating_add(1);
-            stats.missed_tokens = stats.missed_tokens.saturating_add(miss.missed_tokens);
-            stats.last_miss = Some((started_at, miss));
+            note_miss(stats, started_at, miss);
+        }
+        if let Some(conversation) = key.conversation.clone() {
+            let stats = &mut self
+                .conversations
+                .entry(ConversationKey {
+                    session_id: key.session_id.clone(),
+                    conversation,
+                })
+                .or_default()
+                .cache;
+            if !superseded {
+                note_context(stats, prompt, started_at, context_ttl);
+            }
+            if let Some(miss) = miss {
+                note_miss(stats, started_at, miss);
+            }
         }
 
         let cache = if let Some(active) = self.active.get_mut(request_id) {
@@ -1306,6 +1492,7 @@ impl MonitorStore {
             &self.recent,
             &self.session_usage,
             &self.session_cache,
+            &self.conversations,
             &self.session_output_buckets,
         );
         MonitorState {
@@ -1317,11 +1504,174 @@ impl MonitorStore {
     }
 }
 
+/// Where a conversation belongs among its siblings: the main thread leads,
+/// side lanes trail, and the rest keep the order they were first seen in.
+fn conversation_rank(conversation: &ConversationSummary) -> u8 {
+    match conversation.conversation.as_str() {
+        _ if conversation.is_side() => 2,
+        "main" => 0,
+        _ => 1,
+    }
+}
+
+/// The conversation a row hangs under: the one a side call was made from, else
+/// the agent that spawned it. A parent that this session has not been seen
+/// talking to, and a row that would be its own ancestor, leave the row at the
+/// top level rather than hiding it.
+fn resolve_parent(conversations: &[ConversationSummary], index: usize) -> Option<usize> {
+    let position = |label: &str| {
+        conversations
+            .iter()
+            .position(|conversation| conversation.conversation == label)
+    };
+    let conversation = &conversations[index];
+    conversation
+        .conversation
+        .strip_suffix(SIDE_CONVERSATION_SUFFIX)
+        .and_then(position)
+        .or_else(|| conversation.parent.as_deref().and_then(position))
+        .filter(|parent| *parent != index)
+}
+
+/// Arrange a session's conversations into display order: a depth-first walk of
+/// the spawn tree, ranked within every level, with each row's depth and
+/// resolved parent filled in.
+fn order_conversations(conversations: Vec<ConversationSummary>) -> Vec<ConversationSummary> {
+    let count = conversations.len();
+    let mut parents: Vec<Option<usize>> = (0..count)
+        .map(|index| resolve_parent(&conversations, index))
+        .collect();
+    // A conversation that is its own ancestor, or whose chain never reaches a
+    // root, is malformed: it hangs under the session instead, so the walk
+    // below cannot loop and still shows every row.
+    let detached: Vec<bool> = (0..count)
+        .map(|index| {
+            let mut ancestor = parents[index];
+            let mut steps = 0;
+            while let Some(parent) = ancestor {
+                if parent == index || steps > count {
+                    return true;
+                }
+                ancestor = parents[parent];
+                steps += 1;
+            }
+            false
+        })
+        .collect();
+    for (parent, detached) in parents.iter_mut().zip(detached) {
+        if detached {
+            *parent = None;
+        }
+    }
+
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); count];
+    let mut roots: Vec<usize> = Vec::new();
+    for (index, parent) in parents.iter().enumerate() {
+        match parent {
+            Some(parent) => children[*parent].push(index),
+            None => roots.push(index),
+        }
+    }
+    // A stable sort keeps the order the conversations were first seen in
+    // within each rank.
+    let rank = |index: &usize| conversation_rank(&conversations[*index]);
+    roots.sort_by_key(rank);
+    for level in &mut children {
+        level.sort_by_key(rank);
+    }
+
+    let mut ordered: Vec<(usize, usize)> = Vec::with_capacity(count);
+    let mut visited = vec![false; count];
+    let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|index| (*index, 0)).collect();
+    while let Some((index, depth)) = stack.pop() {
+        if std::mem::replace(&mut visited[index], true) {
+            continue;
+        }
+        ordered.push((index, depth));
+        for child in children[index].iter().rev() {
+            stack.push((*child, depth + 1));
+        }
+    }
+    // Whatever the walk could not reach still gets a row of its own.
+    ordered.extend(
+        (0..count)
+            .filter(|index| !visited[*index])
+            .map(|index| (index, 0)),
+    );
+
+    let labels: Vec<String> = conversations
+        .iter()
+        .map(|conversation| conversation.conversation.clone())
+        .collect();
+    let mut slots: Vec<Option<ConversationSummary>> = conversations.into_iter().map(Some).collect();
+    ordered
+        .into_iter()
+        .map(|(index, depth)| {
+            let mut conversation = slots[index].take().expect("each conversation ordered once");
+            conversation.depth = depth;
+            conversation.parent = parents[index].map(|parent| labels[parent].clone());
+            conversation
+        })
+        .collect()
+}
+
+/// The row of a session's conversation, started on first sight.
+fn conversation_entry<'a>(
+    session: &'a mut SessionSummary,
+    conversation: &str,
+) -> &'a mut ConversationSummary {
+    if let Some(index) = session
+        .conversations
+        .iter()
+        .position(|existing| existing.conversation == conversation)
+    {
+        return &mut session.conversations[index];
+    }
+    session
+        .conversations
+        .push(ConversationSummary::new(conversation));
+    session
+        .conversations
+        .last_mut()
+        .expect("conversation just pushed")
+}
+
+/// Count one request on the conversation row it belongs to, the way the
+/// session row counts it.
+fn record_conversation_request(
+    session: &mut SessionSummary,
+    conversation: &str,
+    request: ConversationRequest<'_>,
+    active: bool,
+) {
+    let entry = conversation_entry(session, conversation);
+    entry.request_count += 1;
+    if active {
+        entry.active_count += 1;
+    }
+    if *request.status == RequestStatus::Failed {
+        entry.failure_count += 1;
+    }
+    entry.provider = request.provider.cloned().or(entry.provider.clone());
+    entry.model = request.model.cloned().or(entry.model.clone());
+    entry.parent = request.parent.cloned().or(entry.parent.clone());
+    entry.last_status = request.status.label().to_string();
+}
+
+/// What one request tells about the conversation it belongs to.
+struct ConversationRequest<'a> {
+    provider: Option<&'a String>,
+    model: Option<&'a String>,
+    parent: Option<&'a String>,
+    status: &'a RequestStatus,
+}
+
 fn session_summaries(
     active: &[ActiveRequest],
     recent: &VecDeque<CompletedRequest>,
     session_usage: &HashMap<Option<String>, SessionUsage>,
     session_cache: &HashMap<Option<String>, SessionCacheStats>,
+    conversations: &HashMap<ConversationKey, ConversationState>,
     session_output_buckets: &HashMap<Option<String>, Vec<(u64, u64)>>,
 ) -> Vec<SessionSummary> {
     let mut sessions: HashMap<Option<String>, SessionSummary> = HashMap::new();
@@ -1347,6 +1697,7 @@ fn session_summaries(
                 rate_output_tokens: 0,
                 generation_duration: Duration::ZERO,
                 last_status: "-".to_string(),
+                conversations: Vec::new(),
             });
         entry.request_count += 1;
         if request.status == RequestStatus::Failed {
@@ -1370,6 +1721,19 @@ fn session_summaries(
             entry.generation_duration = entry.generation_duration.saturating_add(duration);
         }
         entry.last_status = request.status.label().to_string();
+        if let Some(conversation) = request.conversation.as_deref() {
+            record_conversation_request(
+                entry,
+                conversation,
+                ConversationRequest {
+                    provider: request.provider.as_ref(),
+                    model: request.model.as_ref(),
+                    parent: request.conversation_parent.as_ref(),
+                    status: &request.status,
+                },
+                false,
+            );
+        }
     }
 
     for request in active {
@@ -1394,6 +1758,7 @@ fn session_summaries(
                 rate_output_tokens: 0,
                 generation_duration: Duration::ZERO,
                 last_status: "-".to_string(),
+                conversations: Vec::new(),
             });
         entry.active_count += 1;
         entry.request_count += 1;
@@ -1415,6 +1780,19 @@ fn session_summaries(
             entry.generation_duration = entry.generation_duration.saturating_add(duration);
         }
         entry.last_status = request.status.label().to_string();
+        if let Some(conversation) = request.conversation.as_deref() {
+            record_conversation_request(
+                entry,
+                conversation,
+                ConversationRequest {
+                    provider: request.provider.as_ref(),
+                    model: request.model.as_ref(),
+                    parent: request.conversation_parent.as_ref(),
+                    status: &request.status,
+                },
+                true,
+            );
+        }
     }
 
     for (session_id, session) in &mut sessions {
@@ -1433,6 +1811,19 @@ fn session_summaries(
                 .map(|(bucket, tokens)| (session_token_bucket_start(*bucket), *tokens))
                 .collect();
         }
+        for conversation in &mut session.conversations {
+            if let Some(state) = conversations.get(&ConversationKey {
+                session_id: session_id.clone(),
+                conversation: conversation.conversation.clone(),
+            }) {
+                conversation.input_tokens = state.usage.input_tokens;
+                conversation.output_tokens = state.usage.output_tokens;
+                conversation.cache_read_tokens = state.usage.cache_read_tokens;
+                conversation.cache_write_tokens = state.usage.cache_write_tokens;
+                conversation.cache = state.cache;
+            }
+        }
+        session.conversations = order_conversations(std::mem::take(&mut session.conversations));
     }
 
     let mut out: Vec<_> = sessions.into_values().collect();
@@ -1737,6 +2128,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             request_id: request_id.to_string(),
             session_id: Some(session_id.to_string()),
             conversation: None,
+            conversation_parent: None,
             session_seq: None,
             project: None,
             provider: Some("codex".to_string()),
@@ -1775,7 +2167,14 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
                 .output_tokens
                 .saturating_add(request.output_tokens.unwrap_or(0));
         }
-        session_summaries(&[], recent, &usage, &HashMap::new(), &HashMap::new())
+        session_summaries(
+            &[],
+            recent,
+            &usage,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
     }
 
     #[test]
@@ -2084,13 +2483,22 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     }
 
     fn start_codex_request(monitor: &MonitorHandle, request_id: &str, conversation: &str) {
+        start_codex_subagent_request(monitor, request_id, conversation, None);
+    }
+
+    fn start_codex_subagent_request(
+        monitor: &MonitorHandle,
+        request_id: &str,
+        conversation: &str,
+        parent: Option<&str>,
+    ) {
         monitor.request_started(
             request_id,
             Some("s1".to_string()),
             None,
             EndpointKind::Messages,
         );
-        monitor.conversation_resolved(request_id, conversation);
+        monitor.conversation_resolved(request_id, conversation, parent.map(str::to_string));
         monitor.provider_selected(request_id, "codex", "gpt-5.6-sol", None);
     }
 
@@ -2216,6 +2624,201 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert_eq!(session.cache.context_tokens, 31_000);
         assert_eq!(session.cache.peak_context_tokens, 31_000);
         assert_eq!(session.cache.last_miss.map(|(_, miss)| miss), Some(miss));
+
+        // The miss belongs to the conversation it happened in, not to the
+        // subagent that ran in between.
+        let main = conversation(session, "main");
+        assert_eq!(main.cache.miss_count, 1);
+        assert_eq!(main.cache.missed_tokens, 30_900);
+        assert_eq!(main.cache.last_miss.map(|(_, miss)| miss), Some(miss));
+        assert_eq!(conversation(session, "agent-1").cache.miss_count, 0);
+    }
+
+    fn conversation<'a>(session: &'a SessionSummary, label: &str) -> &'a ConversationSummary {
+        session
+            .conversations
+            .iter()
+            .find(|conversation| conversation.conversation == label)
+            .expect("conversation row")
+    }
+
+    #[test]
+    fn conversations_of_a_session_accumulate_separately_and_add_up_to_it() {
+        let monitor = MonitorHandle::new(20);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+
+        // A subagent of the same session, on its own model.
+        let start_agent_request = |request_id: &str| {
+            monitor.request_started(
+                request_id,
+                Some("s1".to_string()),
+                None,
+                EndpointKind::Messages,
+            );
+            monitor.conversation_resolved(request_id, "agent-1", None);
+            monitor.provider_selected(request_id, "codex", "gpt-5.6-luna", None);
+        };
+        start_agent_request("a1");
+        monitor.usage_reported("a1", closing_usage(5_000, 1_000, 200, 20));
+        monitor.request_completed("a1", 200, None, None);
+        start_agent_request("a2");
+        monitor.usage_reported("a2", closing_usage(900, 6_000, 0, 30));
+        monitor.request_completed("a2", 200, None, None);
+
+        let state = monitor.snapshot();
+        let session = &state.sessions[0];
+        let main = conversation(session, "main");
+        let agent = conversation(session, "agent-1");
+
+        assert_eq!(main.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(agent.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(main.request_count, 1);
+        assert_eq!(agent.request_count, 2);
+        assert_eq!(main.input_tokens, 30_000);
+        assert_eq!(agent.input_tokens, 5_900);
+        assert_eq!(agent.cache_read_tokens, 7_000);
+        assert_eq!(agent.cache_write_tokens, 200);
+        assert_eq!(agent.output_tokens, 50);
+        // Each conversation keeps its own context, not the session's.
+        assert_eq!(main.cache.context_tokens, 30_000);
+        assert_eq!(agent.cache.context_tokens, 6_900);
+        assert_eq!(session.cache.context_tokens, 30_000);
+        assert_eq!(
+            agent.cache_hit_ratio(),
+            Some(7_000.0 / (5_900.0 + 7_000.0 + 200.0))
+        );
+
+        assert_eq!(
+            session.request_count,
+            main.request_count + agent.request_count
+        );
+        assert_eq!(session.input_tokens, main.input_tokens + agent.input_tokens);
+        assert_eq!(
+            session.output_tokens,
+            main.output_tokens + agent.output_tokens
+        );
+        assert_eq!(
+            session.cache_read_tokens,
+            main.cache_read_tokens + agent.cache_read_tokens
+        );
+        assert_eq!(
+            session.cache_write_tokens,
+            main.cache_write_tokens + agent.cache_write_tokens
+        );
+    }
+
+    fn conversation_shape(session: &SessionSummary) -> Vec<(&str, Option<&str>, usize)> {
+        session
+            .conversations
+            .iter()
+            .map(|conversation| {
+                (
+                    conversation.conversation.as_str(),
+                    conversation.parent.as_deref(),
+                    conversation.depth,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn conversation_rows_lead_with_main_and_trail_with_side_calls() {
+        let monitor = MonitorHandle::new(20);
+        for (request_id, conversation) in [
+            ("w1", "main/side"),
+            ("a1", "agent-1"),
+            ("r1", "main"),
+            ("t1", "agent-1/side"),
+        ] {
+            start_codex_request(&monitor, request_id, conversation);
+            monitor.usage_reported(request_id, closing_usage(1_000, 0, 0, 10));
+            monitor.request_completed(request_id, 200, None, None);
+        }
+
+        let state = monitor.snapshot();
+
+        // Main leads its level, a side call hangs under the conversation that
+        // made it, and later arrivals keep the order they were first seen in.
+        assert_eq!(
+            conversation_shape(&state.sessions[0]),
+            vec![
+                ("main", None, 0),
+                ("main/side", Some("main"), 1),
+                ("agent-1", None, 0),
+                ("agent-1/side", Some("agent-1"), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn subagents_of_subagents_nest_under_the_agent_that_spawned_them() {
+        let monitor = MonitorHandle::new(20);
+        let request = |request_id: &str, conversation: &str, parent: Option<&str>| {
+            start_codex_subagent_request(&monitor, request_id, conversation, parent);
+            monitor.usage_reported(request_id, closing_usage(1_000, 0, 0, 10));
+            monitor.request_completed(request_id, 200, None, None);
+        };
+        request("d1", "agent-deep", Some("agent-mid"));
+        request("m1", "agent-mid", Some("agent-top"));
+        request("t1", "agent-top", None);
+        request("r1", "main", None);
+        request("s1", "agent-deep/side", Some("agent-mid"));
+
+        let state = monitor.snapshot();
+
+        assert_eq!(
+            conversation_shape(&state.sessions[0]),
+            vec![
+                ("main", None, 0),
+                ("agent-top", None, 0),
+                ("agent-mid", Some("agent-top"), 1),
+                ("agent-deep", Some("agent-mid"), 2),
+                ("agent-deep/side", Some("agent-deep"), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_or_looping_parent_leaves_the_row_under_the_session() {
+        let monitor = MonitorHandle::new(20);
+        let request = |request_id: &str, conversation: &str, parent: Option<&str>| {
+            start_codex_subagent_request(&monitor, request_id, conversation, parent);
+            monitor.usage_reported(request_id, closing_usage(1_000, 0, 0, 10));
+            monitor.request_completed(request_id, 200, None, None);
+        };
+        // A parent this session never talked to, and a pair that claims each
+        // other.
+        request("o1", "agent-orphan", Some("agent-never-seen"));
+        request("l1", "agent-loop-a", Some("agent-loop-b"));
+        request("l2", "agent-loop-b", Some("agent-loop-a"));
+
+        let state = monitor.snapshot();
+
+        assert_eq!(
+            conversation_shape(&state.sessions[0]),
+            vec![
+                ("agent-orphan", None, 0),
+                ("agent-loop-a", None, 0),
+                ("agent-loop-b", None, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_request_without_a_conversation_counts_for_its_session_only() {
+        let monitor = MonitorHandle::new(20);
+        monitor.request_started("r1", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.provider_selected("r1", "codex", "gpt-5.6-sol", None);
+        monitor.usage_reported("r1", closing_usage(700, 0, 0, 5));
+        monitor.request_completed("r1", 200, None, None);
+
+        let state = monitor.snapshot();
+
+        assert_eq!(state.sessions[0].input_tokens, 700);
+        assert_eq!(state.sessions[0].request_count, 1);
+        assert!(state.sessions[0].conversations.is_empty());
     }
 
     #[test]
@@ -2262,7 +2865,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             None,
             EndpointKind::Messages,
         );
-        monitor.conversation_resolved(request_id, "main");
+        monitor.conversation_resolved(request_id, "main", None);
         monitor.provider_selected(request_id, "anthropic", model, None);
     }
 

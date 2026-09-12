@@ -59,6 +59,26 @@ impl ConversationIdentity {
 const CONVERSATION_CACHE_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x5b2f_9f3d_7c41_4f0a_9d6e_1c8b_3a57_e204);
 
+/// The agent that spawned the one a request belongs to, when Claude Code says
+/// so. It is read beside the identity instead of inside it: the identity is
+/// what conversation state and the prompt cache key are keyed on, so a lineage
+/// header must never move it. Only a request that has an agent of its own can
+/// have a parent.
+pub fn parent_agent_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    let session = read_identity_header(headers, CLAUDE_SESSION_HEADER);
+    let agent = read_identity_header(headers, CLAUDE_AGENT_HEADER);
+    let parent = read_identity_header(headers, CLAUDE_PARENT_AGENT_HEADER);
+
+    if session.is_invalid() || agent.is_invalid() || parent.is_invalid() {
+        return None;
+    }
+
+    match (session.value(), agent.value(), parent.value()) {
+        (Some(_), Some(_), Some(parent_id)) => Some(parent_id.to_string()),
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 enum ParsedHeader<'a> {
     Missing,
@@ -227,6 +247,69 @@ mod tests {
 
         assert_eq!(direct, nested);
         assert_eq!(nested, reparented);
+    }
+
+    #[test]
+    fn parent_agent_id_is_read_beside_the_identity_it_must_not_change() {
+        let cases = [
+            (
+                "nested agent",
+                vec![
+                    (CLAUDE_SESSION_HEADER, "session-a"),
+                    (CLAUDE_AGENT_HEADER, "agent-child"),
+                    (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
+                ],
+                Some("agent-parent".to_string()),
+            ),
+            (
+                "agent without parent",
+                vec![
+                    (CLAUDE_SESSION_HEADER, "session-a"),
+                    (CLAUDE_AGENT_HEADER, "agent-child"),
+                ],
+                None,
+            ),
+            (
+                "parent without an agent of its own",
+                vec![
+                    (CLAUDE_SESSION_HEADER, "session-a"),
+                    (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
+                ],
+                None,
+            ),
+            (
+                "malformed parent",
+                vec![
+                    (CLAUDE_SESSION_HEADER, "session-a"),
+                    (CLAUDE_AGENT_HEADER, "agent-child"),
+                    (CLAUDE_PARENT_AGENT_HEADER, "two values"),
+                ],
+                None,
+            ),
+        ];
+
+        for (name, values, expected) in cases {
+            assert_eq!(
+                parent_agent_id_from_headers(&headers(&values)),
+                expected,
+                "{name}"
+            );
+        }
+
+        // Reading the lineage leaves the identity, and with it the keys derived
+        // from it, exactly where it was.
+        let nested = headers(&[
+            (CLAUDE_SESSION_HEADER, "session-a"),
+            (CLAUDE_AGENT_HEADER, "agent-child"),
+            (CLAUDE_PARENT_AGENT_HEADER, "agent-parent"),
+        ]);
+        assert_eq!(
+            ConversationIdentity::from_headers(&nested),
+            Some(ConversationIdentity::Agent(
+                "session-a".to_string(),
+                "agent-child".to_string(),
+            ))
+        );
     }
 
     #[test]

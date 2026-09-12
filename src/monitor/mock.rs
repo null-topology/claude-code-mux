@@ -5,8 +5,9 @@ use std::{
 };
 
 use super::{
-    ActiveRequest, CacheMiss, CacheMissCause, CompletedRequest, EndpointKind, MonitorState,
-    RequestCache, RequestStatus, SessionCacheStats, SessionUsage, session_summaries,
+    ActiveRequest, CacheMiss, CacheMissCause, CompletedRequest, ConversationKey, ConversationState,
+    EndpointKind, MonitorState, RequestCache, RequestStatus, SessionCacheStats, SessionUsage,
+    session_summaries,
 };
 
 const TICK_MILLIS: u64 = 250;
@@ -82,6 +83,7 @@ fn mock_state_for_tick(
         RequestStatus::Streaming,
     );
     streaming.project = Some("claude-code-mux".to_string());
+    streaming.conversation = Some("main".to_string());
     streaming.provider = Some("codex".to_string());
     streaming.model = Some("claude-sonnet-4-6 → gpt-5.6-sol".to_string());
     streaming.effort = Some("high".to_string());
@@ -192,6 +194,7 @@ fn mock_state_for_tick(
         Some(200),
     );
     success.project = Some("claude-code-mux".to_string());
+    success.conversation = Some("main".to_string());
     success.provider = Some("codex".to_string());
     success.model = Some("claude-sonnet-4-6 → gpt-5.6-terra".to_string());
     success.effort = Some("xhigh".to_string());
@@ -216,6 +219,81 @@ fn mock_state_for_tick(
         "/tmp/claude-code-mux-demo/traffic/req-complete-codex",
     ));
     recent.push_back(success);
+
+    // A subagent of the same session, running on another model and building a
+    // prompt cache of its own.
+    let mut subagent = completed_request(
+        now,
+        "req-complete-subagent",
+        Some("57c7c914-ada4-4f40-9672-985f950fbb66"),
+        Some(10),
+        EndpointKind::Messages,
+        Duration::from_secs(26),
+        Duration::from_millis(2_140),
+        RequestStatus::Completed,
+        Some(200),
+    );
+    subagent.project = Some("claude-code-mux".to_string());
+    subagent.conversation = Some("agent-3".to_string());
+    subagent.provider = Some("anthropic".to_string());
+    subagent.model = Some("claude-sonnet-5".to_string());
+    subagent.generation_duration = Some(Duration::from_secs(2));
+    subagent.stream_chunks = 61;
+    subagent.streamed_bytes = 7_424;
+    subagent.input_tokens = Some(4_100);
+    subagent.cache.read_tokens = Some(38_400);
+    subagent.cache.write_tokens = Some(1_200);
+    subagent.output_tokens = Some(310);
+    recent.push_back(subagent);
+
+    // A subagent that subagent spawned in turn, nested one level deeper.
+    let mut nested = completed_request(
+        now,
+        "req-complete-nested",
+        Some("57c7c914-ada4-4f40-9672-985f950fbb66"),
+        Some(8),
+        EndpointKind::Messages,
+        Duration::from_secs(29),
+        Duration::from_millis(1_180),
+        RequestStatus::Completed,
+        Some(200),
+    );
+    nested.project = Some("claude-code-mux".to_string());
+    nested.conversation = Some("agent-9".to_string());
+    nested.conversation_parent = Some("agent-3".to_string());
+    nested.provider = Some("codex".to_string());
+    nested.model = Some("gpt-5.6-sol".to_string());
+    nested.effort = Some("medium".to_string());
+    nested.generation_duration = Some(Duration::from_millis(900));
+    nested.stream_chunks = 27;
+    nested.streamed_bytes = 3_072;
+    nested.input_tokens = Some(6_800);
+    nested.cache.read_tokens = Some(12_100);
+    nested.cache.write_tokens = Some(0);
+    nested.output_tokens = Some(96);
+    recent.push_back(nested);
+
+    // The progress label Claude Code asks for that subagent: no client tools,
+    // so it lands in a side lane of its own.
+    let mut summary = completed_request(
+        now,
+        "req-complete-summary",
+        Some("57c7c914-ada4-4f40-9672-985f950fbb66"),
+        Some(9),
+        EndpointKind::Messages,
+        Duration::from_secs(31),
+        Duration::from_millis(640),
+        RequestStatus::Completed,
+        Some(200),
+    );
+    summary.project = Some("claude-code-mux".to_string());
+    summary.conversation = Some("agent-3/side".to_string());
+    summary.provider = Some("codex".to_string());
+    summary.model = Some("gpt-5.6-luna".to_string());
+    summary.effort = Some("low".to_string());
+    summary.input_tokens = Some(2_300);
+    summary.output_tokens = Some(12);
+    recent.push_back(summary);
 
     let mut unavailable = completed_request(
         now,
@@ -409,11 +487,77 @@ fn mock_state_for_tick(
             stats.last_miss = Some((request.started_at, miss));
         }
     }
+    let mut conversations = HashMap::<ConversationKey, ConversationState>::new();
+    let mut add_conversation = |session_id: &Option<String>,
+                                conversation: &Option<String>,
+                                input: Option<u64>,
+                                output: Option<u64>,
+                                cache: &RequestCache,
+                                prompt: u64,
+                                started_at: SystemTime| {
+        let Some(conversation) = conversation.clone() else {
+            return;
+        };
+        let state = conversations
+            .entry(ConversationKey {
+                session_id: session_id.clone(),
+                conversation,
+            })
+            .or_default();
+        state.usage.input_tokens = state.usage.input_tokens.saturating_add(input.unwrap_or(0));
+        state.usage.output_tokens = state
+            .usage
+            .output_tokens
+            .saturating_add(output.unwrap_or(0));
+        state.usage.cache_read_tokens = state
+            .usage
+            .cache_read_tokens
+            .saturating_add(cache.read_tokens.unwrap_or(0));
+        state.usage.cache_write_tokens = state
+            .usage
+            .cache_write_tokens
+            .saturating_add(cache.write_tokens.unwrap_or(0));
+        if prompt >= state.cache.context_tokens {
+            state.cache.context_tokens = prompt;
+            state.cache.context_started_at = Some(started_at);
+            state.cache.context_ttl = cache.ttl;
+        }
+        state.cache.peak_context_tokens = state.cache.peak_context_tokens.max(prompt);
+        if let Some(miss) = cache.miss {
+            state.cache.miss_count += 1;
+            state.cache.missed_tokens =
+                state.cache.missed_tokens.saturating_add(miss.missed_tokens);
+            state.cache.last_miss = Some((started_at, miss));
+        }
+    };
+    for request in &recent {
+        add_conversation(
+            &request.session_id,
+            &request.conversation,
+            request.input_tokens,
+            request.output_tokens,
+            &request.cache,
+            request.prompt_tokens().unwrap_or(0),
+            request.started_at,
+        );
+    }
+    for request in &active {
+        add_conversation(
+            &request.session_id,
+            &request.conversation,
+            request.input_tokens,
+            request.output_tokens,
+            &request.cache,
+            request.prompt_tokens().unwrap_or(0),
+            request.started_at,
+        );
+    }
     let sessions = session_summaries(
         &active,
         &recent,
         &session_usage,
         &session_cache,
+        &conversations,
         output_buckets,
     );
     MonitorState {
@@ -707,6 +851,7 @@ fn active_request(
         request_id: request_id.to_string(),
         session_id: session_id.map(str::to_string),
         conversation: None,
+        conversation_parent: None,
         session_seq,
         project: None,
         provider: None,
@@ -748,6 +893,7 @@ fn completed_request(
         request_id: request_id.to_string(),
         session_id: session_id.map(str::to_string),
         conversation: None,
+        conversation_parent: None,
         session_seq,
         project: None,
         provider: None,
@@ -827,6 +973,41 @@ mod tests {
                 .sessions
                 .iter()
                 .any(|session| session.session_id.is_none())
+        );
+    }
+
+    #[test]
+    fn mock_state_shows_a_session_with_a_nested_conversation_tree() {
+        let state = mock_state();
+        let session = state
+            .sessions
+            .iter()
+            .find(|session| {
+                session.session_id.as_deref() == Some("57c7c914-ada4-4f40-9672-985f950fbb66")
+            })
+            .unwrap();
+
+        assert_eq!(
+            session
+                .conversations
+                .iter()
+                .map(|conversation| (
+                    conversation.conversation.as_str(),
+                    conversation.parent.as_deref(),
+                    conversation.depth
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("main", None, 0),
+                ("agent-3", None, 0),
+                ("agent-9", Some("agent-3"), 1),
+                ("agent-3/side", Some("agent-3"), 1),
+            ]
+        );
+        // The subagent runs on another model than the thread that spawned it.
+        assert_eq!(
+            session.conversations[1].model.as_deref(),
+            Some("claude-sonnet-5")
         );
     }
 
