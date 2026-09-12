@@ -109,6 +109,16 @@ impl LiveStreamTranslator {
             return Ok(Vec::new());
         }
 
+        // A native `tool_search_call` reaches the client as Claude Code's
+        // `ToolSearch` function call.
+        if let Some(events) = super::tool_search::normalize_stream_event(payload) {
+            let mut out = Vec::new();
+            for event in &events {
+                out.extend(self.accept(event, traffic)?);
+            }
+            return Ok(out);
+        }
+
         let kind = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let mut out = Vec::new();
 
@@ -1207,6 +1217,65 @@ mod tests {
             out.extend(translator.accept(&event, None).unwrap());
         }
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn tool_search_call_is_streamed_as_tool_search_tool_use() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-sol");
+        let events = [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "tsc_1", "type": "tool_search_call", "status": "in_progress",
+                         "arguments": {}, "call_id": "call_s", "execution": "client"}
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"id": "tsc_1", "type": "tool_search_call", "status": "completed",
+                         "arguments": {"query": "select:CronList", "max_results": 1},
+                         "call_id": "call_s", "execution": "client"}
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"id": "resp_1", "status": "completed",
+                             "usage": {"input_tokens": 10, "output_tokens": 2}}
+            }),
+        ];
+        assert!(!translator.has_semantic_output());
+        let mut out = Vec::new();
+        for event in &events {
+            out.extend(translator.accept(event, None).unwrap());
+            if event["type"] == "response.output_item.added" {
+                assert!(translator.has_semantic_output());
+            }
+        }
+        let data: Vec<serde_json::Value> = parse_sse_events(&out)
+            .iter()
+            .filter_map(|event| serde_json::from_str(&event.data).ok())
+            .collect();
+
+        let start = data
+            .iter()
+            .find(|event| event["type"] == "content_block_start")
+            .expect("tool block start");
+        assert_eq!(start["content_block"]["type"], "tool_use");
+        assert_eq!(start["content_block"]["id"], "call_s");
+        assert_eq!(start["content_block"]["name"], "ToolSearch");
+
+        let partial: String = data
+            .iter()
+            .filter(|event| event["delta"]["type"] == "input_json_delta")
+            .filter_map(|event| event["delta"]["partial_json"].as_str())
+            .collect();
+        let input: serde_json::Value = serde_json::from_str(&partial).unwrap();
+        assert_eq!(input, json!({"query": "select:CronList", "max_results": 1}));
+
+        let stop = data
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .expect("message delta");
+        assert_eq!(stop["delta"]["stop_reason"], "tool_use");
     }
 
     #[test]

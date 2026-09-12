@@ -24,6 +24,13 @@
   own: `claude-sonnet-5` on Anthropic, because Haiku's 200k window would leave a
   long-running subagent without a label, and `gpt-5.6-luna` on Codex.
   `CCP_AGENT_SUMMARY_MODEL` overrides both.
+- Loading a deferred tool on a Codex model no longer throws away the prompt
+  cache. Claude Code's `ToolSearch` is sent to Codex as the backend's own
+  client-executed tool search: the loaded tool's schema travels in a
+  `tool_search_output` item at the point of the search, and the tools list at
+  the start of the prompt stays unchanged. Before, the loaded tool was added
+  to that list, so the request right after every load was served with no
+  cached tokens. The `tool_reference` placeholder text is gone as well.
 
 ## v0.6.0 (2026-09-11)
 

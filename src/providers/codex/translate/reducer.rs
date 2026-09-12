@@ -297,6 +297,24 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 name,
                 call_id,
                 ..
+            } if name == super::tool_search::CLAUDE_CODE_TOOL_SEARCH_NAME => {
+                // Record the search the way the next request replays it.
+                items.insert(
+                    output_index,
+                    ResponsesInputItem::ToolSearchCall {
+                        call_id: call_id.clone(),
+                        execution: super::tool_search::TOOL_SEARCH_EXECUTION.to_string(),
+                        status: super::tool_search::TOOL_SEARCH_STATUS.to_string(),
+                        arguments: serde_json::from_str(args_accum)
+                            .unwrap_or_else(|_| serde_json::json!({})),
+                    },
+                );
+            }
+            BlockState::Tool {
+                args_accum,
+                name,
+                call_id,
+                ..
             } => {
                 items.insert(
                     output_index,
@@ -310,17 +328,21 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         }
     }
 
-    for evt in &sse_events {
-        let data = evt.data.trim();
-        if data.is_empty() {
-            continue;
-        }
+    // A native `tool_search_call` is replayed to the client as Claude Code's
+    // `ToolSearch` function call, so it goes through the tool handling below.
+    let payloads: Vec<serde_json::Value> = sse_events
+        .iter()
+        .filter_map(|evt| {
+            let data = evt.data.trim();
+            if data.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<serde_json::Value>(data).ok()
+        })
+        .flat_map(|p| super::tool_search::normalize_stream_event(&p).unwrap_or_else(|| vec![p]))
+        .collect();
 
-        let p: serde_json::Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
+    for p in payloads {
         let t = p
             .get("type")
             .and_then(|v| v.as_str())
@@ -1488,6 +1510,48 @@ mod tests {
         assert!(metadata.continuation_eligible);
         assert_eq!(metadata.response_id.as_deref(), Some("resp_1"));
         assert_eq!(metadata.output_items.len(), 1);
+    }
+
+    #[test]
+    fn finish_metadata_records_tool_search_call_as_replayed() {
+        let upstream = format!(
+            "{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index": 0,
+                    "item": {"type":"tool_search_call","call_id":"call_s","execution":"client","status":"in_progress","arguments":{}}
+                })
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index": 0,
+                    "item": {"type":"tool_search_call","call_id":"call_s","execution":"client","status":"completed",
+                             "arguments":{"query":"select:CronList","max_results":1}}
+                })
+            ),
+            sse(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_1","usage":{}}
+                })
+            ),
+        );
+        let metadata = finish_metadata_from_upstream(upstream.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.output_items.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&metadata.output_items[0]).unwrap(),
+            json!({
+                "type": "tool_search_call",
+                "call_id": "call_s",
+                "execution": "client",
+                "status": "completed",
+                "arguments": {"max_results": 1, "query": "select:CronList"}
+            })
+        );
     }
 
     #[test]

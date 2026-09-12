@@ -352,6 +352,43 @@ mod tests {
     }
 
     #[test]
+    fn accumulate_tool_search_call_as_tool_search_tool_use() {
+        let upstream = format!(
+            "{}{}{}",
+            sse_event(
+                "response.output_item.added",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"tool_search_call","call_id":"call_s","execution":"client","status":"in_progress","arguments":{}}
+                })
+            ),
+            sse_event(
+                "response.output_item.done",
+                json!({
+                    "output_index":0,
+                    "item":{"type":"tool_search_call","call_id":"call_s","execution":"client","status":"completed",
+                            "arguments":{"query":"select:CronList","max_results":1}}
+                })
+            ),
+            sse_event(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_1","usage":{"input_tokens":3}}
+                })
+            ),
+        );
+        let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.6-sol").unwrap();
+        assert_eq!(response["content"][0]["type"], "tool_use");
+        assert_eq!(response["content"][0]["id"], "call_s");
+        assert_eq!(response["content"][0]["name"], "ToolSearch");
+        assert_eq!(
+            response["content"][0]["input"],
+            json!({"query": "select:CronList", "max_results": 1})
+        );
+        assert_eq!(response["stop_reason"], "tool_use");
+    }
+
+    #[test]
     fn accumulate_web_search_response() {
         let upstream = format!(
             "{}{}{}{}{}{}{}{}",

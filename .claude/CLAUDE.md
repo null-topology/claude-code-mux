@@ -430,8 +430,19 @@ currently serves, including `visibility` and `use_responses_lite` per model.
   Code on the API-billing path, where it ignores the structured rate-limit
   headers entirely.
 - Claude Code disables lazy tool loading when `ANTHROPIC_BASE_URL` is not a
-  first-party host. `ENABLE_TOOL_SEARCH=true` restores it; this proxy forwards
-  the `tool_reference` blocks, so the flag is safe to set.
+  first-party host. `ENABLE_TOOL_SEARCH=true` restores it, and the flag is safe
+  to set on both routes. The Anthropic passthrough forwards the `tool_reference`
+  blocks untouched. The Codex route maps deferred loading onto the backend's
+  native tool search (`providers/codex/translate/tool_search.rs`): Claude Code's
+  `ToolSearch` becomes a client-executed `tool_search` tool, its call a
+  `tool_search_call`, its result a `tool_search_output` carrying the loaded
+  tools' specs, and deferred tools a search loaded stay out of the tools head.
+  Putting a loaded tool into the head instead changes the first bytes of the
+  prompt and costs a full prompt-cache miss on every load (measured: 0 cached
+  tokens on the request after a load, versus the whole prefix with the native
+  mapping). The mapping is derived from the request alone, so it is
+  byte-stable turn to turn; a deferred tool no search in the history names
+  (the placeholder, or a tool whose search was compacted away) stays in the head.
 - Claude Code's web search is a client-side `WebSearch` function tool. The
   hosted `web_search_20250305` tool only appears inside an isolated, history-free
   inner call, so its `server_tool_use` and `web_search_tool_result` blocks never

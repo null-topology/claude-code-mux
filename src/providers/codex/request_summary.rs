@@ -100,6 +100,8 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
         ResponsesInputItem::Message { .. } => Some("message".to_string()),
         ResponsesInputItem::FunctionCall { .. } => Some("function_call".to_string()),
         ResponsesInputItem::FunctionCallOutput { .. } => Some("function_call_output".to_string()),
+        ResponsesInputItem::ToolSearchCall { .. } => Some("tool_search_call".to_string()),
+        ResponsesInputItem::ToolSearchOutput { .. } => Some("tool_search_output".to_string()),
         ResponsesInputItem::Reasoning { .. } => Some("reasoning".to_string()),
         ResponsesInputItem::Compaction { .. } => Some("compaction".to_string()),
         ResponsesInputItem::CompactionTrigger => Some("compaction_trigger".to_string()),
@@ -127,6 +129,12 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
                     ResponsesInputItem::FunctionCall { .. } => ("function_call".to_string(), None),
                     ResponsesInputItem::FunctionCallOutput { .. } => {
                         ("function_call_output".to_string(), None)
+                    }
+                    ResponsesInputItem::ToolSearchCall { .. } => {
+                        ("tool_search_call".to_string(), None)
+                    }
+                    ResponsesInputItem::ToolSearchOutput { .. } => {
+                        ("tool_search_output".to_string(), None)
                     }
                     ResponsesInputItem::Reasoning { .. } => ("reasoning".to_string(), None),
                     ResponsesInputItem::Compaction { .. } => ("compaction".to_string(), None),
@@ -178,6 +186,7 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
                 let name = match tool {
                     ResponsesTool::Function(f) => f.name.clone(),
                     ResponsesTool::WebSearch(_) => "web_search".to_string(),
+                    ResponsesTool::ToolSearch(_) => "tool_search".to_string(),
                 };
                 let json_bytes_val =
                     json_bytes(Some(&serde_json::to_value(tool).unwrap_or_default()));

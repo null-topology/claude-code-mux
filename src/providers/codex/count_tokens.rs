@@ -55,6 +55,13 @@ fn count_input_item_tokens(item: &ResponsesInputItem) -> u64 {
         ResponsesInputItem::FunctionCallOutput { output, .. } => {
             count_function_call_output_tokens(output)
         }
+        ResponsesInputItem::ToolSearchCall { arguments, .. } => {
+            approx_token_count(&serde_json::to_string(arguments).unwrap_or_default())
+        }
+        ResponsesInputItem::ToolSearchOutput { tools, .. } => tools
+            .iter()
+            .map(|tool| approx_token_count(&serde_json::to_string(tool).unwrap_or_default()))
+            .sum(),
         ResponsesInputItem::Reasoning {
             encrypted_content, ..
         }
@@ -112,6 +119,13 @@ fn count_tool_tokens(tools: &[ResponsesTool]) -> u64 {
             }
             ResponsesTool::WebSearch(_) => {
                 total += 10; // fixed overhead for web search tool
+            }
+            ResponsesTool::ToolSearch(t) => {
+                if let Some(ref desc) = t.description {
+                    total += approx_token_count(desc);
+                }
+                total +=
+                    approx_token_count(&serde_json::to_string(&t.parameters).unwrap_or_default());
             }
         }
     }
