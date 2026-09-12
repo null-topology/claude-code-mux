@@ -7,6 +7,9 @@
   per call, each carrying the whole conversation. The proxy now uses the full
   Responses lane for them. `CCP_CODEX_FULL_LANE=0` (or `codex.fullLane: false`)
   restores the previous behaviour.
+- The Sessions view groups requests into conversations, with the main thread,
+  nested subagents and side calls shown as a tree. Each conversation has its
+  own model, context and cache figures.
 - Each conversation gets its own prompt cache scope on the Codex backend.
   Claude Code gives a subagent its parent's session id, so a session and all of
   its subagents sent one `prompt_cache_key` and one set of routing headers,
