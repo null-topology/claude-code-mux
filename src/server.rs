@@ -25,7 +25,10 @@ use crate::{
         },
     },
     registry::{Registry, normalize_incoming_model},
-    request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, ConversationIdentity},
+    request_identity::{
+        CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, ConversationIdentity,
+        parent_agent_id_from_headers,
+    },
     session::{self, SessionState},
     traffic::{TrafficCaptureOptions, create_traffic_capture},
 };
@@ -1588,7 +1591,11 @@ async fn dispatch_request(
     if let Some(identity) = conversation_identity.as_ref()
         && let Some(monitor) = state.monitor.as_ref()
     {
-        monitor.conversation_resolved(&req_id, monitor_conversation_label(identity, &body));
+        monitor.conversation_resolved(
+            &req_id,
+            monitor_conversation_label(identity, &body),
+            parent_agent_id_from_headers(&headers),
+        );
     }
 
     let model = match body.model.as_deref() {
