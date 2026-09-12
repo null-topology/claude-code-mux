@@ -1,4 +1,4 @@
-## Unreleased
+## v0.7.0 (2026-09-12)
 
 - Codex models answer with several tool calls at once again. Codex marks the
   gpt-5.6 family and `gpt-6-astra` for the Responses Lite lane, which rejects
@@ -23,7 +23,12 @@
   provider's junior model at the lowest effort rather than to the subagent's
   own: `claude-sonnet-5` on Anthropic, because Haiku's 200k window would leave a
   long-running subagent without a label, and `gpt-5.6-luna` on Codex.
-  `CCP_AGENT_SUMMARY_MODEL` overrides both.
+  `CCP_AGENT_SUMMARY_MODEL` overrides both. Known limitation of this release:
+  that request is recognised by its instruction text, so a request that merely
+  quotes those instructions can be answered with a progress label instead of
+  being routed. Auto mode's security classifier sends the action it reviews as
+  text and can be taken for one, leaving that action unevaluated. A narrower
+  detector is a separate change.
 - Loading a deferred tool on a Codex model no longer throws away the prompt
   cache. Claude Code's `ToolSearch` is sent to Codex as the backend's own
   client-executed tool search: the loaded tool's schema travels in a
