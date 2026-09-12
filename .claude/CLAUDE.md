@@ -253,19 +253,38 @@ are rejected by the subscription backend for GPT-5.6 models (openai/codex
 
 ## What the Codex subscription actually meters
 
-Measured 2026-09-12 on a `prolite` plan: `GET /backend-api/wham/usage` reports
-one window, `rate_limit.primary_window` with `limit_window_seconds: 604800`, so
-the allowance is weekly (the `codex.rate_limits` stream event had shown a
-5h/weekly pair earlier; do not assume the shape, read it). Over one evening
-58M input tokens, of which only 2M uncached, and 181k output tokens moved that
-window from 16% to 69%: roughly 1M input tokens per percent. A probe of 156k
-cached plus 78k uncached tokens moved it by less than the 1% resolution, which
-rules out metering by uncached tokens alone.
+Read the allowance window, never assume it. A `codex.rate_limits` event opens
+every healthy Codex stream and names its own windows, and
+`GET /backend-api/wham/usage` reports the same thing. Which slot holds which
+window varies by plan: a weekly window (`window_minutes: 10080`,
+`limit_window_seconds: 604800`) has been seen as `primary` with `secondary:
+null`, and a 5h/weekly pair has been seen too. Match on the window length, not
+on the slot. On the stream only the wire spelling `reset_at` /
+`reset_after_seconds` occurs; `resets_at` / `resets_in_seconds` is a Codex CLI
+log reserialization of the same data.
 
-Consequences for this proxy: prompt-cache hits save latency, not allowance;
-output and reasoning are negligible next to input; what costs is context size
-times request count. So the levers are fewer requests and smaller contexts,
-not cache tuning. `src/agent_summary.rs` is the first of those: Claude Code
+What the meter counts, fitted over a capture corpus of roughly 680 requests
+against the integer `used_percent` readings that open each stream:
+
+- **Total input, with cached tokens billed substantially.** "Cached input is
+  free" is excluded by a wide margin. The weight of a cached token relative to
+  an uncached one lands between about 0.3 and 1.6, so a cache hit saves at most
+  a third of the cost and may save nothing at all. A corpus that is uniformly
+  cached cannot pin this down further; separating the two terms needs traffic
+  with a deliberately low hit rate.
+- **A per-model weight, which is the largest single factor.** Normalised on
+  `gpt-5.6-sol` = 1.00, `gpt-5.6-terra` fits near 0.7 and `gpt-6-astra` near
+  3.5-3.9. A fit that ignores this returns nonsense, so any further measurement
+  has to model it first.
+- **Output and reasoning are negligible** beside input, a fraction of a percent
+  of the billed total, and not separately resolvable.
+
+For example, at one observed model mix a single percentage point of the weekly
+window cost on the order of 5-6M input tokens counted this way.
+
+So the cost is context size times request count times the model's weight, and
+the levers are fewer requests and cheaper models rather than cache tuning.
+`src/agent_summary.rs` is the first of those: Claude Code
 asks a running subagent's own model for a three-word progress label every half
 minute, resending the subagent's whole context, which was a quarter of all
 captured Codex requests. The proxy answers it from the transcript on any route;
