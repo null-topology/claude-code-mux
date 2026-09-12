@@ -367,11 +367,12 @@ with `claude -p --model <id> "/context"` through the proxy on Claude Code
 | Codex row with `behavesAs` `claude-opus-5` or `claude-sonnet-5` | 200k | 1M |
 | Codex row with `behavesAs` `claude-haiku-4-5` | 200k | 200k |
 
-This is the budget Claude Code keeps before auto-compacting, not what the
-backend accepts. For Codex, the backend's own limits are in `/v1/models`
-(`context_window`, `max_context_window` per model); a request past them comes
-back as a context-overflow error that the proxy turns into a compaction
-request.
+This is the budget Claude Code uses before auto-compacting, not proof of what
+a backend endpoint accepts. The Codex inventory in `/v1/models` exposes
+`context_window` and `max_context_window` metadata per model, but whether a
+particular request is accepted has to be verified for its model and route. An
+upstream context-overflow error is surfaced to the client; any recovery
+depends on the configured client and proxy compaction behavior.
 
 ### Claude authentication
 
