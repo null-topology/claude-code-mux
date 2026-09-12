@@ -1,5 +1,12 @@
 ## Unreleased
 
+- Codex models answer with several tool calls at once again. Codex marks the
+  gpt-5.6 family and `gpt-6-astra` for the Responses Lite lane, which rejects
+  `parallel_tool_calls: true`, so a model served through it answered at most one
+  tool call per turn and Claude Code's batched tool use turned into one request
+  per call, each carrying the whole conversation. The proxy now uses the full
+  Responses lane for them. `CCP_CODEX_FULL_LANE=0` (or `codex.fullLane: false`)
+  restores the previous behaviour.
 - Each conversation gets its own prompt cache scope on the Codex backend.
   Claude Code gives a subagent its parent's session id, so a session and all of
   its subagents sent one `prompt_cache_key` and one set of routing headers,

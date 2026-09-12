@@ -436,11 +436,27 @@ captures, and error dumps go to `~/.local/state/claude-code-proxy`.
 | `CCP_CODEX_MODEL` | unset | Send this Codex model regardless of what the client asked for. |
 | `CCP_CODEX_QUOTA_WARN_AT` | `0.9` session, `0.75` weekly | Utilization above which a window is reported as past its warning threshold. One value lowers both. |
 | `CCP_CODEX_SERVER_COMPACTION` | off | Let Codex compact long histories server-side. |
+| `CCP_CODEX_FULL_LANE` | on | Keep Codex models off the Responses Lite lane so they can answer with several tool calls at once. Set to `0` for Lite. |
 | `CCP_CODEX_RESPONSES_API` | off | Also expose `/v1/responses` and `/v1/chat/completions` for OpenAI-style clients. |
 | `CCP_AUTO_REVIEW_MODEL` | `gpt-5.6-luna` | Model for Claude Code's background security classifier when the session runs on Codex. |
 | `CCP_ALIAS_PROVIDER` | `anthropic` | Backend for the Claude aliases. Leave it alone unless you want `opus` to stop meaning Claude. |
 | `CCP_LOG_VERBOSE` | off | Keep full string fields in `proxy.log`. |
 | `CCP_TRAFFIC_LOG` | off | Capture every request and event under the state directory. Contains prompts and file contents; delete after use. |
+
+### Responses lanes and parallel tool calls
+
+Codex marks the gpt-5.6 family and `gpt-6-astra` for the Responses **Lite**
+lane in its model listing. That lane requires `parallel_tool_calls: false` — a
+Lite request that sets it to `true` is rejected with 400 `unsupported_value` —
+so a model on it answers with at most one tool call per turn. Claude Code
+normally batches several, three files read at once for instance, and behind Lite
+each of those becomes its own request carrying the whole conversation again.
+
+The proxy therefore uses the full Responses lane by default, where parallel tool
+calls work. `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra` and `gpt-6-astra`
+were each verified to answer there. This is the one place the proxy overrides
+what the backend's inventory says; `CCP_CODEX_FULL_LANE=0` (or
+`codex.fullLane: false`) puts the marked models back on Lite.
 
 ### Commands
 
