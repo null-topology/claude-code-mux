@@ -40,8 +40,8 @@ use crate::retry::{compute_backoff_delay, sleep};
 use self::auth::token_store::file_store;
 use self::client::CodexHttpClient;
 use self::compaction::{
-    CompactionAttempt, abort_compaction_attempt, activate_compaction, apply_compaction_replay,
-    begin_compaction, request_compaction, store_compaction,
+    CompactionAttempt, CompactionError, abort_compaction_attempt, activate_compaction,
+    apply_compaction_replay, begin_compaction, request_compaction, store_compaction,
 };
 use self::continuation::{
     ContinuationReservation, abort_continuation_for_owner, continuation_candidate_for_owner,
@@ -277,6 +277,16 @@ impl CodexProvider {
                             Some("compaction state was superseded or exceeded the in-memory limit"),
                         );
                     }
+                }
+                Err(CompactionError::Upstream(error)) if error.usage_limit.is_some() => {
+                    abort_compaction_attempt(Some(session_id), Some(attempt));
+                    log_compaction_event(
+                        "server_compaction_failed",
+                        &ctx,
+                        translated.input.len(),
+                        Some(&error.to_string()),
+                    );
+                    return map_codex_error_to_response(&error);
                 }
                 Err(error) => {
                     abort_compaction_attempt(Some(session_id), Some(attempt));

@@ -1625,6 +1625,54 @@ fn assert_responses_lite_lane(request: &Value, label: &str) {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_codex_http_server_compaction_fast_fails_usage_limit() {
+    let _guard = env_lock();
+    clear_all_compactions_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |body: Value| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                body["input"].as_array().unwrap().last().unwrap()["type"],
+                "compaction_trigger"
+            );
+            codex_usage_limit_sse("usage_limit_reached")
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "system": "You are Claude Code.",
+        "messages": [
+            {"role":"user","content":"old conversation"},
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"tool-1","name":"Read","input":{}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"tool-1","content":"result"},
+                {"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests."}
+            ]}
+        ]
+    }))
+    .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_usage_limit_response(response).await;
+    clear_all_compactions_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_server_compaction_replays_native_history() {
     let _guard = env_lock();
     clear_all_compactions_for_tests();

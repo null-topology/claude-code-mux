@@ -199,7 +199,7 @@ fn usage_limit_from_payload(payload: &Value) -> Option<CodexUsageLimit> {
 
     let resets_at = numeric_value(error.get("resets_at"));
     let resets_in_seconds = numeric_value(error.get("resets_in_seconds"));
-    let limiting_prefix = limiting_window_prefix(payload, resets_in_seconds);
+    let limiting_prefix = limiting_window_prefix(payload, resets_in_seconds, resets_at);
     let resets_at = resets_at.or_else(|| {
         let prefix = limiting_prefix?;
         header_number(payload, &format!("X-Codex-{prefix}-Reset-At"))
@@ -221,22 +221,66 @@ fn usage_limit_from_payload(payload: &Value) -> Option<CodexUsageLimit> {
 }
 
 /// Codex sends the clock for both windows on every limit error, so the one that
-/// actually ran out is the one whose countdown matches the error's own.
-fn limiting_window_prefix(payload: &Value, resets_in_seconds: Option<u64>) -> Option<&'static str> {
-    let primary = header_number(payload, "X-Codex-Primary-Reset-After-Seconds");
-    let secondary = header_number(payload, "X-Codex-Secondary-Reset-After-Seconds");
-    match (resets_in_seconds, primary, secondary) {
-        (Some(actual), Some(primary), Some(secondary)) => {
-            Some(if actual.abs_diff(secondary) < actual.abs_diff(primary) {
-                "Secondary"
-            } else {
-                "Primary"
-            })
+/// actually ran out is the one whose countdown or reset epoch matches the
+/// error's own clock.
+fn limiting_window_prefix(
+    payload: &Value,
+    resets_in_seconds: Option<u64>,
+    resets_at: Option<u64>,
+) -> Option<&'static str> {
+    let by_countdown = resets_in_seconds.and_then(|actual| {
+        closest_window(
+            actual,
+            header_number(payload, "X-Codex-Primary-Reset-After-Seconds"),
+            header_number(payload, "X-Codex-Secondary-Reset-After-Seconds"),
+        )
+    });
+    let by_epoch = resets_at.and_then(|actual| {
+        closest_window(
+            actual,
+            header_number(payload, "X-Codex-Primary-Reset-At"),
+            header_number(payload, "X-Codex-Secondary-Reset-At"),
+        )
+    });
+    by_countdown.or(by_epoch).or_else(|| {
+        match (
+            window_headers_present(payload, "Primary"),
+            window_headers_present(payload, "Secondary"),
+        ) {
+            (true, false) => Some("Primary"),
+            (false, true) => Some("Secondary"),
+            _ => None,
         }
-        (_, Some(_), _) => Some("Primary"),
-        (_, None, Some(_)) => Some("Secondary"),
-        _ => None,
+    })
+}
+
+fn closest_window(
+    actual: u64,
+    primary: Option<u64>,
+    secondary: Option<u64>,
+) -> Option<&'static str> {
+    match (primary, secondary) {
+        (Some(primary), Some(secondary)) => {
+            match (actual.abs_diff(primary), actual.abs_diff(secondary)) {
+                (primary_distance, secondary_distance) if primary_distance < secondary_distance => {
+                    Some("Primary")
+                }
+                (primary_distance, secondary_distance) if secondary_distance < primary_distance => {
+                    Some("Secondary")
+                }
+                _ => None,
+            }
+        }
+        (Some(_), None) => Some("Primary"),
+        (None, Some(_)) => Some("Secondary"),
+        (None, None) => None,
     }
+}
+
+fn window_headers_present(payload: &Value, prefix: &str) -> bool {
+    ["Reset-After-Seconds", "Reset-At", "Window-Minutes"]
+        .into_iter()
+        .any(|suffix| header_number(payload, &format!("X-Codex-{prefix}-{suffix}")).is_some())
 }
 
 fn attach_response_headers(payload: &mut Value, headers: &[(String, String)]) {
@@ -397,6 +441,50 @@ mod tests {
             .remove("resets_at");
         let limit = usage_limit_from_event(&payload).expect("usage limit");
         assert_eq!(limit.resets_at, Some(1788879438));
+    }
+
+    #[test]
+    fn attributes_window_by_body_epoch_when_countdown_is_missing() {
+        let mut payload = spent_five_hour_window();
+        payload["error"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resets_in_seconds");
+        payload["error"]["resets_at"] = serde_json::json!(1789466238u64);
+        let limit = usage_limit_from_event(&payload).expect("usage limit");
+        assert_eq!(limit.resets_at, Some(1789466238));
+        assert_eq!(limit.window, Some(CodexLimitWindow::SevenDay));
+    }
+
+    #[test]
+    fn preserves_ambiguous_body_epoch_without_claim() {
+        let mut payload = spent_five_hour_window();
+        payload["error"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resets_in_seconds");
+        payload["error"]["resets_at"] = serde_json::json!(150u64);
+        payload["headers"]["X-Codex-Primary-Reset-At"] = serde_json::json!(100u64);
+        payload["headers"]["X-Codex-Secondary-Reset-At"] = serde_json::json!(200u64);
+        let limit = usage_limit_from_event(&payload).expect("usage limit");
+        assert_eq!(limit.resets_at, Some(150));
+        assert_eq!(limit.window, None);
+    }
+
+    #[test]
+    fn omits_header_reset_and_claim_without_identifying_body_clock() {
+        let mut payload = spent_five_hour_window();
+        payload["error"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resets_at");
+        payload["error"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resets_in_seconds");
+        let limit = usage_limit_from_event(&payload).expect("usage limit");
+        assert_eq!(limit.resets_at, None);
+        assert_eq!(limit.window, None);
     }
 
     #[test]
