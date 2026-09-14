@@ -487,7 +487,7 @@ Only `ANTHROPIC_BASE_URL` is required. Restart Claude Code after changing it.
 | --- | --- |
 | `ANTHROPIC_BASE_URL` | Point Claude Code at the proxy, e.g. `http://127.0.0.1:18765`. |
 | `ANTHROPIC_MODEL` | Force one model for the whole session. |
-| `ANTHROPIC_DEFAULT_OPUS_MODEL`, `..._SONNET_MODEL`, `..._HAIKU_MODEL` | Remap a built-in picker row, e.g. `ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra` sends the Sonnet slot to Codex. |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL`, `..._SONNET_MODEL`, `..._HAIKU_MODEL`, `..._FABLE_MODEL` | Remap a built-in picker row, e.g. `ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra` sends the Sonnet slot to Codex. The remap replaces the id for the whole slot, not for one call. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Claude login for environments without an interactive `claude login`. Passed through to Anthropic unchanged. |
 | `ENABLE_TOOL_SEARCH` | Claude Code disables lazy tool loading behind a non-Anthropic base URL. Set to `true`: requests shrink considerably. Claude models get the tool references untouched; on Codex models loading a tool uses the backend's own tool search, so the cached prompt prefix survives the load. |
 | `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` | Behind a non-Anthropic base URL Claude Code budgets every model at 200k tokens, even the ones its catalog marks as native 1M, and auto-compacts against that. Set to `1`: the passthrough is byte-exact, so the built-in rows keep their 1M window through the proxy, and `modelPicker` rows get the window of their `behavesAs` model. |
@@ -510,6 +510,54 @@ a backend endpoint accepts. The Codex inventory in `/v1/models` exposes
 particular request is accepted has to be verified for its model and route. An
 upstream context-overflow error is surfaced to the client; any recovery
 depends on the configured client and proxy compaction behavior.
+
+### Which backend runs which slot
+
+The proxy routes on the model id in the request and on nothing else. It does
+not detect which subscriptions you hold, does not inspect the credentials the
+client sends, runs no probe to decide a route, and does not fall back to
+another backend after an authentication failure. There is no provider
+selector, no launcher and no profile generator: what each slot sends is
+configured on the client side, and three setups cover the usual cases.
+
+**Claude only.** Nothing beyond `ANTHROPIC_BASE_URL`. The Claude route is a
+passive relay: the proxy stores no Anthropic credential and forwards the login
+Claude Code attaches (see [Claude authentication](#claude-authentication)).
+
+**Codex only, with no Claude login, API key or OAuth token.** Claude Code still
+shows its built-in rows, so point those rows at Codex ids with the client's own
+variables:
+
+| built-in slot | variable | example id |
+| --- | --- | --- |
+| Haiku | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | `gpt-5.6-luna` |
+| Sonnet | `ANTHROPIC_DEFAULT_SONNET_MODEL` | `gpt-5.6-terra` |
+| Opus | `ANTHROPIC_DEFAULT_OPUS_MODEL` | `gpt-5.6-sol` |
+| Fable | `ANTHROPIC_DEFAULT_FABLE_MODEL` | `gpt-6-astra` |
+
+The ids are an example of an assignment by role, not a recommendation: check
+what your login actually lists (`claude-code-mux models`) before copying them,
+and check the variable names against the Claude Code you run. `..._FABLE_MODEL`
+was read out of the CLI binary (2.1.269, still present in 2.1.270). This setup
+has not been exercised live against a client without Claude credentials. A
+request that still names a `claude-*` id keeps going to Anthropic: the proxy
+relays whatever Anthropic answers an unauthenticated call, unchanged, rather
+than quietly substituting another model.
+
+**Claude plus other backends.** Add [`modelPicker`
+rows](#rows-in-the-model-picker), or type the real ids, and remap only the
+slots you want moved — a partial remap is fine, and the two mechanisms mix.
+`CCP_ALIAS_PROVIDER=codex` also exists and sends the `opus`, `sonnet`, `haiku`
+and `fable` aliases plus every `claude-*` id to Codex; it is kept for
+compatibility and is not the recipe to reach for, because it changes what the
+Claude names mean for the whole proxy.
+
+A slot remap moves everything that uses that slot. The proxy's own narrow
+override is `CCP_AUTO_REVIEW_MODEL`, which reroutes Claude Code's background
+security classifier — a non-streaming, tool-free request — and nothing else.
+Left unset, that reroute happens only when the classifier would have gone to
+Codex anyway; set explicitly, it applies on any route, the Anthropic one
+included.
 
 ### Claude authentication
 
@@ -548,6 +596,8 @@ captures, and error dumps go to `~/.local/state/claude-code-proxy`.
 | `CCP_CODEX_LANE_POLICY` | `full` | `full` keeps Codex models off the Responses Lite lane so they can answer with several tool calls at once; `inventory` follows the lane flag from the backend's own model listing. The legacy `CCP_CODEX_FULL_LANE` boolean still works. |
 | `CCP_CODEX_RESPONSES_API` | off | Also expose `/v1/responses` and `/v1/chat/completions` for OpenAI-style clients. |
 | `CCP_AUTO_REVIEW_MODEL` | `gpt-5.6-luna` | Model for Claude Code's background security classifier when the session runs on Codex. |
+| `CCP_AGENT_SUMMARY` | local | While a subagent runs, Claude Code asks for a three-to-five-word progress label every half minute and resends that subagent's whole context with it. The proxy recognizes the prompt and answers it from the transcript. Set to `upstream` (`model` and `remote` do the same) to send those requests to a model again; `agentSummary` in `config.json` is the file form. |
+| `CCP_AGENT_SUMMARY_MODEL` | the provider's junior model | Which model answers a label that is sent upstream. Without it: `claude-sonnet-5` on Anthropic, `gpt-5.6-luna` on Codex, and the request's own model on a backend with no entry. Whenever one of these applies, the label request is pinned to that model at `effort: low`. Ignored while labels are answered locally. |
 | `CCP_ALIAS_PROVIDER` | `anthropic` | Backend for the Claude aliases. Leave it alone unless you want `opus` to stop meaning Claude. |
 | `CCP_LOG_VERBOSE` | off | Keep full string fields in `proxy.log`. |
 | `CCP_TRAFFIC_LOG` | off | Capture every request and event under the state directory. Contains prompts and file contents; delete after use. |
