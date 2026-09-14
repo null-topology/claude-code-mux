@@ -509,7 +509,8 @@ ids as picker rows.
 
 ## How Codex models get into Claude Code's picker
 
-Verified against Claude Code 2.1.266 by reading the binary and by live runs:
+Verified against Claude Code 2.1.266 by reading the binary and by live runs;
+the FABLE variable below on 2.1.269:
 
 - `modelPicker` in user settings (`options[]` of `model`, `label`,
   `description`, `behavesAs`) is the supported way. Rows use bare ids, need no
@@ -524,6 +525,17 @@ Verified against Claude Code 2.1.266 by reading the binary and by live runs:
 - Env-only alternatives exist but are narrower: `ANTHROPIC_DEFAULT_*_MODEL`
   remaps a built-in row (with `..._MODEL_DESCRIPTION` for its subtitle), and
   `ANTHROPIC_CUSTOM_MODEL_OPTION` (+ `_NAME`, `_DESCRIPTION`) adds one row.
+  The slot variables are `ANTHROPIC_DEFAULT_OPUS_MODEL`, `..._SONNET_MODEL`,
+  `..._HAIKU_MODEL` and `..._FABLE_MODEL`; the fable one was read from a
+  2.1.269 binary and the CLI ships new builds quickly, so check the version in
+  use before relying on it.
+
+Those four variables give a whole-picker recipe — haiku to `gpt-5.6-luna`,
+sonnet to `gpt-5.6-terra`, opus to `gpt-5.6-sol`, fable to `gpt-6-astra`. It is
+client configuration, not a proxy feature: the proxy has no subscription
+detection, no provider selector, no launcher and no failover when a backend's
+auth fails. Starting Codex-only, with no Claude credentials present, is not
+covered by a live client test.
 
 `~/.codex/models_cache.json` is the authoritative inventory of what Codex
 currently serves, including `visibility` and `use_responses_lite` per model.
