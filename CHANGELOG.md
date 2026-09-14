@@ -1,3 +1,63 @@
+## v0.8.0 (2026-09-14)
+
+- Auto mode's security classifier is never answered as a progress label any
+  more. The classifier carries the subagent label prompt inside the transcript
+  it evaluates, and the local label detector matched that text anywhere in the
+  last message, so the classifier received a four-token label, Claude Code
+  retried ten times and reported that it could not evaluate the action. The
+  classifier is now recognised first, and the detector requires the label
+  instruction to open the last text block of the last user message. This
+  closes the known limitation of v0.7.0.
+- The Codex lane is an explicit policy. `CCP_CODEX_LANE_POLICY=full|inventory`
+  (or `codex.lanePolicy`) replaces the boolean full-lane switch, which stays
+  accepted as a legacy source. `full`, the default, sends every model through
+  the full Responses lane; `inventory` follows the `use_responses_lite` flag
+  from the backend's listing, else the compiled-in table. The first source
+  that parses wins, an unparsable value is reported without being echoed, and
+  a bad `codex.lanePolicy` no longer fails the whole config file.
+- Every token count in the monitor carries its quality: missing, an opening
+  estimate, or an exact closing report, with a reported zero distinct from no
+  report. The TUI marks an estimate with `~`, a count nobody reported with
+  `n/a`, and shows an exact one plain. The Anthropic 5m and 1h cache-write
+  buckets keep a quality of their own and are never inferred from the
+  aggregate write; a prompt total a backend measured itself is kept apart from
+  the four categories.
+- A response that fails mid-stream is recorded as failed. An SSE `error` event
+  or a body that stops before its terminal event marks the request Failed even
+  though the client already received HTTP 200, and the first cause wins.
+  Monitor usage comes from the counts the backend reported rather than from a
+  synthetic closing event, and a salvaged tool call no longer closes an
+  estimate with a zero.
+- The monitor keeps a compact ledger of every request past its eviction from
+  the recent list, so a late usage report still corrects every session,
+  conversation and model total it fed. Requested and executed models are
+  tracked separately: the id the client named before any override, and the
+  model of a request actually built for a backend. Request rows name the model
+  that ran and mark a routed-only one with `?`; locally answered requests read
+  `local answer`; the session root is an aggregate row with per-model rollups,
+  an unattributed row and an evidence line in its detail; a conversation whose
+  parent was never seen is marked `^`. Selection survives a re-render, and
+  meaning is never carried by colour alone. The `demo` command shows all of it.
+- A progress label answered from the transcript reports its usage as exact
+  (zero input, zero cache, the label's tokens out) instead of as an estimate,
+  and no longer touches its conversation's context size.
+- The Anthropic routes accept request bodies up to 64 MiB, so image-heavy
+  Claude Code histories get through; an oversized body is answered with the
+  Anthropic-shaped 413 `request_too_large` instead of a misleading invalid-JSON
+  400. The OpenAI-compatible routes keep their 16 MiB limit. Ported from
+  upstream.
+- The README describes the whole proxy: a feature overview, what this fork
+  adds, a code-verified comparison with `raine/claude-code-proxy` and
+  `fcakyon/claude-code-with-codex`, every HTTP route and header, the complete
+  `CCP_*` and `config.json` surface, file locations per platform, the TUI panes
+  and key bindings, which backend runs which Claude Code slot, troubleshooting
+  and sensitive data. Stale statements about the curated catalog, the
+  classifier limitation, quota thresholds and install coverage are corrected.
+- The test suite stays away from real credentials and backends: routing smokes
+  assert the registry only, logout checks run in a temporary home, and the
+  native tool search mapping and the lane wire shape are covered by tests that
+  pin the policy explicitly.
+
 ## v0.7.0 (2026-09-12)
 
 - Codex models answer with several tool calls at once again. Codex marks the
