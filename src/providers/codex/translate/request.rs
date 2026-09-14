@@ -2757,4 +2757,292 @@ mod tests {
         let tools = serde_json::to_value(&out.tools).unwrap();
         assert_eq!(tools[0]["name"], "CronList");
     }
+
+    fn directed_tool_choice(mut req: MessagesRequest, name: &str) -> MessagesRequest {
+        req.extra.insert(
+            "tool_choice".to_string(),
+            json!({"type": "tool", "name": name}),
+        );
+        req
+    }
+
+    /// The tools head as the lane carries it: the full lane's `tools` field, the
+    /// lite lane's `additional_tools` item.
+    fn head_tools(out: &ResponsesRequest) -> Vec<Value> {
+        match out.tools {
+            Some(ref tools) => tools
+                .iter()
+                .map(|tool| serde_json::to_value(tool).unwrap())
+                .collect(),
+            None => items_json(out)
+                .into_iter()
+                .find(|item| item["type"] == "additional_tools")
+                .and_then(|item| item["tools"].as_array().cloned())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn head_tool_names(out: &ResponsesRequest) -> Vec<String> {
+        head_tools(out)
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// The prompt prefix a cache hit depends on: the tools head plus the system
+    /// text, wherever the lane puts them.
+    fn head_prefix(out: &ResponsesRequest) -> String {
+        let tools = serde_json::to_string(&head_tools(out)).unwrap();
+        let text = match out.instructions {
+            Some(ref instructions) => instructions.clone(),
+            None => items_json(out)
+                .into_iter()
+                .find(|item| item["type"] == "message" && item["role"] == "developer")
+                .map(|item| item["content"].to_string())
+                .unwrap_or_default(),
+        };
+        format!("{tools}\n{text}")
+    }
+
+    /// The tool names each `tool_search_output` carries, outputs in wire order.
+    fn search_output_tool_names(out: &ResponsesRequest) -> Vec<Vec<String>> {
+        items_json(out)
+            .into_iter()
+            .filter(|item| item["type"] == "tool_search_output")
+            .map(|item| {
+                item["tools"]
+                    .as_array()
+                    .expect("search output tools")
+                    .iter()
+                    .map(|tool| tool["name"].as_str().expect("tool name").to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn function_tool_choice(out: &ResponsesRequest) -> Option<String> {
+        match out.tool_choice {
+            Some(ResponsesToolChoice::Function {
+                ref r#type,
+                ref name,
+            }) if r#type.as_str() == "function" => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn tool_search_directed_tool_choice_names_a_loaded_deferred_tool() {
+        for lite in [true, false] {
+            let req = directed_tool_choice(tool_search_request(true, cron_reference()), "CronList");
+            let out = translate_request(&req, lane_opts(lite)).unwrap();
+
+            // Directing the model at a tool a search loaded stays a plain function
+            // choice by name on either lane.
+            assert_eq!(
+                function_tool_choice(&out).as_deref(),
+                Some("CronList"),
+                "lite={lite}: {:?}",
+                serde_json::to_value(&out.tool_choice).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&out.tool_choice).unwrap(),
+                json!({"type": "function", "name": "CronList"}),
+                "lite={lite}"
+            );
+
+            // Its schema is on the wire where a loaded deferred tool lives: in the
+            // search output, not in the head.
+            let loaded = items_json(&out)
+                .into_iter()
+                .find(|item| item["type"] == "tool_search_output")
+                .expect("search output");
+            assert_eq!(
+                loaded["tools"],
+                json!([{
+                    "type": "function",
+                    "name": "CronList",
+                    "description": "List scheduled jobs.",
+                    "parameters": {"type": "object", "properties": {}},
+                    "strict": false,
+                    "defer_loading": true
+                }]),
+                "lite={lite}"
+            );
+            assert!(
+                !head_tool_names(&out).contains(&"CronList".to_string()),
+                "lite={lite}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_search_directed_tool_choice_is_forwarded_when_nothing_loaded_it() {
+        // A deferred tool no search in this history loaded stays in the head, and
+        // the directed choice names it there.
+        let mut req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "How many cron jobs are scheduled?"}],
+            "tools": claude_code_tools(true),
+        }))
+        .unwrap();
+        req = directed_tool_choice(req, "CronList");
+        for lite in [true, false] {
+            let out = translate_request(&req, lane_opts(lite)).unwrap();
+            assert_eq!(
+                function_tool_choice(&out).as_deref(),
+                Some("CronList"),
+                "lite={lite}"
+            );
+            assert!(
+                head_tool_names(&out).contains(&"CronList".to_string()),
+                "lite={lite}"
+            );
+            assert!(search_output_tool_names(&out).is_empty(), "lite={lite}");
+        }
+
+        // A name the request carries no tool for is forwarded verbatim too:
+        // `map_tool_choice` runs no presence check, and only the hosted
+        // web_search branch is special-cased (see the allowed_tools reset above,
+        // which rewrites an unregistered web search choice to auto).
+        let unknown =
+            directed_tool_choice(tool_search_request(true, cron_reference()), "NeverListed");
+        let out = translate_request(&unknown, lane_opts(true)).unwrap();
+        assert_eq!(function_tool_choice(&out).as_deref(), Some("NeverListed"));
+        // The choice is the only place that name occurs: no schema is invented
+        // for it, in the head or in a search output.
+        assert!(!head_tool_names(&out).contains(&"NeverListed".to_string()));
+        assert!(
+            search_output_tool_names(&out)
+                .iter()
+                .all(|names| !names.contains(&"NeverListed".to_string()))
+        );
+    }
+
+    const CATALOG_SIZE: usize = 500;
+
+    fn catalog_tool_name(index: usize) -> String {
+        format!("Mcp_Tool_{index:03}")
+    }
+
+    /// The stable text catalog of every deferred tool: what the model reads to
+    /// know the tools exist without their schemas being in the prompt.
+    fn catalog_text() -> String {
+        let mut text = String::from("Available tools (load them with ToolSearch):\n");
+        for index in 0..CATALOG_SIZE {
+            let name = catalog_tool_name(index);
+            text.push_str(&format!("- {name}: tool number {index}\n"));
+        }
+        text
+    }
+
+    /// A request out of a catalog of `CATALOG_SIZE` deferred tools after the
+    /// given searches, each one a list of tool indices its result referenced in
+    /// that order. Claude Code appends a loaded tool to `tools` in name order
+    /// with `defer_loading` still set, so the loaded tools lead the array here.
+    fn catalog_request(searches: &[Vec<usize>]) -> MessagesRequest {
+        let mut loaded: Vec<usize> = searches.iter().flatten().copied().collect();
+        loaded.sort_unstable();
+        let mut tools: Vec<Value> = loaded
+            .iter()
+            .map(|index| {
+                json!({
+                    "name": catalog_tool_name(*index),
+                    "description": format!("tool number {index}"),
+                    "defer_loading": true,
+                    "input_schema": {"type": "object", "properties": {"index": {"type": "number"}}}
+                })
+            })
+            .collect();
+        tools.extend(claude_code_tools(false).as_array().unwrap().iter().cloned());
+
+        let mut messages = vec![json!({"role": "user", "content": "Work through the catalog."})];
+        for (turn, references) in searches.iter().enumerate() {
+            let call_id = format!("call_search_{turn}");
+            let query = references
+                .iter()
+                .map(|index| catalog_tool_name(*index))
+                .collect::<Vec<_>>()
+                .join(",");
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": call_id, "name": "ToolSearch",
+                 "input": {"query": format!("select:{query}"), "max_results": references.len()}}
+            ]}));
+            let blocks: Vec<Value> = references
+                .iter()
+                .map(|index| json!({"type": "tool_reference", "tool_name": catalog_tool_name(*index)}))
+                .collect();
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": call_id, "content": blocks}
+            ]}));
+        }
+
+        serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "system": [{"type": "text", "text": catalog_text()}],
+            "messages": messages,
+            "tools": tools,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn tool_search_large_catalog_appends_only_the_loaded_schemas() {
+        // Neither the searches nor the references inside one result are in name
+        // order, so an implementation that sorted by name would show here.
+        let searches = vec![vec![137, 4], vec![250], vec![499, 12]];
+        let expected: Vec<Vec<String>> = searches
+            .iter()
+            .map(|references| references.iter().map(|i| catalog_tool_name(*i)).collect())
+            .collect();
+
+        for lite in [true, false] {
+            let before = translate_request(&catalog_request(&[]), lane_opts(lite)).unwrap();
+            let after = translate_request(&catalog_request(&searches), lane_opts(lite)).unwrap();
+
+            assert!(
+                head_prefix(&before).contains(&catalog_tool_name(CATALOG_SIZE - 1)),
+                "lite={lite}: the catalog text is the fixture's point"
+            );
+            // Five loads out of five hundred leave the cached prefix byte for byte.
+            assert_eq!(head_prefix(&before), head_prefix(&after), "lite={lite}");
+
+            let head = head_tools(&after);
+            let kinds: Vec<(&str, Option<&str>)> = head
+                .iter()
+                .map(|tool| (tool["type"].as_str().unwrap(), tool["name"].as_str()))
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    ("function", Some("Read")),
+                    ("tool_search", None),
+                    ("function", Some("DeferredToolPlaceholder")),
+                ],
+                "lite={lite}"
+            );
+
+            // Only the referenced schemas travel: one output per search, searches
+            // in history order, references in the order the result listed them.
+            assert_eq!(search_output_tool_names(&after), expected, "lite={lite}");
+
+            // The 495 nothing referenced never reach the wire as a schema; their
+            // names live in the catalog text only.
+            let wire = serde_json::to_string(&after).unwrap();
+            for index in 0..CATALOG_SIZE {
+                let name = catalog_tool_name(index);
+                let is_loaded = searches.iter().any(|refs| refs.contains(&index));
+                assert_eq!(
+                    wire.contains(&format!("\"name\":\"{name}\"")),
+                    is_loaded,
+                    "lite={lite}: {name}"
+                );
+                assert!(wire.contains(&format!("- {name}: tool number {index}")));
+            }
+
+            // Same request in, same bytes out: nothing on this path iterates a
+            // hash map.
+            let again = translate_request(&catalog_request(&searches), lane_opts(lite)).unwrap();
+            assert_eq!(wire, serde_json::to_string(&again).unwrap(), "lite={lite}");
+        }
+    }
 }

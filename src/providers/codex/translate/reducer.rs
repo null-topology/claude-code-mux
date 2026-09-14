@@ -1667,6 +1667,133 @@ mod tests {
     }
 
     #[test]
+    fn reduce_keeps_tool_search_calls_paired_and_in_order() {
+        let upstream = format!(
+            "{}{}{}{}{}{}{}{}",
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index": 0,
+                    "item": {"type":"tool_search_call","call_id":"call_a","execution":"client","status":"in_progress","arguments":{}}
+                })
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index": 0,
+                    "item": {"type":"tool_search_call","call_id":"call_a","execution":"client","status":"completed",
+                             "arguments":{"query":"select:CronList"}}
+                })
+            ),
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index": 1,
+                    "item": {"type":"function_call","call_id":"call_b","name":"Bash"}
+                })
+            ),
+            sse(
+                "response.function_call_arguments.delta",
+                json!({
+                    "output_index":1,"delta":"{\"command\":\"true\"}"
+                })
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index": 1,
+                    "item": {"type":"function_call","call_id":"call_b","name":"Bash","arguments":"{\"command\":\"true\"}"}
+                })
+            ),
+            sse(
+                "response.output_item.added",
+                json!({
+                    "output_index": 2,
+                    "item": {"type":"tool_search_call","call_id":"call_c","execution":"client","status":"in_progress","arguments":{}}
+                })
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "output_index": 2,
+                    "item": {"type":"tool_search_call","call_id":"call_c","execution":"client","status":"completed",
+                             "arguments":{"query":"select:AlphaTool"}}
+                })
+            ),
+            sse(
+                "response.completed",
+                json!({
+                    "response":{"id":"resp_1","usage":{}}
+                })
+            ),
+        );
+        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+        let [
+            ReducerEvent::ToolStart {
+                index: 0,
+                id: first_id,
+                name: first_name,
+            },
+            ReducerEvent::ToolDelta {
+                index: 0,
+                partial_json: first_args,
+            },
+            ReducerEvent::ToolStop { index: 0 },
+            ReducerEvent::ToolStart {
+                index: 1,
+                id: bash_id,
+                name: bash_name,
+            },
+            ReducerEvent::ToolDelta {
+                index: 1,
+                partial_json: bash_args,
+            },
+            ReducerEvent::ToolStop { index: 1 },
+            ReducerEvent::ToolStart {
+                index: 2,
+                id: second_id,
+                name: second_name,
+            },
+            ReducerEvent::ToolDelta {
+                index: 2,
+                partial_json: second_args,
+            },
+            ReducerEvent::ToolStop { index: 2 },
+            ReducerEvent::Finish {
+                stop_reason,
+                output_items,
+                ..
+            },
+        ] = out.as_slice()
+        else {
+            panic!("unexpected event sequence: {out:?}");
+        };
+        assert_eq!(first_id, "call_a");
+        assert_eq!(first_name, "ToolSearch");
+        assert_eq!(first_args, r#"{"query":"select:CronList"}"#);
+        assert_eq!(bash_id, "call_b");
+        assert_eq!(bash_name, "Bash");
+        assert_eq!(bash_args, r#"{"command":"true"}"#);
+        assert_eq!(second_id, "call_c");
+        assert_eq!(second_name, "ToolSearch");
+        assert_eq!(second_args, r#"{"query":"select:AlphaTool"}"#);
+        assert_eq!(*stop_reason, "tool_use");
+        assert_eq!(
+            output_items
+                .iter()
+                .map(|item| serde_json::to_value(item).unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                json!({"type":"tool_search_call","call_id":"call_a","execution":"client","status":"completed",
+                       "arguments":{"query":"select:CronList"}}),
+                json!({"type":"function_call","call_id":"call_b","name":"Bash","arguments":"{\"command\":\"true\"}"}),
+                json!({"type":"tool_search_call","call_id":"call_c","execution":"client","status":"completed",
+                       "arguments":{"query":"select:AlphaTool"}}),
+            ]
+        );
+    }
+
+    #[test]
     fn sanitize_tool_args_removes_empty_pages() {
         let args = r#"{"file_path":"/tmp/a","pages":""}"#;
         let sanitized = sanitize_read_args("Read", args, None);
