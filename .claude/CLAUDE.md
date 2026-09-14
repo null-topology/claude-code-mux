@@ -368,6 +368,13 @@ compatibility contracts, not the user-facing name. Do not rename them:
 - Fixtures: `tests/fixtures/anthropic-message.json`, `tests/fixtures/sse-basic.txt`.
 - A unit test that mirrors a wire format can pass while being wrong about the
   format. Verify stream-shape changes end to end against a real capture.
+- The suite must never touch a real credential, a real backend or the
+  developer's own state. Run it from a cleared environment (`env -i` with a
+  minimal `PATH`), with `HOME`, `CCP_CONFIG_DIR` and the XDG config, data and
+  state dirs pointed at temp directories, `CCP_CODEX_AUTH_FILE` pointed at a
+  file that does not exist, every provider base URL pointed at a loopback mock
+  server, client versions pinned to fixed strings, and `--test-threads=1`. A
+  test that reaches outside that perimeter is a bug in the test.
 
 ## Codex model inventory
 

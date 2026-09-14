@@ -926,21 +926,37 @@ mod tests {
 
     static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-    fn clear_env() {
-        unsafe {
-            std::env::remove_var("CCP_BIND_ADDRESS");
-            std::env::remove_var("CCP_CODEX_TRANSPORT");
-            std::env::remove_var("CCP_CONFIG_DIR");
-            std::env::remove_var("CCP_LOG_VERBOSE");
-            std::env::remove_var("CCP_LOG_STDERR");
-            std::env::remove_var("CCP_CODEX_REASONING_SUMMARY");
-            std::env::remove_var("CCP_CODEX_SERVER_COMPACTION");
-            std::env::remove_var("CCP_CODEX_FULL_LANE");
-            std::env::remove_var("CCP_CODEX_RESPONSES_API");
-            std::env::remove_var("CCP_CODEX_IMAGES_API");
-            std::env::remove_var("CCP_CODEX_IMAGES_BASE_URL");
-            std::env::remove_var("CCP_CODEX_TRANSCRIPTIONS_API");
-            std::env::remove_var("CCP_AUTO_REVIEW_MODEL");
+    const CLEARED_VARS: &[&str] = &[
+        "CCP_BIND_ADDRESS",
+        "CCP_CODEX_TRANSPORT",
+        "CCP_LOG_VERBOSE",
+        "CCP_LOG_STDERR",
+        "CCP_CODEX_REASONING_SUMMARY",
+        "CCP_CODEX_SERVER_COMPACTION",
+        "CCP_CODEX_FULL_LANE",
+        "CCP_CODEX_RESPONSES_API",
+        "CCP_CODEX_IMAGES_API",
+        "CCP_CODEX_IMAGES_BASE_URL",
+        "CCP_CODEX_TRANSCRIPTIONS_API",
+        "CCP_AUTO_REVIEW_MODEL",
+    ];
+
+    struct ClearedEnv {
+        _guards: Vec<EnvGuard>,
+        _config: tempfile::TempDir,
+    }
+
+    /// Clears the vars these tests assert on and points the config dir at an empty
+    /// temp dir, so no getter falls back to the host config. Restores on drop, so
+    /// every caller must hold the guard for the whole test.
+    #[must_use]
+    fn clear_env() -> ClearedEnv {
+        let config = tempfile::TempDir::new().unwrap();
+        let mut guards = vec![EnvGuard::set("CCP_CONFIG_DIR", config.path())];
+        guards.extend(CLEARED_VARS.iter().copied().map(EnvGuard::remove));
+        ClearedEnv {
+            _guards: guards,
+            _config: config,
         }
     }
 
@@ -987,6 +1003,14 @@ mod tests {
             }
             Self { key, previous }
         }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
     }
 
     impl Drop for EnvGuard {
@@ -1003,7 +1027,7 @@ mod tests {
     #[test]
     fn codex_transport_defaults_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared = clear_env();
         let result = codex_transport();
         assert_eq!(result, CodexTransport::WebSocket);
     }
@@ -1011,40 +1035,32 @@ mod tests {
     #[test]
     fn codex_transport_reads_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "auto");
-        }
+        let _cleared = clear_env();
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
         assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 
     #[test]
     fn codex_transport_env_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "websocket");
-        }
+        let _cleared = clear_env();
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
         assert_eq!(codex_transport(), CodexTransport::WebSocket);
     }
 
     #[test]
     fn codex_transport_invalid_env_falls_back_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "invalid");
-        }
+        let _cleared = clear_env();
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "invalid");
         assert_eq!(codex_transport(), CodexTransport::WebSocket);
     }
 
     #[test]
     fn codex_transport_empty_env_falls_back_to_websocket() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
-        unsafe {
-            std::env::set_var("CCP_CODEX_TRANSPORT", "");
-        }
+        let _cleared = clear_env();
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "");
         assert_eq!(codex_transport(), CodexTransport::WebSocket);
     }
 
@@ -1098,7 +1114,7 @@ mod tests {
     #[test]
     fn codex_responses_api_defaults_to_disabled() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
 
@@ -1108,7 +1124,7 @@ mod tests {
     #[test]
     fn codex_responses_api_reads_config_and_env_takes_precedence() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1125,7 +1141,7 @@ mod tests {
     #[test]
     fn codex_responses_api_accepts_enabled_env_values() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
 
@@ -1138,7 +1154,7 @@ mod tests {
     #[test]
     fn codex_images_api_defaults_to_disabled_and_env_overrides_config() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1167,7 +1183,7 @@ mod tests {
     #[test]
     fn codex_transcriptions_api_defaults_to_disabled_and_env_overrides_config() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1184,7 +1200,7 @@ mod tests {
     #[test]
     fn codex_reasoning_summary_reads_config() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1199,7 +1215,7 @@ mod tests {
     #[test]
     fn codex_reasoning_summary_env_overrides_config_and_empty_falls_through() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1220,7 +1236,7 @@ mod tests {
     #[test]
     fn auto_review_model_reads_top_level_config_and_env_takes_precedence() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         std::fs::write(
             config.path().join("config.json"),
@@ -1243,7 +1259,7 @@ mod tests {
     #[test]
     fn codex_server_compaction_defaults_and_overrides() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
 
@@ -1265,7 +1281,7 @@ mod tests {
     #[test]
     fn codex_full_lane_defaults_and_overrides() {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_env();
+        let _cleared = clear_env();
         let config = tempfile::TempDir::new().unwrap();
         let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
 
@@ -1282,5 +1298,46 @@ mod tests {
         assert!(!codex_full_lane());
         let _enabled_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "true");
         assert!(codex_full_lane());
+    }
+
+    #[test]
+    fn clear_env_restores_outer_values_and_hides_host_config() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let outer = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            outer.path().join("config.json"),
+            r#"{"codex":{"transport":"http"}}"#,
+        )
+        .unwrap();
+        let _outer_config = EnvGuard::set("CCP_CONFIG_DIR", outer.path());
+        let _outer_transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
+        let _uncleared = EnvGuard::set("CCP_TEST_SENTINEL_UNCLEARED", "keep");
+
+        {
+            let _cleared = clear_env();
+            let inside = std::env::var_os("CCP_CONFIG_DIR").expect("config dir stays set");
+            assert_ne!(inside.as_os_str(), outer.path().as_os_str());
+            assert!(!Path::new(&inside).join("config.json").exists());
+            assert!(std::env::var_os("CCP_CODEX_TRANSPORT").is_none());
+            assert_eq!(codex_transport(), CodexTransport::WebSocket);
+            assert_eq!(
+                std::env::var_os("CCP_TEST_SENTINEL_UNCLEARED").as_deref(),
+                Some(std::ffi::OsStr::new("keep"))
+            );
+        }
+
+        assert_eq!(
+            std::env::var_os("CCP_CONFIG_DIR").as_deref(),
+            Some(outer.path().as_os_str())
+        );
+        assert_eq!(
+            std::env::var_os("CCP_CODEX_TRANSPORT").as_deref(),
+            Some(std::ffi::OsStr::new("auto"))
+        );
+        assert_eq!(codex_transport(), CodexTransport::Auto);
+        assert_eq!(
+            std::env::var_os("CCP_TEST_SENTINEL_UNCLEARED").as_deref(),
+            Some(std::ffi::OsStr::new("keep"))
+        );
     }
 }

@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use predicates::str::contains;
 use std::env;
+use std::path::PathBuf;
 use tempfile::TempDir;
 
 #[test]
@@ -90,12 +91,69 @@ fn unsupported_provider_auth_command_exits_two() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Logout also deletes the legacy `$HOME/.config` copy, and Cursor falls back to
+/// the macOS Keychain when `CCP_CONFIG_DIR` is unset, so both must point at temp.
+fn isolated_auth_env(temp: &TempDir) -> Vec<(&'static str, PathBuf)> {
+    let home = temp.path().join("home");
+    vec![
+        ("HOME", home.clone()),
+        ("USERPROFILE", home.clone()),
+        ("CCP_CONFIG_DIR", temp.path().join("config")),
+        ("XDG_CONFIG_HOME", home.join(".config")),
+        ("XDG_DATA_HOME", home.join(".local").join("share")),
+        ("XDG_STATE_HOME", home.join(".local").join("state")),
+        (
+            "CCP_CODEX_AUTH_FILE",
+            temp.path().join("missing-codex-auth.json"),
+        ),
+    ]
+}
+
+fn isolate_auth(cmd: &mut Command, env: &[(&'static str, PathBuf)]) {
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    for key in [
+        "CCP_CURSOR_AUTH_TOKEN",
+        "CURSOR_AUTH_TOKEN",
+        "OPENAI_API_KEY",
+    ] {
+        cmd.env_remove(key);
+    }
+}
+
 #[test]
 fn provider_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
+    let env = isolated_auth_env(&temp);
+    for (key, value) in &env {
+        assert!(
+            value.starts_with(temp.path()),
+            "{key} must stay inside the temp tree"
+        );
+    }
+
     let mut cmd = Command::cargo_bin("claude-code-mux")?;
     cmd.args(["kimi", "auth", "logout"]);
-    cmd.env("CCP_CONFIG_DIR", temp.path());
+    isolate_auth(&mut cmd, &env);
+    cmd.assert().success();
+    Ok(())
+}
+
+#[test]
+fn cursor_logout_runs_inside_an_isolated_home() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let env = isolated_auth_env(&temp);
+    let config_dir = env
+        .iter()
+        .find(|(key, _)| *key == "CCP_CONFIG_DIR")
+        .map(|(_, value)| value.clone())
+        .expect("CCP_CONFIG_DIR keeps cursor logout off the macOS Keychain");
+    assert!(config_dir.starts_with(temp.path()));
+
+    let mut cmd = Command::cargo_bin("claude-code-mux")?;
+    cmd.args(["cursor", "auth", "logout"]);
+    isolate_auth(&mut cmd, &env);
     cmd.assert().success();
     Ok(())
 }
