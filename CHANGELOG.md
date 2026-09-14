@@ -1,3 +1,26 @@
+## v0.8.1 (2026-09-14)
+
+- A spent Codex window is answered once on every transport. The buffered
+  HTTP and WebSocket paths and the live HTTP stream, including a non-2xx
+  startup status whose body or `X-Codex-*` headers carry the limit, used to
+  retry a `usage_limit_reached` four times and then answer a bare 429 with no
+  reset time; they now answer once with `x-should-retry: false`, the
+  `anthropic-ratelimit-unified-*` status, reset and representative claim, as
+  the live WebSocket path already did. Only the explicit `usage_limit_reached`
+  type is terminal: a transient 429 that happens to carry a reset clock stays
+  retryable instead of becoming a final refusal.
+- The exhausted window is identified from the reset time in the body when no
+  countdown is present. When the five-hour and weekly readings stay
+  ambiguous, no reset clock is invented from the headers and no
+  representative claim is published. The claim is published only for a window
+  duration the proxy recognises, around 300 minutes or around 10080.
+- A server-side compaction request that hits the limit stops at once and
+  clears its pending state, instead of letting the normal request spend the
+  same exhausted quota again.
+- These corrections were written by the upstream maintainer, Raine Virta,
+  when merging this fork's pull request raine/claude-code-proxy#139, and are
+  carried here with his authorship.
+
 ## v0.8.0 (2026-09-14)
 
 - Auto mode's security classifier is never answered as a progress label any
