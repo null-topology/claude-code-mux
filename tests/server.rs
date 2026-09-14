@@ -5,7 +5,7 @@ use axum::response::IntoResponse;
 use claude_code_mux::{
     MessagesRequest,
     config::AliasProvider,
-    monitor::{MonitorHandle, RequestStatus},
+    monitor::{MonitorHandle, RequestStatus, UsageQuality},
     provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
     registry::Registry,
     request_identity::ConversationIdentity,
@@ -1589,6 +1589,23 @@ async fn monitor_records_a_locally_answered_request_without_a_wire_model() {
     assert_eq!(request.provider.as_deref(), Some("local"));
     assert_eq!(request.requested_model.as_deref(), Some("gpt-5.4"));
     assert_eq!(request.effective_model, None);
+    // Nothing went upstream, so every count of the request is the proxy's own
+    // and final: a prompt of nothing, no cache on either side, and the label it
+    // wrote. None of them is an estimate a backend may still correct.
+    assert_eq!(request.input_tokens, Some(0));
+    assert_eq!(request.cache.read_tokens, Some(0));
+    assert_eq!(request.cache.write_tokens, Some(0));
+    assert_eq!(request.output_tokens, Some(4));
+    let quality = request.usage_quality();
+    assert_eq!(quality.input, UsageQuality::Exact);
+    assert_eq!(quality.cache_read, UsageQuality::Exact);
+    assert_eq!(quality.cache_write, UsageQuality::Exact);
+    assert_eq!(quality.output, UsageQuality::Exact);
+    // The lifetime split of a cache write is Anthropic's own evidence. A
+    // request that wrote no cache at all reports neither bucket rather than
+    // claiming two zeroes.
+    assert_eq!(request.cache.write_5m_tokens, None);
+    assert_eq!(request.cache.write_1h_tokens, None);
     let session = &state.sessions[0];
     assert_eq!(session.request_count, 1);
     assert_eq!(session.output_tokens, 0);

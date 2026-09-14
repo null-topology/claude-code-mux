@@ -1379,7 +1379,13 @@ impl MonitorStore {
             let Some(record) = self.ledger.record(request_id) else {
                 return;
             };
-            if record.cache.evaluated || record.endpoint == EndpointKind::CountTokens {
+            // A request whose tokens belong to no total belongs to no cache
+            // lane either: a `count_tokens` estimate counts a prompt the real
+            // request counts again, and a request the proxy answered itself
+            // reached no backend cache at all. Its exact zeroes are the truth
+            // about what it spent and would be a shrunken context and a miss
+            // that never happened if the lane took them.
+            if record.cache.evaluated || !record.counts_tokens() {
                 return;
             }
             // A report naming only part of the prompt sizes none of it: taking
@@ -3475,6 +3481,37 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert_eq!(agent.request_count, 1);
         assert_eq!(agent.output_tokens, 0);
         assert_eq!(agent.evidence.output.requests(), 0);
+    }
+
+    /// A request the proxy answered itself knows its whole cost exactly: no
+    /// prompt, no cache, the label it wrote. Exact as those counts are, they are
+    /// no evidence about a backend's cache, so the conversation keeps the
+    /// context its upstream requests built and nothing is compared.
+    #[test]
+    fn a_locally_answered_request_leaves_its_conversations_cache_lane_alone() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "agent-1");
+        monitor.usage_reported("r1", closing_usage(2_000, 28_000, 0, 40));
+        monitor.request_completed("r1", 200, None, None);
+
+        // The progress label of the same subagent, answered from the transcript.
+        monitor.request_started(
+            "local",
+            Some("s1".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.conversation_resolved("local", "agent-1", None);
+        monitor.provider_selected("local", LOCAL_PROVIDER, "gpt-5.6-sol", None);
+        monitor.usage_reported("local", closing_usage(0, 0, 0, 4));
+        monitor.request_completed("local", 200, None, None);
+
+        let state = monitor.snapshot();
+        let session = &state.sessions[0];
+        let agent = conversation(session, "agent-1");
+        assert_eq!(agent.cache.context_tokens, 30_000);
+        assert_eq!(session.cache.miss_count, 0);
+        assert!(!recent_by_id(&state, "local").cache.evaluated());
     }
 
     #[test]

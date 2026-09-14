@@ -319,8 +319,15 @@ fn mock_state_for_tick(
     // ran it: no effective model, so no row may name one.
     summary.model = Some("claude-sonnet-5".to_string());
     summary.requested_model = Some("claude-sonnet-5".to_string());
+    // Nothing went upstream, so the proxy knows the whole cost rather than
+    // estimating it: the row carries exact zeroes and the label it wrote. The
+    // lifetime buckets of a cache write stay unreported, as a write of nothing
+    // has none.
     summary.input_tokens = Some(0);
+    summary.cache.read_tokens = Some(0);
+    summary.cache.write_tokens = Some(0);
     summary.output_tokens = Some(12);
+    close_reported_counts(&mut summary.cache);
     recent.push_back(summary);
 
     // A subagent whose parent this session never served a request for. The walk

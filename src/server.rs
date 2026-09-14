@@ -1,7 +1,7 @@
 use crate::{
     anthropic::json_error,
     logging::{Logger, REDACT_KEYS, create_logger},
-    monitor::{EndpointKind, MonitorHandle},
+    monitor::{EndpointKind, MonitorHandle, UsageFields, UsageReport},
     openai_compat::{
         MAX_OPENAI_REQUEST_BYTES, OpenAiError, OpenAiSurface,
         request::{extract_model, parse_request},
@@ -1647,7 +1647,27 @@ async fn dispatch_request(
             if let Some(model) = body.model.as_deref() {
                 monitor.provider_selected(&req_id, "local", model, None);
             }
-            monitor.request_completed(&req_id, 200, Some(0), Some(output_tokens));
+            // Nothing was sent upstream, so the whole cost of the request is
+            // known here rather than estimated: no prompt, no cache on either
+            // side, and the label the proxy wrote. It is reported as a closing
+            // usage, because the opening path would leave every count reading
+            // as a number a backend may still correct. The lifetime split of a
+            // cache write stays unreported: it is evidence only an Anthropic
+            // response produces, and a write of nothing has no buckets.
+            monitor.usage_reported(
+                &req_id,
+                UsageReport {
+                    closing: UsageFields {
+                        input_tokens: Some(0),
+                        cache_read_tokens: Some(0),
+                        cache_write_tokens: Some(0),
+                        output_tokens: Some(output_tokens),
+                        ..UsageFields::default()
+                    },
+                    ..UsageReport::default()
+                },
+            );
+            monitor.request_completed(&req_id, 200, None, None);
         }
         log.info(
             "agent_summary_answered_locally",
