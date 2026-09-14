@@ -1,4 +1,5 @@
 use crate::anthropic::sse::parse_sse_events;
+use crate::monitor::UsageReport;
 use crate::providers::codex::events::is_terminal_rate_limit_event;
 
 use super::read_rewrite::sanitize_read_args;
@@ -1137,6 +1138,49 @@ pub fn map_codex_usage_to_anthropic(
     result
 }
 
+/// The usage the backend reported, in the monitor's Anthropic-shaped report.
+///
+/// The mapped [`AnthropicUsage`] above cannot stand in for this: the Messages
+/// shape requires a `usage` object on every finish, so its fields are zero
+/// whenever the backend sent nothing. Here a count the backend did not send
+/// stays absent, which is not the same as a reported zero. Cache writes are
+/// always absent: the Codex backend reports no writes at all.
+///
+/// The Responses API reports `input_tokens` as the whole prompt and names the
+/// cached part separately. Each number is kept as it came: the cached count is a
+/// measurement on its own, and the total is kept as `reported_prompt_tokens`
+/// whether or not the backend said how the prompt divided. Only the uncached
+/// part is derived, and only when both numbers are there to derive it from.
+pub(crate) fn reported_usage_report(usage: Option<&CodexUsage>) -> UsageReport {
+    let mut report = UsageReport::default();
+    let Some(usage) = usage else {
+        return report;
+    };
+    report.reported_prompt_tokens = usage.input_tokens;
+    report.closing.cache_read_tokens = usage.input_tokens_details_cached;
+    if let (Some(total), Some(cached)) = (usage.input_tokens, usage.input_tokens_details_cached) {
+        report.closing.input_tokens = Some(total.saturating_sub(cached));
+    }
+    report.closing.output_tokens = usage.output_tokens;
+    report
+}
+
+/// The usage reported in a buffered upstream body, for the monitor.
+pub(crate) fn reported_usage_report_from_upstream(upstream: &[u8]) -> UsageReport {
+    let Ok(events) = reduce_upstream_bytes(upstream) else {
+        return UsageReport::default();
+    };
+    let usage = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ReducerEvent::Finish { usage, .. } => Some(usage.as_ref()),
+            _ => None,
+        })
+        .flatten();
+    reported_usage_report(usage)
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AnthropicUsage {
     pub input_tokens: u64,
@@ -1165,6 +1209,74 @@ mod tests {
         let mut obj = payload.as_object().cloned().unwrap_or_default();
         obj.insert("type".into(), json!(type_name));
         format!("data: {}\n\n", serde_json::to_string(&obj).unwrap())
+    }
+
+    fn codex_usage(
+        input_tokens: Option<u64>,
+        cached: Option<u64>,
+        output_tokens: Option<u64>,
+    ) -> CodexUsage {
+        CodexUsage {
+            input_tokens,
+            output_tokens,
+            input_tokens_details_cached: cached,
+            output_tokens_details_reasoning: None,
+        }
+    }
+
+    #[test]
+    fn a_total_without_a_cache_split_is_not_uncached_input() {
+        // `input_tokens` is the whole prompt. Without `cached_tokens` there is
+        // no way to say how much of it was processed at full price, and an
+        // absent cache count is not a zero.
+        let report = reported_usage_report(Some(&codex_usage(Some(5_000), None, Some(7))));
+        assert_eq!(report.closing.input_tokens, None);
+        assert_eq!(report.closing.cache_read_tokens, None);
+        assert_eq!(report.closing.output_tokens, Some(7));
+    }
+
+    #[test]
+    fn a_reported_cache_split_closes_both_halves_of_the_prompt() {
+        // A cache count of zero is a measurement: none of the prompt was
+        // served from cache, so all of it was processed at full price.
+        let none_cached = reported_usage_report(Some(&codex_usage(Some(5_000), Some(0), Some(7))));
+        assert_eq!(none_cached.closing.input_tokens, Some(5_000));
+        assert_eq!(none_cached.closing.cache_read_tokens, Some(0));
+        assert_eq!(none_cached.reported_prompt_tokens, Some(5_000));
+
+        let cached = reported_usage_report(Some(&codex_usage(Some(5_000), Some(1_000), Some(7))));
+        assert_eq!(cached.closing.input_tokens, Some(4_000));
+        assert_eq!(cached.closing.cache_read_tokens, Some(1_000));
+        assert_eq!(cached.closing.cache_write_tokens, None);
+        // The total is the same tokens as the two halves, not more of them.
+        assert_eq!(cached.reported_prompt_tokens, Some(5_000));
+    }
+
+    #[test]
+    fn a_cached_count_without_a_total_is_still_a_measured_cache_read() {
+        // Both numbers are needed to work out the uncached part, but the cached
+        // count is a measurement on its own and must not be dropped with it.
+        let report = reported_usage_report(Some(&codex_usage(None, Some(50), Some(7))));
+        assert_eq!(report.closing.cache_read_tokens, Some(50));
+        assert_eq!(report.closing.input_tokens, None);
+        assert_eq!(report.closing.output_tokens, Some(7));
+        // No total was reported, so none is invented from the cache count.
+        assert_eq!(report.reported_prompt_tokens, None);
+    }
+
+    #[test]
+    fn a_total_the_backend_sent_is_kept_and_counts_as_a_report() {
+        let total_only = reported_usage_report(Some(&codex_usage(Some(5_000), None, None)));
+        assert_eq!(total_only.reported_prompt_tokens, Some(5_000));
+        assert!(total_only.closing.is_empty());
+        assert!(
+            !total_only.is_empty(),
+            "a prompt total on its own is still something the backend reported"
+        );
+
+        // Nothing reported at all stays nothing.
+        assert!(reported_usage_report(None).is_empty());
+        assert!(reported_usage_report(Some(&codex_usage(None, None, None))).is_empty());
     }
 
     #[test]

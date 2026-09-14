@@ -74,10 +74,6 @@ impl Provider for KimiProvider {
                 ),
             );
         }
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved);
-        }
-
         let translated = match translate_request(
             &body,
             TranslateOptions {
@@ -93,6 +89,12 @@ impl Provider for KimiProvider {
                 );
             }
         };
+        // The upstream request now exists: `translated.model` is the id in the
+        // body that goes on the wire, so it is the model this call was prepared
+        // with. Before this point the translator can still refuse it.
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.model_resolved(&ctx.req_id, &translated.model);
+        }
 
         // KimiHttpClient uses a blocking client whose lifecycle belongs on a
         // blocking thread.
@@ -171,11 +173,8 @@ impl Provider for KimiProvider {
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        let model = body.model.as_deref().unwrap_or("kimi-for-coding");
-        let resolved = resolve_model(model);
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved);
-        }
+        // Counted here, from the request alone: nothing is sent to Kimi, so no
+        // model runs and none is named as having run.
         let tokens = count_tokens::count_tokens(&body);
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.usage_updated(&ctx.req_id, Some(tokens), None);
@@ -210,9 +209,6 @@ impl Provider for KimiProvider {
                 ),
             )
         })?;
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved);
-        }
         let translated = translate_request(
             &body,
             TranslateOptions {
@@ -226,6 +222,11 @@ impl Provider for KimiProvider {
                 error.to_string(),
             )
         })?;
+        // Same boundary as the Messages route: named once the request exists in
+        // the form it will be sent in.
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.model_resolved(&ctx.req_id, &translated.model);
+        }
         if let Some(traffic) = ctx.traffic.as_ref() {
             traffic.write_json(
                 "020-upstream-request",
@@ -381,3 +382,95 @@ impl CliHandlers for KimiCli {
 }
 
 pub(crate) static KIMI_CLI: KimiCli = KimiCli;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(monitor: &crate::monitor::MonitorHandle, req_id: &str) -> RequestContext {
+        monitor.request_started(req_id, None, None, crate::monitor::EndpointKind::Messages);
+        monitor.provider_selected(req_id, "kimi", "kimi-for-coding", None);
+        RequestContext {
+            req_id: req_id.to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "kimi".to_string(),
+            traffic: None,
+            monitor: Some(monitor.clone()),
+            passthrough: None,
+        }
+    }
+
+    /// The stream entrypoint rejects the same requests the Messages route does,
+    /// and just as there, a request that was never built for the wire names no
+    /// model as having run.
+    #[tokio::test]
+    async fn a_request_the_translator_refuses_names_no_model_as_having_run() {
+        for (case, body) in [
+            (
+                "effort",
+                serde_json::json!({
+                    "model": "kimi-for-coding",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "output_config": {"effort": "ultra"}
+                }),
+            ),
+            (
+                "role",
+                serde_json::json!({
+                    "model": "kimi-for-coding",
+                    "max_tokens": 64,
+                    "messages": [{"role": "tool", "content": "hi"}]
+                }),
+            ),
+        ] {
+            let monitor = crate::monitor::MonitorHandle::new(10);
+            let ctx = context(&monitor, case);
+            let body: MessagesRequest = serde_json::from_value(body).unwrap();
+
+            let error = KimiProvider::new()
+                .generate_anthropic_stream(body, ctx)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{case} must be rejected"));
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{case}");
+            assert!(
+                matches!(error.kind, ProviderErrorKind::InvalidRequest),
+                "{case}"
+            );
+
+            let state = monitor.snapshot();
+            assert_eq!(state.active[0].effective_model, None, "{case}");
+        }
+    }
+
+    /// Once the upstream request exists, the model it was built for is named,
+    /// and the auth failure that follows does not take the name back.
+    #[tokio::test]
+    async fn a_built_request_names_the_model_it_was_built_for() {
+        let monitor = crate::monitor::MonitorHandle::new(10);
+        let ctx = context(&monitor, "built");
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "kimi-for-coding",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+
+        // No Kimi credentials in the test environment: the client stops at its
+        // own auth check, which is past the point where the request was built.
+        let error = KimiProvider::new()
+            .generate_anthropic_stream(body, ctx)
+            .await
+            .err()
+            .expect("no credentials in the test environment");
+        assert_ne!(error.status, StatusCode::BAD_REQUEST);
+
+        let state = monitor.snapshot();
+        assert_eq!(
+            state.active[0].effective_model.as_deref(),
+            Some("kimi-for-coding")
+        );
+    }
+}

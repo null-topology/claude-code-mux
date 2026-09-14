@@ -1,6 +1,6 @@
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -213,24 +213,12 @@ pub fn openai_error(
         .into_response()
 }
 
-#[derive(Clone, Default)]
-pub struct NativeResponseOutcome {
-    failure: Arc<Mutex<Option<String>>>,
-}
-
-impl NativeResponseOutcome {
-    pub fn failure(&self) -> Option<String> {
-        self.failure.lock().ok().and_then(|failure| failure.clone())
-    }
-
-    pub(crate) fn fail(&self, message: String) {
-        if let Ok(mut failure) = self.failure.lock()
-            && failure.is_none()
-        {
-            *failure = Some(message);
-        }
-    }
-}
+/// The outcome mechanism under the name this module has always exported. It is
+/// the shared one now: the native Responses relay, the Messages translator and
+/// the Anthropic passthrough all hand the server the same thing. The native
+/// surfaces keep the weaker contract (report observed failures, expect no
+/// terminal event), so this alias stays `ResponseOutcome::default`.
+pub use crate::provider::ResponseOutcome as NativeResponseOutcome;
 
 fn passthrough_response(
     upstream: reqwest::Response,

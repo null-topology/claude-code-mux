@@ -1255,6 +1255,209 @@ async fn monitor_records_successful_request_events() {
     assert!(state.recent[0].input_tokens.is_some());
 }
 
+/// A token estimate is answered from a local tokenizer: the request never
+/// reaches the backend, so it names no model as having run and contributes no
+/// tokens to what the session actually spent. It is still one request the
+/// caller made.
+#[tokio::test]
+async fn monitor_names_no_wire_model_for_a_local_token_estimate() {
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "estimate-session")
+                .body(body_string(
+                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let state = monitor.snapshot();
+    assert_eq!(state.recent.len(), 1);
+    let request = &state.recent[0];
+    assert_eq!(request.provider.as_deref(), Some("codex"));
+    assert_eq!(request.requested_model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(request.effective_model, None);
+    assert_eq!(request.model.as_deref(), Some("gpt-5.4"));
+
+    let session = &state.sessions[0];
+    assert_eq!(session.request_count, 1);
+    assert_eq!(session.input_tokens, 0);
+    assert_eq!(session.output_tokens, 0);
+    let row = session
+        .models
+        .iter()
+        .find(|row| row.provider.as_deref() == Some("codex"))
+        .expect("the estimate is counted on its provider");
+    assert_eq!(row.model, None);
+    assert_eq!(row.request_count, 1);
+    assert_eq!(row.input_tokens, 0);
+    assert_eq!(row.output_tokens, 0);
+}
+
+/// Every backend answers a token estimate locally, so none of them may name a
+/// model as having run for one.
+#[tokio::test]
+async fn monitor_names_no_wire_model_for_a_local_kimi_token_estimate() {
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "kimi-estimate-session")
+                .body(body_string(
+                    r#"{"model":"kimi-for-coding","messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    // The estimate itself is unchanged: a positive local count is still returned.
+    assert!(body["input_tokens"].as_u64().unwrap_or(0) > 0);
+
+    let state = monitor.snapshot();
+    assert_eq!(state.recent.len(), 1);
+    let request = &state.recent[0];
+    assert_eq!(request.provider.as_deref(), Some("kimi"));
+    assert_eq!(request.requested_model.as_deref(), Some("kimi-for-coding"));
+    assert_eq!(request.effective_model, None);
+    assert_eq!(request.model.as_deref(), Some("kimi-for-coding"));
+
+    let session = &state.sessions[0];
+    assert_eq!(session.request_count, 1);
+    assert_eq!(session.input_tokens, 0);
+    assert_eq!(session.output_tokens, 0);
+    let row = session
+        .models
+        .iter()
+        .find(|row| row.provider.as_deref() == Some("kimi"))
+        .expect("the estimate is counted on its provider");
+    assert_eq!(row.model, None);
+    assert_eq!(row.request_count, 1);
+    assert_eq!(row.input_tokens, 0);
+    assert_eq!(row.output_tokens, 0);
+}
+
+/// A request the translator rejects never becomes an upstream request, so the
+/// model it would have run on is not named. The rejection itself is unchanged.
+#[tokio::test]
+async fn monitor_names_no_wire_model_for_a_request_kimi_refuses_to_translate() {
+    for (case, body) in [
+        (
+            "effort",
+            r#"{"model":"kimi-for-coding","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"output_config":{"effort":"ultra"}}"#,
+        ),
+        (
+            "role",
+            r#"{"model":"kimi-for-coding","max_tokens":64,"messages":[{"role":"tool","content":"hi"}]}"#,
+        ),
+    ] {
+        let monitor = MonitorHandle::new(10);
+        let app = app_with_monitor(
+            Arc::new(Registry::with_default_alias()),
+            Some(monitor.clone()),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(body_string(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case}");
+        let error: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(error["type"], "error", "{case}");
+
+        let state = monitor.snapshot();
+        let request = &state.recent[0];
+        assert_eq!(request.status, RequestStatus::Failed, "{case}");
+        assert_eq!(
+            request.requested_model.as_deref(),
+            Some("kimi-for-coding"),
+            "{case}"
+        );
+        assert_eq!(request.effective_model, None, "{case}");
+    }
+}
+
+/// The counterpart: once the translator has produced the upstream request, the
+/// model it was built for is named, and a failure after that point does not
+/// take the name back.
+#[tokio::test]
+async fn monitor_names_the_wire_model_once_kimi_has_built_the_request() {
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(body_string(
+                    r#"{"model":"kimi-for-coding","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // No Kimi credentials in the test environment, so the prepared request
+    // stops at the auth check inside the client; that is after the boundary.
+    assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(
+        request.effective_model.as_deref(),
+        Some("kimi-for-coding"),
+        "the model the upstream request was built for stays named"
+    );
+}
+
 #[tokio::test]
 async fn monitor_records_invalid_json_failure() {
     let monitor = MonitorHandle::new(10);
@@ -1311,6 +1514,88 @@ async fn monitor_records_unknown_model_failure() {
     let error = state.recent[0].error.as_deref().unwrap_or("");
     assert!(error.starts_with("Unknown model \"not-a-model\""));
     assert!(error.contains("Supported:"));
+    // The model the caller asked for is kept even though nothing was routed:
+    // a request that named a model the proxy does not serve is still a request
+    // for that model, and no provider or wire model is invented for it.
+    assert_eq!(
+        state.recent[0].requested_model.as_deref(),
+        Some("not-a-model")
+    );
+    assert_eq!(state.recent[0].provider, None);
+    assert_eq!(state.recent[0].effective_model, None);
+}
+
+#[tokio::test]
+async fn monitor_records_a_request_that_named_no_model() {
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(body_string(
+                    r#"{"messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let state = monitor.snapshot();
+    assert_eq!(state.recent[0].status, RequestStatus::Failed);
+    // Nothing named a model, so none is invented from anywhere else.
+    assert_eq!(state.recent[0].requested_model, None);
+    assert_eq!(state.recent[0].effective_model, None);
+    assert_eq!(state.recent[0].provider, None);
+}
+
+/// A label request the proxy answers itself never reaches a model. It is still
+/// a request the caller made for a model, and it is counted as one.
+#[tokio::test]
+async fn monitor_records_a_locally_answered_request_without_a_wire_model() {
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_monitor(
+        Arc::new(Registry::with_default_alias()),
+        Some(monitor.clone()),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "local-session")
+                .body(body_string(
+                    r#"{"model":"gpt-5.4","max_tokens":64,"messages":[{"role":"user","content":"Describe your most recent action in 3-5 words"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.provider.as_deref(), Some("local"));
+    assert_eq!(request.requested_model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(request.effective_model, None);
+    let session = &state.sessions[0];
+    assert_eq!(session.request_count, 1);
+    assert_eq!(session.output_tokens, 0);
+    let row = &session.models[0];
+    assert_eq!(row.provider.as_deref(), Some("local"));
+    assert_eq!(row.model, None);
+    assert_eq!(row.request_count, 1);
 }
 
 async fn get_models(app: axum::Router, uri: &str) -> (StatusCode, Value) {

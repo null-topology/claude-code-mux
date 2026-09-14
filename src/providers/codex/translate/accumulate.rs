@@ -1,10 +1,11 @@
 use serde_json::Value;
 
+use crate::monitor::UsageReport;
 use crate::traffic::TrafficCapture;
 
 use super::reducer::{
-    AnthropicUsage, ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic,
-    reduce_upstream_bytes,
+    AnthropicUsage, CodexUsage, ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic,
+    reduce_upstream_bytes, reported_usage_report,
 };
 use super::web_search_compat::{WebSearchCompatContent, build_web_search_compat_blocks};
 
@@ -22,6 +23,20 @@ pub fn accumulate_response_with_traffic(
     model: &str,
     traffic: Option<&TrafficCapture>,
 ) -> Result<Value, anyhow::Error> {
+    accumulate_response_parts(upstream, message_id, model, traffic).map(|(response, _)| response)
+}
+
+/// The accumulated response plus the usage the backend actually reported.
+///
+/// The response always carries a `usage` object because the Messages shape
+/// requires one, and its fields are zero when the backend sent nothing. The
+/// monitor is told from the report instead, where an absent count stays absent.
+pub(crate) fn accumulate_response_parts(
+    upstream: &[u8],
+    message_id: &str,
+    model: &str,
+    traffic: Option<&TrafficCapture>,
+) -> Result<(Value, UsageReport), anyhow::Error> {
     let events = match reduce_upstream_bytes(upstream) {
         Ok(events) => events,
         Err(err) => {
@@ -37,6 +52,7 @@ pub fn accumulate_response_with_traffic(
     let mut blocks: Vec<AccumulatedBlock> = Vec::new();
     let mut stop_reason: Option<String> = None;
     let mut usage: Option<AnthropicUsage> = None;
+    let mut reported_usage: Option<CodexUsage> = None;
     let mut web_search_events: Vec<ReducerEvent> = Vec::new();
     let mut deferred_text_parts: Vec<String> = Vec::new();
 
@@ -133,6 +149,7 @@ pub fn accumulate_response_with_traffic(
                 stop_reason = Some(sr.to_string());
                 let ws = Some(*web_search_requests).filter(|n| *n > 0);
                 usage = Some(map_codex_usage_to_anthropic(u, ws));
+                reported_usage = u.clone();
             }
             _ => {}
         }
@@ -242,7 +259,7 @@ pub fn accumulate_response_with_traffic(
         "usage": usage.unwrap_or_default(),
     });
 
-    Ok(response)
+    Ok((response, reported_usage_report(reported_usage.as_ref())))
 }
 
 fn write_reducer_error_capture(traffic: Option<&TrafficCapture>, err: &UpstreamStreamError) {
@@ -313,6 +330,59 @@ mod tests {
         assert_eq!(response["content"][0]["type"], "text");
         assert_eq!(response["content"][0]["text"], "Hello world");
         assert_eq!(response["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn the_reported_usage_is_separate_from_the_response_body_usage() {
+        let body = |usage: serde_json::Value| {
+            format!(
+                "{}{}{}{}",
+                sse_event(
+                    "response.output_item.added",
+                    json!({"output_index":0,"item":{"type":"message","id":"msg_up"}})
+                ),
+                sse_event(
+                    "response.output_text.delta",
+                    json!({"output_index":0,"delta":"hi"})
+                ),
+                sse_event(
+                    "response.output_item.done",
+                    json!({"output_index":0,"item":{"type":"message"}})
+                ),
+                sse_event(
+                    "response.completed",
+                    json!({"response":{"id":"resp_1","usage":usage}})
+                ),
+            )
+        };
+
+        // The backend counted the turn: the counts it sent close the report.
+        let (response, report) = accumulate_response_parts(
+            body(json!({
+                "input_tokens": 5_000,
+                "output_tokens": 7,
+                "input_tokens_details": {"cached_tokens": 4_800}
+            }))
+            .as_bytes(),
+            "msg_1",
+            "gpt-5.5",
+            None,
+        )
+        .unwrap();
+        assert_eq!(response["usage"]["input_tokens"], json!(200));
+        assert_eq!(report.closing.input_tokens, Some(200));
+        assert_eq!(report.closing.cache_read_tokens, Some(4_800));
+        assert_eq!(report.closing.output_tokens, Some(7));
+        assert_eq!(report.closing.cache_write_tokens, None);
+
+        // It counted nothing: the body still carries the zeros the Messages
+        // shape requires, and the report carries no counts at all.
+        let (response, report) =
+            accumulate_response_parts(body(json!({})).as_bytes(), "msg_1", "gpt-5.5", None)
+                .unwrap();
+        assert_eq!(response["usage"]["input_tokens"], json!(0));
+        assert_eq!(response["usage"]["output_tokens"], json!(0));
+        assert!(report.is_empty());
     }
 
     #[test]

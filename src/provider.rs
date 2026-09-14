@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use clap::Subcommand;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum AuthCommand {
@@ -226,6 +226,83 @@ impl ProviderError {
     }
 }
 
+/// Recorded when a stream whose protocol ends with a terminal event stopped
+/// before one arrived.
+pub const MISSING_TERMINAL_FAILURE: &str = "stream ended before its terminal event";
+
+/// What a streamed response turned out to be, as the code producing it saw.
+///
+/// The status line leaves before the body does, so a protocol failure found
+/// mid-stream can no longer change the HTTP status; the producer records it
+/// here and the server reads it when the body ends. That keeps the reported
+/// status the one the client actually received and still lets the request be
+/// recorded as failed. The first failure wins, so a healthy-looking finish
+/// after it cannot erase it.
+///
+/// A protocol whose responses end with a terminal event — the Anthropic
+/// Messages stream ends with `message_stop` — is tracked with
+/// [`ResponseOutcome::requiring_terminal`]: a body that simply stopped before
+/// one is a failure, not a success. Producers without that guarantee use
+/// [`ResponseOutcome::default`] and report only the failures they observed.
+#[derive(Clone, Default)]
+pub struct ResponseOutcome {
+    state: Arc<Mutex<ResponseOutcomeState>>,
+}
+
+#[derive(Default)]
+struct ResponseOutcomeState {
+    failure: Option<String>,
+    terminal_required: bool,
+    terminal_seen: bool,
+}
+
+impl ResponseOutcome {
+    /// An outcome for a protocol that ends with a terminal event.
+    pub fn requiring_terminal() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ResponseOutcomeState {
+                failure: None,
+                terminal_required: true,
+                terminal_seen: false,
+            })),
+        }
+    }
+
+    /// The failure the producer observed, if any.
+    pub fn failure(&self) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.failure.clone())
+    }
+
+    /// The failure to record now that the body has ended: the first one
+    /// observed, or a missing terminal event when the protocol has one.
+    pub fn failure_at_end(&self) -> Option<String> {
+        let state = self.state.lock().ok()?;
+        if let Some(failure) = state.failure.clone() {
+            return Some(failure);
+        }
+        (state.terminal_required && !state.terminal_seen)
+            .then(|| MISSING_TERMINAL_FAILURE.to_string())
+    }
+
+    pub(crate) fn fail(&self, message: impl Into<String>) {
+        if let Ok(mut state) = self.state.lock()
+            && state.failure.is_none()
+        {
+            state.failure = Some(message.into());
+        }
+    }
+
+    /// Record that the protocol's terminal event reached the client.
+    pub(crate) fn mark_terminal(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.terminal_seen = true;
+        }
+    }
+}
+
 pub trait CliHandlers: Send + Sync {
     fn login(&self) -> Result<()>;
     fn device(&self) -> Result<()>;
@@ -256,4 +333,61 @@ pub struct Passthrough {
     pub headers: axum::http::HeaderMap,
     /// Original path and query, e.g. `/v1/messages?beta=true`.
     pub path_and_query: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_failure_wins_and_a_later_finish_cannot_erase_it() {
+        let outcome = ResponseOutcome::requiring_terminal();
+        outcome.fail("reset before the terminal event");
+        outcome.fail("a second, later complaint");
+        outcome.mark_terminal();
+
+        assert_eq!(
+            outcome.failure().as_deref(),
+            Some("reset before the terminal event")
+        );
+        assert_eq!(
+            outcome.failure_at_end().as_deref(),
+            Some("reset before the terminal event")
+        );
+    }
+
+    #[test]
+    fn a_protocol_with_a_terminal_event_fails_without_one() {
+        let missing = ResponseOutcome::requiring_terminal();
+        assert_eq!(missing.failure(), None);
+        assert_eq!(
+            missing.failure_at_end().as_deref(),
+            Some(MISSING_TERMINAL_FAILURE)
+        );
+
+        let complete = ResponseOutcome::requiring_terminal();
+        complete.mark_terminal();
+        assert_eq!(complete.failure_at_end(), None);
+    }
+
+    #[test]
+    fn a_producer_without_the_stronger_contract_keeps_the_old_one() {
+        // The native Responses surfaces report the failures they see and say
+        // nothing about terminal events; a body that ends is still a success.
+        let outcome = ResponseOutcome::default();
+        assert_eq!(outcome.failure_at_end(), None);
+        outcome.fail("native stream failed");
+        assert_eq!(
+            outcome.failure_at_end().as_deref(),
+            Some("native stream failed")
+        );
+    }
+
+    #[test]
+    fn the_outcome_is_shared_by_every_clone() {
+        let producer = ResponseOutcome::requiring_terminal();
+        let consumer = producer.clone();
+        producer.fail("upstream closed");
+        assert_eq!(consumer.failure().as_deref(), Some("upstream closed"));
+    }
 }

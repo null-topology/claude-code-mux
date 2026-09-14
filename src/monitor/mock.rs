@@ -5,9 +5,8 @@ use std::{
 };
 
 use super::{
-    ActiveRequest, CacheMiss, CacheMissCause, CompletedRequest, ConversationKey, ConversationState,
-    EndpointKind, MonitorState, RequestCache, RequestStatus, SessionCacheStats, SessionUsage,
-    session_summaries,
+    AbsorbedRequest, ActiveRequest, CacheMiss, CacheMissCause, CompletedRequest, EndpointKind,
+    Ledger, MonitorState, RequestCache, RequestStatus, apply_window_rate, session_summaries,
 };
 
 const TICK_MILLIS: u64 = 250;
@@ -88,7 +87,6 @@ fn mock_state_for_tick(
     streaming.model = Some("claude-sonnet-4-6 → gpt-5.6-sol".to_string());
     streaming.effort = Some("high".to_string());
     streaming.generation_started_at = Some(now - Duration::from_secs(10));
-    streaming.generation_started_instant = Some(instant_now - Duration::from_secs(10));
     streaming.generation_initial_output_tokens = 20;
     streaming.generation_finished_at = Some(now - Duration::from_secs(2));
     streaming.generation_duration = Some(Duration::from_secs(8));
@@ -105,8 +103,6 @@ fn mock_state_for_tick(
     streaming.started_at = now - Duration::from_secs(14) - simulated_elapsed;
     streaming.started_instant = instant_now - Duration::from_secs(14) - simulated_elapsed;
     streaming.generation_started_at = Some(now - Duration::from_secs(10) - simulated_elapsed);
-    streaming.generation_started_instant =
-        Some(instant_now - Duration::from_secs(10) - simulated_elapsed);
     streaming.output_tokens = Some(420_u64.saturating_add(simulated_output_tokens(tick)));
     streaming.input_tokens = Some(12_480_u64.saturating_add(tick / 4));
     streaming.streamed_bytes = 18_432_u64.saturating_add(tick.saturating_mul(384));
@@ -173,7 +169,6 @@ fn mock_state_for_tick(
     byte_stream.provider = Some("cursor".to_string());
     byte_stream.model = Some("cursor:claude-4.6-opus-high-thinking".to_string());
     byte_stream.generation_started_at = Some(now - Duration::from_secs(20));
-    byte_stream.generation_started_instant = Some(instant_now - Duration::from_secs(20));
     byte_stream.generation_finished_at = Some(now - Duration::from_secs(4));
     byte_stream.streamed_bytes = 32_768_u64.saturating_add(tick.saturating_mul(640));
     byte_stream.stream_chunks = 128_u64.saturating_add(tick.saturating_mul(4));
@@ -440,126 +435,21 @@ fn mock_state_for_tick(
     recent.push_back(no_status);
 
     add_simulated_requests(now, instant_now, tick, &mut active, &mut recent);
-    let mut session_usage = HashMap::<Option<String>, SessionUsage>::new();
-    let mut session_cache = HashMap::<Option<String>, SessionCacheStats>::new();
-    let mut add_usage = |session_id: &Option<String>,
-                         input: Option<u64>,
-                         output: Option<u64>,
-                         cache: &RequestCache| {
-        let usage = session_usage.entry(session_id.clone()).or_default();
-        usage.input_tokens = usage.input_tokens.saturating_add(input.unwrap_or(0));
-        usage.output_tokens = usage.output_tokens.saturating_add(output.unwrap_or(0));
-        usage.cache_read_tokens = usage
-            .cache_read_tokens
-            .saturating_add(cache.read_tokens.unwrap_or(0));
-        usage.cache_write_tokens = usage
-            .cache_write_tokens
-            .saturating_add(cache.write_tokens.unwrap_or(0));
-    };
-    for request in &recent {
-        add_usage(
-            &request.session_id,
-            request.input_tokens,
-            request.output_tokens,
-            &request.cache,
-        );
+    // The demo builds finished requests instead of replaying their events, so
+    // the ledger absorbs them and answers for the session rows exactly as it
+    // does for observed traffic. Oldest first, so rows keep their order.
+    let mut ledger = Ledger::default();
+    for request in recent.iter().rev() {
+        ledger.absorb(AbsorbedRequest::from_completed(request));
     }
     for request in &active {
-        add_usage(
-            &request.session_id,
-            request.input_tokens,
-            request.output_tokens,
-            &request.cache,
-        );
+        ledger.absorb(AbsorbedRequest::from_active(request));
     }
-    for request in &recent {
-        let prompt = request.prompt_tokens().unwrap_or(0);
-        let stats = session_cache.entry(request.session_id.clone()).or_default();
-        if prompt >= stats.context_tokens {
-            stats.context_tokens = prompt;
-            stats.context_started_at = Some(request.started_at);
-            stats.context_ttl = request.cache.ttl;
-        }
-        stats.peak_context_tokens = stats.peak_context_tokens.max(prompt);
-        if let Some(miss) = request.cache.miss {
-            stats.miss_count += 1;
-            stats.missed_tokens = stats.missed_tokens.saturating_add(miss.missed_tokens);
-            stats.last_miss = Some((request.started_at, miss));
-        }
+    for (session_id, samples) in output_buckets {
+        ledger.seed_output_history(session_id.clone(), samples);
     }
-    let mut conversations = HashMap::<ConversationKey, ConversationState>::new();
-    let mut add_conversation = |session_id: &Option<String>,
-                                conversation: &Option<String>,
-                                input: Option<u64>,
-                                output: Option<u64>,
-                                cache: &RequestCache,
-                                prompt: u64,
-                                started_at: SystemTime| {
-        let Some(conversation) = conversation.clone() else {
-            return;
-        };
-        let state = conversations
-            .entry(ConversationKey {
-                session_id: session_id.clone(),
-                conversation,
-            })
-            .or_default();
-        state.usage.input_tokens = state.usage.input_tokens.saturating_add(input.unwrap_or(0));
-        state.usage.output_tokens = state
-            .usage
-            .output_tokens
-            .saturating_add(output.unwrap_or(0));
-        state.usage.cache_read_tokens = state
-            .usage
-            .cache_read_tokens
-            .saturating_add(cache.read_tokens.unwrap_or(0));
-        state.usage.cache_write_tokens = state
-            .usage
-            .cache_write_tokens
-            .saturating_add(cache.write_tokens.unwrap_or(0));
-        if prompt >= state.cache.context_tokens {
-            state.cache.context_tokens = prompt;
-            state.cache.context_started_at = Some(started_at);
-            state.cache.context_ttl = cache.ttl;
-        }
-        state.cache.peak_context_tokens = state.cache.peak_context_tokens.max(prompt);
-        if let Some(miss) = cache.miss {
-            state.cache.miss_count += 1;
-            state.cache.missed_tokens =
-                state.cache.missed_tokens.saturating_add(miss.missed_tokens);
-            state.cache.last_miss = Some((started_at, miss));
-        }
-    };
-    for request in &recent {
-        add_conversation(
-            &request.session_id,
-            &request.conversation,
-            request.input_tokens,
-            request.output_tokens,
-            &request.cache,
-            request.prompt_tokens().unwrap_or(0),
-            request.started_at,
-        );
-    }
-    for request in &active {
-        add_conversation(
-            &request.session_id,
-            &request.conversation,
-            request.input_tokens,
-            request.output_tokens,
-            &request.cache,
-            request.prompt_tokens().unwrap_or(0),
-            request.started_at,
-        );
-    }
-    let sessions = session_summaries(
-        &active,
-        &recent,
-        &session_usage,
-        &session_cache,
-        &conversations,
-        output_buckets,
-    );
+    let mut sessions = session_summaries(&ledger);
+    apply_window_rate(&mut sessions, &active, &recent);
     MonitorState {
         started_at,
         sessions,
@@ -745,7 +635,6 @@ fn simulated_active_request(
             .saturating_mul(9 + cycle % 5)
             .saturating_add(generation_ticks.saturating_mul(generation_ticks) / 3);
         request.generation_started_at = Some(now - generation_duration);
-        request.generation_started_instant = Some(instant_now - generation_duration);
         request.generation_finished_at = Some(now);
         request.generation_duration = Some(generation_duration);
         request.streamed_bytes = output_tokens.saturating_mul(24);
@@ -856,12 +745,13 @@ fn active_request(
         project: None,
         provider: None,
         model: None,
+        requested_model: None,
+        effective_model: None,
         effort: None,
         endpoint,
         started_at: now - elapsed,
         started_instant: instant_now - elapsed,
         generation_started_at: None,
-        generation_started_instant: None,
         generation_initial_output_tokens: 0,
         generation_finished_at: None,
         generation_duration: None,
@@ -898,12 +788,13 @@ fn completed_request(
         project: None,
         provider: None,
         model: None,
+        requested_model: None,
+        effective_model: None,
         effort: None,
         endpoint,
         started_at: finished_at - latency,
         finished_at,
         generation_started_at: None,
-        generation_started_instant: None,
         generation_initial_output_tokens: 0,
         generation_finished_at: None,
         generation_duration: None,

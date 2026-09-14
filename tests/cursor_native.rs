@@ -874,13 +874,22 @@ async fn cursor_provider_handle_messages_returns_anthropic_json() {
     }))
     .unwrap();
 
+    let monitor = claude_code_mux::monitor::MonitorHandle::new(10);
+    monitor.request_started(
+        "test-req",
+        None,
+        None,
+        claude_code_mux::monitor::EndpointKind::Messages,
+    );
+    monitor.provider_selected("test-req", "cursor", "cursor:gpt-5.5", None);
+
     let ctx = RequestContext {
         req_id: "test-req".into(),
         session_id: None,
         session_seq: None,
         provider: "cursor".into(),
         traffic: None,
-        monitor: None,
+        monitor: Some(monitor.clone()),
         passthrough: None,
     };
 
@@ -891,6 +900,12 @@ async fn cursor_provider_handle_messages_returns_anthropic_json() {
         status != 401 && status != 400,
         "handle_messages returned error status {status}"
     );
+
+    // The request really left over the loopback socket, so the model the call
+    // was prepared with is the one the monitor is told ran. The frames carry
+    // that same id (see the wire test above).
+    let state = monitor.snapshot();
+    assert_eq!(state.active[0].effective_model.as_deref(), Some("gpt-5.5"));
 
     unsafe {
         std::env::remove_var("CCP_CURSOR_BASE_URL");
