@@ -9,9 +9,13 @@ This is a fork of
 [fcakyon/claude-code-with-codex](https://github.com/fcakyon/claude-code-with-codex),
 itself a fork of
 [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy). See
-[Credits](#credits) for what each layer contributed.
+[How this compares with the upstream projects](#how-this-compares-with-the-upstream-projects)
+for what each layer contributed and what differs today.
 
-<img src="https://github.com/fcakyon/claude-code-with-codex/releases/download/v0.3.0/claude-codex-demo.gif" alt="Claude Code running through the proxy" />
+<img src="meta/claude-code-screenshot-2026-07.webp" alt="The claude-code-mux monitor during a session" />
+
+<sub>The monitor in an earlier layout; the panes and columns have changed since
+the screenshot was taken.</sub>
 
 `claude-code-mux` is a small local proxy. Claude Code already speaks the Anthropic
 Messages API, so the proxy speaks it too and sends each request where the model
@@ -27,11 +31,79 @@ So Opus can stay on your Claude plan for the hard parts while a Codex model
 runs the everyday turns on your ChatGPT plan, in one session, with Claude
 Code's own usage warnings and limit messages working for both.
 
-[Quickstart](#quickstart) · [Picking a model](#picking-a-model) ·
-[Claude Agent SDK](#claude-agent-sdk) · [Rate limits](#rate-limits) ·
-[How it works](#how-it-works) · [Configuration](#configuration) ·
-[Other backends](#other-backends) · [Limitations](#limitations) ·
+[What it does](#what-it-does) · [Quickstart](#quickstart) ·
+[Picking a model](#picking-a-model) · [How it works](#how-it-works) ·
+[The monitor](#the-monitor) · [HTTP API](#http-api) ·
+[Rate limits](#rate-limits) · [Configuration](#configuration) ·
+[Other backends](#other-backends) · [Troubleshooting](#troubleshooting) ·
+[Comparison](#how-this-compares-with-the-upstream-projects) ·
 [Development](#development)
+
+## What it does
+
+- **Routes by model name, per request.** `claude-*` ids and the Claude aliases
+  go to Anthropic, Codex ids to the ChatGPT backend, and Kimi, Grok and Cursor
+  ids to their own translators. Nothing else decides the route.
+  [Picking a model](#picking-a-model)
+- **Relays the Claude route byte for byte**, on Claude Code's own subscription
+  login, so Anthropic's prompt cache keeps working. [How it works](#how-it-works)
+- **Translates Anthropic Messages to the OpenAI Responses API** for Codex, over
+  a WebSocket by default, with reasoning that survives a switch between
+  backends. [How it works](#how-it-works)
+- **Lists the models your login can actually use.** `/v1/models` asks the Codex
+  backend on every call instead of serving a list compiled into the binary.
+  [Listing models](#listing-models)
+- **Turns Codex quota into the rate-limit headers Claude Code reads**, so a
+  Codex model shows the same usage warnings and limit messages as a Claude one.
+  [Rate limits](#rate-limits)
+- **Ships a terminal monitor** with per-session, per-conversation and per-model
+  token accounting, cache hit and miss detection, and a conversation tree.
+  [The monitor](#the-monitor)
+- **Answers Claude Code's subagent progress label itself**, instead of resending
+  a running subagent's whole context to a model every half minute.
+  [Proxy side](#proxy-side)
+- **Maps deferred tool loading onto Codex's native tool search**, so loading a
+  tool mid-conversation does not rewrite the head of the prompt.
+  [Claude Code side](#claude-code-side)
+- **Keeps Codex models on the full Responses lane** so they can answer with
+  several tool calls at once.
+  [Responses lanes and parallel tool calls](#responses-lanes-and-parallel-tool-calls)
+- **Gives each conversation its own prompt-cache scope** on the Codex backend, so
+  a subagent does not share the main thread's cache key.
+  [How it works](#how-it-works)
+- **Optionally exposes OpenAI-compatible surfaces** — responses, chat
+  completions, images, transcriptions — for clients that do not speak the
+  Anthropic API. [HTTP API](#http-api)
+
+## What this fork adds
+
+Neither upstream project has these; the details and the evidence are in
+[the comparison](#how-this-compares-with-the-upstream-projects).
+
+- **Live Codex model discovery.** `/v1/models` and `claude-code-mux models` ask
+  the Codex backend what the logged-in account may use, instead of printing a
+  list compiled into the build.
+- **A richer `/v1/models`.** Every row carries its `provider`, a top-level
+  `providers[]` block says where each group's rows came from and whether the
+  listing succeeded, and `?provider=` asks one backend and fails loudly.
+- **Codex quota as `anthropic-ratelimit-unified-*` headers**, including the
+  spent-window answer with `x-should-retry: false` instead of a bare 429 after
+  every retry was burned.
+- **Deferred tool loading on the Codex route**, mapped onto the backend's own
+  tool search so the cached prompt prefix survives a tool load.
+- **Local answers for Claude Code's subagent progress label**, with
+  `CCP_AGENT_SUMMARY=upstream` to send them to a junior model instead.
+- **A per-conversation prompt-cache scope** on Codex: the session id for a main
+  thread, a derived id for each subagent.
+- **The monitor's token accounting** — the cache read and write split, evidence
+  marks on every count, per-lane cache-miss detection, and the session
+  conversation tree.
+- **The Responses lane as configuration** (`CCP_CODEX_LANE_POLICY`), instead of
+  a decision made only by a compiled-in table.
+
+Inherited from the parent fork, so not unique to this one but still a difference
+from the original: the Anthropic passthrough itself, Claude aliases defaulting
+to Anthropic, and reading the Codex login from the Codex CLI.
 
 ## What you need
 
@@ -45,11 +117,17 @@ Code's own usage warnings and limit messages working for both.
 
 **1. Install `claude-code-mux`.**
 
-Prebuilt binary for macOS and Linux:
+The install script covers macOS and Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/null-topology/claude-code-mux/main/scripts/install.sh | bash
 ```
+
+`CLAUDE_CODE_MUX_VERSION=v0.7.0` pins a release and
+`CLAUDE_CODE_MUX_INSTALL_DIR=/opt/bin` chooses where the binary lands (default
+`/usr/local/bin`, else `~/.local/bin`). Releases also carry prebuilt binaries
+for Windows on x86_64 and aarch64; the script refuses to run there, so download
+the archive from the release page or build from source.
 
 Or build from source with Rust:
 
@@ -85,9 +163,10 @@ Do **not** set `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. See
 claude-code-mux serve
 ```
 
-It listens on `127.0.0.1:18765` and shows a live monitor when run in a
-terminal. `claude-code-mux serve --no-monitor` gives a plain server for a service
-manager or a background job.
+It listens on `127.0.0.1:18765` and opens the monitor when stdout is a
+terminal. When stdout is a pipe or a service manager's log, it starts in plain
+mode on its own and prints a short banner instead; `--no-monitor` forces plain
+mode in a terminal too.
 
 **5. Restart Claude Code** and pick a model:
 
@@ -112,11 +191,14 @@ Two suffixes are understood on any id:
 - `-fast` (for example `gpt-5.6-sol-fast`) requests Codex's priority service
   tier for that model.
 - `[1m]` (for example `gpt-5.6-sol[1m]`) is Claude Code's large-context marker.
-  The proxy strips it before talking to Codex.
+  The proxy strips it before routing and before talking to a backend. The
+  monitor still records the id the client sent, suffix included.
 
-Claude models keep their normal names: `claude-opus-5`, `claude-sonnet-5`,
-`opus`, `sonnet`, and so on. `claude-code-mux models` prints every id the proxy
-accepts.
+Claude models keep their normal names. The bundled aliases are `opus`,
+`sonnet`, `haiku`, `fable`, `claude-opus-5`, `claude-opus-4-8`,
+`claude-opus-4-7`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-haiku-4-5`
+(and its dated id) and `claude-fable-5`; any other `claude-*` id routes the same
+way. `claude-code-mux models` prints every id the proxy accepts.
 
 Any of these works with `/model` inside Claude Code, with `--model` on the
 command line, and with `ANTHROPIC_MODEL` to fix one model for a whole session.
@@ -169,8 +251,7 @@ arrow key like the built-in rows, add a `modelPicker` block to
 
 The rows appear after the built-in lineup. Each field does one thing:
 
-- `model` is sent to the proxy verbatim, so it must be an id from the table
-  above.
+- `model` is sent to the proxy verbatim, so it must be an id the proxy accepts.
 - `label` and `description` are only what the picker shows.
 - `behavesAs` names a Claude model whose client-side defaults (prompt profile,
   context window, effort handling) Claude Code applies to the row. Without it
@@ -257,11 +338,15 @@ discovery from turning a marker into a picker row.
 `GET /v1/models?provider=codex` asks one backend only. When that backend cannot
 list, the request fails with 502 and the reason, so a consumer never mistakes
 an empty answer for "no models". Without the filter the answer is always 200
-and the failure is in the `providers` block.
+and the failure is in the `providers` block. `?limit=N` truncates `data` and
+sets `has_more`.
 
 A model the backend listed routes to codex from then on, `-fast` variant
-included, even if this build did not know it. Nothing is cached across
-restarts: every call is a fresh answer from the backend.
+included, even if this build did not know it. That is why an id the compiled-in
+catalog does not contain can still be accepted. The listing itself is never
+cached: every call is a fresh answer from the backend, only the slugs it named
+are remembered in memory for routing, and a restart forgets them along with
+every other piece of conversation state (see [How it works](#how-it-works)).
 
 The listing call requires a `client_version` query parameter. The proxy sends
 the version recorded in the Codex CLI's `~/.codex/models_cache.json` when that
@@ -269,50 +354,127 @@ file exists next to `auth.json`, else a compiled-in default;
 `CCP_CODEX_CLIENT_VERSION` (or `codex.clientVersion` in `config.json`)
 overrides both.
 
-## Claude Agent SDK
+## How it works
 
-The SDK drives the same Claude Code binary, so the proxy works there without
-changes. Point it at the proxy and name a model:
-
-```python
-from claude_agent_sdk import ClaudeAgentOptions, query
-
-options = ClaudeAgentOptions(
-    model="gpt-5.6-sol",
-    env={"ANTHROPIC_BASE_URL": "http://127.0.0.1:18765", "ANTHROPIC_API_KEY": ""},
-)
-
-async for message in query(prompt="Summarize this repository.", options=options):
-    print(message)
+```mermaid
+flowchart LR
+    CC[Claude Code / Agent SDK] -->|Anthropic Messages API| P[claude-code-mux]
+    P -->|claude-*: bytes forwarded verbatim| A[api.anthropic.com]
+    P -->|gpt-*: translated to Responses API| X[Codex backend]
+    P -->|kimi/k2.6/k3, grok-*, cursor:* and cursor ids| O[other backends]
+    K[~/.codex/auth.json] -. ChatGPT token .-> P
 ```
 
-Blank `ANTHROPIC_API_KEY` in the `env` if the surrounding environment carries
-one. With a non-empty key the SDK takes the API-billing path and the
-`RateLimitEvent` described below is never emitted. Authentication stays the
-same as for the terminal: the Claude Code login on the machine, or
-`CLAUDE_CODE_OAUTH_TOKEN` in the environment.
+- **Routing** is by model name only. `claude-*` ids and the bundled Claude
+  aliases go to Anthropic. Any other id must either match a backend's compiled-in
+  list exactly — Kimi's `kimi-for-coding`, `kimi-k2.6`, `kimi-k3`, `k2.6`, `k3`;
+  Grok's `grok-4.5`, `grok-composer-2.5-fast`; Cursor's `cursor:`, `cursor-plan:`
+  and `cursor-ask:` prefixes plus its bare legacy ids — or be a slug the Codex
+  backend named in its last successful listing. An id matching none of those
+  returns a 400 that lists the accepted ids.
+- **Session affinity never overrides a Claude-shaped id.** A session that has
+  been running on Codex still sends `claude-opus-5` to Anthropic, which is what
+  lets one slot stay on each plan in the same conversation.
+- **The Claude route is a byte-exact passthrough.** The proxy forwards the
+  request body and headers as received, including whatever authorization
+  Claude Code attached, and streams the reply back. Because the bytes are
+  unchanged, Anthropic's prompt caching keeps working. The one rewrite it
+  performs is turning a signature-less `thinking` block into tagged text, and
+  it only reserializes a request that has one.
+- **The Codex route** maps the Messages API onto the Responses API over a
+  WebSocket per conversation (`CCP_CODEX_TRANSPORT` picks `websocket`, `http`
+  or `auto`) and reads the ChatGPT login from the Codex CLI's
+  `~/.codex/auth.json`. When the token is refreshed it is written back so the
+  Codex CLI keeps working. `previous_response_id` continuation state is kept
+  per conversation as well, but it is off unless
+  `CCP_CODEX_PREVIOUS_RESPONSE_ID` turns it on.
+- **Conversations come from Claude Code's headers.** The proxy reads
+  `x-claude-code-session-id`, `x-claude-code-agent-id` and
+  `x-claude-code-parent-agent-id`: the session plus the agent id identify a
+  conversation, and the parent id only draws the tree. A request that sends no
+  session header has no conversation and is accounted on its own.
+- **Each conversation gets its own prompt-cache scope on Codex.** Claude Code
+  gives a subagent its parent's session id, so the proxy sends the session id
+  for a main thread and a derived id (a uuid v5 of session plus agent id) for a
+  subagent, as both the request's `prompt_cache_key` and the `session_id`
+  header. Without it every subagent would share the main thread's cache key and
+  routing bucket.
+- **Reasoning survives a switch.** A `thinking` block produced by one backend
+  cannot be replayed to the other natively, so the proxy rewrites it as tagged
+  text before sending the history on. Context is not lost when you move a
+  conversation from one plan to the other.
+- **All conversation state is in memory and process-local.** Sessions (30
+  minutes idle before they are forgotten), provider affinity, continuation
+  state, server-side compaction state, the WebSocket pool and the last model
+  listing live in the running process. Restarting the proxy clears every one of
+  them; nothing is written to disk to be reloaded.
 
-## Rate limits
+## The monitor
 
-Codex reports its quota inside the stream, and the proxy translates it into the
-`anthropic-ratelimit-unified-*` headers Claude Code already reads. The effect
-is that Codex models behave like a Claude subscription:
+`claude-code-mux serve` opens a terminal UI when stdout is a TTY.
+`claude-code-mux demo` opens the same UI on simulated traffic with no server
+listening, which is the way to look around without sending a request.
 
-- **Healthy window.** The 5-hour and 7-day utilization arrive on every
-  response. Claude Code's usage warning works, and an SDK caller receives a
-  `RateLimitEvent` with `status='allowed'` or `'allowed_warning'` and the
-  utilization figures.
-- **Spent window.** Codex refuses with `usage_limit_reached` and a reset time.
-  The proxy answers once, without retrying, with `status='rejected'` and the
-  reset time. Claude Code shows its own
-  "You've hit your session limit · resets 1:07pm" message and an SDK caller
-  gets `RateLimitEvent` with `resets_at`. Before this the proxy burned every
-  retry first and the client saw a bare 429 minutes later.
+### Panes and key bindings
 
-`Retry-After` is deliberately not sent: clients sleep for its full value, and
-here that value is hours.
+The screen holds four panes — **Sessions** (a tree: a `Σ` row per session with
+its conversations under it), **Active requests**, **Recent requests** and
+**Events** (the failed and 4xx/5xx requests out of the recent list) — under a
+header bar showing the listen URL, uptime, and the session and active-request
+counts. `Enter` on a Sessions or Recent row opens a detail view for it.
 
-## What the monitor counts
+| key | what it does |
+| --- | --- |
+| `q` | ask to quit; `y` confirms, `n`, `q` or `Esc` cancels |
+| `Ctrl-C` | begin shutdown at once, no confirmation; again while shutting down force-quits |
+| `?` | toggle the shortcuts overlay |
+| `b` | toggle the setup overlay |
+| `Tab` | move focus between the Sessions and Recent panes |
+| `←` / `→` | focus the Sessions / Recent pane |
+| `↑` / `↓`, `k` / `j` | move the selection within the focused pane |
+| `Enter` | open the detail view for the selected row |
+| `Esc` | close the overlay, then the detail view |
+
+The setup overlay (`b`) prints the log and config paths, how many models each
+backend lists, and ready-to-paste `export` lines for a client. It is a
+starting point, not the recommended dual-subscription setup: the token line it
+prints is for a Codex-only client, and setting a token breaks the Claude route
+(see [Claude authentication](#claude-authentication)).
+
+Columns are dropped as the terminal narrows — the widest layout shows the
+session sparkline and the request `Endpoint` and `Details` columns, and the
+narrowest keeps little more than the time, status code, target and latency. A
+column that disappeared is a width effect, not a missing value.
+
+### Columns and marks
+
+Sessions: `A/R/F` (active, total, failed requests), `Project`, `Provider`,
+`Model`, `Effort`, `Ctx`, `Hit`, `Miss`, `In`, `Out`, `Rate` (output tokens per
+second during generation), a tokens-per-10-seconds sparkline, and `Status`.
+`Project` is derived from the working directory Claude Code states in its
+system prompt.
+
+Recent requests: `Finished`, `Code` (the HTTP status the client got),
+`Project`, `Session`, `Provider`, `Model`, `Endpoint`, `Latency`, `Rate`,
+`Hit`, `Miss`, `In`, `Out`, `Details`.
+
+Marks that carry meaning:
+
+| mark | where | meaning |
+| --- | --- | --- |
+| `~` | any token cell | a provisional count; a final report has not replaced it yet |
+| `n/a` | any token cell | nothing ever reported this count. Not a zero |
+| `?<model>` | model cells | the request was only routed to that model; no upstream request was built |
+| `local answer` | model cells | the proxy answered without calling a backend |
+| `Σ` | Sessions | the session as a whole, above its conversations |
+| `main thread` | Sessions | the session's own conversation, the one with no agent id |
+| `^` | Sessions | a conversation whose named parent this session never saw |
+| `/side` | conversation labels | a side call: a request carrying no client tool with an `input_schema` (session titles, the auto-mode classifier, the isolated web-search call) |
+| `mixed N` | Sessions | the session ran N different backends or models, rather than the last one |
+| `no tokens counted` | detail views | the row was never metered at all, which is not the same as four counts nobody reported |
+| `(selection reset)` | pane titles | the selected row is gone; selection follows the row, not its position |
+
+### What the monitor counts
 
 Every count carries how well it is known. The four counts a request costs —
 uncached input, cache read, cache write, output — are each `missing` until
@@ -371,11 +533,12 @@ token totals.
 The monitor shows all of this rather than only recording it. A request row
 names the model that ran; a model the request only asked for or was routed to
 is prefixed `?`, and a request the proxy answered itself reads `local answer`
-in place of a model. Token cells carry their own evidence: `~` in front of a
-provisional count, `n/a` where nothing was ever reported. The request detail
-spells out `requested … · executed …`, states what those two marks mean, and
-lists the cache write's five-minute and one-hour buckets as parts reported
-separately rather than as a split of the write.
+in place of a model, with counts the proxy measured itself rather than
+estimated. Token cells carry their own evidence: `~` in front of a provisional
+count, `n/a` where nothing was ever reported. The request detail spells out
+`requested … · executed …`, states what those two marks mean, and lists the
+cache write's five-minute and one-hour buckets as parts reported separately
+rather than as a split of the write.
 
 The Sessions pane leads each session with a `Σ` row for the session as a whole.
 The conversations under it are those same requests grouped another way, never
@@ -388,12 +551,11 @@ ids that asked for it as `asked: …`, the four counts with their marks, request
 and errors — an `unattributed` line for the requests belonging to no
 conversation, and an `evidence` line counting, for each of the four categories,
 how many requests reported it exactly, held only an estimate, or never reported
-it at all. A row nothing was ever metered for — answers the proxy gave itself,
-or token estimates — reads `no tokens counted` in place of those four counts,
-which is not the same as four counts nobody reported. In the `asked: …` list a
-caller that named no model at all is counted as `unnamed`. Selection follows the
-row rather than its position, and a pane whose selected row is gone says
-`(selection reset)` in its title.
+it at all. A row nothing was ever metered for reads `no tokens counted` in place
+of those four counts, which is not the same as four counts nobody reported. In
+the `asked: …` list a caller that named no model at all is counted as `unnamed`.
+Selection follows the row rather than its position, and a pane whose selected
+row is gone says `(selection reset)` in its title.
 
 ### Prompt cache
 
@@ -418,21 +580,21 @@ response without changing it) and for Codex models.
 
 A request is compared with the previous request of its conversation on the
 same model. The expected cached prefix is the smaller of the two prompts, and
-a shortfall counts as a miss once it reaches 1024 tokens and either a tenth of
-that prefix or 20k tokens. Some requests are not compared:
+a shortfall counts as a miss once it reaches a tenth of that prefix, with a
+floor of 1024 tokens and a ceiling of 20k. Some requests are not compared:
 
 - Subagents have their own conversations.
 - Requests without client tools are side calls: session titles, the auto-mode
   classifier, Claude Code's isolated web search call. They do not extend the
   transcript, so they are counted but not compared.
-- A prompt that shrank was rewritten by the client, for example by compaction.
-  It starts a new baseline.
+- A prompt that shrank by more than 1024 tokens was rewritten by the client,
+  for example by compaction. It starts a new baseline.
 - A request sent before the previous response began could not read that
   response's cache.
 - A Claude conversation that has never read or written cache is below the
   model's minimum cacheable length.
 
-Each miss is labelled with the time since the previous request of its
+Each miss is labeled with the time since the previous request of its
 conversation:
 
 - `expired`: the gap exceeded the cache lifetime. Claude Code writes Claude
@@ -441,41 +603,83 @@ conversation:
   their last use.
 - `within ttl`: the prefix should still have been alive. On Claude this means
   the prompt changed. On Codex it can also be the backend serving the request
-  from a machine without the cache. On the ChatGPT backend, identical
-  gpt-5.6-sol requests were served from the cache after 11, 21 and 35 minutes,
-  and after 45 minutes when read again at 20. Re-sends after 2, 6, 29 and 61
-  minutes were not.
+  from a machine without the cache, so a single miss inside the documented
+  lifetime is not proof the prompt changed.
 
-Switching a conversation to another model is not labelled as a miss. The new
+Switching a conversation to another model is not labeled as a miss. The new
 model starts its own cache, so its first request processes the whole context.
 
-## How it works
+## HTTP API
 
-```mermaid
-flowchart LR
-    CC[Claude Code / Agent SDK] -->|Anthropic Messages API| P[claude-code-mux]
-    P -->|claude-*: bytes forwarded verbatim| A[api.anthropic.com]
-    P -->|gpt-*: translated to Responses API| X[Codex backend]
-    P -->|kimi-*, grok-*, cursor:*| O[other backends]
-    K[~/.codex/auth.json] -. ChatGPT token .-> P
-```
+The proxy speaks the Anthropic Messages API. These routes are always served:
 
-- **Routing** is by model name only. `claude-*` ids and the `opus`, `sonnet`,
-  `haiku`, `fable` aliases go to Anthropic. Any other id must match a backend's
-  catalog exactly; an unknown id returns a 400 that lists the accepted ids.
-- **The Claude route is a byte-exact passthrough.** The proxy forwards the
-  request body and headers as received, including whatever authorization
-  Claude Code attached, and streams the reply back. Because the bytes are
-  unchanged, Anthropic's prompt caching keeps working.
-- **The Codex route** maps the Messages API onto the Responses API over a
-  WebSocket per conversation, keeps `previous_response_id` state per Claude
-  Code session and subagent, and reads the ChatGPT login from the Codex CLI's
-  `~/.codex/auth.json`. When the token is refreshed it is written back so the
-  Codex CLI keeps working.
-- **Reasoning survives a switch.** A `thinking` block produced by one backend
-  cannot be replayed to the other natively, so the proxy rewrites it as tagged
-  text before sending the history on. Context is not lost when you move a
-  conversation from one plan to the other.
+| route | what it does |
+| --- | --- |
+| `GET /healthz` | Liveness check. Answers `{"ok": true}` with 200 and touches no backend. |
+| `POST /v1/messages` | The Messages API, streaming and non-streaming. The `model` field decides the backend. |
+| `POST /v1/messages/count_tokens` | Token count for a prompt. On the Claude route this is a real relay to Anthropic; on every other backend it is a local estimate and no upstream call is made. |
+| `GET /v1/models` | The model listing described in [Listing models](#listing-models). Takes `?provider=<name>` and `?limit=N`. |
+
+Three OpenAI-compatible surfaces are off by default and each needs its own
+switch. They route by model id the same way the Anthropic routes do, so a Kimi,
+Grok or Cursor id works on them too:
+
+| route | switch |
+| --- | --- |
+| `POST /v1/responses`, `POST /v1/chat/completions` | `CCP_CODEX_RESPONSES_API=1` |
+| `POST /v1/images/generations`, `POST /v1/images/edits` | `CCP_CODEX_IMAGES_API=1` |
+| `POST /v1/audio/transcriptions` | `CCP_CODEX_TRANSCRIPTIONS_API=1` |
+
+Any other path answers 404 with an Anthropic-shaped `not_found` error.
+
+**Request body limits.** The Anthropic routes accept up to 64 MiB and answer a
+larger body with 413 and an Anthropic-shaped `request_too_large` error. The
+OpenAI-compatible responses and chat-completions routes accept up to 16 MiB and
+answer 413 with the OpenAI error shape (`error.code: "request_too_large"`).
+Image generation is capped at 256 KiB of JSON, image edits at 64 MiB (at most 5
+images, 20 MiB each and 50 MiB combined), and a transcription at 25 MiB of
+audio plus 1 MiB of form fields.
+
+**Headers the proxy reads.** `x-claude-code-session-id` names the session,
+`x-claude-code-agent-id` a subagent within it, and
+`x-claude-code-parent-agent-id` that subagent's parent. The first two form the
+conversation identity that continuation state, the prompt-cache scope and the
+monitor's grouping are keyed on; the third only draws the tree and can never
+move a request to another conversation. Each value must be a single header, at
+most 512 characters, printable ASCII with no comma; anything else makes the
+request conversationless rather than mis-grouped. Everything else on the Claude
+route, authorization included, is forwarded untouched.
+
+**Headers the proxy emits.** Codex responses carry the
+`anthropic-ratelimit-unified-*` family described in
+[Rate limits](#rate-limits), and a spent window also carries
+`x-should-retry: false`.
+
+## Rate limits
+
+Codex reports its quota inside the stream, and the proxy translates it into the
+`anthropic-ratelimit-unified-*` headers Claude Code already reads. The effect
+is that Codex models behave like a Claude subscription:
+
+- **Healthy window.** The 5-hour and 7-day utilization arrive on every
+  response, as `-5h-utilization` / `-5h-reset` and the `-7d-*` pair, with
+  `-surpassed-threshold` once a window is past its warning threshold. Claude
+  Code's usage warning works, and an SDK caller receives a `RateLimitEvent`
+  with `status='allowed'` or `'allowed_warning'` and the utilization figures.
+- **Spent window.** Codex refuses with `usage_limit_reached` and a reset time.
+  The proxy answers once, without retrying, with `status='rejected'` and the
+  reset time. Claude Code shows its own
+  "You've hit your session limit · resets 1:07pm" message and an SDK caller
+  gets `RateLimitEvent` with `resets_at`. Before this the proxy burned every
+  retry first and the client saw a bare 429 minutes later.
+
+`Retry-After` is deliberately not sent: clients sleep for its full value, and
+here that value is hours.
+
+A reading whose reset time has already passed is dropped rather than published.
+This handling lives on the WebSocket transport, which is the default; the
+buffered HTTP transport still retries a spent window (see
+[Troubleshooting](#troubleshooting)).
 
 ## Configuration
 
@@ -526,31 +730,24 @@ Claude Code attaches (see [Claude authentication](#claude-authentication)).
 
 **Codex only, with no Claude login, API key or OAuth token.** Claude Code still
 shows its built-in rows, so point those rows at Codex ids with the client's own
-variables:
-
-| built-in slot | variable | example id |
-| --- | --- | --- |
-| Haiku | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | `gpt-5.6-luna` |
-| Sonnet | `ANTHROPIC_DEFAULT_SONNET_MODEL` | `gpt-5.6-terra` |
-| Opus | `ANTHROPIC_DEFAULT_OPUS_MODEL` | `gpt-5.6-sol` |
-| Fable | `ANTHROPIC_DEFAULT_FABLE_MODEL` | `gpt-6-astra` |
-
-The ids are an example of an assignment by role, not a recommendation: check
-what your login actually lists (`claude-code-mux models`) before copying them,
-and check the variable names against the Claude Code you run. `..._FABLE_MODEL`
-was read out of the CLI binary (2.1.269, still present in 2.1.270). This setup
-has not been exercised live against a client without Claude credentials. A
-request that still names a `claude-*` id keeps going to Anthropic: the proxy
-relays whatever Anthropic answers an unauthenticated call, unchanged, rather
-than quietly substituting another model.
+`ANTHROPIC_DEFAULT_*_MODEL` variables from the table above — for instance the
+Haiku slot at `gpt-5.6-luna`, Sonnet at `gpt-5.6-terra`, Opus at `gpt-5.6-sol`
+and Fable at `gpt-6-astra`. That assignment is an example of mapping by role,
+not a recommendation: check what your login actually lists
+(`claude-code-mux models`) before copying it, and check the variable names
+against the Claude Code you run. `..._FABLE_MODEL` was read out of the CLI
+binary (2.1.269, still present in 2.1.270). This setup has not been exercised
+live against a client without Claude credentials. A request that still names a
+`claude-*` id keeps going to Anthropic: the proxy relays whatever Anthropic
+answers an unauthenticated call, unchanged, rather than quietly substituting
+another model.
 
 **Claude plus other backends.** Add [`modelPicker`
 rows](#rows-in-the-model-picker), or type the real ids, and remap only the
 slots you want moved — a partial remap is fine, and the two mechanisms mix.
-`CCP_ALIAS_PROVIDER=codex` also exists and sends the `opus`, `sonnet`, `haiku`
-and `fable` aliases plus every `claude-*` id to Codex; it is kept for
-compatibility and is not the recipe to reach for, because it changes what the
-Claude names mean for the whole proxy.
+`CCP_ALIAS_PROVIDER=codex` also exists and sends the Claude aliases plus every
+`claude-*` id to Codex; it is kept for compatibility and is not the recipe to
+reach for, because it changes what the Claude names mean for the whole proxy.
 
 A slot remap moves everything that uses that slot. The proxy's own narrow
 override is `CCP_AUTO_REVIEW_MODEL`, which reroutes Claude Code's background
@@ -576,33 +773,162 @@ Claude route.
 ### Proxy side
 
 Settings are read from `CCP_*` environment variables first, then from
-`config.json` in the config directory, then defaults. The config directory is
-`~/.config/claude-code-proxy` (`CCP_CONFIG_DIR` overrides it); logs, traffic
-captures, and error dumps go to `~/.local/state/claude-code-proxy`.
+`config.json` in the config directory, then defaults. An environment value the
+grammar does not accept is skipped rather than obeyed. The startup config
+summary lists what was overridden: an environment setting is named by its
+variable and source only, never with the value it carried, while a value read
+from `config.json` is mostly printed as it stands.
+
+This is the complete list of variables the proxy reads.
+
+**Server and routing**
 
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `PORT` | `18765` | Listening port. `claude-code-mux serve --port N` overrides it. |
 | `CCP_BIND_ADDRESS` | `127.0.0.1` | Listening address. |
-| `CCP_CODEX_AUTH_FILE` | `~/.codex/auth.json` | Where the Codex CLI keeps its login. |
+| `CCP_CONFIG_DIR` | per platform | Move the config directory. It does **not** move the state directory. |
+| `CCP_ALIAS_PROVIDER` | `anthropic` | Backend for the Claude aliases: `anthropic`, `codex` or `kimi`. Leave it alone unless you want `opus` to stop meaning Claude. |
+| `CCP_AUTO_REVIEW_MODEL` | unset | Model for Claude Code's background security classifier. Unset, the classifier goes to `gpt-5.6-luna` only when it would have reached Codex anyway; set, it applies on any route. |
+| `CCP_AGENT_SUMMARY` | `local` | While a subagent runs, Claude Code asks for a three-to-five-word progress label every half minute and resends that subagent's whole context with it. The proxy recognizes the prompt and answers it from the transcript. Set to `upstream` (`model` and `remote` do the same) to send those requests to a model again. |
+| `CCP_AGENT_SUMMARY_MODEL` | the provider's junior model | Which model answers a label that is sent upstream. Without it: `claude-sonnet-5` on Anthropic, `gpt-5.6-luna` on Codex, and the request's own model on a backend with no entry. Whenever one of these applies, the label request is pinned to that model at `effort: low`. Ignored while labels are answered locally. |
+| `CCP_USER_AGENT` | per backend | Fallback `User-Agent` for the Codex and Kimi backends when neither has its own override. |
+
+**Anthropic route**
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `CCP_ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Where the passthrough relays to. Point it at a gateway or a mock; the relay stays byte-exact either way. |
+
+**Codex backend**
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `CCP_CODEX_AUTH_FILE` | `~/.codex/auth.json` | Where the Codex CLI keeps its login. The proxy reads and refreshes this file and never deletes it. |
+| `CCP_CODEX_BASE_URL` | the ChatGPT backend | Completions endpoint. The model listing is derived from it. |
 | `CCP_CODEX_CLIENT_VERSION` | from `~/.codex/models_cache.json`, else built-in | `client_version` sent on the Codex model listing call. |
-| `CCP_CODEX_TRANSPORT` | `websocket` | `websocket`, `http`, or `auto`. |
+| `CCP_CODEX_ORIGINATOR` | built-in | The `originator` the ChatGPT backend sees. A compatibility contract; changing it changes what the server is told. |
+| `CCP_CODEX_USER_AGENT` | built-in | Same, for the `User-Agent`. |
+| `CCP_CODEX_TRANSPORT` | `websocket` | `websocket`, `http`, or `auto`. Rate-limit handling is implemented on the WebSocket path. |
 | `CCP_CODEX_EFFORT` | unset | Reasoning effort sent to Codex, e.g. `high`. |
-| `CCP_CODEX_SERVICE_TIER` | unset | Service tier for every Codex request. `-fast` ids request `priority` per call. |
+| `CCP_COMPACT_EFFORT` | `low` | Effort cap for compaction turns only; the cap never raises a request's effort. `off` disables the cap, `none` asks for no reasoning. |
+| `CCP_CODEX_SERVICE_TIER` | unset | Service tier for every Codex request: `fast`, `priority` or `flex`. `-fast` ids request priority per call. |
 | `CCP_CODEX_REASONING_SUMMARY` | unset | Reasoning summary mode requested from Codex, e.g. `auto`. |
 | `CCP_CODEX_MODEL` | unset | Send this Codex model regardless of what the client asked for. |
-| `CCP_CODEX_QUOTA_WARN_AT` | `0.9` session, `0.75` weekly | Utilization above which a window is reported as past its warning threshold. One value lowers both. |
-| `CCP_CODEX_SERVER_COMPACTION` | off | Let Codex compact long histories server-side. |
-| `CCP_CODEX_LANE_POLICY` | `full` | `full` keeps Codex models off the Responses Lite lane so they can answer with several tool calls at once; `inventory` follows the lane flag from the backend's own model listing. The legacy `CCP_CODEX_FULL_LANE` boolean still works. |
-| `CCP_CODEX_RESPONSES_API` | off | Also expose `/v1/responses` and `/v1/chat/completions` for OpenAI-style clients. |
-| `CCP_AUTO_REVIEW_MODEL` | `gpt-5.6-luna` | Model for Claude Code's background security classifier when the session runs on Codex. |
-| `CCP_AGENT_SUMMARY` | local | While a subagent runs, Claude Code asks for a three-to-five-word progress label every half minute and resends that subagent's whole context with it. The proxy recognizes the prompt and answers it from the transcript. Set to `upstream` (`model` and `remote` do the same) to send those requests to a model again; `agentSummary` in `config.json` is the file form. |
-| `CCP_AGENT_SUMMARY_MODEL` | the provider's junior model | Which model answers a label that is sent upstream. Without it: `claude-sonnet-5` on Anthropic, `gpt-5.6-luna` on Codex, and the request's own model on a backend with no entry. Whenever one of these applies, the label request is pinned to that model at `effort: low`. Ignored while labels are answered locally. |
-| `CCP_ALIAS_PROVIDER` | `anthropic` | Backend for the Claude aliases. Leave it alone unless you want `opus` to stop meaning Claude. |
-| `CCP_LOG_VERBOSE` | off | Keep full string fields in `proxy.log`. |
-| `CCP_TRAFFIC_LOG` | off | Capture every request and event under the state directory. Contains prompts and file contents; delete after use. |
+| `CCP_CODEX_LANE_POLICY` | `full` | `full` keeps Codex models off the Responses Lite lane so they can answer with several tool calls at once; `inventory` follows the lane flag from the backend's own model listing. |
+| `CCP_CODEX_FULL_LANE` | unset | The legacy boolean form of the above; `1` means `full`, `0` means `inventory`. |
+| `CCP_CODEX_PREVIOUS_RESPONSE_ID` | off | Send `previous_response_id` continuations instead of the whole history each turn. Off by default. |
+| `CCP_CODEX_SERVER_COMPACTION` | off | Let Codex compact long histories server-side. State is kept per session for 30 minutes, at most 1000 states, 4 MiB each and 20 MB in total. |
+| `CCP_CODEX_QUOTA_WARN_AT` | `0.9` session, `0.75` weekly | Utilization at or above which a window is reported as past its warning threshold. One value **replaces both** defaults, so `0.95` raises the session threshold as well as the weekly one. A value outside `0.0`–`1.0` is ignored. |
+| `CCP_CODEX_RESPONSES_API` | off | Also expose `/v1/responses` and `/v1/chat/completions`. |
+| `CCP_CODEX_IMAGES_API` | off | Also expose `/v1/images/generations` and `/v1/images/edits`. |
+| `CCP_CODEX_IMAGES_BASE_URL` | built-in | Where the image routes send their requests. |
+| `CCP_CODEX_TRANSCRIPTIONS_API` | off | Also expose `/v1/audio/transcriptions`. |
 
-### Responses lanes and parallel tool calls
+**Kimi, Grok and Cursor**
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `CCP_KIMI_BASE_URL` | built-in | Kimi API endpoint. |
+| `CCP_KIMI_OAUTH_HOST` | built-in | Host used for the Kimi OAuth flow. |
+| `CCP_KIMI_USER_AGENT` | built-in | `User-Agent` for Kimi requests. |
+| `CCP_GROK_BASE_URL` | built-in | Grok API endpoint. |
+| `CCP_GROK_CLIENT_VERSION` | built-in | Client version sent to Grok. |
+| `CCP_GROK_TOOL_IMAGE` | `omit` | What the Grok translator does with image blocks: `omit` replaces them with a placeholder, `reattach` also appends them as a user message, `inline` sends the tool output as text and image parts, `reject` fails the request. An unknown value falls back to `omit` and logs a warning once. |
+| `CCP_CURSOR_BASE_URL` | built-in | Cursor API endpoint. |
+| `CCP_CURSOR_CLIENT_VERSION` | detected, else built-in | Client version sent to Cursor. |
+| `CCP_CURSOR_AGENT_BUNDLE` | unset | Agent bundle identifier sent to Cursor. |
+| `CCP_CURSOR_AUTH_TOKEN` | unset | Use this Cursor token instead of a stored login. An alternative to `claude-code-mux cursor auth login` for non-interactive environments. |
+
+**Logging and capture**
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `CCP_LOG_VERBOSE` | off | Keep full string fields in `proxy.log` instead of truncating them. |
+| `CCP_LOG_STDERR` | off | Mirror the JSONL log to stderr. The way to see what a headless run is doing. |
+| `CCP_TRAFFIC_LOG` | off | Capture every request and event under the state directory. Contains prompts and file contents; see [Sensitive data](#sensitive-data). |
+
+The proxy also honors the usual `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
+`NO_PROXY` variables (lowercase spellings included) on the Codex backend,
+including the WebSocket transport.
+
+### Configuration file
+
+`config.json` in the config directory holds most of the same settings in
+camelCase. An environment variable always wins over the file, and the file over
+the default. Ten variables have no key in the file and are environment-only:
+`CCP_CONFIG_DIR` (it locates the file), `CCP_CODEX_AUTH_FILE`,
+`CCP_ANTHROPIC_BASE_URL`, `CCP_COMPACT_EFFORT`, `CCP_CODEX_QUOTA_WARN_AT`,
+`CCP_GROK_TOOL_IMAGE`, `CCP_CURSOR_AUTH_TOKEN`, `CCP_AGENT_SUMMARY_MODEL`,
+`CCP_USER_AGENT` and `CCP_TRAFFIC_LOG`.
+
+```json
+{
+  "bindAddress": "127.0.0.1",
+  "port": 18765,
+  "aliasProvider": "anthropic",
+  "autoReviewModel": "gpt-5.6-luna",
+  "agentSummary": "local",
+  "log": { "verbose": false, "stderr": false },
+  "codex": {
+    "transport": "websocket",
+    "lanePolicy": "full",
+    "serverCompaction": false,
+    "responsesApi": false,
+    "effort": "high"
+  }
+}
+```
+
+| object | keys |
+| --- | --- |
+| top level | `bindAddress`, `port`, `aliasProvider`, `autoReviewModel`, `agentSummary` |
+| `log` | `verbose`, `stderr` |
+| `codex` | `baseUrl`, `originator`, `userAgent`, `clientVersion`, `previousResponseId`, `lanePolicy`, `fullLane` (legacy), `serverCompaction`, `responsesApi`, `imagesApi`, `imagesBaseUrl`, `transcriptionsApi`, `serviceTier`, `reasoningSummary`, `effort`, `model`, `transport` |
+| `kimi` | `baseUrl`, `oauthHost`, `userAgent` |
+| `grok` | `baseUrl`, `clientVersion` |
+| `cursor` | `baseUrl`, `clientVersion`, `agentBundle` |
+
+The lane setting reads four sources in order and takes the first that parses:
+`CCP_CODEX_LANE_POLICY`, the legacy `CCP_CODEX_FULL_LANE`, `codex.lanePolicy`,
+the legacy `codex.fullLane`. A value the grammar does not accept is reported in
+the startup summary — for an unusable environment value,
+`CCP_CODEX_LANE_POLICY (env): invalid value; expected full|inventory; ignored`
+— and the next source decides. Note that a wrong **type** under `codex.fullLane`
+fails the whole file in parsing, so the file is then ignored entirely.
+
+### File locations
+
+Two directories, resolved independently. `CCP_CONFIG_DIR` moves only the first
+of them; there is no override for the state directory.
+
+| | config directory | state directory |
+| --- | --- | --- |
+| macOS | `~/.config/claude-code-proxy` | `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy` |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/claude-code-proxy` | `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy` |
+| Windows | `%APPDATA%\claude-code-proxy` | `%LOCALAPPDATA%\claude-code-proxy` |
+
+The config directory holds `config.json` and the stored Kimi, Grok and Cursor
+logins (`<backend>/auth.json`). The state directory holds `proxy.log`, the
+`errors/` dumps and, when `CCP_TRAFFIC_LOG=1` is set, `traffic/` captures laid
+out per session and request.
+
+The `claude-code-proxy` directory name, and the macOS Keychain service name
+used for some backend logins, are kept deliberately: they are compatibility
+contracts from before this fork was renamed, and changing them would orphan any
+saved Kimi, Grok or Cursor login.
+
+### Retries and quota
+
+Retryable upstream failures — 429, 500, 502, 503, 504 — are retried at most
+three times, with a wait that starts at a few seconds and doubles each attempt.
+A `Retry-After` the upstream sent is used instead of that wait, unless it asks
+for more than 30 seconds, in which case the request fails rather than sleeping
+that long. A Codex window
+that is actually spent is *not* retried: it is recognized and answered once
+(see [Rate limits](#rate-limits)), which is the whole point of that handling.
+
+## Responses lanes and parallel tool calls
 
 Codex marks the gpt-5.6 family and `gpt-6-astra` for the Responses **Lite**
 lane in its model listing. That lane requires `parallel_tool_calls: false` — a
@@ -612,10 +938,10 @@ normally batches several, three files read at once for instance, and behind Lite
 each of those becomes its own request carrying the whole conversation again.
 
 The proxy therefore uses the full Responses lane by default, where parallel tool
-calls work. `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra` and `gpt-6-astra`
-were each verified to answer there. This is the one place the proxy overrides
-what the backend's inventory says, and `CCP_CODEX_LANE_POLICY` picks between
-the two behaviors:
+calls work. The full lane accepts top-level `tools` with
+`parallel_tool_calls: true`. This is the one place the proxy overrides what the
+backend's inventory says, and `CCP_CODEX_LANE_POLICY` picks between the two
+behaviors:
 
 | value | lane for an ordinary request |
 | --- | --- |
@@ -625,17 +951,8 @@ the two behaviors:
 `inventory` is not "force Lite" — it hands the decision back to the backend's
 own flag — and it costs no extra call: the flag comes from the listing
 `/v1/models` already fetched, held in memory and not kept across restarts.
-
-Values are trimmed and case-insensitive. Four sources are read in this order
-and the first one that parses decides: `CCP_CODEX_LANE_POLICY`, the legacy
-`CCP_CODEX_FULL_LANE`, `codex.lanePolicy` in `config.json`, the legacy
-`codex.fullLane`. The booleans keep their old meaning — `1`/`true`/`yes`/`on`
-is `full`, `0`/`false`/`no`/`off` is `inventory` — so an existing
-`CCP_CODEX_FULL_LANE=0` or `codex.fullLane: false` still puts the marked models
-back on Lite. A value the grammar does not accept is skipped rather than
-obeyed: the config summary reports it — for an unusable environment value,
-`CCP_CODEX_LANE_POLICY (env): invalid value; expected full|inventory; ignored`
-— and the next source decides.
+Values are trimmed and case-insensitive; the four sources that feed this
+setting are listed under [Configuration file](#configuration-file).
 
 A request carrying the hosted `web_search_20250305` tool goes on the full lane
 whatever the policy says, because the Lite lane only accepts function and
@@ -646,22 +963,122 @@ itself has not been retested. A request whose `tool_choice` pins the hosted
 `web_search` tool takes a separate path that builds its own search request and
 keeps the requested model, `gpt-5.6-luna` included.
 
-### Commands
+## Other backends
+
+The same proxy also routes to **Kimi**, **Grok** and **Cursor** models, each
+with its own login stored under the config directory. Their translators come
+from the upstream project this is based on and this fork has not changed them;
+run `claude-code-mux models` for the ids each one currently offers.
+
+| backend | ids | login |
+| --- | --- | --- |
+| Kimi | `kimi-for-coding`, `kimi-k2.6`, `kimi-k3`, `k2.6`, `k3` | `claude-code-mux kimi auth login`. `auth device` runs the same flow. |
+| Grok | `grok-4.5`, `grok-composer-2.5-fast` | `claude-code-mux grok auth login`, or `auth device` for a device-code flow on a machine with no browser. |
+| Cursor | the `cursor:`, `cursor-plan:` and `cursor-ask:` prefixes (for example `cursor:gpt-5.5`) plus the bare legacy ids `cursor`, `cursor-agent`, `cursor-composer`, `cursor-composer-fast`, `cursor-plan`, `cursor-ask`, `composer-2.5`, `composer-2.5-fast` | `claude-code-mux cursor auth login`, or `CCP_CURSOR_AUTH_TOKEN`. `auth device` is not implemented. |
+
+Their ids come from a list compiled into the build, not from the backend, so
+`/v1/models` reports them with `source: bundled`. Each has its own `CCP_*`
+overrides in [Proxy side](#proxy-side).
+
+## Commands
 
 | Command | What it does |
 | --- | --- |
-| `claude-code-mux serve [--port N] [--no-monitor]` | Run the proxy. Default command. |
-| `claude-code-mux models [--full]` | List model ids per backend: what Codex lists for your login right now, the bundled lists for the others. |
-| `claude-code-mux codex auth status` | Show the Codex CLI login the proxy will use. |
-| `claude-code-mux kimi\|grok\|cursor auth login\|status\|logout` | Manage the other backends' logins. |
-| `claude-code-mux --version` | Print the version. |
+| `claude-code-mux serve [--port N] [--no-monitor]` | Run the proxy. This is the default command, so a bare `claude-code-mux` does the same. The monitor opens only when stdout is a terminal. |
+| `claude-code-mux models [--full]` | List model ids per backend: what Codex lists for your login right now, the bundled lists for the others. `--full` prints every alias rather than a summary. |
+| `claude-code-mux demo` | Open the monitor on simulated traffic, with no server listening. |
+| `claude-code-mux codex auth status` | Show the Codex CLI login the proxy will use. `codex auth login` and `codex auth device` only point you at `codex login`, and `codex auth logout` at `codex logout`: the proxy has no Codex login of its own and never deletes that file, writing to it only to store a refreshed token. |
+| `claude-code-mux kimi\|grok\|cursor auth login\|device\|status\|logout` | Manage the other backends' logins. `device` is a real device-code flow on Grok, an alias of `login` on Kimi, and not implemented on Cursor. |
+| `claude-code-mux version`, `--version`, `-v` | Print the version. |
 
-## Other backends
+## Claude Agent SDK
 
-The same proxy also routes to **Kimi**, **Grok**, and **Cursor** models, each
-with its own login. Run `claude-code-mux models` for their ids and
-`claude-code-mux <backend> auth status` to check a login. These backends keep the
-behavior of the upstream project this is based on.
+The SDK drives the same Claude Code binary, so the proxy works there without
+changes. Point it at the proxy and name a model:
+
+```python
+from claude_agent_sdk import ClaudeAgentOptions, query
+
+options = ClaudeAgentOptions(
+    model="gpt-5.6-sol",
+    env={"ANTHROPIC_BASE_URL": "http://127.0.0.1:18765", "ANTHROPIC_API_KEY": ""},
+)
+
+async for message in query(prompt="Summarize this repository.", options=options):
+    print(message)
+```
+
+Blank `ANTHROPIC_API_KEY` in the `env` if the surrounding environment carries
+one. With a non-empty key the SDK takes the API-billing path and the
+`RateLimitEvent` described in [Rate limits](#rate-limits) is never emitted.
+Authentication stays the same as for the terminal: the Claude Code login on the
+machine, or `CLAUDE_CODE_OAUTH_TOKEN` in the environment.
+
+## Troubleshooting
+
+**The Claude route answers 401.** `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`
+is set somewhere in the client's environment. Claude Code forwards its
+subscription login only when neither is present; with one set it sends that
+value instead. Unset both and restart Claude Code. See
+[Claude authentication](#claude-authentication).
+
+**No usage warnings and no rate-limit events, on any model.** Same cause: a
+non-empty `ANTHROPIC_API_KEY` puts Claude Code on the API-billing path, where
+it ignores the structured rate-limit headers entirely, and
+`ANTHROPIC_AUTH_TOKEN` drops the events too.
+
+**A Codex model refuses and the weekly window is spent.** That is the
+`usage_limit_reached` answer, surfaced once with the reset time rather than
+after every retry. There is nothing to configure; switch to a Claude model or
+wait for the reset. `GET /v1/models` still answers while a window is spent, so
+it is a usable liveness check.
+
+**A spent Codex window retried anyway.** The handling lives on the WebSocket
+transport, which is the default. If `CCP_CODEX_TRANSPORT=http` is set, the
+buffered path still treats a spent window as retryable.
+
+**Requests are much larger than expected.** Claude Code disables lazy tool
+loading behind a non-Anthropic base URL. Set `ENABLE_TOOL_SEARCH=true`; the
+proxy forwards `tool_reference` blocks on the Claude route and maps them onto
+the backend's native tool search on the Codex route, so the flag is safe on
+both.
+
+**"Auto mode could not evaluate" and a progress label where a verdict belonged.**
+Fixed. The subagent progress-label detector once matched Claude Code's security
+classifier because that request quotes the text it reviews. The classifier is
+now recognized first, and the label marker must open the last text block of the
+last user message.
+
+**A model id is rejected with a 400.** The id matched no backend's list and was
+not in the Codex backend's last listing. The error body lists what is accepted;
+`claude-code-mux models` prints the same thing.
+
+**A Codex request fails with 400 `unsupported_value` on parallel tool calls.**
+Something put the model back on the Responses Lite lane. See
+[Responses lanes and parallel tool calls](#responses-lanes-and-parallel-tool-calls).
+
+**Nothing is visible in a headless run.** Set `CCP_LOG_STDERR=1` to mirror the
+JSONL log to stderr. `proxy.log` in the state directory has the same records;
+`CCP_LOG_VERBOSE=1` stops them being truncated. Failed requests also leave a
+JSON dump under `errors/` in the state directory. For a full reproduction,
+`scripts/debug-proxy` starts an isolated instance on a random port with verbose
+logging, stderr mirroring, traffic capture and a temporary state directory, so
+it touches nothing an installed proxy uses.
+
+## Sensitive data
+
+Traffic captures (`CCP_TRAFFIC_LOG=1`) and the `errors/` dumps contain prompts,
+tool input, tool output and file contents in the clear. `scripts/debug-proxy`
+turns capture on. Keep them local, never paste them into an issue or a bug
+report, and delete them after a debugging session.
+
+`proxy.log` redacts known credential keys — authorization headers, access and
+refresh tokens, id tokens, authorization codes and verifiers, account ids,
+cookies — but it is a key list, not a content scanner, so a secret pasted into
+a prompt is not covered by it.
+
+The proxy never prints the contents of `~/.codex/auth.json`;
+`claude-code-mux codex auth status` reports the account and expiry only.
 
 ## Limitations
 
@@ -670,15 +1087,58 @@ behavior of the upstream project this is based on.
   next model cannot verify reasoning that came from the other plan. Starting
   the next step fresh avoids it.
 - Codex rate limits are handled on the WebSocket transport, which is the
-  default. The HTTP transport still retries a spent window.
+  default. The HTTP transport still retries a spent window, and a 429 on the
+  WebSocket handshake itself is not covered either.
 - Codex models are not in Claude Code's built-in catalog, so without a
   `modelPicker` row Claude Code assumes a 200k context window for them.
-- The proxy answers the progress label of a running subagent itself and
-  recognises that request by its instruction text. A different request that
-  merely quotes those instructions can be taken for one: Auto mode's security
-  classifier sends the action it reviews as text, so it can receive a progress
-  label instead of a verdict and leave that action unevaluated. This is a known
-  limitation of this release; a narrower detector is a separate change.
+- The monitor's per-request ledger grows with the number of requests served
+  until the process restarts.
+
+## How this compares with the upstream projects
+
+Read from the source of each checkout. Nothing here was built or run, and no
+backend was contacted.
+
+| Dimension | raine/claude-code-proxy | fcakyon/claude-code-with-codex | this fork |
+| --- | --- | --- | --- |
+| Backends | codex, kimi, grok, cursor, opencode | codex, kimi, grok, cursor, anthropic | codex, kimi, grok, cursor, anthropic |
+| `claude-*` and alias routing | remapped to another backend; the alias target is codex or kimi, codex by default | passthrough to `api.anthropic.com` on the client's own login, and the default | same as fcakyon, plus usage read off the relayed bytes and a `list_models` override |
+| Codex authentication | its own browser, device and PKCE login | reads the Codex CLI's `auth.json`; `codex auth login` points at `codex login` | same as fcakyon |
+| Codex model inventory | compiled-in lists | compiled-in lists | live listing from the Codex backend, never cached |
+| `/v1/models` shape | flat list from the compiled-in registry | same | per-row `provider`, a `providers[]` block with auth/source/status, `?provider=` with a 502 on failure |
+| Codex quota as rate-limit headers | not recognized | not recognized | `anthropic-ratelimit-unified-*`, `usage_limit_reached` answered once with `x-should-retry: false` |
+| Deferred tool loading | `tool_reference` blocks dropped in the grok translator | same | mapped onto Codex's native tool search |
+| Subagent progress label | not handled | not handled | answered locally, or sent to a junior model |
+| Prompt-cache scope per subagent | the bare session id, so a subagent shares the main thread's scope and routing bucket | same | a derived id per conversation, sent as both the request's `prompt_cache_key` and the `session_id` header |
+| Responses lane policy | compiled-in table only | same | `CCP_CODEX_LANE_POLICY` / `CCP_CODEX_FULL_LANE`, with the backend listing able to decide |
+| Monitor accounting | request list and totals | same | cache read/write split, evidence marks, per-lane cache-miss detection, conversation tree |
+| Anthropic request body limit | 64 MiB, 413 `request_too_large` | 16 MiB, 400 | 64 MiB, 413 `request_too_large` |
+| Docs site / Nix | Astro docs site, `flake.nix` | no docs site, `flake.nix` | neither |
+| Crate name / `publish` key | `claude-code-proxy`, `publish = false` | `claude-codex`, no `publish` key | `claude-code-mux`, no `publish` key |
+| Release artifacts | prebuilt binaries, 6 targets | prebuilt binaries, 6 targets | prebuilt binaries, 6 targets |
+| Size (`.rs` lines under `src/`) | ~66.6k | ~59.7k | ~74.5k |
+
+Compared at `raine/claude-code-proxy` `ba8cd70` (0.1.39),
+`fcakyon/claude-code-with-codex` `2c34184` (0.3.1) and this fork's `main` at
+0.7.0. Lineage: this fork ← fcakyon ← raine.
+
+**What upstream has that this fork does not.** These are differences of scope,
+not defects.
+
+- The `opencode` provider.
+- A Codex login of its own — browser, device code and PKCE — so Codex can be
+  authenticated without the Codex CLI installed. This fork deliberately reads
+  the Codex CLI's credentials instead.
+- The Astro documentation site, published from `docs/`.
+- A Nix flake (the parent fork still has one too).
+- Grok's hosted-search text projection and its `CCP_GROK_*` search switches.
+
+**What this fork has that neither of them does.** Live Codex model discovery
+and the richer `/v1/models`; Codex quota translated into Anthropic rate-limit
+headers; deferred tool loading mapped onto Codex's tool search; local answers
+for the subagent progress label; a per-conversation prompt-cache scope; the
+monitor's token accounting and conversation tree; and the Responses lane as
+configuration.
 
 ## Development
 
@@ -691,9 +1151,14 @@ cargo run -- serve --no-monitor --port 19000
 scripts/debug-proxy                   # isolated instance with traffic capture
 ```
 
-`just check` runs the same checks through `checkle` when both are installed;
-CI runs `just check-ci`. Pushing a `vX.Y.Z` tag builds prebuilt binaries for
-macOS, Linux, and Windows through `.github/workflows/release.yml`.
+`just check` runs the same checks through `checkle` when both are installed, and
+`just install-hooks` installs the pre-commit hook that runs them. CI runs
+`just check-ci`, which additionally fails if the checks left the tree dirty.
+Pushing a `vX.Y.Z` tag builds prebuilt binaries for six targets — macOS and
+Linux on x86_64 and aarch64, Windows on x86_64 and aarch64 — through
+`.github/workflows/release.yml`.
+
+Release notes are in [CHANGELOG.md](CHANGELOG.md).
 
 Layout: `src/server.rs` is the axum router and request dispatch,
 `src/registry.rs` maps model ids to backends, `src/providers/anthropic/` is the
@@ -707,6 +1172,7 @@ Built on [`raine/claude-code-proxy`](https://github.com/raine/claude-code-proxy)
 which provides the Codex, Kimi, Grok, and Cursor backends, and on
 [`fcakyon/claude-code-with-codex`](https://github.com/fcakyon/claude-code-with-codex),
 which added the Claude subscription passthrough, reasoning that survives a
-mid-conversation switch, and reading the Codex login from the Codex CLI. This
-fork adds Codex rate limits reported the way Claude Code expects, the curated
-Codex catalog, and the picker setup above.
+mid-conversation switch, and reading the Codex login from the Codex CLI. What
+this fork adds on top is listed in [What this fork adds](#what-this-fork-adds)
+and set against both projects in
+[the comparison](#how-this-compares-with-the-upstream-projects).

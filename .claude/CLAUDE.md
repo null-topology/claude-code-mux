@@ -34,17 +34,23 @@ This is a fork of `fcakyon/claude-code-with-codex`, itself a fork of
 `origin` is a plain repository, not a GitHub fork: GitHub allows one fork per
 network per account and `mine` already occupies that slot.
 
-Only this fork has `src/providers/anthropic/` and `AliasProvider::Anthropic`.
-Upstream has no passthrough at all: its registry routes `claude-*` to another
+`src/providers/anthropic/` and `AliasProvider::Anthropic` came from the parent
+fork `fcakyon`, which has both and defaults the aliases to Anthropic just as
+this fork does. `upstream` (raine) is the one with no passthrough at all: its
+`AliasProvider` is `{Codex, Kimi}` and its registry routes `claude-*` to another
 backend (codex by default). A "Claude through the proxy" test against an
 upstream build silently goes to Codex. If a Claude-route test ever returns a
 Codex-looking answer or a Codex rate limit, check which build is running first.
+This fork's own additions to the passthrough are `UsageObserver`, the
+`list_models` override and stream-error classification, not the provider itself.
 
-Other differences when moving code between the two:
+Other differences when moving code between the trees:
 
 - Upstream additionally has `src/providers/opencode/`, its own Codex
-  browser/device/PKCE login under `codex/auth/`, and an Astro docs site. In
-  this fork Codex sign-in is `codex login` from the Codex CLI.
+  browser/device/PKCE login under `codex/auth/`, an Astro docs site, and a grok
+  hosted-search text projection. In this fork Codex sign-in is `codex login`
+  from the Codex CLI. `fcakyon` has none of those either, except the Nix flake
+  it still shares with upstream.
 - Crate names differ in imports and test helpers: `claude_codex::` vs
   `claude_code_proxy::`, `Command::cargo_bin("claude-code-mux")` vs
   `Command::cargo_bin("claude-code-proxy")`. Ported test files need that edit.
