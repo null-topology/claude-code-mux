@@ -8,6 +8,7 @@ use claude_code_mux::providers::codex::compaction::clear_all_compactions_for_tes
 use claude_code_mux::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_mux::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
 use claude_code_mux::{
+    config::AliasProvider,
     registry::Registry,
     server::{app, app_with_options},
 };
@@ -824,15 +825,18 @@ async fn smoke_healthz_returns_ok() {
     assert_eq!(body, json!({"ok": true}));
 }
 
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn smoke_codex_model_routes_to_real_provider() {
-    let _guard = env_lock();
-    let response = call_messages("gpt-5.5").await;
-    // Should attempt auth (not return 501 placeholder)
+#[test]
+fn smoke_codex_model_is_registered() {
+    let registry = Registry::new(AliasProvider::Anthropic);
+    let provider = registry.provider_for_model("gpt-5.5", None);
     assert!(
-        response.status() != StatusCode::NOT_IMPLEMENTED,
-        "codex models must resolve to the real provider, not a placeholder"
+        provider.is_some(),
+        "gpt-5.5 must resolve to a registered provider"
+    );
+    assert_eq!(
+        provider.unwrap().name(),
+        "codex",
+        "gpt-5.5 must route to the codex provider"
     );
 }
 
