@@ -29,9 +29,9 @@ use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
-use crate::monitor::{usage_report_from_anthropic_body, usage_report_from_anthropic_sse};
 use crate::provider::{
     CliHandlers, ListingAuth, ListingSource, ModelListing, Provider, RequestContext,
+    ResponseOutcome,
 };
 use crate::registry;
 use crate::request_identity::ConversationIdentity;
@@ -48,13 +48,15 @@ use self::continuation::{
     record_continuation_for_owner,
 };
 use self::count_tokens::count_translated_tokens;
-use self::translate::accumulate::accumulate_response_with_traffic;
+use self::translate::accumulate::accumulate_response_parts;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
     assert_allowed_model, full_lane_web_search_model, resolve_model_request_with_config_override,
     uses_responses_lite,
 };
-use self::translate::reducer::finish_metadata_from_upstream;
+use self::translate::reducer::{
+    finish_metadata_from_upstream, reported_usage_report_from_upstream,
+};
 use self::translate::request::{
     TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
 };
@@ -115,9 +117,6 @@ impl CodexProvider {
             );
         }
         if search::is_standalone_search_request(&body) {
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                monitor.model_resolved(&ctx.req_id, &resolved.model);
-            }
             let (search_request, query) = match search::build_search_request(
                 &body,
                 &resolved.model,
@@ -132,6 +131,13 @@ impl CodexProvider {
                     );
                 }
             };
+            // This branch builds a request of its own and keeps the lite-only
+            // model the ordinary path would upgrade, so the model is read off
+            // the request that will be sent, once it exists and before anything
+            // is counted against it.
+            if let Some(monitor) = ctx.monitor.as_ref() {
+                monitor.model_resolved(&ctx.req_id, &search_request.model);
+            }
             let log = create_logger("codex");
             let started_at = Instant::now();
             log.info(
@@ -194,9 +200,6 @@ impl CodexProvider {
             );
         }
         let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved.model);
-        }
 
         // Subagents arrive with their parent's session id and their own agent
         // header; give each conversation its own cache scope so they do not
@@ -224,6 +227,15 @@ impl CodexProvider {
                 );
             }
         };
+
+        // The translated request is the document that goes to the backend, so
+        // the model it carries is the one that will run: after the alias, the
+        // configured override and the lane upgrade, and before compaction or
+        // any transport touches it. A request that failed to translate never
+        // reached a model and names none.
+        if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.model_resolved(&ctx.req_id, &translated.model);
+        }
 
         let compact_boundary = is_compact_messages_request(&body);
         let server_compaction_enabled = config::codex_server_compaction();
@@ -455,11 +467,14 @@ impl CodexProvider {
                 }
             };
             if let Some(monitor) = ctx.monitor.as_ref() {
+                // The usage comes from the upstream body, not from the stream
+                // just written: its terminal `usage` object is zero-filled
+                // whenever the backend reported nothing.
                 monitor.stream_progress_usage(
                     &ctx.req_id,
                     sse_bytes.len() as u64,
                     count_sse_events(&sse_bytes),
-                    usage_report_from_anthropic_sse(&sse_bytes),
+                    reported_usage_report_from_upstream(&upstream.body),
                 );
             }
             update_continuation_from_upstream(
@@ -479,16 +494,15 @@ impl CodexProvider {
             ];
             (headers, sse_bytes).into_response()
         } else {
-            match accumulate_response_with_traffic(
+            match accumulate_response_parts(
                 &upstream.body,
                 &message_id,
                 model,
                 ctx.traffic.as_deref(),
             ) {
-                Ok(json) => {
+                Ok((json, reported_usage)) => {
                     if let Some(monitor) = ctx.monitor.as_ref() {
-                        monitor
-                            .usage_reported(&ctx.req_id, usage_report_from_anthropic_body(&json));
+                        monitor.usage_reported(&ctx.req_id, reported_usage);
                     }
                     update_continuation_from_upstream(
                         ctx.session_id.as_deref(),
@@ -591,10 +605,9 @@ impl Provider for CodexProvider {
             );
         }
         let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved.model);
-        }
 
+        // The estimate below is computed here, against the translated request;
+        // nothing is sent, so no model runs and none is named as having run.
         let translated = match translate_request(
             &body,
             TranslateOptions {
@@ -982,7 +995,7 @@ async fn live_stream_response_once(
         }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
-            record_live_stream_progress(&ctx, &pending_chunk);
+            record_live_stream_progress(&ctx, &mut translator, &pending_chunk);
             if terminal {
                 update_continuation_from_upstream(
                     ctx.session_id.as_deref(),
@@ -993,7 +1006,11 @@ async fn live_stream_response_once(
                     upstream_events.socket_id(),
                     compaction.compact_boundary,
                 );
-                return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
+                let outcome = live_stream_outcome(&translator);
+                return LiveStreamStart::Response(single_live_stream_response(
+                    pending_chunk,
+                    outcome,
+                ));
             }
             return LiveStreamStart::Response(remaining_live_stream_response(
                 upstream_events,
@@ -1016,12 +1033,13 @@ async fn live_stream_response_once(
                 upstream_events.socket_id(),
                 compaction.compact_boundary,
             );
+            let outcome = live_stream_outcome(&translator);
             if pending_chunk.is_empty() {
-                return LiveStreamStart::Response(empty_live_stream_response());
+                return LiveStreamStart::Response(empty_live_stream_response(outcome));
             }
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
-            record_live_stream_progress(&ctx, &pending_chunk);
-            return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
+            record_live_stream_progress(&ctx, &mut translator, &pending_chunk);
+            return LiveStreamStart::Response(single_live_stream_response(pending_chunk, outcome));
         }
     }
 
@@ -1082,25 +1100,55 @@ fn record_live_stream_downstream_capture(ctx: &RequestContext, chunk: &[u8]) {
     }
 }
 
-fn record_live_stream_progress(ctx: &RequestContext, chunk: &[u8]) {
+/// Report one outgoing chunk to the monitor.
+///
+/// The usage comes from the translator, not from the bytes: every finish
+/// carries a `usage` object because the Messages shape requires one, and the
+/// salvage paths fill it with zeros the backend never sent. Reading it back
+/// would turn those zeros into the backend's final count.
+fn record_live_stream_progress(
+    ctx: &RequestContext,
+    translator: &mut LiveStreamTranslator,
+    chunk: &[u8],
+) {
+    let usage = translator.take_usage_report();
     if let Some(monitor) = ctx.monitor.as_ref() {
         monitor.stream_progress_usage(
             &ctx.req_id,
             chunk.len() as u64,
             count_sse_events(chunk),
-            usage_report_from_anthropic_sse(chunk),
+            usage,
         );
     }
 }
 
-fn single_live_stream_response(chunk: Vec<u8>) -> Response {
-    event_stream_response(futures_util::stream::once(async move {
-        Ok::<Bytes, std::io::Error>(Bytes::from(chunk))
-    }))
+/// The outcome of a Messages stream: it ends with `message_stop` or it did not
+/// complete, whatever the 200 that already left says.
+fn live_stream_outcome(translator: &LiveStreamTranslator) -> ResponseOutcome {
+    let outcome = ResponseOutcome::requiring_terminal();
+    note_live_stream_outcome(&outcome, translator);
+    outcome
 }
 
-fn empty_live_stream_response() -> Response {
-    event_stream_response(futures_util::stream::empty::<Result<Bytes, std::io::Error>>())
+fn note_live_stream_outcome(outcome: &ResponseOutcome, translator: &LiveStreamTranslator) {
+    if translator.emitted_terminal() {
+        outcome.mark_terminal();
+    }
+}
+
+fn single_live_stream_response(chunk: Vec<u8>, outcome: ResponseOutcome) -> Response {
+    let mut response = event_stream_response(futures_util::stream::once(async move {
+        Ok::<Bytes, std::io::Error>(Bytes::from(chunk))
+    }));
+    response.extensions_mut().insert(outcome);
+    response
+}
+
+fn empty_live_stream_response(outcome: ResponseOutcome) -> Response {
+    let mut response =
+        event_stream_response(futures_util::stream::empty::<Result<Bytes, std::io::Error>>());
+    response.extensions_mut().insert(outcome);
+    response
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1114,6 +1162,8 @@ fn remaining_live_stream_response(
     mut upstream_sse_body: Vec<u8>,
     compaction: LiveStreamCompaction,
 ) -> Response {
+    let outcome = live_stream_outcome(&translator);
+    let response_outcome = outcome.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
@@ -1142,7 +1192,7 @@ fn remaining_live_stream_response(
                 _ = heartbeat.tick() => {
                     let chunk = translator.ping_chunk(ctx.traffic.as_deref());
                     if !chunk.is_empty() {
-                        record_live_stream_progress(&ctx, &chunk);
+                        record_live_stream_progress(&ctx, &mut translator, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                             abort_request_state(
                                 ctx.session_id.as_deref(),
@@ -1179,15 +1229,18 @@ fn remaining_live_stream_response(
                                 "api_error",
                                 ctx.traffic.as_deref(),
                             );
+                            // The status left with the first chunk, so the
+                            // failure travels beside the body instead.
+                            outcome.fail(message);
                             if !chunk.is_empty() {
-                                record_live_stream_progress(&ctx, &chunk);
+                                record_live_stream_progress(&ctx, &mut translator, &chunk);
                                 let _ = tx.send(Ok(Bytes::from(chunk))).await;
                             }
                             return;
                         }
                     };
                     if !chunk.is_empty() {
-                        record_live_stream_progress(&ctx, &chunk);
+                        record_live_stream_progress(&ctx, &mut translator, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                             abort_request_state(
                                 ctx.session_id.as_deref(),
@@ -1197,6 +1250,7 @@ fn remaining_live_stream_response(
                             return;
                         }
                     }
+                    note_live_stream_outcome(&outcome, &translator);
                     if terminal {
                         update_continuation_from_upstream(
                             ctx.session_id.as_deref(),
@@ -1219,7 +1273,10 @@ fn remaining_live_stream_response(
                     let chunk =
                         translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
                     if !chunk.is_empty() {
-                        record_live_stream_progress(&ctx, &chunk);
+                        // A tool call the backend had already closed is a
+                        // complete turn: the salvaged finish is a real terminal.
+                        note_live_stream_outcome(&outcome, &translator);
+                        record_live_stream_progress(&ctx, &mut translator, &chunk);
                         let _ = tx.send(Ok(Bytes::from(chunk))).await;
                         return;
                     }
@@ -1229,8 +1286,9 @@ fn remaining_live_stream_response(
                         error_type,
                         ctx.traffic.as_deref(),
                     );
+                    outcome.fail(codex_error_message(&err));
                     if !chunk.is_empty() {
-                        record_live_stream_progress(&ctx, &chunk);
+                        record_live_stream_progress(&ctx, &mut translator, &chunk);
                         let _ = tx.send(Ok(Bytes::from(chunk))).await;
                     }
                     return;
@@ -1245,17 +1303,16 @@ fn remaining_live_stream_response(
         );
         let chunk = translator.finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
         if !chunk.is_empty() {
-            record_live_stream_progress(&ctx, &chunk);
+            note_live_stream_outcome(&outcome, &translator);
+            record_live_stream_progress(&ctx, &mut translator, &chunk);
             let _ = tx.send(Ok(Bytes::from(chunk))).await;
             return;
         }
-        let chunk = translator.error_chunk(
-            "Upstream event stream closed before terminal Codex response event",
-            "api_error",
-            ctx.traffic.as_deref(),
-        );
+        let message = "Upstream event stream closed before terminal Codex response event";
+        let chunk = translator.error_chunk(message, "api_error", ctx.traffic.as_deref());
+        outcome.fail(message);
         if !chunk.is_empty() {
-            record_live_stream_progress(&ctx, &chunk);
+            record_live_stream_progress(&ctx, &mut translator, &chunk);
             let _ = tx.send(Ok(Bytes::from(chunk))).await;
         }
     });
@@ -1263,7 +1320,9 @@ fn remaining_live_stream_response(
     let stream = futures_util::stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| (item, rx))
     });
-    event_stream_response(stream)
+    let mut response = event_stream_response(stream);
+    response.extensions_mut().insert(response_outcome);
+    response
 }
 
 fn append_upstream_sse_payload(buffer: &mut Vec<u8>, payload: &serde_json::Value) {
@@ -2030,17 +2089,11 @@ mod tests {
         })));
     }
 
-    #[test]
-    fn live_stream_progress_records_terminal_usage() {
+    fn monitored_live_context(req_id: &str) -> (crate::monitor::MonitorHandle, RequestContext) {
         let monitor = crate::monitor::MonitorHandle::new(10);
-        monitor.request_started(
-            "request",
-            None,
-            None,
-            crate::monitor::EndpointKind::Messages,
-        );
+        monitor.request_started(req_id, None, None, crate::monitor::EndpointKind::Messages);
         let ctx = RequestContext {
-            req_id: "request".to_string(),
+            req_id: req_id.to_string(),
             session_id: None,
             session_seq: None,
             provider: "codex".to_string(),
@@ -2048,13 +2101,150 @@ mod tests {
             monitor: Some(monitor.clone()),
             passthrough: None,
         };
-        let chunk = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":12,\"output_tokens\":48}}\n\n";
+        (monitor, ctx)
+    }
 
-        record_live_stream_progress(&ctx, chunk);
+    /// Feed the translator one upstream event and report the chunk it produced,
+    /// the way the live stream does.
+    fn relay_live_event(
+        ctx: &RequestContext,
+        translator: &mut LiveStreamTranslator,
+        payload: serde_json::Value,
+    ) {
+        let chunk = translator.accept(&payload, None).unwrap();
+        if !chunk.is_empty() {
+            record_live_stream_progress(ctx, translator, &chunk);
+        }
+    }
+
+    #[test]
+    fn live_stream_progress_reports_the_counts_the_backend_sent() {
+        let (monitor, ctx) = monitored_live_context("request");
+        let mut translator =
+            LiveStreamTranslator::with_estimated_input_tokens("msg_1", "gpt-5.6-sol", 31_066);
+
+        relay_live_event(
+            &ctx,
+            &mut translator,
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "id": "msg_up"}
+            }),
+        );
+        // While the stream runs, the prompt count is this proxy's estimate.
+        let streaming = monitor.snapshot();
+        assert_eq!(streaming.active[0].input_tokens, Some(31_066));
+        assert_eq!(
+            streaming.active[0].usage_quality(),
+            crate::monitor::QualityFields {
+                input: crate::monitor::UsageQuality::Opening,
+                cache_read: crate::monitor::UsageQuality::Missing,
+                cache_write: crate::monitor::UsageQuality::Missing,
+                output: crate::monitor::UsageQuality::Opening,
+            }
+        );
+
+        relay_live_event(
+            &ctx,
+            &mut translator,
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": "hi"
+            }),
+        );
+        relay_live_event(
+            &ctx,
+            &mut translator,
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 31_000,
+                        "output_tokens": 117,
+                        "input_tokens_details": {"cached_tokens": 28_160}
+                    }
+                }
+            }),
+        );
 
         let state = monitor.snapshot();
-        assert_eq!(state.active[0].input_tokens, Some(12));
-        assert_eq!(state.active[0].output_tokens, Some(48));
+        let request = &state.active[0];
+        assert_eq!(request.input_tokens, Some(2_840));
+        assert_eq!(request.cache.read_tokens, Some(28_160));
+        assert_eq!(request.output_tokens, Some(117));
+        // The prompt is the total the backend measured, which is the two halves
+        // above and nothing more.
+        assert_eq!(request.cache.reported_prompt_tokens, Some(31_000));
+        assert_eq!(request.prompt_tokens(), Some(31_000));
+        // The backend reports no cache writes, so that count stays absent
+        // instead of being measured as zero.
+        assert_eq!(request.cache.write_tokens, None);
+        assert_eq!(
+            request.usage_quality(),
+            crate::monitor::QualityFields {
+                input: crate::monitor::UsageQuality::Exact,
+                cache_read: crate::monitor::UsageQuality::Exact,
+                cache_write: crate::monitor::UsageQuality::Missing,
+                output: crate::monitor::UsageQuality::Exact,
+            }
+        );
+        assert!(translator.emitted_terminal());
+    }
+
+    #[test]
+    fn a_salvaged_tool_call_finish_reports_no_backend_counts() {
+        let (monitor, ctx) = monitored_live_context("salvage");
+        let mut translator =
+            LiveStreamTranslator::with_estimated_input_tokens("msg_2", "gpt-5.6-sol", 12_345);
+
+        for payload in [
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "Bash"}
+            }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": "{\"command\":\"ls\"}"
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "Bash"}
+            }),
+        ] {
+            relay_live_event(&ctx, &mut translator, payload);
+        }
+
+        // The socket dropped after a closed tool call: the finish is this
+        // proxy's, and the zeros its `usage` object carries are not counts.
+        let chunk = translator.finish_after_closed_completed_tool_call(None);
+        assert!(String::from_utf8_lossy(&chunk).contains("\"input_tokens\":0"));
+        record_live_stream_progress(&ctx, &mut translator, &chunk);
+
+        let state = monitor.snapshot();
+        let request = &state.active[0];
+        assert_eq!(request.input_tokens, Some(12_345));
+        assert_eq!(request.output_tokens, Some(0));
+        assert_eq!(request.cache.read_tokens, None);
+        assert_eq!(request.cache.write_tokens, None);
+        assert_eq!(
+            request.usage_quality(),
+            crate::monitor::QualityFields {
+                input: crate::monitor::UsageQuality::Opening,
+                cache_read: crate::monitor::UsageQuality::Missing,
+                cache_write: crate::monitor::UsageQuality::Missing,
+                output: crate::monitor::UsageQuality::Opening,
+            }
+        );
+        // The wire keeps its terminal finish, so the turn still completed.
+        assert!(translator.emitted_terminal());
+        assert_eq!(live_stream_outcome(&translator).failure_at_end(), None);
     }
 
     #[tokio::test]

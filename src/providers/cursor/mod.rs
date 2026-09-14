@@ -75,14 +75,22 @@ impl Provider for CursorProvider {
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("cursor");
 
-        let resolved = resolve_cursor_model(model);
-        if let Err(e) = resolved {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!("Model \"{model}\" is not supported: {e}"),
-            );
-        }
+        // The client resolves the caller's id to the model id it puts in its
+        // frames; the same resolution decides here whether the request is
+        // servable at all. Which model ran is published later, where a call to
+        // Cursor is actually prepared: the tool bridge answers from state the
+        // proxy holds and a missing credential stops the request, and neither
+        // runs a model.
+        let resolved = match resolve_cursor_model(model) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("Model \"{model}\" is not supported: {e}"),
+                );
+            }
+        };
 
         if let Some(ref session_id) = ctx.session_id
             && let Some(pending) = BridgeRegistry::pending_tool(session_id)
@@ -140,7 +148,12 @@ impl Provider for CursorProvider {
         let images = request::cursor_selected_images(&body);
 
         let client = CursorHttpClient::new();
+        // The last common point before the request leaves: the client resolves
+        // the caller's id the same way and puts this id in its frames, so it is
+        // the model the call was prepared with, whatever the transport then
+        // does with it.
         if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.model_resolved(&ctx.req_id, &resolved.model_id);
             monitor.upstream_started(&ctx.req_id);
         }
         let upstream = match client.run_agent(&token, &prompt, model, &images).await {
@@ -252,9 +265,6 @@ impl Provider for CursorProvider {
                 format!("Model \"{requested}\" is not supported: {error}"),
             )
         })?;
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved.model_id);
-        }
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         if let Some(session_id) = ctx.session_id.as_deref()
             && let Some(pending) = BridgeRegistry::pending_tool(session_id)
@@ -301,7 +311,11 @@ impl Provider for CursorProvider {
                 }),
             );
         }
+        // Same boundary as the Messages route: the model is named where the
+        // call to Cursor is prepared, not where the id was resolved, so a
+        // bridged answer or a missing credential names none.
         if let Some(monitor) = ctx.monitor.as_ref() {
+            monitor.model_resolved(&ctx.req_id, &resolved.model_id);
             monitor.upstream_started(&ctx.req_id);
         }
         let upstream = CursorHttpClient::new()
@@ -499,5 +513,114 @@ mod tests {
         assert!(models.contains(&"cursor-agent".to_string()));
         assert!(models.contains(&"cursor-plan".to_string()));
         assert!(models.contains(&"cursor-ask".to_string()));
+    }
+
+    /// A request that stops at the auth check never prepares a call to Cursor,
+    /// so no model ran: the row keeps the id the caller typed and names no
+    /// executed model. The resolution the route performed is not evidence that
+    /// anything was sent.
+    #[tokio::test]
+    async fn a_request_that_stops_at_auth_names_no_model_as_having_run() {
+        let monitor = crate::monitor::MonitorHandle::new(10);
+        monitor.request_started(
+            "cursor-1",
+            None,
+            None,
+            crate::monitor::EndpointKind::Messages,
+        );
+        monitor.provider_selected("cursor-1", "cursor", "cursor:composer-2.5-fast", None);
+        let ctx = RequestContext {
+            req_id: "cursor-1".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "cursor".to_string(),
+            traffic: None,
+            monitor: Some(monitor.clone()),
+            passthrough: None,
+        };
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:composer-2.5-fast",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        // No Cursor credentials in the test environment, so the request stops at
+        // the auth check.
+        let response = CursorProvider::new().handle_messages(body, ctx).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let state = monitor.snapshot();
+        assert_eq!(
+            state.active[0].model.as_deref(),
+            Some("cursor:composer-2.5-fast")
+        );
+        assert_eq!(state.active[0].effective_model, None);
+    }
+
+    /// The tool bridge answers a resumed tool call from state the proxy holds,
+    /// without a request to Cursor. Nothing ran upstream, so nothing may be
+    /// named as the model that ran.
+    #[tokio::test]
+    async fn a_locally_bridged_answer_names_no_model_as_having_run() {
+        let session_id = "session-bridge-monitor";
+        BridgeRegistry::remove(session_id);
+        let events = vec![
+            crate::providers::cursor::response::CursorStreamEvent::TextDelta {
+                text: r#"<tool_use name="Read">{"file_path":"/tmp/bridge"}</tool_use>"#.to_string(),
+            },
+        ];
+        let allowed: std::collections::BTreeSet<String> =
+            ["Read".to_string()].into_iter().collect();
+        let (_first, paused) = start_cursor_tool_bridge(
+            "msg_bridge",
+            "cursor:composer-2.5-fast",
+            session_id,
+            &events,
+            Some(allowed),
+            Box::new(|| "call_bridge_1".to_string()),
+        );
+        assert!(paused, "the bridge must be waiting for the tool result");
+
+        let monitor = crate::monitor::MonitorHandle::new(10);
+        monitor.request_started(
+            "cursor-bridge",
+            Some(session_id.to_string()),
+            None,
+            crate::monitor::EndpointKind::Messages,
+        );
+        monitor.provider_selected("cursor-bridge", "cursor", "cursor:composer-2.5-fast", None);
+        let ctx = RequestContext {
+            req_id: "cursor-bridge".to_string(),
+            session_id: Some(session_id.to_string()),
+            session_seq: None,
+            provider: "cursor".to_string(),
+            traffic: None,
+            monitor: Some(monitor.clone()),
+            passthrough: None,
+        };
+        let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "cursor:composer-2.5-fast",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_bridge_1",
+                    "content": "file contents"
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let response = CursorProvider::new().handle_messages(body, ctx).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let state = monitor.snapshot();
+        assert_eq!(
+            state.active[0].model.as_deref(),
+            Some("cursor:composer-2.5-fast")
+        );
+        assert_eq!(state.active[0].effective_model, None);
+
+        BridgeRegistry::remove(session_id);
     }
 }

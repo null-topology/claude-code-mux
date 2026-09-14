@@ -211,6 +211,24 @@ prompt size is their sum. Providers report usage in one of two ways:
   relayed body in `UsageObserver` (bytes untouched) and treats
   `message_start` prompt counts as closing, because Anthropic's are exact.
 
+Each count carries its own quality, derived from the value held and whether a
+closing observation produced it (`quality_of` in `src/monitor/usage.rs`,
+`usage_quality` in `src/monitor.rs`): `Missing` with no value, `Opening` while
+only an estimate has arrived, `Exact` once a closing value did, a reported zero
+included. A missing count is not a zero, and a status never upgrades a quality:
+a request that completes with no closing report stays `Opening`. The two
+lifetime buckets of a cache write have their own `CacheWriteQuality` and are
+closed only on their own reports — a bucket is never inferred from the write it
+belongs to, from the other bucket, or from a TTL — so the buckets may not
+reconcile with the aggregate write, which the backend reports independently;
+they are also never added to the prompt or to the aggregate. Codex reports
+neither cache writes nor buckets, so those stay `Missing` rather than zero.
+
+`reported_prompt_tokens` keeps a full prompt total that a backend measured
+itself, apart from the four categories: `prompt_tokens()` prefers it over their
+sum, it is never added to them as a fifth category, and it says nothing about
+the cached split, which stays unknown when only the total arrived.
+
 Session totals apply signed deltas and skip `count_tokens` requests. Cache
 misses are judged per lane (session, conversation from
 `MonitorEvent::ConversationResolved`, provider, model) in
@@ -239,6 +257,63 @@ A model switch is not labelled: the new model's lane has no baseline. Doing it
 reliably needs the previous request of the same conversation and a guard for
 side calls on other models. Do not switch cursor to the report API: it sends
 `cache_read_input_tokens: 0` always and would produce false misses.
+
+Whether a response counts as a failure is the shared `ResponseOutcome`
+(`src/provider.rs`). The status line leaves before the body does, so a producer
+records a mid-stream failure there and the server reads it when the body ends.
+A protocol that ends with a terminal event uses `requiring_terminal`: for an
+observed Anthropic Messages SSE stream — the passthrough's relayed body and the
+Codex live stream both — an `error` event or a body that stopped before
+`message_stop` is recorded as Failed even though the client already received
+HTTP 200. The first failure wins, so a semantic cause is not replaced by a
+later transport error, nor erased by a healthy-looking finish.
+
+`src/monitor/accounting.rs` is the persistent ledger behind the recent list.
+The recent list holds the last few hundred requests in full; the ledger keeps
+one compact numeric record plus small metadata per request id, so a report
+arriving after a request was evicted still lands on its record and corrects
+every session, conversation and model total it fed. The live Codex path needs
+that: it hands the response to the client before the stream ends, so the
+backend's own counts can arrive arbitrarily late. The price is a map that grows
+with the number of requests served until the process restarts. Records hold
+numbers and small metadata only — no prompt, no request or response body, no
+output text. Every mutation goes through `Ledger::update`, which detaches a
+record's contribution from the rows it feeds, applies the change, and attaches
+it again, so a row is always the sum of the records attached to it; one signed
+`UsageDelta` path carries the numbers, and a change worth nothing numerically
+still counts, because a missing count arriving as a reported zero moves the
+evidence behind a total. Metadata is ordered by `(started_at, rank)` and a row
+shows the metadata of the request with the greatest order, so a late report for
+an older request cannot take a row's model or status back; a session's project
+and a conversation's parent have independent watermarks (`project_order`,
+`parent_order`) because a request states them separately from being routed. In
+`note_metadata` a `None` never erases a value already known.
+
+Requested and effective model are tracked separately. `ModelRequested` captures
+the id the client's body named, before the agent-summary and auto-review
+overrides, the one-hour suffix and any provider alias; the first naming wins and
+a request that never reached a provider still says what it asked for.
+`ModelResolved` is published only by a producer that saw the outgoing request
+built, so it names the model of a genuine upstream request — which is not proof
+that the backend accepted it. The `requested → effective` string is display for
+the visible row; no total is keyed on it. The rollups are keyed on provider plus
+effective model (`SessionSummary.models`, `ModelKey`) and carry a histogram of
+the requested ids that fed each row. Paths that build no upstream request name
+no effective model: the local Codex, Kimi and Cursor `count_tokens` estimates,
+the
+locally answered agent summary (provider `local`, whose synthetic counts stay
+out of every token total), and Cursor's tool-bridge and auth-failure early
+returns. Anthropic's `count_tokens` is a genuine relay and may name one. Kimi
+names one only once the translated request exists, so a body rejected in
+translation has none. A `[1m]` suffix is reported as the string the client sent,
+as evidence of what went on the wire rather than as a one-hour cache marker.
+
+The TUI renders none of this yet: `src/tui.rs` reads no quality, no evidence and
+no model rollup. The data exists ahead of the view; do not assume a change there
+is visible.
+
+Deferred and non-blocking: `RequestRecord::model_key` and the requested-model
+histogram allocate `String`s on every ledger update.
 
 What the Codex backend keys its prompt cache on is the request's
 `prompt_cache_key` plus the `session_id` header, and the proxy sends

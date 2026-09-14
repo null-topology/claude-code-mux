@@ -21,7 +21,7 @@ use crate::anthropic::error::json_error;
 use crate::anthropic::schema::MessagesRequest;
 use crate::logging::create_logger;
 use crate::monitor::{MonitorHandle, UsageReport, usage_report_from_anthropic_body};
-use crate::provider::{CliHandlers, ModelListing, Provider, RequestContext};
+use crate::provider::{CliHandlers, ModelListing, Provider, RequestContext, ResponseOutcome};
 use crate::providers::translate_shared::wrap_reasoning;
 use crate::registry::ANTHROPIC_STYLE_ALIASES;
 
@@ -37,15 +37,32 @@ use crate::registry::ANTHROPIC_STYLE_ALIASES;
 /// without a signature and the reasoning stays in context. Genuine Anthropic reasoning
 /// (a non-empty signature) is left untouched.
 ///
-/// Returns rewritten bytes only when something changed; `None` forwards the body
+/// `rewritten` holds bytes only when something changed; `None` forwards the body
 /// verbatim, keeping the byte-identical cache prefix for pure-Anthropic conversations.
-fn sanitize_anthropic_request(raw: &[u8], req_id: &str) -> Option<Vec<u8>> {
-    let mut doc: Value = serde_json::from_slice(raw).ok()?;
-    let obj = doc.as_object_mut()?;
+///
+/// The same parse also reports the model written in the outgoing document. That
+/// document is the client's own body, which the proxy does not rewrite the model
+/// of, so what it names is what Anthropic will run — even where the proxy pointed
+/// its typed copy of the request at another model. Reading it here costs nothing:
+/// the parse already happens, and the value is taken before the early return for a
+/// body with no `messages`, so a request that needs no rewrite still reports it.
+fn sanitize_anthropic_request(raw: &[u8], req_id: &str) -> OutgoingRequest {
+    let Ok(mut doc) = serde_json::from_slice::<Value>(raw) else {
+        return OutgoingRequest::default();
+    };
+    let Some(obj) = doc.as_object_mut() else {
+        return OutgoingRequest::default();
+    };
 
     detect_hosted_web_search_regression(obj, req_id);
+    let model = obj.get("model").and_then(Value::as_str).map(str::to_string);
 
-    let messages = obj.get_mut("messages")?.as_array_mut()?;
+    let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) else {
+        return OutgoingRequest {
+            model,
+            rewritten: None,
+        };
+    };
     let mut changed = false;
     for message in messages.iter_mut() {
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
@@ -59,7 +76,18 @@ fn sanitize_anthropic_request(raw: &[u8], req_id: &str) -> Option<Vec<u8>> {
         }
     }
 
-    changed.then(|| serde_json::to_vec(&doc).unwrap_or_else(|_| raw.to_vec()))
+    OutgoingRequest {
+        model,
+        rewritten: changed.then(|| serde_json::to_vec(&doc).unwrap_or_else(|_| raw.to_vec())),
+    }
+}
+
+/// What the relay is about to send: the model the outgoing document names, and
+/// the rewritten bytes when the body needed one.
+#[derive(Debug, Default)]
+struct OutgoingRequest {
+    model: Option<String>,
+    rewritten: Option<Vec<u8>>,
 }
 
 /// Convert one signature-less `thinking` block into a tagged `text` block in place.
@@ -220,7 +248,13 @@ impl AnthropicProvider {
 
         // Rehydrate signature-less codex `thinking` blocks so a mid-conversation switch
         // to Anthropic does not 400. Unchanged bodies are forwarded verbatim.
-        let outgoing = match sanitize_anthropic_request(&passthrough.raw_body, &req_id) {
+        let prepared = sanitize_anthropic_request(&passthrough.raw_body, &req_id);
+        // What the relayed bytes ask for is what will run, whatever the proxy
+        // decided about its own copy of the request.
+        if let (Some(monitor), Some(model)) = (monitor.as_ref(), prepared.model.as_deref()) {
+            monitor.model_resolved(&req_id, model);
+        }
+        let outgoing = match prepared.rewritten {
             Some(bytes) => reqwest::Body::from(bytes),
             None => reqwest::Body::from(passthrough.raw_body),
         };
@@ -250,11 +284,21 @@ impl AnthropicProvider {
                         .get(axum::http::header::CONTENT_TYPE)
                         .and_then(|value| value.to_str().ok()),
                 );
-                let body = match (monitor, body_kind) {
+                // A relayed stream ends with `message_stop`; anything else, an
+                // Anthropic `error` event included, did not complete. The
+                // observer reads the events as they pass and the bytes reach the
+                // client exactly as they arrived. Without a monitor nothing reads
+                // either result, so the relay does no work at all.
+                let (body, outcome) = match (monitor, body_kind) {
                     (Some(monitor), Some(kind)) => {
-                        let mut observer = UsageObserver::new(monitor, req_id, kind);
+                        let outcome = match kind {
+                            ObservedBody::EventStream => ResponseOutcome::requiring_terminal(),
+                            ObservedBody::Json => ResponseOutcome::default(),
+                        };
+                        let mut observer =
+                            UsageObserver::new(monitor, req_id, kind, outcome.clone());
                         let mut inner = Box::pin(upstream.bytes_stream());
-                        Body::from_stream(futures_util::stream::poll_fn(move |cx| {
+                        let body = Body::from_stream(futures_util::stream::poll_fn(move |cx| {
                             match Stream::poll_next(inner.as_mut(), cx) {
                                 Poll::Ready(Some(Ok(bytes))) => {
                                     observer.observe(&bytes);
@@ -266,13 +310,17 @@ impl AnthropicProvider {
                                 }
                                 other => other,
                             }
-                        }))
+                        }));
+                        (body, Some(outcome))
                     }
-                    _ => Body::from_stream(upstream.bytes_stream()),
+                    _ => (Body::from_stream(upstream.bytes_stream()), None),
                 };
                 let mut response = Response::new(body);
                 *response.status_mut() = status;
                 *response.headers_mut() = out_headers;
+                if let Some(outcome) = outcome {
+                    response.extensions_mut().insert(outcome);
+                }
                 response
             }
             Err(err) => json_error(
@@ -312,26 +360,34 @@ impl ObservedBody {
     }
 }
 
-/// Reads token usage out of a relayed response for the monitor. The bytes go
-/// to the client untouched; the observer only looks at them: SSE events are
-/// parsed line by line as they pass, a JSON body is kept up to a limit and
-/// parsed once the stream ends. Anthropic's `message_start` carries the exact
-/// prompt counts, so a cache miss is visible as soon as the stream starts.
+/// Reads a relayed response as it passes: the token usage the monitor records,
+/// and whether the stream actually completed. The bytes go to the client
+/// untouched; the observer only looks at them. SSE events are parsed line by
+/// line as they pass, a JSON body is kept up to a limit and parsed once the
+/// stream ends. Anthropic's `message_start` carries the exact prompt counts, so
+/// a cache miss is visible as soon as the stream starts.
 struct UsageObserver {
     monitor: MonitorHandle,
     req_id: String,
     kind: ObservedBody,
+    outcome: ResponseOutcome,
     pending: Vec<u8>,
     overflow: bool,
     finished: bool,
 }
 
 impl UsageObserver {
-    fn new(monitor: MonitorHandle, req_id: String, kind: ObservedBody) -> Self {
+    fn new(
+        monitor: MonitorHandle,
+        req_id: String,
+        kind: ObservedBody,
+        outcome: ResponseOutcome,
+    ) -> Self {
         Self {
             monitor,
             req_id,
             kind,
+            outcome,
             pending: Vec::new(),
             overflow: false,
             finished: false,
@@ -349,6 +405,7 @@ impl UsageObserver {
                     if let Some(data) = line.strip_prefix(b"data:")
                         && let Ok(event) = serde_json::from_slice::<Value>(data.trim_ascii())
                     {
+                        self.note_protocol_event(&event);
                         report.add_event(&event, true);
                     }
                 }
@@ -369,6 +426,24 @@ impl UsageObserver {
                     self.pending.extend_from_slice(chunk);
                 }
             }
+        }
+    }
+
+    /// Judge the event by its own identity, never by the content it carries: a
+    /// model that writes the word error, or a whole error document, into a text
+    /// delta has not failed. Only a top-level `error` event has, and only
+    /// `message_stop` ends the stream.
+    fn note_protocol_event(&self, event: &Value) {
+        match event.get("type").and_then(Value::as_str) {
+            Some("error") => {
+                let message = event
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the relayed stream reported an error event");
+                self.outcome.fail(message);
+            }
+            Some("message_stop") => self.outcome.mark_terminal(),
+            _ => {}
         }
     }
 
@@ -504,7 +579,9 @@ mod tests {
             ]
         });
         let raw = serde_json::to_vec(&body).unwrap();
-        let out = sanitize_anthropic_request(&raw, "req1").expect("should rewrite");
+        let out = sanitize_anthropic_request(&raw, "req1")
+            .rewritten
+            .expect("should rewrite");
         let doc = parse(&out);
         let blocks = doc["messages"][1]["content"].as_array().unwrap();
         // the thinking block is gone, replaced by tagged text; the real answer survives
@@ -528,7 +605,7 @@ mod tests {
             ]
         });
         let raw = serde_json::to_vec(&body).unwrap();
-        assert!(sanitize_anthropic_request(&raw, "req2").is_none());
+        assert!(sanitize_anthropic_request(&raw, "req2").rewritten.is_none());
     }
 
     #[test]
@@ -541,7 +618,9 @@ mod tests {
             ]
         });
         let raw = serde_json::to_vec(&body).unwrap();
-        let out = sanitize_anthropic_request(&raw, "req3").expect("should rewrite");
+        let out = sanitize_anthropic_request(&raw, "req3")
+            .rewritten
+            .expect("should rewrite");
         assert_eq!(parse(&out)["messages"][0]["content"][0]["type"], "text");
     }
 
@@ -554,7 +633,7 @@ mod tests {
             ]
         });
         let raw = serde_json::to_vec(&body).unwrap();
-        assert!(sanitize_anthropic_request(&raw, "req4").is_none());
+        assert!(sanitize_anthropic_request(&raw, "req4").rewritten.is_none());
     }
 
     #[test]
@@ -567,8 +646,8 @@ mod tests {
             ]
         });
         let raw = serde_json::to_vec(&body).unwrap();
-        let a = sanitize_anthropic_request(&raw, "r").unwrap();
-        let b = sanitize_anthropic_request(&raw, "r").unwrap();
+        let a = sanitize_anthropic_request(&raw, "r").rewritten.unwrap();
+        let b = sanitize_anthropic_request(&raw, "r").rewritten.unwrap();
         assert_eq!(
             a, b,
             "rewrite must be byte-stable to preserve the cache prefix"
@@ -577,7 +656,66 @@ mod tests {
 
     #[test]
     fn non_json_body_is_forwarded_verbatim() {
-        assert!(sanitize_anthropic_request(b"not json", "req5").is_none());
+        assert!(
+            sanitize_anthropic_request(b"not json", "req5")
+                .rewritten
+                .is_none()
+        );
+    }
+
+    /// The relay sends the caller's bytes, so the model that reaches Anthropic
+    /// is the one written in them. It is read from the document that leaves,
+    /// in the parse the rewrite already does, whether or not anything is
+    /// rewritten and whatever else the proxy decided about the request.
+    #[test]
+    fn the_outgoing_model_is_read_from_the_document_that_leaves() {
+        let plain = serde_json::json!({
+            "model": "claude-opus-5",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let raw = serde_json::to_vec(&plain).unwrap();
+        let outgoing = sanitize_anthropic_request(&raw, "req6");
+        assert_eq!(outgoing.model.as_deref(), Some("claude-opus-5"));
+        assert!(
+            outgoing.rewritten.is_none(),
+            "reading the model must not make the relay reserialize"
+        );
+
+        // A body with no `messages` at all still names its model.
+        let bare = serde_json::to_vec(&serde_json::json!({"model": "opus"})).unwrap();
+        assert_eq!(
+            sanitize_anthropic_request(&bare, "req7").model.as_deref(),
+            Some("opus")
+        );
+
+        // The one-hour suffix is part of what the client sent, so it is
+        // reported as the string it is rather than guessed away.
+        let suffixed =
+            serde_json::to_vec(&serde_json::json!({"model": "claude-opus-5[1m]"})).unwrap();
+        assert_eq!(
+            sanitize_anthropic_request(&suffixed, "req8")
+                .model
+                .as_deref(),
+            Some("claude-opus-5[1m]")
+        );
+
+        // A rewritten body is still the one that leaves, and its model with it.
+        let rewritten = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "codex reasoning", "signature": ""}
+            ]}]
+        });
+        let raw = serde_json::to_vec(&rewritten).unwrap();
+        let outgoing = sanitize_anthropic_request(&raw, "req9");
+        assert_eq!(outgoing.model.as_deref(), Some("claude-sonnet-5"));
+        let bytes = outgoing.rewritten.expect("should rewrite");
+        assert_eq!(parse(&bytes)["model"], "claude-sonnet-5");
+
+        // Nothing to read from, nothing invented.
+        assert_eq!(sanitize_anthropic_request(b"not json", "req10").model, None);
+        let modelless = serde_json::to_vec(&serde_json::json!({"messages": []})).unwrap();
+        assert_eq!(sanitize_anthropic_request(&modelless, "req11").model, None);
     }
 
     fn observed_monitor(request_id: &str, endpoint: crate::monitor::EndpointKind) -> MonitorHandle {
@@ -592,18 +730,25 @@ mod tests {
     #[test]
     fn usage_observer_reads_anthropic_stream_usage_across_split_chunks() {
         let monitor = observed_monitor("r1", crate::monitor::EndpointKind::Messages);
-        let mut observer =
-            UsageObserver::new(monitor.clone(), "r1".to_string(), ObservedBody::EventStream);
+        let outcome = ResponseOutcome::requiring_terminal();
+        let mut observer = UsageObserver::new(
+            monitor.clone(),
+            "r1".to_string(),
+            ObservedBody::EventStream,
+            outcome.clone(),
+        );
         let stream = concat!(
             "event: message_start\r\n",
             "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2,",
             "\"cache_read_input_tokens\":10126,\"cache_creation_input_tokens\":22405,",
-            "\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":22405},",
+            "\"cache_creation\":{\"ephemeral_5m_input_tokens\":4105,\"ephemeral_1h_input_tokens\":18300},",
             "\"output_tokens\":3}}}\r\n\r\n",
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
             "event: message_delta\n",
             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":120}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
         )
         .as_bytes();
         let mut relayed = Vec::new();
@@ -613,6 +758,9 @@ mod tests {
         }
         observer.finish();
         assert_eq!(relayed, stream);
+        // A stream that reached its terminal event is a success, and the bytes
+        // the client received are the ones that arrived.
+        assert_eq!(outcome.failure_at_end(), None);
 
         let state = monitor.snapshot();
         let request = &state.recent[0];
@@ -624,6 +772,20 @@ mod tests {
             request.cache.ttl,
             Some(std::time::Duration::from_secs(60 * 60))
         );
+        // The lifetime split the response sent reaches the request as it was
+        // reported, each bucket on its own evidence.
+        assert_eq!(request.cache.write_5m_tokens, Some(4_105));
+        assert_eq!(request.cache.write_1h_tokens, Some(18_300));
+        assert_eq!(
+            request.cache_write_quality(),
+            crate::monitor::CacheWriteQuality {
+                ephemeral_5m: crate::monitor::UsageQuality::Exact,
+                ephemeral_1h: crate::monitor::UsageQuality::Exact,
+            }
+        );
+        // The buckets are a breakdown of the write, not tokens beside it, so
+        // the prompt stays input plus read plus write.
+        assert_eq!(request.prompt_tokens(), Some(2 + 10_126 + 22_405));
         assert!(request.cache.evaluated());
         assert!(request.stream_chunks > 0);
         let session = &state.sessions[0];
@@ -631,13 +793,22 @@ mod tests {
         assert_eq!(session.cache_read_tokens, 10_126);
         assert_eq!(session.cache_write_tokens, 22_405);
         assert_eq!(session.output_tokens, 120);
+        assert_eq!(session.cache_write_5m_tokens, 4_105);
+        assert_eq!(session.cache_write_1h_tokens, 18_300);
+        assert_eq!(session.evidence.cache_write_5m.exact, 1);
+        assert_eq!(session.evidence.cache_write_1h.exact, 1);
     }
 
     #[test]
     fn usage_observer_reads_json_bodies_when_the_stream_ends() {
         let monitor = observed_monitor("count", crate::monitor::EndpointKind::CountTokens);
-        let mut observer =
-            UsageObserver::new(monitor.clone(), "count".to_string(), ObservedBody::Json);
+        let outcome = ResponseOutcome::default();
+        let mut observer = UsageObserver::new(
+            monitor.clone(),
+            "count".to_string(),
+            ObservedBody::Json,
+            outcome.clone(),
+        );
         observer.observe(b"{\"input_tok");
         observer.observe(b"ens\": 4242}");
         observer.finish();
@@ -646,6 +817,200 @@ mod tests {
         let state = monitor.snapshot();
         assert_eq!(state.recent[0].input_tokens, Some(4_242));
         assert_eq!(state.sessions[0].input_tokens, 0);
+        // A whole JSON body has no terminal event to wait for.
+        assert_eq!(outcome.failure_at_end(), None);
+    }
+
+    #[test]
+    fn usage_observer_reads_the_cache_creation_split_of_a_buffered_message() {
+        let monitor = observed_monitor("r_buffered", crate::monitor::EndpointKind::Messages);
+        // A non-streaming Messages reply: one JSON document, read once the body
+        // ends. It names the five-minute bucket as a zero and says nothing at
+        // all about the one-hour one.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "id": "msg_boundary",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-5",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 7,
+                "cache_read_input_tokens": 5_000,
+                "cache_creation_input_tokens": 1_536,
+                "cache_creation": {"ephemeral_5m_input_tokens": 0},
+                "output_tokens": 64
+            }
+        }))
+        .unwrap();
+        let outcome = ResponseOutcome::default();
+        let mut observer = UsageObserver::new(
+            monitor.clone(),
+            "r_buffered".to_string(),
+            ObservedBody::Json,
+            outcome.clone(),
+        );
+        let mut relayed = Vec::new();
+        for chunk in body.chunks(29) {
+            observer.observe(chunk);
+            relayed.extend_from_slice(chunk);
+        }
+        observer.finish();
+
+        assert_eq!(relayed, body, "relayed bytes must stay exact");
+        assert_eq!(outcome.failure_at_end(), None);
+
+        let state = monitor.snapshot();
+        let request = &state.recent[0];
+        assert_eq!(request.input_tokens, Some(7));
+        assert_eq!(request.cache.read_tokens, Some(5_000));
+        assert_eq!(request.cache.write_tokens, Some(1_536));
+        assert_eq!(request.output_tokens, Some(64));
+        // A reported zero is the backend's own count; a bucket the body never
+        // named stays unknown rather than becoming the rest of the write.
+        assert_eq!(request.cache.write_5m_tokens, Some(0));
+        assert_eq!(request.cache.write_1h_tokens, None);
+        assert_eq!(
+            request.cache_write_quality(),
+            crate::monitor::CacheWriteQuality {
+                ephemeral_5m: crate::monitor::UsageQuality::Exact,
+                ephemeral_1h: crate::monitor::UsageQuality::Missing,
+            }
+        );
+        assert_eq!(
+            request.usage_quality(),
+            crate::monitor::QualityFields {
+                input: crate::monitor::UsageQuality::Exact,
+                cache_read: crate::monitor::UsageQuality::Exact,
+                cache_write: crate::monitor::UsageQuality::Exact,
+                output: crate::monitor::UsageQuality::Exact,
+            }
+        );
+        // The breakdown neither moves the write it belongs to nor the prompt.
+        assert_eq!(request.prompt_tokens(), Some(7 + 5_000 + 1_536));
+        // No lifetime was actually written, so none is claimed.
+        assert_eq!(request.cache.ttl, None);
+
+        let session = &state.sessions[0];
+        assert_eq!(session.cache_write_tokens, 1_536);
+        assert_eq!(session.cache_write_5m_tokens, 0);
+        assert_eq!(session.cache_write_1h_tokens, 0);
+        assert_eq!(session.evidence.cache_write.exact, 1);
+        assert_eq!(session.evidence.cache_write_5m.exact, 1);
+        assert_eq!(session.evidence.cache_write_1h.missing, 1);
+    }
+
+    #[test]
+    fn a_top_level_error_event_fails_the_relayed_stream_without_touching_its_bytes() {
+        let monitor = observed_monitor("r_err", crate::monitor::EndpointKind::Messages);
+        let outcome = ResponseOutcome::requiring_terminal();
+        let mut observer = UsageObserver::new(
+            monitor.clone(),
+            "r_err".to_string(),
+            ObservedBody::EventStream,
+            outcome.clone(),
+        );
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":11,\"cache_read_input_tokens\":900,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+        )
+        .as_bytes();
+        let mut relayed = Vec::new();
+        for chunk in stream.chunks(23) {
+            observer.observe(chunk);
+            relayed.extend_from_slice(chunk);
+        }
+        observer.finish();
+
+        assert_eq!(relayed, stream, "relayed bytes must stay exact");
+        assert_eq!(outcome.failure().as_deref(), Some("Overloaded"));
+        assert_eq!(outcome.failure_at_end().as_deref(), Some("Overloaded"));
+        // Anthropic's prompt counts are its own, so they stay exact even though
+        // the output never finished.
+        let request = &monitor.snapshot().recent[0];
+        assert_eq!(request.input_tokens, Some(11));
+        assert_eq!(request.cache.read_tokens, Some(900));
+        assert_eq!(
+            request.usage_quality(),
+            crate::monitor::QualityFields {
+                input: crate::monitor::UsageQuality::Exact,
+                cache_read: crate::monitor::UsageQuality::Exact,
+                cache_write: crate::monitor::UsageQuality::Exact,
+                output: crate::monitor::UsageQuality::Opening,
+            }
+        );
+    }
+
+    #[test]
+    fn a_stream_that_quotes_an_error_in_its_text_still_completes() {
+        let monitor = observed_monitor("r_quote", crate::monitor::EndpointKind::Messages);
+        let outcome = ResponseOutcome::requiring_terminal();
+        let mut observer = UsageObserver::new(
+            monitor.clone(),
+            "r_quote".to_string(),
+            ObservedBody::EventStream,
+            outcome.clone(),
+        );
+        // The model writes the word error and a whole error document into its
+        // answer. Only the event's own type decides, so this is a success.
+        let quoted = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "text_delta",
+                "text": "error: {\"type\":\"error\",\"error\":{\"message\":\"quoted, not raised\"}}"
+            }
+        });
+        let stream = format!(
+            concat!(
+                "event: message_start\n",
+                "data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":3,\"output_tokens\":0}}}}}}\n\n",
+                "event: content_block_delta\n",
+                "data: {quoted}\n\n",
+                "event: message_delta\n",
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":44}}}}\n\n",
+                "event: message_stop\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n",
+            ),
+            quoted = quoted
+        );
+        let stream = stream.as_bytes();
+        let mut relayed = Vec::new();
+        for chunk in stream.chunks(19) {
+            observer.observe(chunk);
+            relayed.extend_from_slice(chunk);
+        }
+        observer.finish();
+
+        assert_eq!(relayed, stream, "relayed bytes must stay exact");
+        assert_eq!(outcome.failure(), None);
+        assert_eq!(outcome.failure_at_end(), None);
+        assert_eq!(monitor.snapshot().recent[0].output_tokens, Some(44));
+    }
+
+    #[test]
+    fn a_relayed_stream_that_simply_stopped_is_not_a_success() {
+        let monitor = observed_monitor("r_cut", crate::monitor::EndpointKind::Messages);
+        let outcome = ResponseOutcome::requiring_terminal();
+        let mut observer = UsageObserver::new(
+            monitor,
+            "r_cut".to_string(),
+            ObservedBody::EventStream,
+            outcome.clone(),
+        );
+        observer.observe(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n");
+        observer.finish();
+
+        // No error event named a reason, but no `message_stop` arrived either.
+        assert_eq!(outcome.failure(), None);
+        assert_eq!(
+            outcome.failure_at_end().as_deref(),
+            Some(crate::provider::MISSING_TERMINAL_FAILURE)
+        );
     }
 
     #[test]

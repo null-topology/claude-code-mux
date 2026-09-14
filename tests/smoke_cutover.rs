@@ -9,8 +9,9 @@ use claude_code_mux::providers::codex::continuation::clear_all_continuations_for
 use claude_code_mux::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
 use claude_code_mux::{
     config::AliasProvider,
+    monitor::{MonitorHandle, QualityFields, RequestStatus, UsageQuality},
     registry::Registry,
-    server::{app, app_with_options},
+    server::{app, app_with_monitor, app_with_options},
 };
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
@@ -136,6 +137,72 @@ async fn call_messages_body(body: Value) -> Response {
         .unwrap()
 }
 
+/// Same request, with a monitor watching, so a test can read what the proxy
+/// recorded about the request next to what the client received.
+async fn call_messages_body_with_monitor(monitor: MonitorHandle, body: Value) -> Response {
+    let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    app_with_monitor(Arc::new(Registry::with_default_alias()), Some(monitor))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "smoke-session")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// The message of the `error` event an SSE body ends with, if it has one.
+fn sse_error_message(body: &str) -> Option<String> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+        .find(|event| event["type"] == "error")
+        .and_then(|event| {
+            event["error"]["message"]
+                .as_str()
+                .map(std::string::ToString::to_string)
+        })
+}
+
+/// Read a streamed response until it ends or its body breaks: the bytes that
+/// arrived, and whether the transport failed.
+async fn drain_stream_allowing_error(response: Response) -> (String, bool) {
+    let mut body = response.into_body();
+    let mut collected = Vec::new();
+    let mut failed = false;
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Ok(data) = frame.into_data() {
+                    collected.extend_from_slice(&data);
+                }
+            }
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    (String::from_utf8_lossy(&collected).into_owned(), failed)
+}
+
+/// Read a streamed response to the end, which is what finishes the request in
+/// the monitor.
+async fn drain_stream(response: Response) -> String {
+    let body = tokio::time::timeout(
+        Duration::from_secs(2),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("stream must terminate")
+    .unwrap();
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 async fn call_responses_body(body: Value) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
     app_with_options(Arc::new(Registry::with_default_alias()), None, true)
@@ -218,6 +285,35 @@ where
                     .body(Body::from(response_bytes))
                     .unwrap()
             }
+        }
+    });
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    addr_str
+}
+
+/// Same, but keeping the request body exactly as it arrived, so a test can
+/// compare the bytes the proxy relayed with the ones the client sent.
+async fn spawn_capturing_http_upstream(
+    captured: Arc<Mutex<Option<Vec<u8>>>>,
+    response: &'static str,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_str = format!("http://{addr}");
+
+    let app = axum::Router::new().fallback(move |body: axum::body::Bytes| {
+        let captured = captured.clone();
+        async move {
+            *captured.lock().unwrap() = Some(body.to_vec());
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(response.as_bytes()))
+                .unwrap()
         }
     });
 
@@ -433,6 +529,57 @@ async fn spawn_websocket_error_upstream(message: &'static str) -> String {
 
     addr_str
 }
+
+/// A socket that starts a response, reasons, and then drops without ever
+/// sending a terminal event. Every accepted connection is counted, so a test can
+/// see whether the proxy retried after the client already had output.
+async fn spawn_websocket_reset_upstream(
+    attempts: Arc<AtomicUsize>,
+    events: &'static [&'static str],
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let _ = ws.next().await;
+            for event in events {
+                let _ = ws.send(Message::Text((*event).to_string())).await;
+            }
+            // No response.completed, no close frame: the socket simply goes.
+            drop(ws);
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+const WEBSOCKET_RESET_AFTER_REASONING: &[&str] = &[
+    r#"{"type":"response.created","response":{"id":"resp_reset"}}"#,
+    r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#,
+    r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"weighing the options"}"#,
+];
+
+const WEBSOCKET_FAILED_AFTER_TEXT: &[&str] = &[
+    r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#,
+    r#"{"type":"response.output_text.delta","output_index":0,"delta":"partial answer"}"#,
+    r#"{"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"message":"generation failed midway"}}}"#,
+];
+
+const WEBSOCKET_RESET_AFTER_CLOSED_TOOL_CALL: &[&str] = &[
+    r#"{"type":"response.created","response":{"id":"resp_tool"}}"#,
+    r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"Bash"}}"#,
+    r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"command\":\"ls\"}"}"#,
+    r#"{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"command\":\"ls\"}"}"#,
+    r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"Bash","arguments":"{\"command\":\"ls\"}"}}"#,
+];
 
 async fn spawn_websocket_sequence_upstream(captured: Arc<Mutex<Vec<Value>>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2762,4 +2909,876 @@ async fn smoke_codex_websocket_traffic_capture_writes_upstream_artifacts() {
     );
     traffic_file(&files, "032-upstream-response-body.sse");
     traffic_file(&files, "040-upstream-event.json");
+}
+
+// ---------------------------------------------------------------------------
+// What the proxy records about a stream that went wrong after its 200 left, and
+// which token counts it treats as the backend's own.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_reset_after_reasoning_is_recorded_as_failed() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream =
+        spawn_websocket_reset_upstream(attempts.clone(), WEBSOCKET_RESET_AFTER_REASONING).await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(
+        monitor.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        }),
+    )
+    .await;
+
+    // The status and the body are what the client really received.
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = drain_stream(response).await;
+    assert!(text.contains("thinking_delta"), "stream body: {text}");
+    assert!(text.contains("event: error"), "stream body: {text}");
+    assert!(!text.contains("message_stop"), "stream body: {text}");
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(
+        request.status,
+        RequestStatus::Failed,
+        "a stream that never reached message_stop did not complete: {:?}",
+        request.error
+    );
+    assert_eq!(request.http_status, Some(200));
+    // The reason recorded is the one the client was given, not a guess.
+    let reported = sse_error_message(&text).expect("the client received an error event");
+    assert!(!reported.is_empty(), "stream body: {text}");
+    assert_eq!(request.error.as_deref(), Some(reported.as_str()));
+    // Output had already reached the client, so the request is not retried.
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    // Nothing closed these counts: the prompt is still this proxy's estimate and
+    // the zero output is the one the stream opened with, not a final count.
+    assert_eq!(
+        request.usage_quality(),
+        QualityFields {
+            input: UsageQuality::Opening,
+            cache_read: UsageQuality::Missing,
+            cache_write: UsageQuality::Missing,
+            output: UsageQuality::Opening,
+        }
+    );
+    assert!(request.input_tokens.unwrap_or(0) > 0);
+    assert_eq!(request.output_tokens, Some(0));
+    assert_eq!(request.cache.read_tokens, None);
+    assert_eq!(request.cache.write_tokens, None);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_reset_after_closed_tool_call_completes_without_backend_counts() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream =
+        spawn_websocket_reset_upstream(attempts.clone(), WEBSOCKET_RESET_AFTER_CLOSED_TOOL_CALL)
+            .await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(
+        monitor.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = drain_stream(response).await;
+    // A tool call the backend had already closed is a complete turn: the client
+    // keeps it and runs the tool once.
+    assert!(text.contains("tool_use"), "stream body: {text}");
+    assert_eq!(text.matches(r#""stop_reason":"tool_use""#).count(), 1);
+    assert_eq!(text.matches("event: message_stop").count(), 1);
+    assert!(!text.contains("event: error"), "stream body: {text}");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.status, RequestStatus::Completed);
+    assert_eq!(request.http_status, Some(200));
+    // The salvaged finish carries a zero `usage` object because the wire format
+    // needs one. It is not the backend's accounting, so the estimate stands and
+    // the counts stay provisional.
+    assert!(request.input_tokens.unwrap_or(0) > 0);
+    assert_eq!(request.output_tokens, Some(0));
+    assert_eq!(request.cache.read_tokens, None);
+    assert_eq!(request.cache.write_tokens, None);
+    assert_eq!(
+        request.usage_quality(),
+        QualityFields {
+            input: UsageQuality::Opening,
+            cache_read: UsageQuality::Missing,
+            cache_write: UsageQuality::Missing,
+            output: UsageQuality::Opening,
+        }
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_failure_after_text_is_recorded_with_its_reason() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream =
+        spawn_websocket_reset_upstream(attempts.clone(), WEBSOCKET_FAILED_AFTER_TEXT).await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(
+        monitor.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = drain_stream(response).await;
+    assert!(text.contains("partial answer"), "stream body: {text}");
+    assert_eq!(
+        sse_error_message(&text).as_deref(),
+        Some("generation failed midway")
+    );
+    // The answer had already started, so the turn is not sent again.
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.status, RequestStatus::Failed);
+    assert_eq!(request.http_status, Some(200));
+    assert_eq!(request.error.as_deref(), Some("generation failed midway"));
+}
+
+/// A client that stops reading has abandoned its request; that is not the
+/// stream's protocol failing.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_client_drop_stays_an_abandoned_request() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let upstream = spawn_websocket_delayed_terminal_upstream().await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(
+        monitor.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(
+        request.error.as_deref(),
+        Some("Request future ended before completion")
+    );
+    assert_eq!(request.http_status, None);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_completed_stream_records_the_backend_counts() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_websocket_upstream(captured.clone()).await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(
+        monitor.clone(),
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = drain_stream(response).await;
+    assert!(text.contains("codex websocket ok"), "stream body: {text}");
+    assert!(text.contains("event: message_stop"), "stream body: {text}");
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.status, RequestStatus::Completed);
+    assert_eq!(request.http_status, Some(200));
+    // The mock reports a five-token prompt and two output tokens, and says
+    // nothing about caching. The prompt size is therefore known exactly, while
+    // how much of it was cached is not, so neither half of it is pinned down.
+    assert_eq!(request.cache.reported_prompt_tokens, Some(5));
+    assert_eq!(request.prompt_tokens(), Some(5));
+    assert_eq!(request.output_tokens, Some(2));
+    assert_eq!(request.cache.read_tokens, None);
+    assert_eq!(request.cache_hit_ratio(), None);
+    assert_eq!(
+        request.usage_quality(),
+        QualityFields {
+            input: UsageQuality::Opening,
+            cache_read: UsageQuality::Missing,
+            cache_write: UsageQuality::Missing,
+            output: UsageQuality::Exact,
+        }
+    );
+}
+
+/// The Anthropic relay: an SSE error after a 200 is a failure, the bytes reach
+/// the client untouched, and the prompt counts Anthropic sent stay exact.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_anthropic_stream_error_event_fails_the_request_with_exact_bytes() {
+    let _guard = env_lock();
+    const UPSTREAM_SSE: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":1000,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    );
+    let upstream = spawn_http_upstream(|_body: Value| UPSTREAM_SSE.as_bytes().to_vec()).await;
+    let _base_url_env = EnvGuard::set("CCP_ANTHROPIC_BASE_URL", &upstream);
+
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(
+        monitor.clone(),
+        json!({
+            "model": "claude-opus-5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = drain_stream(response).await;
+    assert_eq!(text, UPSTREAM_SSE, "the relay must stay byte-exact");
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.provider.as_deref(), Some("anthropic"));
+    assert_eq!(request.status, RequestStatus::Failed);
+    assert_eq!(request.http_status, Some(200));
+    assert_eq!(request.error.as_deref(), Some("Overloaded"));
+    // Anthropic counts its own prompt, so those counts are final even though the
+    // output never finished.
+    assert_eq!(request.input_tokens, Some(12));
+    assert_eq!(request.cache.read_tokens, Some(1_000));
+    assert_eq!(
+        request.usage_quality(),
+        QualityFields {
+            input: UsageQuality::Exact,
+            cache_read: UsageQuality::Exact,
+            cache_write: UsageQuality::Exact,
+            output: UsageQuality::Opening,
+        }
+    );
+}
+
+/// An error event names the reason, and a broken body afterwards cannot rename
+/// it: the first failure wins.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_anthropic_error_event_survives_a_broken_body() {
+    let _guard = env_lock();
+    const UPSTREAM_SSE: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":9,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    );
+    let upstream = spawn_truncated_http_upstream(UPSTREAM_SSE.as_bytes()).await;
+    let _base_url_env = EnvGuard::set("CCP_ANTHROPIC_BASE_URL", &upstream);
+
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(
+        monitor.clone(),
+        json!({
+            "model": "claude-opus-5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let (text, failed) = drain_stream_allowing_error(response).await;
+    assert!(failed, "the relayed body must break: {text}");
+    assert_eq!(text, UPSTREAM_SSE, "the relay must stay byte-exact");
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.status, RequestStatus::Failed);
+    assert_eq!(request.http_status, Some(200));
+    assert_eq!(
+        request.error.as_deref(),
+        Some("Overloaded"),
+        "the reason upstream gave must not be replaced by the transport's"
+    );
+}
+
+/// With no failure named before it, the transport error is the reason; the
+/// missing terminal event must not stand in for it.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_anthropic_broken_body_keeps_the_transport_reason() {
+    let _guard = env_lock();
+    const UPSTREAM_SSE: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":9,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+    );
+    let upstream = spawn_truncated_http_upstream(UPSTREAM_SSE.as_bytes()).await;
+    let _base_url_env = EnvGuard::set("CCP_ANTHROPIC_BASE_URL", &upstream);
+
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(
+        monitor.clone(),
+        json!({
+            "model": "claude-opus-5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let (text, failed) = drain_stream_allowing_error(response).await;
+    assert!(failed, "the relayed body must break: {text}");
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.status, RequestStatus::Failed);
+    assert_eq!(request.http_status, Some(200));
+    let error = request.error.as_deref().unwrap_or_default();
+    assert!(!error.is_empty());
+    assert_ne!(
+        error,
+        claude_code_mux::provider::MISSING_TERMINAL_FAILURE,
+        "a real transport error must not be reported as a missing terminal event"
+    );
+}
+
+/// The same relay, with the word error and a whole error document quoted inside
+/// the answer: a healthy stream stays a success.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_anthropic_stream_quoting_an_error_completes_with_exact_bytes() {
+    let _guard = env_lock();
+    const UPSTREAM_SSE: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":7,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"error: {\\\"type\\\":\\\"error\\\",\\\"error\\\":{\\\"message\\\":\\\"quoted, not raised\\\"}}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":31}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let upstream = spawn_http_upstream(|_body: Value| UPSTREAM_SSE.as_bytes().to_vec()).await;
+    let _base_url_env = EnvGuard::set("CCP_ANTHROPIC_BASE_URL", &upstream);
+
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(
+        monitor.clone(),
+        json!({
+            "model": "claude-opus-5",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = drain_stream(response).await;
+    assert_eq!(text, UPSTREAM_SSE, "the relay must stay byte-exact");
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.status, RequestStatus::Completed);
+    assert_eq!(request.http_status, Some(200));
+    assert_eq!(request.error, None);
+    assert_eq!(request.output_tokens, Some(31));
+    assert_eq!(
+        request.usage_quality(),
+        QualityFields {
+            input: UsageQuality::Exact,
+            cache_read: UsageQuality::Exact,
+            cache_write: UsageQuality::Exact,
+            output: UsageQuality::Exact,
+        }
+    );
+}
+
+/// A hosted web_search request that does not force the tool goes down the
+/// ordinary path, where the lite-only model is upgraded to a full-lane one. The
+/// monitor must report the model that reached the backend, with the one the
+/// caller asked for still named beside it.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_web_search_reports_the_full_lane_model_it_ran_on() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    clear_all_continuations_for_tests();
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            *captured.lock().unwrap() = Some(body);
+            concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"searched\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":9,\"output_tokens\":3}}}\n\n"
+            )
+            .as_bytes()
+            .to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(
+        monitor.clone(),
+        json!({
+            "model": "gpt-5.6-luna",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"find it"}],
+            "tools": [{"type":"web_search_20250305","name":"web_search"}]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = drain_stream(response).await;
+
+    // What the backend was actually asked to run.
+    let sent = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream was called");
+    assert_eq!(sent["model"], "gpt-5.6-sol");
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.requested_model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(request.effective_model.as_deref(), Some("gpt-5.6-sol"));
+    let row = state.sessions[0]
+        .models
+        .iter()
+        .find(|row| row.model.as_deref() == Some("gpt-5.6-sol"))
+        .expect("a row for the model that ran");
+    assert_eq!(row.provider.as_deref(), Some("codex"));
+    assert_eq!(row.request_count, 1);
+    assert_eq!(
+        row.requested_models
+            .iter()
+            .map(|(model, count)| (model.as_deref(), *count))
+            .collect::<Vec<_>>(),
+        vec![(Some("gpt-5.6-luna"), 1)]
+    );
+}
+
+/// A `-fast` id and the configured model override both change what leaves for
+/// the backend without changing what the caller asked for. The pair is read off
+/// the outgoing request, never off the display that joins them.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_fast_alias_and_model_override_report_what_left() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    clear_all_continuations_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            captured.lock().unwrap().push(body);
+            concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"ok\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}}\n\n"
+            )
+            .as_bytes()
+            .to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    let monitor = MonitorHandle::new(10);
+    let fast = call_messages_body_with_monitor(
+        monitor.clone(),
+        json!({
+            "model": "gpt-5.6-sol-fast",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role":"user","content":"hello"}]
+        }),
+    )
+    .await;
+    assert_eq!(fast.status(), StatusCode::OK);
+    let _ = drain_stream(fast).await;
+
+    {
+        let _model_env = EnvGuard::set("CCP_CODEX_MODEL", "gpt-5.6-terra");
+        let overridden = call_messages_body_with_monitor(
+            monitor.clone(),
+            json!({
+                "model": "gpt-5.6-sol",
+                "max_tokens": 64,
+                "stream": true,
+                "messages": [{"role":"user","content":"hello again"}]
+            }),
+        )
+        .await;
+        assert_eq!(overridden.status(), StatusCode::OK);
+        let _ = drain_stream(overridden).await;
+    }
+
+    let sent = captured.lock().unwrap().clone();
+    assert_eq!(sent.len(), 2);
+    // The `-fast` id is a service tier, not a model of its own.
+    assert_eq!(sent[0]["model"], "gpt-5.6-sol");
+    assert_eq!(sent[1]["model"], "gpt-5.6-terra");
+
+    let state = monitor.snapshot();
+    let by_requested = |requested: &str| {
+        state
+            .recent
+            .iter()
+            .find(|request| request.requested_model.as_deref() == Some(requested))
+            .unwrap_or_else(|| panic!("no request asked for {requested}"))
+    };
+    assert_eq!(
+        by_requested("gpt-5.6-sol-fast").effective_model.as_deref(),
+        Some("gpt-5.6-sol")
+    );
+    assert_eq!(
+        by_requested("gpt-5.6-sol").effective_model.as_deref(),
+        Some("gpt-5.6-terra")
+    );
+    let session = &state.sessions[0];
+    let row = |model: &str| {
+        session
+            .models
+            .iter()
+            .find(|row| row.model.as_deref() == Some(model))
+            .unwrap_or_else(|| panic!("no row for {model}"))
+    };
+    assert_eq!(
+        row("gpt-5.6-sol")
+            .requested_models
+            .iter()
+            .map(|(model, count)| (model.as_deref(), *count))
+            .collect::<Vec<_>>(),
+        vec![(Some("gpt-5.6-sol-fast"), 1)]
+    );
+    assert_eq!(
+        row("gpt-5.6-terra")
+            .requested_models
+            .iter()
+            .map(|(model, count)| (model.as_deref(), *count))
+            .collect::<Vec<_>>(),
+        vec![(Some("gpt-5.6-sol"), 1)]
+    );
+}
+
+/// Forcing the hosted tool takes the standalone search branch instead, which
+/// posts to a different endpoint and keeps the lite-only model. The two paths
+/// are observed separately, so this one must report what its own request
+/// carried rather than what the ordinary path would have chosen.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_forced_search_reports_the_model_its_own_request_carried() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            *captured.lock().unwrap() = Some(body);
+            serde_json::to_vec(&json!({
+                "encrypted_output": "opaque",
+                "output": "search output",
+                "results": [{
+                    "type": "text_result",
+                    "ref_id": "turn0search0",
+                    "url": "https://example.com",
+                    "title": "Example"
+                }]
+            }))
+            .unwrap()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(
+        monitor.clone(),
+        json!({
+            "model": "gpt-5.6-luna",
+            "max_tokens": 64,
+            "stream": false,
+            "messages": [{"role":"user","content":"find Codex"}],
+            "tools": [{"type":"web_search_20250305","name":"web_search"}],
+            "tool_choice": {"type":"tool","name":"web_search"}
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let sent = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream was called");
+    assert_eq!(sent["model"], "gpt-5.6-luna");
+    assert_eq!(sent["commands"]["search_query"][0]["q"], "find Codex");
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.requested_model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(request.effective_model.as_deref(), Some("gpt-5.6-luna"));
+}
+
+/// The security classifier is rerouted to another model. What the caller asked
+/// for is kept as it arrived, and what ran is read off the request that left.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_auto_review_keeps_the_requested_model_beside_the_one_that_ran() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    clear_all_continuations_for_tests();
+
+    let captured = Arc::new(Mutex::new(None));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            *captured.lock().unwrap() = Some(body);
+            concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"review ok\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+            )
+            .as_bytes()
+            .to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(
+        monitor.clone(),
+        json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64,
+            "stream": false,
+            "system": [{
+                "type": "text",
+                "text": "You are a security monitor for autonomous AI coding agents.\n\n## Context"
+            }],
+            "messages": [{"role":"user","content":"review this Bash command"}],
+            "tools": []
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let sent = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream was called");
+    assert_eq!(sent["model"], "gpt-5.6-luna");
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.requested_model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(request.effective_model.as_deref(), Some("gpt-5.6-luna"));
+    let row = state.sessions[0]
+        .models
+        .iter()
+        .find(|row| row.model.as_deref() == Some("gpt-5.6-luna"))
+        .expect("a row for the model that ran");
+    assert_eq!(
+        row.requested_models
+            .iter()
+            .map(|(model, count)| (model.as_deref(), *count))
+            .collect::<Vec<_>>(),
+        vec![(Some("gpt-5.6-sol"), 1)]
+    );
+}
+
+/// The relay forwards the caller's own bytes, so the model that reaches
+/// Anthropic is the one written in them — not the one the proxy pointed the
+/// typed request at. The agent-summary override rewrites the typed model and
+/// leaves the bytes alone, so the two differ, and the monitor has to show the
+/// difference rather than either half of it.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_anthropic_wire_model_is_the_one_in_the_relayed_bytes() {
+    let _guard = env_lock();
+    const UPSTREAM_SSE: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":11,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let upstream = spawn_capturing_http_upstream(captured.clone(), UPSTREAM_SSE).await;
+    let _base_url_env = EnvGuard::set("CCP_ANTHROPIC_BASE_URL", &upstream);
+    // Send the label request to a model instead of answering it locally, which
+    // is what makes the typed model and the relayed bytes disagree.
+    let _summary_env = EnvGuard::set("CCP_AGENT_SUMMARY", "upstream");
+
+    let body = json!({
+        "model": "claude-opus-5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"Describe your most recent action in 3-5 words"}]
+    });
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(monitor.clone(), body.clone()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = drain_stream(response).await;
+    assert_eq!(text, UPSTREAM_SSE, "the relay must stay byte-exact");
+
+    let relayed = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream was called");
+    assert_eq!(
+        relayed,
+        body.to_string().into_bytes(),
+        "the relay must forward the client's bytes verbatim"
+    );
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.provider.as_deref(), Some("anthropic"));
+    // The override chose claude-sonnet-5 for the typed request; the bytes on the
+    // wire still asked for claude-opus-5, and that is what answered.
+    assert_eq!(
+        request.model.as_deref(),
+        Some("claude-sonnet-5 → claude-opus-5")
+    );
+    assert_eq!(request.requested_model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(request.effective_model.as_deref(), Some("claude-opus-5"));
+    let row = state.sessions[0]
+        .models
+        .iter()
+        .find(|row| row.model.as_deref() == Some("claude-opus-5"))
+        .expect("a row for the model that answered");
+    assert_eq!(row.provider.as_deref(), Some("anthropic"));
+    assert_eq!(row.request_count, 1);
+    assert_eq!(row.input_tokens, 11);
+    assert_eq!(row.output_tokens, 4);
 }

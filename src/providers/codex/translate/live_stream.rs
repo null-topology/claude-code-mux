@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::anthropic::sse::encode_sse_event;
+use crate::monitor::UsageReport;
 use crate::providers::codex::events::is_terminal_rate_limit_event;
 use crate::traffic::TrafficCapture;
 
@@ -8,6 +9,7 @@ use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
     CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_TOOL_USE, map_codex_usage_to_anthropic,
+    reported_usage_report,
 };
 
 const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
@@ -68,6 +70,13 @@ pub struct LiveStreamTranslator {
     // authoritative usage in the terminal message_delta.
     estimated_input_tokens: u64,
     finished: bool,
+    /// Whether a terminal `message_stop` has been written to the client. An
+    /// error event also finishes the stream, but it is not a terminal event.
+    terminal_emitted: bool,
+    /// Usage for the monitor, kept apart from the `usage` object the Messages
+    /// shape requires on every finish: the request's own estimate opens it, and
+    /// only counts the backend itself reported close it.
+    usage_report: UsageReport,
 }
 
 impl LiveStreamTranslator {
@@ -97,6 +106,8 @@ impl LiveStreamTranslator {
             semantic_output_started: false,
             estimated_input_tokens,
             finished: false,
+            terminal_emitted: false,
+            usage_report: UsageReport::default(),
         }
     }
 
@@ -194,6 +205,23 @@ impl LiveStreamTranslator {
         self.semantic_output_started
     }
 
+    /// Whether the client received a terminal `message_stop`. A stream that
+    /// ended any other way did not complete, whatever its HTTP status says.
+    pub fn emitted_terminal(&self) -> bool {
+        self.terminal_emitted
+    }
+
+    /// Usage observed since the last call, for the monitor.
+    ///
+    /// Opening counts are the request's own prompt estimate and the zero output
+    /// a stream starts with; closing counts are the backend's own and appear
+    /// only once it reported them. The `usage` object on the wire cannot stand
+    /// in for this: the Messages shape requires one on every finish, so the
+    /// salvage paths serialize zeros there that the backend never sent.
+    pub fn take_usage_report(&mut self) -> UsageReport {
+        std::mem::take(&mut self.usage_report)
+    }
+
     pub fn ping_chunk(&mut self, traffic: Option<&TrafficCapture>) -> Vec<u8> {
         let mut out = Vec::new();
         if !self.finished {
@@ -249,6 +277,11 @@ impl LiveStreamTranslator {
             return;
         }
         self.message_started = true;
+        // The prompt count here is this proxy's estimate and the output count is
+        // the zero every stream starts with, so both open the monitor's report
+        // instead of closing it.
+        self.usage_report.opening.input_tokens = Some(self.estimated_input_tokens);
+        self.usage_report.opening.output_tokens = Some(0);
         self.emit(
             traffic,
             out,
@@ -906,6 +939,9 @@ impl LiveStreamTranslator {
         self.emit_web_searches(traffic, out);
         self.ensure_message_start(traffic, out);
         let usage = payload.get("response").map(parse_codex_usage);
+        if let Some(usage) = usage.as_ref() {
+            self.note_reported_usage(usage);
+        }
         let incomplete = response_is_incomplete(payload);
         let stop_reason = if incomplete {
             STOP_MAX_TOKENS
@@ -945,6 +981,16 @@ impl LiveStreamTranslator {
             &serde_json::json!({"type": "message_stop"}),
         );
         self.finished = true;
+        self.terminal_emitted = true;
+    }
+
+    /// Record usage exactly as the backend reported it, closing the monitor's
+    /// counts. A stream finishes once, so this replaces nothing but the estimate
+    /// it supersedes; counts the backend did not send stay absent.
+    fn note_reported_usage(&mut self, usage: &CodexUsage) {
+        let reported = reported_usage_report(Some(usage));
+        self.usage_report.closing = reported.closing;
+        self.usage_report.reported_prompt_tokens = reported.reported_prompt_tokens;
     }
 
     fn close_open_blocks(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
@@ -1301,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn estimated_input_is_visible_at_start_and_provider_usage_is_exact_at_finish() {
+    fn estimated_input_is_visible_at_start_and_the_provider_total_closes_the_finish() {
         let mut translator =
             LiveStreamTranslator::with_estimated_input_tokens("msg_1", "gpt-5.5", 321);
 
@@ -1349,6 +1395,171 @@ mod tests {
             .unwrap();
         assert_eq!(finished.pointer("/usage/input_tokens"), Some(&json!(300)));
         assert_eq!(finished.pointer("/usage/output_tokens"), Some(&json!(9)));
+
+        // The monitor's report keeps the two apart: the estimate opens it and
+        // the backend's own counts close it. The wire numbers above are the same
+        // as before either way.
+        let report = translator.take_usage_report();
+        assert_eq!(report.opening.input_tokens, Some(321));
+        assert_eq!(report.opening.output_tokens, Some(0));
+        assert_eq!(report.closing.output_tokens, Some(9));
+        // 300 is the whole prompt, and the backend did not say how much of it
+        // came from cache, so neither half is pinned down. The measured total is
+        // kept as such instead of being passed off as the uncached part.
+        assert_eq!(report.reported_prompt_tokens, Some(300));
+        assert_eq!(report.closing.input_tokens, None);
+        assert_eq!(report.closing.cache_read_tokens, None);
+        assert_eq!(report.closing.cache_write_tokens, None);
+        assert!(translator.emitted_terminal());
+        // Draining is what the live stream does per chunk, so a second read
+        // cannot report the same counts twice.
+        assert!(translator.take_usage_report().is_empty());
+    }
+
+    #[test]
+    fn a_cached_prompt_closes_the_read_and_leaves_writes_unreported() {
+        let mut translator =
+            LiveStreamTranslator::with_estimated_input_tokens("msg_1", "gpt-5.5", 31_066);
+        translator
+            .accept(
+                &json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "done"
+                }),
+                None,
+            )
+            .unwrap();
+        translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "usage": {
+                            "input_tokens": 31_066,
+                            "output_tokens": 117,
+                            "input_tokens_details": {"cached_tokens": 28_160}
+                        }
+                    }
+                }),
+                None,
+            )
+            .unwrap();
+
+        let report = translator.take_usage_report();
+        assert_eq!(report.closing.input_tokens, Some(2_906));
+        assert_eq!(report.closing.cache_read_tokens, Some(28_160));
+        assert_eq!(report.closing.output_tokens, Some(117));
+        assert_eq!(report.closing.cache_write_tokens, None);
+        // The same tokens, counted once as a whole.
+        assert_eq!(report.reported_prompt_tokens, Some(31_066));
+    }
+
+    #[test]
+    fn a_finish_the_backend_sent_no_usage_with_closes_nothing() {
+        let mut translator =
+            LiveStreamTranslator::with_estimated_input_tokens("msg_1", "gpt-5.5", 500);
+        translator
+            .accept(
+                &json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "done"
+                }),
+                None,
+            )
+            .unwrap();
+        let finished = translator
+            .accept(
+                &json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_1", "status": "completed"}
+                }),
+                None,
+            )
+            .unwrap();
+
+        // The wire keeps the `usage` object the Messages shape requires, zeros
+        // and all; the monitor is told nothing was reported.
+        let rendered = String::from_utf8(finished).unwrap();
+        assert!(rendered.contains(r#""input_tokens":0"#), "{rendered}");
+        let report = translator.take_usage_report();
+        assert!(report.closing.is_empty());
+        assert_eq!(report.opening.input_tokens, Some(500));
+        assert_eq!(report.opening.output_tokens, Some(0));
+        assert!(translator.emitted_terminal());
+    }
+
+    #[test]
+    fn an_incomplete_response_finishes_as_a_terminal_max_tokens_turn() {
+        let mut translator =
+            LiveStreamTranslator::with_estimated_input_tokens("msg_1", "gpt-5.5", 42);
+        translator
+            .accept(
+                &json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "as far as it got"
+                }),
+                None,
+            )
+            .unwrap();
+        let finished = translator
+            .accept(
+                &json!({
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_output_tokens"},
+                        "usage": {"input_tokens": 40, "output_tokens": 64}
+                    }
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Running out of output is a complete turn with a stop reason, not a
+        // protocol failure.
+        let rendered = String::from_utf8(finished).unwrap();
+        assert!(
+            rendered.contains(r#""stop_reason":"max_tokens""#),
+            "{rendered}"
+        );
+        assert!(rendered.contains("message_stop"), "{rendered}");
+        assert!(translator.emitted_terminal());
+        let report = translator.take_usage_report();
+        assert_eq!(report.reported_prompt_tokens, Some(40));
+        assert_eq!(report.closing.input_tokens, None);
+        assert_eq!(report.closing.output_tokens, Some(64));
+    }
+
+    #[test]
+    fn an_error_chunk_ends_the_stream_without_a_terminal_event() {
+        let mut translator =
+            LiveStreamTranslator::with_estimated_input_tokens("msg_1", "gpt-5.5", 700);
+        translator
+            .accept(
+                &json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "output_index": 0,
+                    "delta": "thinking"
+                }),
+                None,
+            )
+            .unwrap();
+        let chunk = translator.error_chunk("upstream closed", "api_error", None);
+
+        let rendered = String::from_utf8(chunk).unwrap();
+        assert!(rendered.contains("event: error"), "{rendered}");
+        assert!(!rendered.contains("message_stop"), "{rendered}");
+        assert!(translator.is_finished());
+        assert!(!translator.emitted_terminal());
+        let report = translator.take_usage_report();
+        assert!(report.closing.is_empty());
+        assert_eq!(report.opening.input_tokens, Some(700));
     }
 
     #[test]
@@ -1521,6 +1732,10 @@ mod tests {
         assert!(rendered.contains(r#""stop_reason":"tool_use""#));
         assert!(rendered.contains("message_stop"));
         assert!(translator.is_finished());
+        // The repaired finish is this proxy's, so its zero `usage` object is not
+        // a count the backend sent, while the terminal event is real.
+        assert!(translator.emitted_terminal());
+        assert!(translator.take_usage_report().closing.is_empty());
     }
 
     #[test]
@@ -1558,6 +1773,10 @@ mod tests {
         assert!(rendered.contains(r#""stop_reason":"tool_use""#));
         assert!(rendered.contains("message_stop"));
         assert!(!rendered.contains("event: error"));
+        // A closed tool call is a complete turn on the wire; the backend still
+        // reported no counts for it.
+        assert!(translator.emitted_terminal());
+        assert!(translator.take_usage_report().closing.is_empty());
     }
 
     #[test]

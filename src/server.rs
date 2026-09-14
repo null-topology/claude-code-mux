@@ -8,7 +8,7 @@ use crate::{
         stream::openai_response as render_openai_response,
     },
     project,
-    provider::RequestContext,
+    provider::{RequestContext, ResponseOutcome},
     providers::codex::{
         chat_completions::{ChatCompletionsBackend, request::translate_request},
         images::{
@@ -16,9 +16,7 @@ use crate::{
             MAX_GENERATION_REQUEST_BYTES, MultipartEditInput, UploadedImage, image_error_response,
             prepare_json_request, prepare_multipart_edit,
         },
-        native::{
-            CodexNativeBackend, NativeResponseOutcome, openai_error, validate_native_request_model,
-        },
+        native::{CodexNativeBackend, openai_error, validate_native_request_model},
         transcription::{
             CodexTranscriptionBackend, MAX_TRANSCRIPTION_REQUEST_BYTES, TranscriptionRequestError,
             prepare_transcription, transcription_error_response,
@@ -1581,6 +1579,15 @@ async fn dispatch_request(
         }
     };
 
+    // The model the client asked for, as its body named it. Everything below
+    // may rewrite it — the agent-summary and auto-review overrides, the
+    // one-hour suffix, a provider alias — so it is recorded here, before any of
+    // that, and once: a request that is answered locally or rejected outright
+    // still says what it asked for, and no later value can overwrite it. A body
+    // that named no model leaves it unknown rather than inventing one.
+    if let (Some(monitor), Some(model)) = (state.monitor.as_ref(), body.model.as_deref()) {
+        monitor.model_requested(&req_id, model);
+    }
     if let Some(project) = project::name_from_request(
         body.extra.get("system"),
         body.messages.iter().rev().map(|message| &message.content),
@@ -1940,12 +1947,17 @@ async fn dispatch_request(
     response
 }
 
+/// Finish the request in the monitor when its body ends, and report what the
+/// producer said the stream turned out to be.
+///
+/// The status is the one the client received: the headers left long before the
+/// body did, so a protocol failure found on the way cannot turn into a 502. It
+/// decides the recorded outcome, not the status. A body the client stopped
+/// reading leaves the guard to its own `Drop`, which records an abandoned
+/// request rather than a protocol failure.
 fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Response {
     let status = response.status();
-    let outcome = response
-        .extensions()
-        .get::<NativeResponseOutcome>()
-        .cloned();
+    let outcome = response.extensions().get::<ResponseOutcome>().cloned();
     let (parts, body) = response.into_parts();
     let stream = futures_util::stream::unfold(
         (body, guard, outcome),
@@ -1953,11 +1965,21 @@ fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Resp
             match body.frame().await {
                 Some(Ok(frame)) => Some((Ok(frame), (body, guard, outcome))),
                 Some(Err(err)) => {
-                    guard.failed(status, err.to_string());
+                    // A failure the producer already named happened first and
+                    // stays the reason; only a body that broke with nothing
+                    // named before it reports the transport's own error. The
+                    // missing terminal event is never the reason here: a broken
+                    // body has a real one.
+                    let message = outcome
+                        .as_ref()
+                        .and_then(ResponseOutcome::failure)
+                        .unwrap_or_else(|| err.to_string());
+                    guard.failed(status, message);
                     Some((Err(err), (body, guard, outcome)))
                 }
                 None => {
-                    if let Some(message) = outcome.as_ref().and_then(NativeResponseOutcome::failure)
+                    if let Some(message) =
+                        outcome.as_ref().and_then(ResponseOutcome::failure_at_end)
                     {
                         guard.failed(status, message);
                     } else if status.is_success() {

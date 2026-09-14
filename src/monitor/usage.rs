@@ -45,12 +45,22 @@ pub const CACHE_MISS_MIN_TOKENS: u64 = 1024;
 pub const CACHE_MISS_ALWAYS_TOKENS: u64 = 20_000;
 
 /// One set of token counts. `input_tokens` excludes cached tokens.
+///
+/// The two `cache_write_*` lifetime counts are a breakdown of
+/// `cache_write_tokens`, not tokens beside it: Anthropic reports how much of
+/// the write it made with the five-minute lifetime and how much with the
+/// one-hour one. Each is only ever the number the response sent, so a report
+/// naming one bucket says nothing about the other and nothing about the total.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UsageFields {
     pub input_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Part of the cache write made with the five-minute lifetime.
+    pub cache_write_5m_tokens: Option<u64>,
+    /// Part of the cache write made with the one-hour lifetime.
+    pub cache_write_1h_tokens: Option<u64>,
 }
 
 impl UsageFields {
@@ -59,6 +69,8 @@ impl UsageFields {
             && self.cache_read_tokens.is_none()
             && self.cache_write_tokens.is_none()
             && self.output_tokens.is_none()
+            && self.cache_write_5m_tokens.is_none()
+            && self.cache_write_1h_tokens.is_none()
     }
 
     /// Take every count an Anthropic `usage` object carries; absent or null
@@ -77,6 +89,23 @@ impl UsageFields {
         if let Some(tokens) = read("output_tokens") {
             self.output_tokens = Some(tokens);
         }
+        self.merge_cache_creation(usage.get("cache_creation"));
+    }
+
+    /// Take the lifetime breakdown of the cache write, when the response sent
+    /// one. A bucket the object does not name keeps whatever was known about
+    /// it: it is not zero, and it is not the rest of the total either.
+    fn merge_cache_creation(&mut self, creation: Option<&Value>) {
+        let Some(creation) = creation else {
+            return;
+        };
+        let read = |key: &str| creation.get(key).and_then(Value::as_u64);
+        if let Some(tokens) = read("ephemeral_5m_input_tokens") {
+            self.cache_write_5m_tokens = Some(tokens);
+        }
+        if let Some(tokens) = read("ephemeral_1h_input_tokens") {
+            self.cache_write_1h_tokens = Some(tokens);
+        }
     }
 }
 
@@ -92,6 +121,13 @@ pub struct UsageReport {
     pub closing: UsageFields,
     /// Lifetime of the cache entries this response wrote, when it says.
     pub cache_ttl: Option<Duration>,
+    /// The whole prompt as the backend counted it, when it reported a total of
+    /// its own. It is the same tokens as `input_tokens` plus the cache counts,
+    /// never extra ones, and it is kept separately because a backend can report
+    /// the total without saying how much of it was served from cache. Only a
+    /// number the backend sent belongs here; nothing is derived from an unknown
+    /// split.
+    pub reported_prompt_tokens: Option<u64>,
 }
 
 impl UsageReport {
@@ -107,7 +143,10 @@ impl UsageReport {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.opening.is_empty() && self.closing.is_empty() && self.cache_ttl.is_none()
+        self.opening.is_empty()
+            && self.closing.is_empty()
+            && self.cache_ttl.is_none()
+            && self.reported_prompt_tokens.is_none()
     }
 
     /// Add one Anthropic-shaped event: `message_start`, `message_delta`, or a
@@ -131,6 +170,12 @@ impl UsageReport {
                     self.closing.cache_write_tokens = prompt
                         .cache_write_tokens
                         .or(self.closing.cache_write_tokens);
+                    self.closing.cache_write_5m_tokens = prompt
+                        .cache_write_5m_tokens
+                        .or(self.closing.cache_write_5m_tokens);
+                    self.closing.cache_write_1h_tokens = prompt
+                        .cache_write_1h_tokens
+                        .or(self.closing.cache_write_1h_tokens);
                     if let Some(tokens) = prompt.output_tokens {
                         self.opening.output_tokens = Some(tokens);
                     }
@@ -300,21 +345,78 @@ pub(crate) struct ClosedFields {
     pub cache_read: bool,
     pub cache_write: bool,
     pub output: bool,
+    pub cache_write_5m: bool,
+    pub cache_write_1h: bool,
+}
+
+/// How far one count has been pinned down.
+///
+/// `Missing` is not a zero: the Codex backend never reports cache writes, and a
+/// stream that ended before its final event reported no output. `Opening` is an
+/// estimate a closing value may still replace, upwards or downwards. `Exact` is
+/// the backend's own final count, a final zero included.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UsageQuality {
+    #[default]
+    Missing,
+    Opening,
+    Exact,
+}
+
+impl UsageQuality {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Opening => "opening",
+            Self::Exact => "exact",
+        }
+    }
+}
+
+/// Quality of each count of one request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QualityFields {
+    pub input: UsageQuality,
+    pub cache_read: UsageQuality,
+    pub cache_write: UsageQuality,
+    pub output: UsageQuality,
+}
+
+/// Quality of the two lifetime buckets one request's cache write is made of.
+///
+/// Kept apart from [`QualityFields`], which is the quality of the four counts a
+/// request costs. A bucket is known when the response named it, and no bucket
+/// is ever inferred from the write it belongs to or from the other bucket, so
+/// each carries its own evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheWriteQuality {
+    pub ephemeral_5m: UsageQuality,
+    pub ephemeral_1h: UsageQuality,
+}
+
+/// Quality of one count, from the value held and whether a closing observation
+/// produced it.
+pub(crate) fn quality_of(value: Option<u64>, closed: bool) -> UsageQuality {
+    match value {
+        Some(_) if closed => UsageQuality::Exact,
+        Some(_) => UsageQuality::Opening,
+        None => UsageQuality::Missing,
+    }
 }
 
 /// Signed change of each count caused by one report.
+///
+/// A report that changes no count at all still changes what is known about one:
+/// a missing count that arrives as a reported zero moves its evidence without
+/// moving any total, so nothing is skipped on a zero delta.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct UsageDelta {
     pub input: i64,
     pub cache_read: i64,
     pub cache_write: i64,
     pub output: i64,
-}
-
-impl UsageDelta {
-    pub fn is_zero(&self) -> bool {
-        *self == Self::default()
-    }
+    pub cache_write_5m: i64,
+    pub cache_write_1h: i64,
 }
 
 /// An opening observation only raises a count, and only until it is closed.
@@ -388,6 +490,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input
                 cache_read_tokens: Some(28160),
                 cache_write_tokens: Some(0),
                 output_tokens: Some(117),
+                ..UsageFields::default()
             }
         );
     }
@@ -501,5 +604,104 @@ data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input
         assert_eq!(value, Some(2_906));
         assert_eq!(add_signed(31_066, 2_906 - 31_066), 2_906);
         assert_eq!(add_signed(10, -20), 0);
+    }
+
+    #[test]
+    fn a_count_nothing_reported_is_not_a_reported_zero() {
+        assert_eq!(quality_of(None, false), UsageQuality::Missing);
+        assert_eq!(quality_of(Some(0), false), UsageQuality::Opening);
+        assert_eq!(quality_of(Some(0), true), UsageQuality::Exact);
+        assert_eq!(quality_of(Some(341_974), false), UsageQuality::Opening);
+        assert_eq!(quality_of(Some(341_974), true), UsageQuality::Exact);
+
+        // A zero a stream opened with is held as a value and stays an estimate
+        // until a closing zero confirms it.
+        let mut output = None;
+        let mut closed = false;
+        assert_eq!(apply_opening(&mut output, closed, Some(0)), 0);
+        assert_eq!(output, Some(0));
+        assert_eq!(quality_of(output, closed), UsageQuality::Opening);
+        assert_eq!(apply_closing(&mut output, &mut closed, Some(0)), 0);
+        assert_eq!(output, Some(0));
+        assert_eq!(quality_of(output, closed), UsageQuality::Exact);
+
+        // A count no report carries keeps no value and is not forced to zero.
+        let mut write = None;
+        let mut write_closed = false;
+        assert_eq!(apply_opening(&mut write, write_closed, None), 0);
+        assert_eq!(apply_closing(&mut write, &mut write_closed, None), 0);
+        assert_eq!(write, None);
+        assert_eq!(quality_of(write, write_closed), UsageQuality::Missing);
+    }
+
+    #[test]
+    fn the_cache_creation_object_reports_the_two_lifetimes_it_wrote() {
+        let mut both = UsageReport::default();
+        both.add_event(
+            &json!({"type": "message_start", "message": {"usage": {
+                "input_tokens": 2, "cache_read_input_tokens": 10_126,
+                "cache_creation_input_tokens": 22_405,
+                "cache_creation": {"ephemeral_5m_input_tokens": 405, "ephemeral_1h_input_tokens": 22_000}
+            }}}),
+            true,
+        );
+        assert_eq!(both.closing.cache_write_tokens, Some(22_405));
+        assert_eq!(both.closing.cache_write_5m_tokens, Some(405));
+        assert_eq!(both.closing.cache_write_1h_tokens, Some(22_000));
+        // The lifetime it wrote is still read the way it always was.
+        assert_eq!(both.cache_ttl, Some(Duration::from_secs(3600)));
+
+        // One bucket named, the other absent: nothing is derived from the total
+        // or from the bucket that is known.
+        let mut partial = UsageReport::default();
+        partial.add_event(
+            &json!({"type": "message_delta", "usage": {
+                "cache_creation_input_tokens": 900,
+                "cache_creation": {"ephemeral_1h_input_tokens": 500}
+            }}),
+            true,
+        );
+        assert_eq!(partial.closing.cache_write_tokens, Some(900));
+        assert_eq!(partial.closing.cache_write_5m_tokens, None);
+        assert_eq!(partial.closing.cache_write_1h_tokens, Some(500));
+
+        // A report with no `cache_creation` object at all names no bucket.
+        let mut absent = UsageReport::default();
+        absent.add_event(
+            &json!({"type": "message_delta", "usage": {"cache_creation_input_tokens": 900}}),
+            true,
+        );
+        assert_eq!(absent.closing.cache_write_tokens, Some(900));
+        assert_eq!(absent.closing.cache_write_5m_tokens, None);
+        assert_eq!(absent.closing.cache_write_1h_tokens, None);
+
+        // A translated stream's estimate keeps the buckets on the opening side.
+        let mut translated = UsageReport::default();
+        translated.add_event(
+            &json!({"type": "message_start", "message": {"usage": {
+                "input_tokens": 31_066,
+                "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0}
+            }}}),
+            false,
+        );
+        assert_eq!(translated.opening.cache_write_5m_tokens, Some(0));
+        assert_eq!(translated.opening.cache_write_1h_tokens, Some(0));
+        assert_eq!(translated.closing.cache_write_5m_tokens, None);
+        // Two zeros write nothing, so they say nothing about the lifetime.
+        assert_eq!(translated.cache_ttl, None);
+    }
+
+    #[test]
+    fn a_report_carrying_only_a_lifetime_bucket_is_not_empty() {
+        let mut report = UsageReport::default();
+        report.add_event(
+            &json!({"type": "message_delta", "usage": {
+                "cache_creation": {"ephemeral_5m_input_tokens": 7}
+            }}),
+            true,
+        );
+        assert!(!report.is_empty());
+        assert_eq!(report.closing.cache_write_5m_tokens, Some(7));
+        assert_eq!(report.closing.cache_write_tokens, None);
     }
 }
