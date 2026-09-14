@@ -308,9 +308,17 @@ names one only once the translated request exists, so a body rejected in
 translation has none. A `[1m]` suffix is reported as the string the client sent,
 as evidence of what went on the wire rather than as a one-hour cache marker.
 
-The TUI renders none of this yet: `src/tui.rs` reads no quality, no evidence and
-no model rollup. The data exists ahead of the view; do not assume a change there
-is visible.
+The TUI renders this. `src/tui.rs` marks every count with its quality (`~`
+opening, `n/a` missing, plain exact, a reported zero included), names the
+executed model on request rows and marks a routed-only one with `?`, labels a
+locally answered request `local answer` in every cell, shows the session root
+as `Σ <id>` with `mixed N` when the rollups name more than one model, lists the
+`models` rollups, the `unattributed` row and an `evidence` line in the session
+detail, prints the 5m/1h buckets as parts reported separately, marks a
+conversation whose `raw_parent` was never resolved with `^`, and keys the
+selection by row identity so a re-render keeps it (`(selection reset)` in the
+pane title when the row is gone). Meaning is never carried by color alone.
+The `demo` command shows all of it from `src/monitor/mock.rs`.
 
 Deferred and non-blocking: `RequestRecord::model_key` and the requested-model
 histogram allocate `String`s on every ledger update.

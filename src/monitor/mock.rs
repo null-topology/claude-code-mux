@@ -6,7 +6,8 @@ use std::{
 
 use super::{
     AbsorbedRequest, ActiveRequest, CacheMiss, CacheMissCause, CompletedRequest, EndpointKind,
-    Ledger, MonitorState, RequestCache, RequestStatus, apply_window_rate, session_summaries,
+    LOCAL_PROVIDER, Ledger, MonitorState, RequestCache, RequestStatus, apply_window_rate,
+    session_summaries,
 };
 
 const TICK_MILLIS: u64 = 250;
@@ -84,7 +85,11 @@ fn mock_state_for_tick(
     streaming.project = Some("claude-code-mux".to_string());
     streaming.conversation = Some("main".to_string());
     streaming.provider = Some("codex".to_string());
+    // The alias the client asked for, and the model a producer was seen putting
+    // on the wire for it.
     streaming.model = Some("claude-sonnet-4-6 → gpt-5.6-sol".to_string());
+    streaming.requested_model = Some("claude-sonnet-4-6".to_string());
+    streaming.effective_model = Some("gpt-5.6-sol".to_string());
     streaming.effort = Some("high".to_string());
     streaming.generation_started_at = Some(now - Duration::from_secs(10));
     streaming.generation_initial_output_tokens = 20;
@@ -94,7 +99,8 @@ fn mock_state_for_tick(
     streaming.stream_chunks = 96;
     streaming.input_tokens = Some(12_480);
     streaming.cache.read_tokens = Some(118_000);
-    streaming.cache.write_tokens = Some(0);
+    // Codex reports no cache write at all, which is not a write of zero.
+    streaming.cache.write_tokens = None;
     streaming.output_tokens = Some(420);
     streaming.traffic_capture_path = Some(PathBuf::from(
         "/tmp/claude-code-mux-demo/traffic/req-active-codex",
@@ -126,6 +132,8 @@ fn mock_state_for_tick(
     upstream.project = Some("terminal-dashboard".to_string());
     upstream.provider = Some("kimi".to_string());
     upstream.model = Some("kimi-k2.6".to_string());
+    upstream.requested_model = Some("kimi-k2.6".to_string());
+    upstream.effective_model = Some("kimi-k2.6".to_string());
     upstream.effort = Some("medium".to_string());
     upstream.input_tokens = Some(3_200);
 
@@ -141,7 +149,10 @@ fn mock_state_for_tick(
     );
     selected.project = Some("companion-app".to_string());
     selected.provider = Some("grok".to_string());
+    // Routed, but no outgoing request has been built yet, so nothing has been
+    // observed running: the row marks the model as the one asked for.
     selected.model = Some("grok-composer-2.5-fast".to_string());
+    selected.requested_model = Some("grok-composer-2.5-fast".to_string());
     selected.effort = Some("low".to_string());
 
     let started = active_request(
@@ -168,6 +179,8 @@ fn mock_state_for_tick(
     byte_stream.project = Some("responsive-layout-lab".to_string());
     byte_stream.provider = Some("cursor".to_string());
     byte_stream.model = Some("cursor:claude-4.6-opus-high-thinking".to_string());
+    byte_stream.requested_model = Some("cursor:claude-4.6-opus-high-thinking".to_string());
+    byte_stream.effective_model = Some("cursor:claude-4.6-opus-high-thinking".to_string());
     byte_stream.generation_started_at = Some(now - Duration::from_secs(20));
     byte_stream.generation_finished_at = Some(now - Duration::from_secs(4));
     byte_stream.streamed_bytes = 32_768_u64.saturating_add(tick.saturating_mul(640));
@@ -192,15 +205,19 @@ fn mock_state_for_tick(
     success.conversation = Some("main".to_string());
     success.provider = Some("codex".to_string());
     success.model = Some("claude-sonnet-4-6 → gpt-5.6-terra".to_string());
+    success.requested_model = Some("claude-sonnet-4-6".to_string());
+    success.effective_model = Some("gpt-5.6-terra".to_string());
     success.effort = Some("xhigh".to_string());
     success.generation_duration = Some(Duration::from_secs(4));
     success.generation_initial_output_tokens = 32;
     success.streamed_bytes = 24_576;
     success.stream_chunks = 142;
-    // A request that came back after a long pause and rebuilt its prefix.
+    // A request that came back after a long pause and rebuilt its prefix. Its
+    // counts are the backend's own final ones; the cache write is the one the
+    // Codex backend never reports.
     success.input_tokens = Some(121_900);
     success.cache.read_tokens = Some(3_700);
-    success.cache.write_tokens = Some(0);
+    success.cache.write_tokens = None;
     success.cache.ttl = Some(Duration::from_secs(30 * 60));
     success.cache.miss = Some(CacheMiss {
         missed_tokens: 118_200,
@@ -210,13 +227,15 @@ fn mock_state_for_tick(
         cause: CacheMissCause::Expired,
     });
     success.output_tokens = Some(832);
+    close_reported_counts(&mut success.cache);
     success.traffic_capture_path = Some(PathBuf::from(
         "/tmp/claude-code-mux-demo/traffic/req-complete-codex",
     ));
     recent.push_back(success);
 
-    // A subagent of the same session, running on another model and building a
-    // prompt cache of its own.
+    // A subagent of the same session, running on another backend and building a
+    // prompt cache of its own. Anthropic measures every count and names the two
+    // lifetimes it wrote under, so this row carries no estimate anywhere.
     let mut subagent = completed_request(
         now,
         "req-complete-subagent",
@@ -232,16 +251,25 @@ fn mock_state_for_tick(
     subagent.conversation = Some("agent-3".to_string());
     subagent.provider = Some("anthropic".to_string());
     subagent.model = Some("claude-sonnet-5".to_string());
+    subagent.requested_model = Some("claude-sonnet-5".to_string());
+    subagent.effective_model = Some("claude-sonnet-5".to_string());
     subagent.generation_duration = Some(Duration::from_secs(2));
     subagent.stream_chunks = 61;
     subagent.streamed_bytes = 7_424;
     subagent.input_tokens = Some(4_100);
     subagent.cache.read_tokens = Some(38_400);
     subagent.cache.write_tokens = Some(1_200);
+    subagent.cache.write_5m_tokens = Some(900);
+    subagent.cache.write_1h_tokens = Some(300);
+    subagent.cache.ttl = Some(Duration::from_secs(5 * 60));
     subagent.output_tokens = Some(310);
+    close_reported_counts(&mut subagent.cache);
+    close_cache_write_buckets(&mut subagent.cache);
     recent.push_back(subagent);
 
-    // A subagent that subagent spawned in turn, nested one level deeper.
+    // A subagent that subagent spawned in turn, nested one level deeper. Its
+    // stream ended without a closing report, so every count it holds is still
+    // the estimate the stream opened with.
     let mut nested = completed_request(
         now,
         "req-complete-nested",
@@ -258,18 +286,21 @@ fn mock_state_for_tick(
     nested.conversation_parent = Some("agent-3".to_string());
     nested.provider = Some("codex".to_string());
     nested.model = Some("gpt-5.6-sol".to_string());
+    nested.requested_model = Some("gpt-5.6-sol".to_string());
+    nested.effective_model = Some("gpt-5.6-sol".to_string());
     nested.effort = Some("medium".to_string());
     nested.generation_duration = Some(Duration::from_millis(900));
     nested.stream_chunks = 27;
     nested.streamed_bytes = 3_072;
     nested.input_tokens = Some(6_800);
     nested.cache.read_tokens = Some(12_100);
-    nested.cache.write_tokens = Some(0);
+    nested.cache.write_tokens = None;
     nested.output_tokens = Some(96);
     recent.push_back(nested);
 
     // The progress label Claude Code asks for that subagent: no client tools,
-    // so it lands in a side lane of its own.
+    // so it lands in a side lane of its own. The proxy answers it from the
+    // transcript, so no model ran and no backend metered anything.
     let mut summary = completed_request(
         now,
         "req-complete-summary",
@@ -283,12 +314,50 @@ fn mock_state_for_tick(
     );
     summary.project = Some("claude-code-mux".to_string());
     summary.conversation = Some("agent-3/side".to_string());
-    summary.provider = Some("codex".to_string());
-    summary.model = Some("gpt-5.6-luna".to_string());
-    summary.effort = Some("low".to_string());
-    summary.input_tokens = Some(2_300);
+    summary.provider = Some(LOCAL_PROVIDER.to_string());
+    // The routed model is recorded, as routing always records it, and nothing
+    // ran it: no effective model, so no row may name one.
+    summary.model = Some("claude-sonnet-5".to_string());
+    summary.requested_model = Some("claude-sonnet-5".to_string());
+    summary.input_tokens = Some(0);
     summary.output_tokens = Some(12);
     recent.push_back(summary);
+
+    // A subagent whose parent this session never served a request for. The walk
+    // cannot place it, so its row hangs under the session with the mark that
+    // says why it sits where a thread with no parent does.
+    let mut orphan = completed_request(
+        now,
+        "req-complete-orphan",
+        Some("57c7c914-ada4-4f40-9672-985f950fbb66"),
+        Some(7),
+        EndpointKind::Messages,
+        Duration::from_secs(38),
+        Duration::from_millis(1_960),
+        RequestStatus::Completed,
+        Some(200),
+    );
+    orphan.project = Some("claude-code-mux".to_string());
+    orphan.conversation = Some("agent-16".to_string());
+    orphan.conversation_parent = Some("agent-11".to_string());
+    orphan.provider = Some("anthropic".to_string());
+    orphan.model = Some("claude-opus-5".to_string());
+    orphan.requested_model = Some("opus".to_string());
+    orphan.effective_model = Some("claude-opus-5".to_string());
+    orphan.generation_duration = Some(Duration::from_millis(1_500));
+    orphan.stream_chunks = 44;
+    orphan.streamed_bytes = 5_120;
+    orphan.input_tokens = Some(2_600);
+    orphan.cache.read_tokens = Some(21_800);
+    orphan.cache.write_tokens = Some(640);
+    orphan.cache.write_5m_tokens = Some(640);
+    orphan.cache.ttl = Some(Duration::from_secs(5 * 60));
+    orphan.output_tokens = Some(188);
+    close_reported_counts(&mut orphan.cache);
+    // Anthropic named the five-minute lifetime and said nothing about the
+    // one-hour one, which stays unknown rather than becoming the rest.
+    orphan.cache.closed.cache_write_5m = true;
+    recent.push_back(orphan);
 
     let mut unavailable = completed_request(
         now,
@@ -304,6 +373,8 @@ fn mock_state_for_tick(
     unavailable.project = Some("terminal-dashboard".to_string());
     unavailable.provider = Some("kimi".to_string());
     unavailable.model = Some("kimi-for-coding".to_string());
+    unavailable.requested_model = Some("kimi-for-coding".to_string());
+    unavailable.effective_model = Some("kimi-for-coding".to_string());
     unavailable.effort = Some("high".to_string());
     unavailable.input_tokens = Some(8_900);
     unavailable.error = Some("upstream connection closed before response headers".to_string());
@@ -326,6 +397,8 @@ fn mock_state_for_tick(
     rate_limited.project = Some("responsive-layout-lab".to_string());
     rate_limited.provider = Some("cursor".to_string());
     rate_limited.model = Some("cursor:claude-4.6-opus-high-thinking".to_string());
+    rate_limited.requested_model = Some("cursor:claude-4.6-opus-high-thinking".to_string());
+    rate_limited.effective_model = Some("cursor:claude-4.6-opus-high-thinking".to_string());
     rate_limited.error = Some("provider rate limit reached; retry after 30 seconds".to_string());
     recent.push_back(rate_limited);
 
@@ -343,6 +416,8 @@ fn mock_state_for_tick(
     bytes.project = Some("companion-app".to_string());
     bytes.provider = Some("grok".to_string());
     bytes.model = Some("grok-4.5".to_string());
+    bytes.requested_model = Some("grok-4.5".to_string());
+    bytes.effective_model = Some("grok-4.5".to_string());
     bytes.generation_duration = Some(Duration::from_secs(2));
     bytes.streamed_bytes = 8_192;
     bytes.stream_chunks = 64;
@@ -362,6 +437,8 @@ fn mock_state_for_tick(
     events.project = Some("provider-playground".to_string());
     events.provider = Some("codex".to_string());
     events.model = Some("gpt-5.6-luna".to_string());
+    events.requested_model = Some("gpt-5.6-luna".to_string());
+    events.effective_model = Some("gpt-5.6-luna".to_string());
     events.generation_duration = Some(Duration::from_secs(4));
     events.stream_chunks = 48;
     recent.push_back(events);
@@ -377,7 +454,10 @@ fn mock_state_for_tick(
         RequestStatus::Failed,
         Some(400),
     );
+    // Rejected before any backend was picked, so the only model it can name is
+    // the one it asked for.
     bad_model.model = Some("unknown-model".to_string());
+    bad_model.requested_model = Some("unknown-model".to_string());
     bad_model.error = Some("unknown model; choose a registered provider model".to_string());
     recent.push_back(bad_model);
 
@@ -394,7 +474,10 @@ fn mock_state_for_tick(
     );
     counted.project = Some("terminal-dashboard".to_string());
     counted.provider = Some("kimi".to_string());
+    // A local estimate: it builds no outgoing request, so it names no model
+    // that ran.
     counted.model = Some("kimi-k2.6".to_string());
+    counted.requested_model = Some("kimi-k2.6".to_string());
     counted.input_tokens = Some(2_048);
     recent.push_back(counted);
 
@@ -412,6 +495,8 @@ fn mock_state_for_tick(
     server_error.project = Some("provider-playground".to_string());
     server_error.provider = Some("codex".to_string());
     server_error.model = Some("gpt-5.5".to_string());
+    server_error.requested_model = Some("gpt-5.5".to_string());
+    server_error.effective_model = Some("gpt-5.5".to_string());
     server_error.effort = Some("medium".to_string());
     server_error.error =
         Some("response translation failed: missing message stop event".to_string());
@@ -431,6 +516,8 @@ fn mock_state_for_tick(
     no_status.project = Some("automation-sandbox".to_string());
     no_status.provider = Some("codex".to_string());
     no_status.model = Some("gpt-5.4-mini".to_string());
+    no_status.requested_model = Some("gpt-5.4-mini".to_string());
+    no_status.effective_model = Some("gpt-5.4-mini".to_string());
     no_status.error = Some("request future ended before completion".to_string());
     recent.push_back(no_status);
 
@@ -625,7 +712,13 @@ fn simulated_active_request(
     if phase >= 3 {
         request.provider = Some(profile.provider.to_string());
         request.model = Some(profile.model.to_string());
+        request.requested_model = Some(profile.model.to_string());
         request.effort = profile.effort.map(str::to_string);
+    }
+    // A request is only seen running once its outgoing body has been built,
+    // which is what the upstream phase stands for here.
+    if phase >= 6 {
+        request.effective_model = Some(profile.model.to_string());
     }
     if phase >= 10 {
         let generation_ticks = phase - 9;
@@ -673,6 +766,8 @@ fn simulated_completed_request(
     request.project = Some(profile.project.to_string());
     request.provider = Some(profile.provider.to_string());
     request.model = Some(profile.model.to_string());
+    request.requested_model = Some(profile.model.to_string());
+    request.effective_model = Some(profile.model.to_string());
     request.effort = profile.effort.map(str::to_string);
     request.input_tokens = Some(1_800 + cycle.saturating_mul(137));
     if failed {
@@ -682,8 +777,31 @@ fn simulated_completed_request(
         request.stream_chunks = 33 + cycle % 9;
         request.output_tokens = Some(128 + cycle.saturating_mul(11));
         request.streamed_bytes = request.output_tokens.unwrap_or(0).saturating_mul(24);
+        close_reported_counts(&mut request.cache);
     }
     request
+}
+
+/// What a backend's final report leaves behind: each of the four counts is the
+/// backend's own number rather than an estimate a later report may replace. A
+/// count the request holds none of stays unreported, which is what closing it
+/// says — not a zero.
+///
+/// The demo builds finished requests instead of replaying their events, so the
+/// evidence behind every count has to be stated here for the rows to carry the
+/// marks observed traffic gives them.
+fn close_reported_counts(cache: &mut RequestCache) {
+    cache.closed.input = true;
+    cache.closed.cache_read = true;
+    cache.closed.cache_write = true;
+    cache.closed.output = true;
+}
+
+/// The same for the two lifetime buckets of a cache write, which a backend
+/// reports on their own and neither of which follows from the write total.
+fn close_cache_write_buckets(cache: &mut RequestCache) {
+    cache.closed.cache_write_5m = true;
+    cache.closed.cache_write_1h = true;
 }
 
 #[derive(Clone, Copy)]
@@ -885,19 +1003,23 @@ mod tests {
                 .map(|conversation| (
                     conversation.conversation.as_str(),
                     conversation.parent.as_deref(),
+                    conversation.raw_parent.as_deref(),
                     conversation.depth
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("main", None, 0),
-                ("agent-3", None, 0),
-                ("agent-9", Some("agent-3"), 1),
-                ("agent-3/side", Some("agent-3"), 1),
+                ("main", None, None, 0),
+                // Named a parent the session never served a request for, so the
+                // walk leaves it at the top level with its claim intact.
+                ("agent-16", None, Some("agent-11"), 0),
+                ("agent-3", None, None, 0),
+                ("agent-9", Some("agent-3"), Some("agent-3"), 1),
+                ("agent-3/side", Some("agent-3"), None, 1),
             ]
         );
         // The subagent runs on another model than the thread that spawned it.
         assert_eq!(
-            session.conversations[1].model.as_deref(),
+            session.conversations[2].model.as_deref(),
             Some("claude-sonnet-5")
         );
     }
