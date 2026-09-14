@@ -40,8 +40,8 @@ use crate::retry::{compute_backoff_delay, sleep};
 use self::auth::token_store::file_store;
 use self::client::CodexHttpClient;
 use self::compaction::{
-    CompactionAttempt, abort_compaction_attempt, activate_compaction, apply_compaction_replay,
-    begin_compaction, request_compaction, store_compaction,
+    CompactionAttempt, CompactionError, abort_compaction_attempt, activate_compaction,
+    apply_compaction_replay, begin_compaction, request_compaction, store_compaction,
 };
 use self::continuation::{
     ContinuationReservation, abort_continuation_for_owner, continuation_candidate_for_owner,
@@ -277,6 +277,16 @@ impl CodexProvider {
                             Some("compaction state was superseded or exceeded the in-memory limit"),
                         );
                     }
+                }
+                Err(CompactionError::Upstream(error)) if error.usage_limit.is_some() => {
+                    abort_compaction_attempt(Some(session_id), Some(attempt));
+                    log_compaction_event(
+                        "server_compaction_failed",
+                        &ctx,
+                        translated.input.len(),
+                        Some(&error.to_string()),
+                    );
+                    return map_codex_error_to_response(&error);
                 }
                 Err(error) => {
                     abort_compaction_attempt(Some(session_id), Some(attempt));
@@ -974,6 +984,7 @@ async fn live_stream_response_once(
                             message: message.clone(),
                             detail: Some(message),
                             retry_after: retry_after_from_live_payload(&payload),
+                            usage_limit: None,
                             origin: client::CodexErrorOrigin::WebSocket,
                         },
                     );
@@ -1050,6 +1061,7 @@ async fn live_stream_response_once(
             message: "WebSocket connection closed before terminal Codex response event".to_string(),
             detail: Some(websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: client::CodexErrorOrigin::WebSocket,
         },
     )
@@ -1061,6 +1073,7 @@ fn empty_live_completion_error() -> client::CodexError {
         message: "Codex completed without producing output".to_string(),
         detail: Some(EMPTY_CODEX_COMPLETION_DETAIL.to_string()),
         retry_after: None,
+        usage_limit: None,
         origin: client::CodexErrorOrigin::WebSocket,
     }
 }
@@ -1353,6 +1366,7 @@ fn empty_buffered_completion_error() -> client::CodexError {
         message: "Codex completed without producing output".to_string(),
         detail: Some(EMPTY_CODEX_COMPLETION_DETAIL.to_string()),
         retry_after: None,
+        usage_limit: None,
         origin: match config::codex_transport() {
             config::CodexTransport::Http => client::CodexErrorOrigin::BufferedHttp,
             _ => client::CodexErrorOrigin::BufferedWebSocket,
@@ -1591,6 +1605,9 @@ fn usage_limit_response(limit: &events::CodexUsageLimit) -> Response {
 }
 
 fn map_codex_error_to_response(err: &client::CodexError) -> Response {
+    if let Some(limit) = err.usage_limit.as_ref() {
+        return usage_limit_response(limit);
+    }
     let message = codex_error_message(err);
     if is_context_window_overflow(message) {
         return map_codex_failure_to_response(message);
@@ -2405,6 +2422,7 @@ mod tests {
             message: "invalid request".to_string(),
             detail: Some("invalid request".to_string()),
             retry_after: Some("7".to_string()),
+            usage_limit: None,
             origin: client::CodexErrorOrigin::WebSocketHandshake,
         };
         let response = map_codex_error_to_response(&err);
@@ -2422,6 +2440,7 @@ mod tests {
             message: "WebSocket connect error: HTTP error: 502 Bad Gateway".to_string(),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: client::CodexErrorOrigin::WebSocket,
         };
 
@@ -2457,6 +2476,7 @@ mod tests {
             message: "WebSocket connect timeout after 15000ms".to_string(),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: client::CodexErrorOrigin::WebSocketHandshake,
         };
 
@@ -2470,6 +2490,7 @@ mod tests {
             message: "WebSocket proxy tunnel was rejected".to_string(),
             detail: Some(websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: client::CodexErrorOrigin::WebSocketHandshake,
         };
 
@@ -2483,6 +2504,7 @@ mod tests {
             message: "WebSocket keepalive error: test write failed".to_string(),
             detail: Some(websocket::WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: client::CodexErrorOrigin::WebSocket,
         };
 
@@ -2518,7 +2540,7 @@ mod tests {
         session_id: &str,
         event: serde_json::Value,
         expected_attempts: usize,
-    ) -> StatusCode {
+    ) -> Response {
         let owner = ConversationIdentity::Main(session_id.to_string());
         continuation::clear_continuation_for_owner(Some(&owner));
         websocket::invalidate_codex_websocket_pool_owner(&owner);
@@ -2568,7 +2590,54 @@ mod tests {
             Vec::new()
         ));
         websocket::invalidate_codex_websocket_pool_owner(&owner);
-        response.status()
+        response
+    }
+
+    #[tokio::test]
+    async fn usage_limit_fast_fails_websocket_and_aborts_request_state() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let response = run_live_failure_case(
+            "live-usage-limit-cleanup",
+            serde_json::json!({
+                "type": "error",
+                "status_code": 429,
+                "error": {
+                    "type": "usage_limit_reached",
+                    "message": "The usage limit has been reached",
+                    "resets_at": 1788879437u64,
+                    "resets_in_seconds": 9568
+                },
+                "headers": {
+                    "X-Codex-Primary-Window-Minutes": "300",
+                    "X-Codex-Primary-Reset-After-Seconds": "9569",
+                    "X-Codex-Secondary-Window-Minutes": "10080",
+                    "X-Codex-Secondary-Reset-After-Seconds": "596369"
+                }
+            }),
+            1,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["x-should-retry"], "false");
+        assert_eq!(
+            response.headers()["anthropic-ratelimit-unified-status"],
+            "rejected"
+        );
+        assert_eq!(
+            response.headers()["anthropic-ratelimit-unified-reset"],
+            "1788879437"
+        );
+        assert_eq!(
+            response.headers()["anthropic-ratelimit-unified-representative-claim"],
+            "five_hour"
+        );
+        assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["message"], "The usage limit has been reached");
     }
 
     #[tokio::test]
@@ -2775,7 +2844,8 @@ mod tests {
             }),
             11,
         )
-        .await;
+        .await
+        .status();
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -2795,7 +2865,8 @@ mod tests {
             }),
             1,
         )
-        .await;
+        .await
+        .status();
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -2814,7 +2885,8 @@ mod tests {
             }),
             1,
         )
-        .await;
+        .await
+        .status();
         assert_eq!(status, StatusCode::BAD_GATEWAY);
     }
 

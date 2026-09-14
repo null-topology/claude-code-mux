@@ -324,6 +324,38 @@ async fn spawn_capturing_http_upstream(
     addr_str
 }
 
+async fn spawn_auto_fallback_usage_limit_upstream(
+    websocket_attempts: Arc<AtomicUsize>,
+    http_attempts: Arc<AtomicUsize>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+        let websocket_attempts = websocket_attempts.clone();
+        let http_attempts = http_attempts.clone();
+        async move {
+            if request.headers().contains_key(http::header::UPGRADE) {
+                websocket_attempts.fetch_add(1, Ordering::SeqCst);
+                http::Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::empty())
+                    .unwrap()
+            } else {
+                http_attempts.fetch_add(1, Ordering::SeqCst);
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(codex_usage_limit_sse("usage_limit_reached")))
+                    .unwrap()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    format!("http://{addr}")
+}
+
 async fn spawn_truncated_http_upstream(body: &'static [u8]) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -439,6 +471,22 @@ async fn spawn_websocket_upstream(captured: Arc<Mutex<Option<Value>>>) -> String
     });
 
     addr_str
+}
+
+async fn spawn_websocket_usage_limit_upstream(attempts: Arc<AtomicUsize>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await
+        {
+            let _ = websocket.next().await;
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let event = codex_usage_limit_event("usage_limit_reached");
+            let _ = websocket.send(Message::Text(event.to_string())).await;
+        }
+    });
+    format!("http://{addr}")
 }
 
 /// Reproduce the Codex subscription-credit response observed in production:
@@ -1185,6 +1233,53 @@ fn empty_message_completion_sse() -> Vec<u8> {
     .to_vec()
 }
 
+fn codex_usage_limit_event(error_type: &str) -> Value {
+    json!({
+        "type": "error",
+        "status_code": 429,
+        "error": {
+            "type": error_type,
+            "message": "The usage limit has been reached",
+            "resets_at": 1788879437u64,
+            "resets_in_seconds": 9568
+        },
+        "headers": {
+            "X-Codex-Primary-Window-Minutes": "300",
+            "X-Codex-Primary-Reset-After-Seconds": "9569",
+            "X-Codex-Secondary-Window-Minutes": "10080",
+            "X-Codex-Secondary-Reset-After-Seconds": "596369"
+        }
+    })
+}
+
+fn codex_usage_limit_sse(error_type: &str) -> Vec<u8> {
+    format!("data: {}\n\n", codex_usage_limit_event(error_type)).into_bytes()
+}
+
+async fn assert_usage_limit_response(response: Response) {
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["x-should-retry"], "false");
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-unified-status"],
+        "rejected"
+    );
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-unified-reset"],
+        "1788879437"
+    );
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-unified-representative-claim"],
+        "five_hour"
+    );
+    assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["message"], "The usage limit has been reached");
+}
+
 fn buffered_success_sse(text: &str) -> Vec<u8> {
     format!(
         concat!(
@@ -1196,6 +1291,66 @@ fn buffered_success_sse(text: &str) -> Vec<u8> {
         text = text
     )
     .into_bytes()
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_usage_limit_event_fast_fails_live_request() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            codex_usage_limit_sse("usage_limit_reached")
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_usage_limit_response(response).await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_usage_limit_event_fast_fails_buffered_request() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            codex_usage_limit_sse("usage_limit_reached")
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages("gpt-5.5").await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_usage_limit_response(response).await;
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -1466,6 +1621,54 @@ fn assert_responses_lite_lane(request: &Value, label: &str) {
         request["reasoning"]["context"], "all_turns",
         "{label} must keep the lite lane's reasoning context"
     );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_server_compaction_fast_fails_usage_limit() {
+    let _guard = env_lock();
+    clear_all_compactions_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |body: Value| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                body["input"].as_array().unwrap().last().unwrap()["type"],
+                "compaction_trigger"
+            );
+            codex_usage_limit_sse("usage_limit_reached")
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "system": "You are Claude Code.",
+        "messages": [
+            {"role":"user","content":"old conversation"},
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"tool-1","name":"Read","input":{}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"tool-1","content":"result"},
+                {"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests."}
+            ]}
+        ]
+    }))
+    .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_usage_limit_response(response).await;
+    clear_all_compactions_for_tests();
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -1910,6 +2113,12 @@ async fn smoke_codex_http_retries_rate_limit_after_control_events() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_codex_http_retries_transient_rate_limit_with_reset_clock() {
+    assert_codex_http_presemantic_retry(codex_usage_limit_sse("rate_limit_exceeded")).await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_retries_transient_failure_after_control_events() {
     assert_codex_http_presemantic_retry(
         concat!(
@@ -1931,6 +2140,63 @@ async fn smoke_codex_http_retries_presemantic_eof() {
             .to_vec(),
     )
     .await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_usage_limit_status_fast_fails_live_request() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = format!("http://{addr}");
+    let mock = axum::Router::new().fallback({
+        let attempts = attempts.clone();
+        move || {
+            let attempts = attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                http::Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("content-type", "application/json")
+                    .header("x-codex-primary-window-minutes", "300")
+                    .header("x-codex-primary-reset-after-seconds", "9568")
+                    .body(Body::from(
+                        json!({
+                            "error": {
+                                "type": "usage_limit_reached",
+                                "message": "The usage limit has been reached",
+                                "resets_at": 1788879437u64,
+                                "resets_in_seconds": 9568
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, mock).await.ok();
+    });
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_usage_limit_response(response).await;
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -2232,6 +2498,38 @@ async fn smoke_codex_http_truncated_upstream_writes_reducer_diagnostic() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_auto_fallback_usage_limit_fast_fails_live_request() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let websocket_attempts = Arc::new(AtomicUsize::new(0));
+    let http_attempts = Arc::new(AtomicUsize::new(0));
+    let upstream =
+        spawn_auto_fallback_usage_limit_upstream(websocket_attempts.clone(), http_attempts.clone())
+            .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(websocket_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(http_attempts.load(Ordering::SeqCst), 1);
+    assert_usage_limit_response(response).await;
+    clear_codex_websocket_pool_for_tests();
+}
+
 // ---------------------------------------------------------------------------
 // Codex WebSocket smoke: mock upstream verifies request shape and returns
 // Responses events over WebSocket.
@@ -2282,6 +2580,34 @@ async fn smoke_codex_websocket_messages_uses_mock_upstream() {
     assert_eq!(sent["model"], "gpt-5.5");
     assert!(sent.get("max_output_tokens").is_none());
     assert!(sent.get("stream").is_none());
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_usage_limit_fast_fails_request() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_websocket_usage_limit_upstream(attempts.clone()).await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_usage_limit_response(response).await;
+    clear_codex_websocket_pool_for_tests();
 }
 
 #[allow(clippy::await_holding_lock)]
