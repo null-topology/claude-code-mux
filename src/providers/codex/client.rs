@@ -12,6 +12,7 @@ use crate::traffic::TrafficCapture;
 use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIGINATOR};
 use super::auth::manager::CodexAuthManager;
 use super::auth::token_store::{DefaultCodexAuthStore, StoredAuth, file_store};
+pub use super::events::{CodexLimitWindow, CodexUsageLimit};
 use super::search::{SearchRequest, SearchResponse};
 use super::translate::request::ResponsesRequest;
 
@@ -25,6 +26,7 @@ pub struct CodexError {
     pub message: String,
     pub detail: Option<String>,
     pub retry_after: Option<String>,
+    pub usage_limit: Option<Box<CodexUsageLimit>>,
     pub origin: CodexErrorOrigin,
 }
 
@@ -45,6 +47,7 @@ impl CodexError {
             message,
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         }
     }
@@ -305,6 +308,7 @@ fn header_value(name: &str, value: &str) -> Result<http::HeaderValue, CodexError
         message: format!("Failed to parse {name} header"),
         detail: Some(e.to_string()),
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::Http,
     })
 }
@@ -496,6 +500,7 @@ fn http_sse_error(message: &str) -> CodexError {
         message: message.to_string(),
         detail: Some("http_response_sse".to_string()),
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::Http,
     }
 }
@@ -814,6 +819,7 @@ impl CodexHttpClient {
                 message: "Auth error".to_string(),
                 detail: Some(error.to_string()),
                 retry_after: None,
+                usage_limit: None,
                 origin: CodexErrorOrigin::Auth,
             })?;
         let mut refresh_attempted = false;
@@ -849,6 +855,7 @@ impl CodexHttpClient {
                 message: "Invalid audio content type".to_string(),
                 detail: Some(error.to_string()),
                 retry_after: None,
+                usage_limit: None,
                 origin: CodexErrorOrigin::Http,
             })?;
         let mut form = reqwest::multipart::Form::new().part("file", part);
@@ -872,6 +879,7 @@ impl CodexHttpClient {
             ),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })?
         .map_err(|error| CodexError {
@@ -879,6 +887,7 @@ impl CodexHttpClient {
             message: format!("Codex transcription transport error: {error}"),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })
     }
@@ -895,6 +904,7 @@ impl CodexHttpClient {
             message: "Failed to serialize image request".to_string(),
             detail: Some(error.to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })?;
         let url = format!(
@@ -911,6 +921,7 @@ impl CodexHttpClient {
                 message: "Auth error".to_string(),
                 detail: Some(error.to_string()),
                 retry_after: None,
+                usage_limit: None,
                 origin: CodexErrorOrigin::Auth,
             })?;
         let mut refresh_attempted = false;
@@ -957,6 +968,7 @@ impl CodexHttpClient {
             ),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })?
         .map_err(|error| CodexError {
@@ -964,6 +976,7 @@ impl CodexHttpClient {
             message: format!("Codex image transport error: {error}"),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })
     }
@@ -980,6 +993,7 @@ impl CodexHttpClient {
             message: "Failed to serialize native Responses request".to_string(),
             detail: Some(err.to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })?;
         let mut auth = self
@@ -991,6 +1005,7 @@ impl CodexHttpClient {
                 message: "Auth error".to_string(),
                 detail: Some(err.to_string()),
                 retry_after: None,
+                usage_limit: None,
                 origin: CodexErrorOrigin::Auth,
             })?;
         let mut refresh_attempted = false;
@@ -1051,6 +1066,7 @@ impl CodexHttpClient {
             ),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })?
         .map_err(|err| CodexError {
@@ -1058,6 +1074,7 @@ impl CodexHttpClient {
             message: format!("Native Responses transport error: {err}"),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })
     }
@@ -1100,6 +1117,7 @@ impl CodexHttpClient {
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Auth,
         })?;
         let body_json = serde_json::to_string(body).map_err(|e| CodexError {
@@ -1107,6 +1125,7 @@ impl CodexHttpClient {
             message: "Failed to serialize search request".to_string(),
             detail: Some(e.to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })?;
         let mut auth_refresh_attempted = false;
@@ -1147,6 +1166,7 @@ impl CodexHttpClient {
                 message: "Failed to decode Codex search response".to_string(),
                 detail: Some(e.to_string()),
                 retry_after: None,
+                usage_limit: None,
                 origin: CodexErrorOrigin::Http,
             });
         }
@@ -1162,6 +1182,7 @@ impl CodexHttpClient {
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Auth,
         })?;
         let body_json = serde_json::to_string(body).map_err(|e| CodexError {
@@ -1169,6 +1190,7 @@ impl CodexHttpClient {
             message: "Failed to serialize request".to_string(),
             detail: Some(e.to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })?;
         let mut auth_refresh_attempted = false;
@@ -1313,6 +1335,7 @@ impl CodexHttpClient {
                 message: "WebSocket connection closed before the first Codex event".to_string(),
                 detail: Some(super::websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
                 retry_after: None,
+                usage_limit: None,
                 origin: CodexErrorOrigin::WebSocket,
             }),
         }
@@ -1415,6 +1438,7 @@ impl CodexHttpClient {
                                 ),
                                 detail: Some("http_response_body".to_string()),
                                 retry_after: None,
+                                usage_limit: None,
                                 origin: CodexErrorOrigin::Http,
                             };
                             log_http_stream_end(
@@ -1441,6 +1465,7 @@ impl CodexHttpClient {
                                 ),
                                 detail: Some("http_response_body".to_string()),
                                 retry_after: None,
+                                usage_limit: None,
                                 origin: CodexErrorOrigin::Http,
                             };
                             log_http_stream_end(
@@ -1498,12 +1523,23 @@ impl CodexHttpClient {
                         }
 
                         let failure = super::events::classify_event_failure(&payload);
-                        if !semantic_output_forwarded
-                            && let Some(failure) = failure.as_ref()
-                            && failure.retryable()
-                        {
-                            pending_events.clear();
-                            break 'read_attempt codex_event_failure_error(failure.clone());
+                        if !semantic_output_forwarded {
+                            if let Some(limit) = super::events::usage_limit_from_event(&payload) {
+                                pending_events.clear();
+                                let _ = tx
+                                    .send(Err(codex_usage_limit_error(
+                                        limit,
+                                        CodexErrorOrigin::Http,
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            if let Some(failure) = failure.as_ref()
+                                && failure.retryable()
+                            {
+                                pending_events.clear();
+                                break 'read_attempt codex_event_failure_error(failure.clone());
+                            }
                         }
 
                         let terminal = event_closes_http_stream(&payload);
@@ -1610,6 +1646,7 @@ impl CodexHttpClient {
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Auth,
         })?;
 
@@ -1634,6 +1671,7 @@ impl CodexHttpClient {
                         message: "Failed to serialize request".to_string(),
                         detail: Some(e.to_string()),
                         retry_after: None,
+                        usage_limit: None,
                         origin: CodexErrorOrigin::Http,
                     })?;
                     self.attempt_post_http(
@@ -1727,6 +1765,7 @@ impl CodexHttpClient {
                                     message: "Failed to serialize request".to_string(),
                                     detail: Some(e.to_string()),
                                     retry_after: None,
+                                    usage_limit: None,
                                     origin: CodexErrorOrigin::Http,
                                 })?;
                             self.attempt_post_http(
@@ -1760,10 +1799,22 @@ impl CodexHttpClient {
                             message: "Unauthorized".to_string(),
                             detail: Some(e.to_string()),
                             retry_after: None,
+                            usage_limit: None,
                             origin: CodexErrorOrigin::Http,
                         });
                     }
                 }
+            }
+
+            if let Ok(response) = &result
+                && let Some(limit) =
+                    super::events::usage_limit_from_response(&response.body, &response.headers)
+            {
+                let origin = match response.transport {
+                    ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
+                    ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
+                };
+                return Err(codex_usage_limit_error(limit, origin));
             }
 
             if let Ok(response) = &result
@@ -1779,6 +1830,7 @@ impl CodexHttpClient {
                             message: failure.message.clone(),
                             detail: Some(failure.message),
                             retry_after: failure.retry_after,
+                            usage_limit: None,
                             origin: match response.transport {
                                 ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
                                 ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
@@ -1812,6 +1864,7 @@ impl CodexHttpClient {
                     message: failure.message.clone(),
                     detail: Some(failure.message),
                     retry_after: failure.retry_after,
+                    usage_limit: None,
                     origin: CodexErrorOrigin::Http,
                 });
             }
@@ -1824,6 +1877,7 @@ impl CodexHttpClient {
                         message: "Unauthorized".to_string(),
                         detail: Some(detail),
                         retry_after: None,
+                        usage_limit: None,
                         origin: CodexErrorOrigin::Http,
                     });
                 }
@@ -1834,6 +1888,7 @@ impl CodexHttpClient {
                         message: "Forbidden".to_string(),
                         detail: Some(detail),
                         retry_after: None,
+                        usage_limit: None,
                         origin: CodexErrorOrigin::Http,
                     });
                 }
@@ -1853,6 +1908,7 @@ impl CodexHttpClient {
                                 message: "Rate limited".to_string(),
                                 detail: Some(detail),
                                 retry_after,
+                                usage_limit: None,
                                 origin: CodexErrorOrigin::Http,
                             });
                         }
@@ -1882,6 +1938,7 @@ impl CodexHttpClient {
                         message: "Rate limited".to_string(),
                         detail: Some(detail),
                         retry_after,
+                        usage_limit: None,
                         origin: CodexErrorOrigin::Http,
                     });
                 }
@@ -1989,6 +2046,7 @@ impl CodexHttpClient {
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Auth,
         })?;
 
@@ -2301,6 +2359,7 @@ impl CodexHttpClient {
                 ),
                 detail: None,
                 retry_after: None,
+                usage_limit: None,
                 origin: CodexErrorOrigin::Http,
             })?
             .map_err(|e| {
@@ -2310,6 +2369,7 @@ impl CodexHttpClient {
                         message: format!("Transport error: {e}"),
                         detail: None,
                         retry_after: None,
+                        usage_limit: None,
                         origin: CodexErrorOrigin::Http,
                     }
                 } else {
@@ -2318,6 +2378,7 @@ impl CodexHttpClient {
                         message: format!("Network error: {e}"),
                         detail: None,
                         retry_after: None,
+                        usage_limit: None,
                         origin: CodexErrorOrigin::Http,
                     }
                 }
@@ -2355,6 +2416,7 @@ impl CodexHttpClient {
                 ),
                 detail: Some("http_response_body".to_string()),
                 retry_after: None,
+                usage_limit: None,
                 origin: CodexErrorOrigin::Http,
             })?
             .map_err(|e| CodexError {
@@ -2362,6 +2424,7 @@ impl CodexHttpClient {
                 message: format!("Transport error reading Codex response body: {e}"),
                 detail: Some("http_response_body".to_string()),
                 retry_after: None,
+                usage_limit: None,
                 origin: CodexErrorOrigin::Http,
             })?;
 
@@ -2426,6 +2489,7 @@ impl CodexHttpClient {
             ),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })?
         .map_err(|e| CodexError {
@@ -2433,6 +2497,7 @@ impl CodexHttpClient {
             message: format!("Codex search network error: {e}"),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })?;
 
@@ -2463,6 +2528,7 @@ impl CodexHttpClient {
                 ),
                 detail: Some("http_response_body".to_string()),
                 retry_after: None,
+                usage_limit: None,
                 origin: CodexErrorOrigin::Http,
             })?
             .map_err(|e| CodexError {
@@ -2470,6 +2536,7 @@ impl CodexHttpClient {
                 message: format!("Transport error reading Codex search response body: {e}"),
                 detail: Some("http_response_body".to_string()),
                 retry_after: None,
+                usage_limit: None,
                 origin: CodexErrorOrigin::Http,
             })?;
             let Some(chunk) = chunk else {
@@ -2577,11 +2644,26 @@ fn codex_event_failure_error(failure: super::events::CodexEventFailure) -> Codex
         message: failure.message.clone(),
         detail: Some(failure.message),
         retry_after: failure.retry_after,
+        usage_limit: None,
         origin: CodexErrorOrigin::Http,
     }
 }
 
+fn codex_usage_limit_error(limit: CodexUsageLimit, origin: CodexErrorOrigin) -> CodexError {
+    CodexError {
+        status: 429,
+        message: limit.message.clone(),
+        detail: Some(limit.message.clone()),
+        retry_after: None,
+        usage_limit: Some(Box::new(limit)),
+        origin,
+    }
+}
+
 fn retryable_http_stream_error(error: &CodexError) -> bool {
+    if error.usage_limit.is_some() {
+        return false;
+    }
     if should_retry_codex_status(error.status) || is_retryable_transport_error(error) {
         return true;
     }
@@ -2791,11 +2873,14 @@ fn auth_refresh_error(err: anyhow::Error) -> CodexError {
         message: "Unauthorized".to_string(),
         detail: Some(err.to_string()),
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::Auth,
     }
 }
 
 fn codex_status_error(response: CodexResponse) -> CodexError {
+    let usage_limit =
+        super::events::usage_limit_from_response(&response.body, &response.headers).map(Box::new);
     let retry_after = response
         .headers
         .iter()
@@ -2812,6 +2897,7 @@ fn codex_status_error(response: CodexResponse) -> CodexError {
         message: message.clone(),
         detail: Some(message),
         retry_after,
+        usage_limit,
         origin: match response.transport {
             ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
             ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
@@ -4919,6 +5005,7 @@ mod tests {
             message: "Rate limited".to_string(),
             detail: Some("body".to_string()),
             retry_after: Some("5".to_string()),
+            usage_limit: None,
             origin: CodexErrorOrigin::Http,
         };
         let display = format!("{err}");
@@ -4933,6 +5020,7 @@ mod tests {
             message: "WebSocket connect error".to_string(),
             detail: Some("websocket_pre_request".to_string()),
             retry_after: Some("3".to_string()),
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 
@@ -4948,6 +5036,7 @@ mod tests {
                 super::super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string(),
             ),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         };
 
@@ -4962,6 +5051,7 @@ mod tests {
             message: "WebSocket connect timeout after 15000ms".to_string(),
             detail: Some("websocket_pre_request".to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 
@@ -4975,6 +5065,7 @@ mod tests {
             message: "WebSocket connect error".to_string(),
             detail: Some("websocket_pre_request".to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 
@@ -4989,6 +5080,7 @@ mod tests {
                 .to_string(),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 
@@ -5002,6 +5094,7 @@ mod tests {
             message: "WebSocket keepalive error: test write failed".to_string(),
             detail: Some(super::super::websocket::WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 
@@ -5016,6 +5109,7 @@ mod tests {
             message: "WebSocket stream error: IO error: Broken pipe (os error 32)".to_string(),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 
@@ -5292,6 +5386,7 @@ mod tests {
             message: "WebSocket connect error".to_string(),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocket,
         });
         let forbidden = Err(CodexError {
@@ -5299,6 +5394,7 @@ mod tests {
             message: "Forbidden".to_string(),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocket,
         });
         let rejected_handshake = Err(CodexError {
@@ -5306,6 +5402,7 @@ mod tests {
             message: "WebSocket connect error".to_string(),
             detail: Some("policy denied".to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         });
         let rejected_handshake_err = match &rejected_handshake {
@@ -5374,6 +5471,7 @@ mod tests {
                 super::super::websocket::WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL.to_string(),
             ),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocket,
         };
         let missing = CodexError {
@@ -5381,6 +5479,7 @@ mod tests {
             message: "Previous response not found".to_string(),
             detail: Some("previous_response_not_found".to_string()),
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocket,
         };
         let idle = CodexError {
@@ -5388,6 +5487,7 @@ mod tests {
             message: "WebSocket idle timeout after 60000ms".to_string(),
             detail: None,
             retry_after: None,
+            usage_limit: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 

@@ -23,6 +23,31 @@ const PERCENT: f64 = 100.0;
 /// 300 minutes for it (299 in older payloads), against 10080 for the weekly.
 const FIVE_HOUR_MAX_MINUTES: u64 = 360;
 
+/// The other end of the five hour band, and the band around the weekly window.
+/// These exist so a duration can be recognised rather than merely compared: a
+/// reading shorter than this names some window other than the five hour one.
+const FIVE_HOUR_MIN_MINUTES: u64 = 240;
+const SEVEN_DAY_MIN_MINUTES: u64 = 9_000;
+const SEVEN_DAY_MAX_MINUTES: u64 = 11_000;
+
+/// The window a reported duration names, when it is one this build can name.
+///
+/// Announcing a window to a client is a claim about which allowance refused a
+/// request, so a duration that falls outside both bands is left unnamed rather
+/// than rounded into the nearer one — a window Codex adds later would otherwise
+/// be published under the wrong name. Binning a healthy reading into a gauge
+/// lane is the other question and stays deliberately tolerant: there being no
+/// name for a lane is worse than an approximate one for a gauge.
+pub(crate) fn claimable_window(minutes: u64) -> Option<super::events::CodexLimitWindow> {
+    if (FIVE_HOUR_MIN_MINUTES..=FIVE_HOUR_MAX_MINUTES).contains(&minutes) {
+        Some(super::events::CodexLimitWindow::FiveHour)
+    } else if (SEVEN_DAY_MIN_MINUTES..=SEVEN_DAY_MAX_MINUTES).contains(&minutes) {
+        Some(super::events::CodexLimitWindow::SevenDay)
+    } else {
+        None
+    }
+}
+
 /// Where each window starts being worth announcing. These mirror the thresholds
 /// the client applies to Anthropic's own windows, so a Codex session warns at
 /// the same points a Claude session does.
@@ -272,6 +297,20 @@ mod tests {
             .headers()
             .into_iter()
             .collect()
+    }
+
+    #[test]
+    fn names_only_the_window_durations_it_recognises() {
+        use super::super::events::CodexLimitWindow;
+
+        // 300 is what the stream reports for the five hour window and 299 is
+        // what older payloads reported, so both have to reach the same name.
+        assert_eq!(claimable_window(300), Some(CodexLimitWindow::FiveHour));
+        assert_eq!(claimable_window(299), Some(CodexLimitWindow::FiveHour));
+        assert_eq!(claimable_window(10_080), Some(CodexLimitWindow::SevenDay));
+        // A daily window is neither, and guessing which of the two it is closer
+        // to would publish a name Codex never used.
+        assert_eq!(claimable_window(1_440), None);
     }
 
     #[test]
