@@ -522,6 +522,37 @@ mod tests {
         assert_eq!(translated.effort.as_deref(), Some("high"));
     }
 
+    const LANE_POLICY_VAR: &str = "CCP_CODEX_LANE_POLICY";
+
+    /// Pins the lane policy for as long as it is held and restores the previous
+    /// value on drop, unwinding included. `CCP_CODEX_LANE_POLICY` is the first
+    /// source the resolver consults, so pinning it also overrides an inherited
+    /// legacy `CCP_CODEX_FULL_LANE` and both config-file spellings.
+    struct LanePolicyGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl LanePolicyGuard {
+        fn pin(policy: &str) -> Self {
+            let previous = std::env::var_os(LANE_POLICY_VAR);
+            unsafe {
+                std::env::set_var(LANE_POLICY_VAR, policy);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for LanePolicyGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(LANE_POLICY_VAR, value),
+                    None => std::env::remove_var(LANE_POLICY_VAR),
+                }
+            }
+        }
+    }
+
     #[test]
     fn validates_stream_options_and_sampling_controls() {
         let mut options = base();
@@ -531,21 +562,49 @@ mod tests {
             Some("stream_options")
         );
 
-        // Sampling controls are rejected only on the Responses Lite lane, and
-        // the full lane is the default, so a gpt-5.6 model takes them now.
-        let mut sampling = base();
-        sampling["temperature"] = json!(0.2);
-        assert_eq!(
-            translate_request(sampling).unwrap().upstream["temperature"],
-            0.2
-        );
+        // Sampling controls are rejected only on the Responses Lite lane, so
+        // which lane a model lands on decides these assertions. The policy is
+        // pinned rather than inherited, and with no listing remembered the
+        // compiled-in lane table is what `inventory` follows.
+        crate::providers::codex::models::clear_discovered_models_for_tests();
 
-        let mut full = base();
-        full["model"] = json!("gpt-5.4");
-        full["temperature"] = json!(0.2);
-        full["top_p"] = json!(0.9);
-        let translated = translate_request(full).unwrap();
-        assert_eq!(translated.upstream["temperature"], 0.2);
-        assert_eq!(translated.upstream["top_p"], 0.9);
+        {
+            let _lane = LanePolicyGuard::pin("full");
+            let mut sampling = base();
+            sampling["temperature"] = json!(0.2);
+            let translated = translate_request(sampling).unwrap();
+            assert_eq!(translated.upstream["temperature"], 0.2);
+            assert!(!translated.use_responses_lite);
+
+            let mut full = base();
+            full["model"] = json!("gpt-5.4");
+            full["temperature"] = json!(0.2);
+            full["top_p"] = json!(0.9);
+            let translated = translate_request(full).unwrap();
+            assert_eq!(translated.upstream["temperature"], 0.2);
+            assert_eq!(translated.upstream["top_p"], 0.9);
+        }
+
+        {
+            let _lane = LanePolicyGuard::pin("inventory");
+            // gpt-5.6-sol is lite in the compiled-in table, so the very same
+            // request is refused here.
+            let mut sampling = base();
+            sampling["temperature"] = json!(0.2);
+            let error = translate_request(sampling).unwrap_err();
+            assert_eq!(error.code.as_deref(), Some("unsupported_parameter"));
+            assert_eq!(error.param.as_deref(), Some("temperature"));
+
+            // gpt-5.4 is not, which is what tells `inventory` apart from
+            // forcing the lite lane on everything.
+            let mut full = base();
+            full["model"] = json!("gpt-5.4");
+            full["temperature"] = json!(0.2);
+            full["top_p"] = json!(0.9);
+            let translated = translate_request(full).unwrap();
+            assert_eq!(translated.upstream["temperature"], 0.2);
+            assert_eq!(translated.upstream["top_p"], 0.9);
+            assert!(!translated.use_responses_lite);
+        }
     }
 }

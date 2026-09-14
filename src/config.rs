@@ -64,6 +64,8 @@ struct CodexConfig {
     pub previous_response_id: Option<bool>,
     #[serde(rename = "fullLane")]
     pub full_lane: Option<bool>,
+    #[serde(rename = "lanePolicy")]
+    pub lane_policy: Option<serde_json::Value>,
     #[serde(rename = "serverCompaction")]
     pub server_compaction: Option<bool>,
     #[serde(rename = "responsesApi")]
@@ -241,6 +243,7 @@ pub fn log_stderr() -> bool {
 pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     let file = read_file_config(&cfg.config_dir);
     let env: HashMap<_, _> = std::env::vars().collect();
+    let lane_settings = codex_lane_settings(&env, file.as_ref().and_then(|f| f.codex.as_ref()));
     let mut out = Vec::new();
     if env.contains_key("CCP_BIND_ADDRESS") {
         out.push("bindAddress (env)".to_string());
@@ -299,8 +302,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_SERVER_COMPACTION") {
         out.push("CCP_CODEX_SERVER_COMPACTION (env)".to_string());
     }
-    if env.contains_key("CCP_CODEX_FULL_LANE") {
-        out.push("CCP_CODEX_FULL_LANE (env)".to_string());
+    for (source, setting) in lane_settings {
+        if source.is_env()
+            && let Some(line) = codex_lane_summary_line(source, setting)
+        {
+            out.push(line);
+        }
     }
     if env
         .get("CCP_AUTO_REVIEW_MODEL")
@@ -342,8 +349,12 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             if let Some(enabled) = codex.server_compaction {
                 out.push(format!("codex.serverCompaction: {enabled}"));
             }
-            if let Some(enabled) = codex.full_lane {
-                out.push(format!("codex.fullLane: {enabled}"));
+            for (source, setting) in lane_settings {
+                if !source.is_env()
+                    && let Some(line) = codex_lane_summary_line(source, setting)
+                {
+                    out.push(line);
+                }
             }
             if codex.responses_api == Some(true) {
                 out.push("codex.responsesApi: true".to_string());
@@ -595,31 +606,177 @@ pub fn codex_previous_response_id() -> bool {
     false
 }
 
+/// Which lane the Codex models run on. `Full` keeps them off the Responses
+/// Lite lane; `Inventory` leaves the decision to the `use_responses_lite` flag
+/// the backend's own model listing reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexLanePolicy {
+    Full,
+    Inventory,
+}
+
+impl CodexLanePolicy {
+    pub fn as_str(&self) -> &str {
+        match self {
+            CodexLanePolicy::Full => "full",
+            CodexLanePolicy::Inventory => "inventory",
+        }
+    }
+}
+
+/// A lane source as configured: absent, carrying a value the grammar accepts,
+/// or present but unusable. An invalid source is reported once in the config
+/// summary and then skipped, so the next source decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexLaneSetting {
+    Unset,
+    Valid(CodexLanePolicy),
+    Invalid,
+}
+
+/// The places a lane policy can come from, newest spelling first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexLaneSource {
+    PolicyEnv,
+    FullLaneEnv,
+    PolicyFile,
+    FullLaneFile,
+}
+
+impl CodexLaneSource {
+    fn is_env(self) -> bool {
+        matches!(self, Self::PolicyEnv | Self::FullLaneEnv)
+    }
+}
+
+/// `full` / `inventory`, trimmed and case-insensitive. Anything else, the empty
+/// string included, is invalid rather than unset.
+fn parse_codex_lane_policy(raw: &str) -> CodexLaneSetting {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "full" => CodexLaneSetting::Valid(CodexLanePolicy::Full),
+        "inventory" => CodexLaneSetting::Valid(CodexLanePolicy::Inventory),
+        _ => CodexLaneSetting::Invalid,
+    }
+}
+
+/// The legacy boolean grammar, unchanged: on means the full lane.
+fn parse_codex_full_lane(raw: &str) -> CodexLaneSetting {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => CodexLaneSetting::Valid(CodexLanePolicy::Full),
+        "0" | "false" | "no" | "off" => CodexLaneSetting::Valid(CodexLanePolicy::Inventory),
+        _ => CodexLaneSetting::Invalid,
+    }
+}
+
+/// `codex.lanePolicy` is deserialized as a raw value so an unusable one is
+/// ignored on its own instead of failing the whole file. Serde maps a JSON
+/// `null` onto `None`; `Value::Null` is handled too so the helper stays total.
+fn parse_codex_lane_policy_value(raw: Option<&serde_json::Value>) -> CodexLaneSetting {
+    match raw {
+        None | Some(serde_json::Value::Null) => CodexLaneSetting::Unset,
+        Some(serde_json::Value::String(value)) => parse_codex_lane_policy(value),
+        Some(_) => CodexLaneSetting::Invalid,
+    }
+}
+
+/// Every lane source in precedence order. The resolver takes the first valid
+/// one; the config summary reports each of them.
+fn codex_lane_settings(
+    env: &HashMap<String, String>,
+    codex: Option<&CodexConfig>,
+) -> [(CodexLaneSource, CodexLaneSetting); 4] {
+    let from_env = |key: &str, parse: fn(&str) -> CodexLaneSetting| {
+        env.get(key)
+            .map_or(CodexLaneSetting::Unset, |raw| parse(raw.as_str()))
+    };
+    [
+        (
+            CodexLaneSource::PolicyEnv,
+            from_env("CCP_CODEX_LANE_POLICY", parse_codex_lane_policy),
+        ),
+        (
+            CodexLaneSource::FullLaneEnv,
+            from_env("CCP_CODEX_FULL_LANE", parse_codex_full_lane),
+        ),
+        (
+            CodexLaneSource::PolicyFile,
+            parse_codex_lane_policy_value(codex.and_then(|codex| codex.lane_policy.as_ref())),
+        ),
+        (
+            CodexLaneSource::FullLaneFile,
+            match codex.and_then(|codex| codex.full_lane) {
+                Some(true) => CodexLaneSetting::Valid(CodexLanePolicy::Full),
+                Some(false) => CodexLaneSetting::Valid(CodexLanePolicy::Inventory),
+                None => CodexLaneSetting::Unset,
+            },
+        ),
+    ]
+}
+
+/// One config-summary line for a lane source, or nothing when it is unset. A
+/// valid source is named, an unusable one is diagnosed without echoing what was
+/// set.
+fn codex_lane_summary_line(source: CodexLaneSource, setting: CodexLaneSetting) -> Option<String> {
+    match (source, setting) {
+        (_, CodexLaneSetting::Unset) => None,
+        (CodexLaneSource::PolicyEnv, CodexLaneSetting::Valid(_)) => {
+            Some("CCP_CODEX_LANE_POLICY (env)".to_string())
+        }
+        (CodexLaneSource::PolicyEnv, CodexLaneSetting::Invalid) => Some(
+            "CCP_CODEX_LANE_POLICY (env): invalid value; expected full|inventory; ignored"
+                .to_string(),
+        ),
+        (CodexLaneSource::FullLaneEnv, CodexLaneSetting::Valid(_)) => {
+            Some("CCP_CODEX_FULL_LANE (env)".to_string())
+        }
+        (CodexLaneSource::FullLaneEnv, CodexLaneSetting::Invalid) => {
+            Some("CCP_CODEX_FULL_LANE (env): invalid boolean; ignored".to_string())
+        }
+        (CodexLaneSource::PolicyFile, CodexLaneSetting::Valid(policy)) => {
+            Some(format!("codex.lanePolicy: {}", policy.as_str()))
+        }
+        (CodexLaneSource::PolicyFile, CodexLaneSetting::Invalid) => {
+            Some("codex.lanePolicy: invalid value; expected full|inventory; ignored".to_string())
+        }
+        (CodexLaneSource::FullLaneFile, CodexLaneSetting::Valid(policy)) => Some(format!(
+            "codex.fullLane: {}",
+            policy == CodexLanePolicy::Full
+        )),
+        // A `codex.fullLane` of the wrong type fails the whole file, so an
+        // invalid legacy file value never reaches this arm.
+        (CodexLaneSource::FullLaneFile, CodexLaneSetting::Invalid) => None,
+    }
+}
+
 /// Keep Codex models off the Responses Lite lane. Lite requires
 /// `parallel_tool_calls: false`, so a model served through it answers with at
 /// most one tool call per turn and Claude Code's batched tool use becomes one
 /// full-context request per call — the dominant cost on tool-heavy work.
 ///
-/// On by default. This is the one place the proxy deliberately overrides the
-/// `use_responses_lite` flag the backend's own model listing reports; set it to
-/// `0` to go back to Lite.
-pub fn codex_full_lane() -> bool {
+/// `Full` by default. This is the one place the proxy deliberately overrides
+/// the `use_responses_lite` flag the backend's own model listing reports; set
+/// `inventory` to follow that flag again.
+///
+/// `CCP_CODEX_LANE_POLICY`, then the legacy `CCP_CODEX_FULL_LANE`, then
+/// `codex.lanePolicy`, then the legacy `codex.fullLane`. The first source that
+/// parses wins; an unusable one is skipped and reported by
+/// [`config_override_summary_lines`].
+pub fn codex_lane_policy() -> CodexLanePolicy {
     let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => return true,
-            "0" | "false" | "no" | "off" => return false,
-            _ => {}
-        }
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(enabled) = codex.full_lane
-    {
-        return enabled;
-    }
-    true
+    let codex = read_file_config(&paths::config_dir()).and_then(|file| file.codex);
+    codex_lane_settings(&env, codex.as_ref())
+        .into_iter()
+        .find_map(|(_, setting)| match setting {
+            CodexLaneSetting::Valid(policy) => Some(policy),
+            CodexLaneSetting::Unset | CodexLaneSetting::Invalid => None,
+        })
+        .unwrap_or(CodexLanePolicy::Full)
+}
+
+/// The boolean view of [`codex_lane_policy`], for callers that only ask whether
+/// the full lane is forced.
+pub fn codex_full_lane() -> bool {
+    matches!(codex_lane_policy(), CodexLanePolicy::Full)
 }
 
 pub fn codex_server_compaction() -> bool {
@@ -934,6 +1091,7 @@ mod tests {
         "CCP_CODEX_REASONING_SUMMARY",
         "CCP_CODEX_SERVER_COMPACTION",
         "CCP_CODEX_FULL_LANE",
+        "CCP_CODEX_LANE_POLICY",
         "CCP_CODEX_RESPONSES_API",
         "CCP_CODEX_IMAGES_API",
         "CCP_CODEX_IMAGES_BASE_URL",
@@ -1298,6 +1456,351 @@ mod tests {
         assert!(!codex_full_lane());
         let _enabled_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "true");
         assert!(codex_full_lane());
+    }
+
+    fn write_config(config: &tempfile::TempDir, body: &str) {
+        std::fs::write(config.path().join("config.json"), body).unwrap();
+    }
+
+    #[test]
+    fn codex_lane_policy_defaults_to_full() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(codex_lane_policy(), CodexLanePolicy::Full);
+        assert!(codex_full_lane());
+    }
+
+    #[test]
+    fn codex_lane_policy_reads_the_new_env_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        for (raw, expected) in [
+            ("full", CodexLanePolicy::Full),
+            ("inventory", CodexLanePolicy::Inventory),
+            ("FULL", CodexLanePolicy::Full),
+            ("  INVENTORY  ", CodexLanePolicy::Inventory),
+            ("\tInVeNtOrY\n", CodexLanePolicy::Inventory),
+        ] {
+            let _policy_env = EnvGuard::set("CCP_CODEX_LANE_POLICY", raw);
+            assert_eq!(codex_lane_policy(), expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn codex_lane_policy_ignores_an_unrecognized_new_env_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        let rejected = [
+            "",
+            "   ",
+            "lite",
+            "1",
+            "true",
+            "inventory-only",
+            "full-lane",
+        ];
+        for raw in rejected {
+            let _policy_env = EnvGuard::set("CCP_CODEX_LANE_POLICY", raw);
+            assert_eq!(codex_lane_policy(), CodexLanePolicy::Full, "value {raw:?}");
+        }
+
+        // An invalid new value must hand the decision to the next source rather
+        // than mask it.
+        let _legacy_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "off");
+        for raw in rejected {
+            let _policy_env = EnvGuard::set("CCP_CODEX_LANE_POLICY", raw);
+            assert_eq!(
+                codex_lane_policy(),
+                CodexLanePolicy::Inventory,
+                "value {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_lane_policy_keeps_the_legacy_env_boolean_grammar() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        for (raw, expected) in [
+            ("1", CodexLanePolicy::Full),
+            ("true", CodexLanePolicy::Full),
+            ("yes", CodexLanePolicy::Full),
+            ("on", CodexLanePolicy::Full),
+            (" On ", CodexLanePolicy::Full),
+            ("0", CodexLanePolicy::Inventory),
+            ("false", CodexLanePolicy::Inventory),
+            ("no", CodexLanePolicy::Inventory),
+            ("off", CodexLanePolicy::Inventory),
+            (" OFF ", CodexLanePolicy::Inventory),
+            // Unparsable values keep falling through to the default.
+            ("", CodexLanePolicy::Full),
+            ("maybe", CodexLanePolicy::Full),
+            ("2", CodexLanePolicy::Full),
+        ] {
+            let _legacy_env = EnvGuard::set("CCP_CODEX_FULL_LANE", raw);
+            assert_eq!(codex_lane_policy(), expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn codex_lane_policy_reads_the_new_file_field() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        for (raw, expected) in [
+            ("inventory", CodexLanePolicy::Inventory),
+            ("full", CodexLanePolicy::Full),
+            ("  INVENTORY  ", CodexLanePolicy::Inventory),
+            ("Full", CodexLanePolicy::Full),
+        ] {
+            write_config(&config, &format!(r#"{{"codex":{{"lanePolicy":"{raw}"}}}}"#));
+            assert_eq!(codex_lane_policy(), expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn codex_lane_policy_orders_the_four_sources() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        // Legacy file field alone still decides.
+        write_config(&config, r#"{"codex":{"fullLane":false}}"#);
+        assert_eq!(codex_lane_policy(), CodexLanePolicy::Inventory);
+
+        // The new file field beats the legacy one, in both directions.
+        write_config(
+            &config,
+            r#"{"codex":{"lanePolicy":"full","fullLane":false}}"#,
+        );
+        assert_eq!(codex_lane_policy(), CodexLanePolicy::Full);
+        write_config(
+            &config,
+            r#"{"codex":{"lanePolicy":"inventory","fullLane":true}}"#,
+        );
+        assert_eq!(codex_lane_policy(), CodexLanePolicy::Inventory);
+
+        // The legacy env var beats both file fields.
+        let _legacy_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "1");
+        assert_eq!(codex_lane_policy(), CodexLanePolicy::Full);
+
+        // The new env var beats the legacy one.
+        let _policy_env = EnvGuard::set("CCP_CODEX_LANE_POLICY", "inventory");
+        assert_eq!(codex_lane_policy(), CodexLanePolicy::Inventory);
+    }
+
+    #[test]
+    fn codex_lane_policy_falls_through_invalid_file_values_and_keeps_other_settings() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        // An unknown string hands the decision to the legacy field and leaves
+        // every other setting in the file intact.
+        write_config(
+            &config,
+            r#"{"codex":{"lanePolicy":"lite","fullLane":false,"serverCompaction":true}}"#,
+        );
+        assert_eq!(codex_lane_policy(), CodexLanePolicy::Inventory);
+        assert!(codex_server_compaction());
+
+        // A non-string value is invalid too, and must not fail the whole file.
+        for raw in ["42", "true", r#"["full"]"#, r#"{"mode":"full"}"#] {
+            write_config(
+                &config,
+                &format!(r#"{{"codex":{{"lanePolicy":{raw},"serverCompaction":true}}}}"#),
+            );
+            assert_eq!(codex_lane_policy(), CodexLanePolicy::Full, "value {raw}");
+            assert!(codex_server_compaction(), "value {raw}");
+        }
+    }
+
+    #[test]
+    fn codex_lane_policy_treats_a_missing_or_null_file_field_as_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        // Pin what serde actually does with an explicit JSON null.
+        let parsed: FileConfig = serde_json::from_str(r#"{"codex":{"lanePolicy":null}}"#).unwrap();
+        assert!(
+            parsed.codex.expect("codex block").lane_policy.is_none(),
+            "serde maps an explicit null onto None"
+        );
+
+        for body in [
+            r#"{"codex":{"lanePolicy":null,"fullLane":false}}"#,
+            r#"{"codex":{"fullLane":false}}"#,
+        ] {
+            write_config(&config, body);
+            assert_eq!(codex_lane_policy(), CodexLanePolicy::Inventory, "{body}");
+            let lines = config_override_summary_lines(&load_config());
+            assert!(
+                !lines.iter().any(|line| line.contains("lanePolicy")),
+                "an unset field must not be diagnosed: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_full_lane_wrapper_tracks_the_lane_policy() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        let assert_agrees = || {
+            assert_eq!(
+                codex_full_lane(),
+                codex_lane_policy() == CodexLanePolicy::Full
+            );
+        };
+
+        assert_agrees();
+        write_config(&config, r#"{"codex":{"lanePolicy":"inventory"}}"#);
+        assert_agrees();
+        assert!(!codex_full_lane());
+        write_config(&config, r#"{"codex":{"lanePolicy":"full"}}"#);
+        assert_agrees();
+        assert!(codex_full_lane());
+        {
+            let _policy_env = EnvGuard::set("CCP_CODEX_LANE_POLICY", "inventory");
+            assert_agrees();
+            assert!(!codex_full_lane());
+        }
+        let _legacy_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "off");
+        assert_agrees();
+        assert!(!codex_full_lane());
+    }
+
+    #[test]
+    fn codex_lane_summary_reports_valid_sources() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        write_config(
+            &config,
+            r#"{"codex":{"lanePolicy":"  INVENTORY  ","fullLane":true}}"#,
+        );
+        let _policy_env = EnvGuard::set("CCP_CODEX_LANE_POLICY", "Inventory");
+        let _legacy_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "off");
+
+        let lines = config_override_summary_lines(&load_config());
+        for expected in [
+            "CCP_CODEX_LANE_POLICY (env)",
+            "CCP_CODEX_FULL_LANE (env)",
+            "codex.lanePolicy: inventory",
+            "codex.fullLane: true",
+        ] {
+            assert!(
+                lines.iter().any(|line| line == expected),
+                "missing {expected:?} in {lines:?}"
+            );
+        }
+
+        write_config(&config, r#"{"codex":{"lanePolicy":"full"}}"#);
+        let lines = config_override_summary_lines(&load_config());
+        assert!(
+            lines.iter().any(|line| line == "codex.lanePolicy: full"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn codex_lane_summary_diagnoses_invalid_sources_without_leaking_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        write_config(&config, r#"{"codex":{"lanePolicy":"quince"}}"#);
+        let _policy_env = EnvGuard::set("CCP_CODEX_LANE_POLICY", "banana");
+        let _legacy_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "perhaps");
+
+        // Every source is unusable, so the default stands.
+        assert_eq!(codex_lane_policy(), CodexLanePolicy::Full);
+
+        let lines = config_override_summary_lines(&load_config());
+        for expected in [
+            "CCP_CODEX_LANE_POLICY (env): invalid value; expected full|inventory; ignored",
+            "CCP_CODEX_FULL_LANE (env): invalid boolean; ignored",
+            "codex.lanePolicy: invalid value; expected full|inventory; ignored",
+        ] {
+            assert!(
+                lines.iter().any(|line| line == expected),
+                "missing {expected:?} in {lines:?}"
+            );
+        }
+        // An unusable legacy var is diagnosed only, never also announced as a
+        // plain override.
+        assert!(
+            !lines.iter().any(|line| line == "CCP_CODEX_FULL_LANE (env)"),
+            "{lines:?}"
+        );
+        for secret in ["banana", "perhaps", "quince"] {
+            assert!(
+                !lines.iter().any(|line| line.contains(secret)),
+                "raw value {secret:?} leaked into {lines:?}"
+            );
+        }
+
+        // A non-string file value is diagnosed the same way.
+        write_config(&config, r#"{"codex":{"lanePolicy":17}}"#);
+        let lines = config_override_summary_lines(&load_config());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line
+                    == "codex.lanePolicy: invalid value; expected full|inventory; ignored"),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|line| line.contains("17")), "{lines:?}");
+    }
+
+    #[test]
+    fn codex_lane_summary_diagnoses_lower_sources_when_a_higher_one_wins() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        write_config(&config, r#"{"codex":{"lanePolicy":9,"fullLane":true}}"#);
+        let _policy_env = EnvGuard::set("CCP_CODEX_LANE_POLICY", "inventory");
+        let _legacy_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "perhaps");
+
+        assert_eq!(codex_lane_policy(), CodexLanePolicy::Inventory);
+
+        let lines = config_override_summary_lines(&load_config());
+        for expected in [
+            "CCP_CODEX_LANE_POLICY (env)",
+            "CCP_CODEX_FULL_LANE (env): invalid boolean; ignored",
+            "codex.lanePolicy: invalid value; expected full|inventory; ignored",
+            "codex.fullLane: true",
+        ] {
+            assert!(
+                lines.iter().any(|line| line == expected),
+                "missing {expected:?} in {lines:?}"
+            );
+        }
     }
 
     #[test]

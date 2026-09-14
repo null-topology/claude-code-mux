@@ -87,6 +87,16 @@ impl EnvGuard {
         }
         Self { key, previous }
     }
+
+    /// Remove a variable for the test's lifetime, restoring it on drop, so a
+    /// value in the developer's shell cannot steer what the proxy sends.
+    fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -1290,6 +1300,27 @@ async fn smoke_auto_review_uses_codex_default_and_configured_override() {
     assert_eq!(sent[2]["model"], "gpt-5.6-sol");
 }
 
+/// Assert that one captured upstream body is on the Responses Lite lane:
+/// the `client_metadata` marker the backend reads, plus the two fields the
+/// lane forces on every request built for it.
+fn assert_responses_lite_lane(request: &Value, label: &str) {
+    assert_eq!(
+        request.get("client_metadata"),
+        Some(&json!({
+            "ws_request_header_x_openai_internal_codex_responses_lite": "true"
+        })),
+        "{label} must carry the lite lane marker"
+    );
+    assert_eq!(
+        request["parallel_tool_calls"], false,
+        "{label} must keep the lite lane's parallel_tool_calls"
+    );
+    assert_eq!(
+        request["reasoning"]["context"], "all_turns",
+        "{label} must keep the lite lane's reasoning context"
+    );
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_http_server_compaction_replays_native_history() {
@@ -1340,6 +1371,15 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
     let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
+    // Pin the lane instead of inheriting it: under the default `full` policy no
+    // request carries `client_metadata` at all, so the lane assertions below
+    // would hold vacuously. `inventory` follows the backend's own flag, which
+    // for `gpt-5.6-sol` is lite from the compiled-in table while no model
+    // listing has been fetched (this binary never fetches one).
+    let _lane_policy_env = EnvGuard::set("CCP_CODEX_LANE_POLICY", "inventory");
+    // Neither of these may decide which lane the request lands on.
+    let _codex_model_env = EnvGuard::unset("CCP_CODEX_MODEL");
+    let _originator_env = EnvGuard::unset("CCP_CODEX_ORIGINATOR");
     let compact_response = call_messages_body(json!({
         "model": "gpt-5.6-sol",
         "max_tokens": 64,
@@ -1379,11 +1419,11 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[0]["model"], "gpt-5.6-sol");
     // The compaction call must run on the same Responses lane as the
-    // conversation it compacts; `client_metadata` is what marks the lite lane.
-    assert_eq!(
-        requests[0].get("client_metadata"),
-        requests[1].get("client_metadata")
-    );
+    // conversation it compacts, and the replay after it must stay on that lane
+    // too. Assert the marker on each request rather than comparing two of them:
+    // an equality check passes when both sides are absent.
+    assert_responses_lite_lane(&requests[0], "the compaction request");
+    assert_responses_lite_lane(&requests[1], "the summary request");
     assert_eq!(
         requests[0]["input"].as_array().unwrap().last().unwrap()["type"],
         "compaction_trigger"
@@ -1400,10 +1440,7 @@ async fn smoke_codex_http_server_compaction_replays_native_history() {
     );
     assert!(!requests[1].to_string().contains("opaque-history"));
     let replay = requests[2]["input"].as_array().unwrap();
-    assert_eq!(
-        requests[2].get("client_metadata"),
-        requests[1].get("client_metadata")
-    );
+    assert_responses_lite_lane(&requests[2], "the replay request");
     assert!(requests[2].to_string().contains("current instructions"));
     let compaction = replay
         .iter()

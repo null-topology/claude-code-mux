@@ -1944,20 +1944,76 @@ mod tests {
         }
     }
 
+    const LANE_POLICY_VAR: &str = "CCP_CODEX_LANE_POLICY";
+
+    /// Pins the lane policy for as long as it is held and restores the previous
+    /// value on drop, unwinding included. `CCP_CODEX_LANE_POLICY` is the first
+    /// source the resolver consults, so pinning it also overrides an inherited
+    /// legacy `CCP_CODEX_FULL_LANE` and both config-file spellings.
+    struct LanePolicyGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl LanePolicyGuard {
+        fn pin(policy: &str) -> Self {
+            let previous = std::env::var_os(LANE_POLICY_VAR);
+            unsafe {
+                std::env::set_var(LANE_POLICY_VAR, policy);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for LanePolicyGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(LANE_POLICY_VAR, value),
+                    None => std::env::remove_var(LANE_POLICY_VAR),
+                }
+            }
+        }
+    }
+
     #[test]
     fn requests_without_web_search_keep_model_and_lane() {
         let body = request_with_tools(serde_json::json!([
             {"name":"Bash", "input_schema":{}}
         ]));
-        for resolved in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.4"] {
-            let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request(&mut model, &body);
-            assert_eq!(model, resolved, "model must not change without web_search");
-            assert_eq!(
-                lite,
-                uses_responses_lite(resolved),
-                "{resolved} without web_search keeps the lane it is configured for"
-            );
+        // With no listing remembered, the compiled-in lane table is what
+        // `inventory` follows, so the expectations below are fixed.
+        super::models::clear_discovered_models_for_tests();
+
+        for (policy, expected) in [
+            (
+                "full",
+                [
+                    ("gpt-5.6-luna", false),
+                    ("gpt-5.6-sol", false),
+                    ("gpt-5.4", false),
+                ],
+            ),
+            (
+                "inventory",
+                [
+                    ("gpt-5.6-luna", true),
+                    ("gpt-5.6-sol", true),
+                    // Not every model is lite under `inventory`: the policy
+                    // follows the inventory, it does not force the lite lane.
+                    ("gpt-5.4", false),
+                ],
+            ),
+        ] {
+            let _lane = LanePolicyGuard::pin(policy);
+            for (resolved, expected_lite) in expected {
+                let mut model = resolved.to_string();
+                let lite = apply_model_lane_for_request(&mut model, &body);
+                assert_eq!(model, resolved, "model must not change without web_search");
+                assert_eq!(
+                    lite, expected_lite,
+                    "{resolved} without web_search on the {policy} lane policy"
+                );
+            }
         }
     }
 
