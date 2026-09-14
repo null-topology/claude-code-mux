@@ -350,6 +350,223 @@ mod tests {
     }
 
     #[test]
+    fn one_result_loads_every_referenced_deferred_tool_once() {
+        let req = request(json!({
+            "model": "gpt-5.6-sol",
+            "tools": [
+                tool_search_tool(),
+                {"name": "DeferredToolPlaceholder", "defer_loading": true, "input_schema": {"type": "object"}},
+                {"name": "ZebraTool", "defer_loading": true, "input_schema": {"type": "object"}},
+                {"name": "AlphaTool", "defer_loading": true, "input_schema": {"type": "object"}},
+                {"name": "CronList", "defer_loading": true, "input_schema": {"type": "object"}}
+            ],
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_s", "name": "ToolSearch", "input": {"query": "select:ZebraTool,AlphaTool,CronList", "max_results": 3}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_s", "content": [
+                        {"type": "tool_reference", "tool_name": "ZebraTool"},
+                        {"type": "tool_reference", "tool_name": "AlphaTool"},
+                        {"type": "tool_reference", "tool_name": "CronList"},
+                        {"type": "tool_reference", "tool_name": "AlphaTool"}
+                    ]}
+                ]}
+            ]
+        }));
+        let plan = plan(&req).expect("plan");
+        let mut loaded: Vec<&str> = plan.loaded.iter().map(String::as_str).collect();
+        loaded.sort_unstable();
+        assert_eq!(loaded, vec!["AlphaTool", "CronList", "ZebraTool"]);
+
+        // One search's output carries them in reference order, first mention
+        // wins; the deferred map is only the lookup, it does not reorder.
+        let content = json!([
+            {"type": "tool_reference", "tool_name": "ZebraTool"},
+            {"type": "tool_reference", "tool_name": "AlphaTool"},
+            {"type": "tool_reference", "tool_name": "CronList"},
+            {"type": "tool_reference", "tool_name": "AlphaTool"}
+        ]);
+        let names: Vec<&str> = plan
+            .referenced_deferred_tools(&content)
+            .into_iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(names, vec!["ZebraTool", "AlphaTool", "CronList"]);
+
+        for name in ["ZebraTool", "AlphaTool", "CronList"] {
+            assert!(!plan.keeps_in_head(&json!({"name": name, "defer_loading": true})));
+        }
+        assert!(
+            plan.keeps_in_head(&json!({"name": "DeferredToolPlaceholder", "defer_loading": true}))
+        );
+    }
+
+    #[test]
+    fn searches_across_turns_accumulate_loaded_tools() {
+        let req = request(json!({
+            "model": "gpt-5.6-sol",
+            "tools": [
+                tool_search_tool(),
+                {"name": "DeferredToolPlaceholder", "defer_loading": true, "input_schema": {"type": "object"}},
+                {"name": "CronList", "defer_loading": true, "input_schema": {"type": "object"}},
+                {"name": "AlphaTool", "defer_loading": true, "input_schema": {"type": "object"}}
+            ],
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_s1", "name": "ToolSearch", "input": {"query": "select:CronList", "max_results": 1}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_s1", "content": [
+                        {"type": "tool_reference", "tool_name": "CronList"}
+                    ]}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_s2", "name": "ToolSearch", "input": {"query": "select:AlphaTool", "max_results": 1}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_s2", "content": [
+                        {"type": "tool_reference", "tool_name": "AlphaTool"}
+                    ]}
+                ]}
+            ]
+        }));
+        let plan = plan(&req).expect("plan");
+        assert!(plan.is_tool_search_call("call_s1"));
+        assert!(plan.is_tool_search_call("call_s2"));
+        assert_eq!(
+            plan.loaded,
+            HashSet::from(["CronList".to_string(), "AlphaTool".to_string()])
+        );
+        assert!(!plan.keeps_in_head(&json!({"name": "CronList", "defer_loading": true})));
+        assert!(!plan.keeps_in_head(&json!({"name": "AlphaTool", "defer_loading": true})));
+        assert!(
+            plan.keeps_in_head(&json!({"name": "DeferredToolPlaceholder", "defer_loading": true}))
+        );
+
+        // Each search still expands only what it referenced.
+        let first = plan.referenced_deferred_tools(&json!([
+            {"type": "tool_reference", "tool_name": "CronList"}
+        ]));
+        let second = plan.referenced_deferred_tools(&json!([
+            {"type": "tool_reference", "tool_name": "AlphaTool"}
+        ]));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["name"], "CronList");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0]["name"], "AlphaTool");
+    }
+
+    #[test]
+    fn loading_an_already_loaded_tool_again_changes_nothing() {
+        let tools = json!([
+            tool_search_tool(),
+            {"name": "DeferredToolPlaceholder", "defer_loading": true, "input_schema": {"type": "object"}},
+            {"name": "CronList", "defer_loading": true, "input_schema": {"type": "object"}},
+            {"name": "Read", "input_schema": {"type": "object"}}
+        ]);
+        let first_search = json!([
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "call_s1", "name": "ToolSearch", "input": {"query": "select:CronList", "max_results": 1}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_s1", "content": [
+                    {"type": "tool_reference", "tool_name": "CronList"}
+                ]}
+            ]}
+        ]);
+        let mut repeated = first_search.as_array().unwrap().clone();
+        repeated.push(json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "call_s2", "name": "ToolSearch", "input": {"query": "select:CronList", "max_results": 1}}
+        ]}));
+        repeated.push(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_s2", "content": [
+                {"type": "tool_reference", "tool_name": "CronList"},
+                {"type": "tool_reference", "tool_name": "CronList"}
+            ]}
+        ]}));
+
+        let once = plan(&request(json!({
+            "model": "gpt-5.6-sol",
+            "tools": tools,
+            "messages": first_search
+        })))
+        .expect("plan");
+        let twice = plan(&request(json!({
+            "model": "gpt-5.6-sol",
+            "tools": tools,
+            "messages": Value::Array(repeated)
+        })))
+        .expect("plan");
+
+        assert_eq!(once.loaded, HashSet::from(["CronList".to_string()]));
+        assert_eq!(twice.loaded, once.loaded);
+        assert_eq!(twice.call_ids.len(), 2);
+        for tool in [
+            json!({"name": "DeferredToolPlaceholder", "defer_loading": true}),
+            json!({"name": "CronList", "defer_loading": true}),
+            json!({"name": "Read"}),
+        ] {
+            assert_eq!(twice.keeps_in_head(&tool), once.keeps_in_head(&tool));
+        }
+
+        // The repeat's own output carries the tool once, not twice.
+        let names: Vec<&str> = twice
+            .referenced_deferred_tools(&json!([
+                {"type": "tool_reference", "tool_name": "CronList"},
+                {"type": "tool_reference", "tool_name": "CronList"}
+            ]))
+            .into_iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(names, vec!["CronList"]);
+    }
+
+    #[test]
+    fn references_to_unknown_or_non_deferred_tools_load_nothing() {
+        let req = request(json!({
+            "model": "gpt-5.6-sol",
+            "tools": [
+                tool_search_tool(),
+                {"name": "CronList", "defer_loading": true, "input_schema": {"type": "object"}},
+                {"name": "Read", "input_schema": {"type": "object"}}
+            ],
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_s", "name": "ToolSearch", "input": {"query": "select:NoSuchTool,Read", "max_results": 2}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_s", "content": [
+                        {"type": "tool_reference", "tool_name": "NoSuchTool"},
+                        {"type": "tool_reference", "tool_name": "Read"},
+                        {"type": "text", "text": "no deferred tool matched"}
+                    ]}
+                ]}
+            ]
+        }));
+        let plan = plan(&req).expect("plan");
+        assert!(plan.is_tool_search_call("call_s"));
+        assert!(plan.loaded.is_empty());
+        assert!(plan.keeps_in_head(&json!({"name": "CronList", "defer_loading": true})));
+
+        let content = json!([
+            {"type": "tool_reference", "tool_name": "NoSuchTool"},
+            {"type": "tool_reference", "tool_name": "Read"},
+            {"type": "text", "text": "no deferred tool matched"}
+        ]);
+        // Extraction keeps every referenced name; only the deferred map filters.
+        assert_eq!(
+            referenced_tool_names(&content),
+            vec!["NoSuchTool".to_string(), "Read".to_string()]
+        );
+        assert!(plan.referenced_deferred_tools(&content).is_empty());
+
+        // A result that is not a block array carries no references at all.
+        assert!(referenced_tool_names(&json!("no deferred tool matched")).is_empty());
+        assert!(plan.referenced_deferred_tools(&Value::Null).is_empty());
+    }
+
+    #[test]
     fn other_events_are_left_alone() {
         assert!(
             normalize_stream_event(&json!({

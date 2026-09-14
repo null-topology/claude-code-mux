@@ -328,4 +328,194 @@ mod tests {
         assert_eq!(summary.input_image_part_count, 2);
         assert!(summary.input_image_data_url_bytes > 0);
     }
+
+    fn item_json_bytes(item: &ResponsesInputItem) -> u64 {
+        serde_json::to_string(&serde_json::to_value(item).unwrap())
+            .unwrap()
+            .len() as u64
+    }
+
+    #[test]
+    fn summarize_reports_tool_search_items_and_tool() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "load a tool"}]
+                },
+                {
+                    "type": "tool_search_call",
+                    "call_id": "toolsearch_1",
+                    "execution": "client",
+                    "status": "completed",
+                    "arguments": {"query": "read a file"}
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "toolsearch_1",
+                    "status": "completed",
+                    "execution": "client",
+                    "tools": [{
+                        "type": "function",
+                        "name": "Read",
+                        "parameters": {"type": "object"},
+                        "defer_loading": true
+                    }]
+                }
+            ],
+            "tools": [
+                {"type": "function", "name": "Bash", "parameters": {"type": "object"}},
+                {
+                    "type": "tool_search",
+                    "execution": "client",
+                    "description": "Search the deferred tools",
+                    "parameters": {"type": "object"}
+                }
+            ],
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "text": {"verbosity": "low"}
+        }))
+        .unwrap();
+
+        let summary = summarize_codex_request_size(&req);
+
+        assert_eq!(summary.input_item_count, 3);
+        assert_eq!(
+            summary.input_type_counts,
+            std::collections::BTreeMap::from([
+                ("message".to_string(), 1),
+                ("tool_search_call".to_string(), 1),
+                ("tool_search_output".to_string(), 1),
+            ])
+        );
+        // Tool search items carry no role, so only the message is counted.
+        assert_eq!(
+            summary.role_counts,
+            std::collections::BTreeMap::from([("user".to_string(), 1)])
+        );
+
+        let call = summary
+            .largest_input_items
+            .iter()
+            .find(|item| item.r#type == "tool_search_call")
+            .expect("tool_search_call is reported");
+        assert_eq!(call.index, 1);
+        assert_eq!(call.role, None);
+        assert_eq!(call.json_bytes, item_json_bytes(&req.input[1]));
+
+        let output = summary
+            .largest_input_items
+            .iter()
+            .find(|item| item.r#type == "tool_search_output")
+            .expect("tool_search_output is reported");
+        assert_eq!(output.index, 2);
+        assert_eq!(output.role, None);
+        assert_eq!(output.json_bytes, item_json_bytes(&req.input[2]));
+
+        assert_eq!(summary.tool_count, 2);
+        let mut tool_names: Vec<&str> = summary
+            .largest_tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        tool_names.sort_unstable();
+        assert_eq!(tool_names, ["Bash", "tool_search"]);
+        assert_eq!(summary.input_image_part_count, 0);
+    }
+
+    #[test]
+    fn summarize_tolerates_empty_tool_search_shapes() {
+        // A search still running (`arguments: null`), one with an empty
+        // argument object, an output that loaded nothing, and no tools at all.
+        // An entirely absent `arguments` key fails to deserialize, so the
+        // summary never sees that shape.
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "input": [
+                {
+                    "type": "tool_search_call",
+                    "call_id": "",
+                    "execution": "client",
+                    "status": "in_progress",
+                    "arguments": null
+                },
+                {
+                    "type": "tool_search_call",
+                    "call_id": "toolsearch_1",
+                    "execution": "client",
+                    "status": "completed",
+                    "arguments": {}
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "toolsearch_1",
+                    "status": "completed",
+                    "execution": "client",
+                    "tools": []
+                }
+            ],
+            "tools": [],
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "text": {"verbosity": "low"}
+        }))
+        .unwrap();
+
+        let summary = summarize_codex_request_size(&req);
+
+        assert_eq!(summary.input_item_count, 3);
+        assert_eq!(
+            summary.input_type_counts,
+            std::collections::BTreeMap::from([
+                ("tool_search_call".to_string(), 2),
+                ("tool_search_output".to_string(), 1),
+            ])
+        );
+        assert!(summary.role_counts.is_empty());
+        assert_eq!(summary.tool_count, 0);
+        assert!(summary.largest_tools.is_empty());
+        assert_eq!(summary.tools_json_bytes, 2); // "[]"
+        assert_eq!(summary.input_image_part_count, 0);
+        assert!(summary.body_json_bytes > 0);
+    }
+
+    #[test]
+    fn summarize_reports_a_tool_search_tool_with_no_items() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }],
+            "tools": [{
+                "type": "tool_search",
+                "execution": "client",
+                "description": "Search the deferred tools",
+                "parameters": {"type": "object"}
+            }],
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "text": {"verbosity": "low"}
+        }))
+        .unwrap();
+
+        let summary = summarize_codex_request_size(&req);
+
+        assert_eq!(summary.tool_count, 1);
+        assert_eq!(summary.largest_tools.len(), 1);
+        assert_eq!(summary.largest_tools[0].name, "tool_search");
+        assert_eq!(summary.largest_tools[0].index, 0);
+        assert!(summary.largest_tools[0].json_bytes > 0);
+        assert_eq!(
+            summary.input_type_counts,
+            std::collections::BTreeMap::from([("message".to_string(), 1)])
+        );
+    }
 }

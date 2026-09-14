@@ -271,4 +271,161 @@ mod tests {
         assert_eq!(approx_reasoning_token_count(&encoded_content), 588);
         assert_eq!(approx_reasoning_token_count("short"), 0);
     }
+
+    const TOOL_SEARCH_DESCRIPTION: &str = "Search the deferred tools";
+
+    fn tool_search_call_arguments() -> serde_json::Value {
+        json!({"query": "read a file"})
+    }
+
+    fn tool_search_loaded_tools() -> Vec<serde_json::Value> {
+        vec![json!({
+            "type": "function",
+            "name": "Read",
+            "description": "Read a file from disk",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            "defer_loading": true,
+        })]
+    }
+
+    fn tool_search_tool_parameters() -> serde_json::Value {
+        json!({"type": "object", "properties": {"query": {"type": "string"}}})
+    }
+
+    /// A translated request with a client-executed tool search replayed in the
+    /// history, or the same request without any of it.
+    fn tool_search_request(with_tool_search: bool) -> ResponsesRequest {
+        let mut input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "load a tool"}],
+        })];
+        let mut tools = vec![json!({
+            "type": "function",
+            "name": "Bash",
+            "parameters": {"type": "object"},
+        })];
+        if with_tool_search {
+            input.push(json!({
+                "type": "tool_search_call",
+                "call_id": "toolsearch_1",
+                "execution": "client",
+                "status": "completed",
+                "arguments": tool_search_call_arguments(),
+            }));
+            input.push(json!({
+                "type": "tool_search_output",
+                "call_id": "toolsearch_1",
+                "status": "completed",
+                "execution": "client",
+                "tools": tool_search_loaded_tools(),
+            }));
+            tools.push(json!({
+                "type": "tool_search",
+                "execution": "client",
+                "description": TOOL_SEARCH_DESCRIPTION,
+                "parameters": tool_search_tool_parameters(),
+            }));
+        }
+        serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "input": input,
+            "tools": tools,
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "text": {"verbosity": "low"},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn tool_search_items_and_tool_add_their_serialized_size() {
+        let with = tool_search_request(true);
+        let without = tool_search_request(false);
+
+        assert!(matches!(
+            with.input[1],
+            ResponsesInputItem::ToolSearchCall { .. }
+        ));
+        assert!(matches!(
+            with.input[2],
+            ResponsesInputItem::ToolSearchOutput { .. }
+        ));
+        assert!(matches!(
+            with.tools.as_ref().unwrap()[1],
+            ResponsesTool::ToolSearch(_)
+        ));
+
+        // The counting rule: a tool search call contributes only its
+        // `arguments` JSON, its output only the JSON of each loaded tool spec,
+        // and the tool definition its description plus its `parameters` JSON.
+        // `call_id`, `status`, `execution` and the tool's `type` add nothing
+        // beyond the flat 4-token framing charged per input item and per tool.
+        let expected_delta =
+            approx_token_count(&serde_json::to_string(&tool_search_call_arguments()).unwrap())
+                + tool_search_loaded_tools()
+                    .iter()
+                    .map(|tool| approx_token_count(&serde_json::to_string(tool).unwrap()))
+                    .sum::<u64>()
+                + approx_token_count(TOOL_SEARCH_DESCRIPTION)
+                + approx_token_count(
+                    &serde_json::to_string(&tool_search_tool_parameters()).unwrap(),
+                )
+                + 2 * 4
+                + 4;
+
+        let with_count = count_translated_tokens(&with);
+        let without_count = count_translated_tokens(&without);
+        assert!(with_count > without_count);
+        assert_eq!(with_count, without_count + expected_delta);
+    }
+
+    #[test]
+    fn tool_search_estimate_is_stable_across_identical_calls() {
+        let req = tool_search_request(true);
+        let first = count_translated_tokens(&req);
+        assert!(first > 0);
+        assert_eq!(first, count_translated_tokens(&req));
+        assert_eq!(first, count_translated_tokens(&tool_search_request(true)));
+    }
+
+    #[test]
+    fn empty_tool_search_shapes_count_without_panicking() {
+        // A search still running (`arguments: null`) and one that loaded no
+        // tool, with an empty tools list. An entirely absent `arguments` key
+        // fails to deserialize, so it never reaches the counter.
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "input": [
+                {
+                    "type": "tool_search_call",
+                    "call_id": "",
+                    "execution": "client",
+                    "status": "in_progress",
+                    "arguments": null,
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "",
+                    "status": "completed",
+                    "execution": "client",
+                    "tools": [],
+                }
+            ],
+            "tools": [],
+            "store": false,
+            "stream": true,
+            "parallel_tool_calls": true,
+            "text": {"verbosity": "low"},
+        }))
+        .unwrap();
+
+        // Only the serialized `null`, the two per-item overheads and the model
+        // name remain; an output that loaded nothing contributes no content.
+        assert_eq!(
+            count_translated_tokens(&req),
+            approx_token_count("null") + 2 * 4 + approx_token_count("gpt-5.5")
+        );
+    }
 }
