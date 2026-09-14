@@ -464,7 +464,7 @@ captures, and error dumps go to `~/.local/state/claude-code-proxy`.
 | `CCP_CODEX_MODEL` | unset | Send this Codex model regardless of what the client asked for. |
 | `CCP_CODEX_QUOTA_WARN_AT` | `0.9` session, `0.75` weekly | Utilization above which a window is reported as past its warning threshold. One value lowers both. |
 | `CCP_CODEX_SERVER_COMPACTION` | off | Let Codex compact long histories server-side. |
-| `CCP_CODEX_FULL_LANE` | on | Keep Codex models off the Responses Lite lane so they can answer with several tool calls at once. Set to `0` for Lite. |
+| `CCP_CODEX_LANE_POLICY` | `full` | `full` keeps Codex models off the Responses Lite lane so they can answer with several tool calls at once; `inventory` follows the lane flag from the backend's own model listing. The legacy `CCP_CODEX_FULL_LANE` boolean still works. |
 | `CCP_CODEX_RESPONSES_API` | off | Also expose `/v1/responses` and `/v1/chat/completions` for OpenAI-style clients. |
 | `CCP_AUTO_REVIEW_MODEL` | `gpt-5.6-luna` | Model for Claude Code's background security classifier when the session runs on Codex. |
 | `CCP_ALIAS_PROVIDER` | `anthropic` | Backend for the Claude aliases. Leave it alone unless you want `opus` to stop meaning Claude. |
@@ -483,8 +483,37 @@ each of those becomes its own request carrying the whole conversation again.
 The proxy therefore uses the full Responses lane by default, where parallel tool
 calls work. `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra` and `gpt-6-astra`
 were each verified to answer there. This is the one place the proxy overrides
-what the backend's inventory says; `CCP_CODEX_FULL_LANE=0` (or
-`codex.fullLane: false`) puts the marked models back on Lite.
+what the backend's inventory says, and `CCP_CODEX_LANE_POLICY` picks between
+the two behaviors:
+
+| value | lane for an ordinary request |
+| --- | --- |
+| `full` (default) | The full lane, whatever the inventory says. |
+| `inventory` | Whatever `use_responses_lite` said in the last successful model listing; for a model that listing did not name, or named without the flag, the built-in table, which marks `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra` and `gpt-6-astra` as Lite. |
+
+`inventory` is not "force Lite" — it hands the decision back to the backend's
+own flag — and it costs no extra call: the flag comes from the listing
+`/v1/models` already fetched, held in memory and not kept across restarts.
+
+Values are trimmed and case-insensitive. Four sources are read in this order
+and the first one that parses decides: `CCP_CODEX_LANE_POLICY`, the legacy
+`CCP_CODEX_FULL_LANE`, `codex.lanePolicy` in `config.json`, the legacy
+`codex.fullLane`. The booleans keep their old meaning — `1`/`true`/`yes`/`on`
+is `full`, `0`/`false`/`no`/`off` is `inventory` — so an existing
+`CCP_CODEX_FULL_LANE=0` or `codex.fullLane: false` still puts the marked models
+back on Lite. A value the grammar does not accept is skipped rather than
+obeyed: the config summary reports it — for an unusable environment value,
+`CCP_CODEX_LANE_POLICY (env): invalid value; expected full|inventory; ignored`
+— and the next source decides.
+
+A request carrying the hosted `web_search_20250305` tool goes on the full lane
+whatever the policy says, because the Lite lane only accepts function and
+custom tools. On `gpt-5.6-luna` such a request is currently sent as
+`gpt-5.6-sol` instead. The 404 that this substitution was written for did not
+reproduce when ordinary full-lane requests were rechecked, and the substitution
+itself has not been retested. A request whose `tool_choice` pins the hosted
+`web_search` tool takes a separate path that builds its own search request and
+keeps the requested model, `gpt-5.6-luna` included.
 
 ### Commands
 

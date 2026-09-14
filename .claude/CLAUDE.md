@@ -176,6 +176,18 @@ Request path:
    overrides only the config dir), `config.rs` (precedence: `CCP_*` env, then
    `config.json` in the config dir, then default).
 
+The Codex lane setting has a chain of its own in `config.rs`:
+`CCP_CODEX_LANE_POLICY` (`full|inventory`, default `full`), then the legacy
+`CCP_CODEX_FULL_LANE`, then `codex.lanePolicy`, then the legacy
+`codex.fullLane`. The first source that parses wins. For both env keys and for
+`codex.lanePolicy`, a value that does not parse is invalid rather than unset:
+it is skipped and reported by `config_override_summary_lines`, which names the
+source without echoing what was set. `codex.lanePolicy` is deserialized as a
+raw `Value`, so an unusable value there is ignored on its own instead of
+failing the whole file; the legacy `codex.fullLane` keeps its boolean grammar
+and a wrong type there still fails the whole file in serde, which is why its
+invalid arm is unreachable and reports nothing.
+
 All conversation state (sessions, continuations, compaction, WebSocket pool)
 lives in process-wide statics. A restart clears it.
 
@@ -382,10 +394,23 @@ compatibility contracts, not the user-facing name. Do not rename them:
 `providers/codex/models.rs` calls `GET {api root}/models?client_version=X` on
 the Codex CLI's bearer (the completions URL with `/responses` replaced by
 `/models`), forwards the entries as the backend sent them, and remembers the
-slugs so routing and `assert_allowed_model` accept them; `use_responses_lite`
-from the listing overrides the compiled-in lane table. Nothing is cached
+slugs so routing and `assert_allowed_model` accept them; under the `inventory`
+lane policy `use_responses_lite` from the listing overrides the compiled-in
+lane table, while under the default `full` policy the proxy forces the full
+lane for every model and ignores that flag entirely
+(`uses_responses_lite_with_full_lane` in
+`providers/codex/translate/model_allowlist.rs`). Nothing is cached
 across calls or restarts, deliberately: a consumer that reads the listing as
 the truth about available models must see changes, not a stale fallback.
+
+Hosted web search sits outside the policy: a request carrying the hosted
+`web_search_20250305` tool is forced onto the full lane, and there a non-forced
+`gpt-5.6-luna` is rewritten to `gpt-5.6-sol` (`apply_model_lane_for_request`,
+`full_lane_web_search_model`). The forced standalone `/alpha/search` path
+(`is_standalone_search_request`) builds a request of its own and keeps the
+model that was asked for. The rewrite rests on no reproducible capture of a
+Luna refusal on the full lane, and no live capability check has been run
+either way.
 
 Verified live 2026-09-11: the call answers 200 with the proxy's own
 `originator`, with or without `ChatGPT-Account-Id`, and while the weekly
