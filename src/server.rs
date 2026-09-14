@@ -1,5 +1,5 @@
 use crate::{
-    anthropic::json_error,
+    anthropic::{MAX_ANTHROPIC_REQUEST_BYTES, json_error},
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle, UsageFields, UsageReport},
     openai_compat::{
@@ -58,6 +58,20 @@ const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-5.6-luna";
 struct AutoReviewRoute {
     requested_model: String,
     override_model: String,
+}
+
+/// Whether reading a body stopped because it passed the limit rather than
+/// because the connection failed. The limit is enforced by `Limited`, which
+/// reports it as a `LengthLimitError` under axum's own error.
+fn body_exceeded_limit(err: &axum::Error) -> bool {
+    let mut error: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(source) = error {
+        if source.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        error = std::error::Error::source(source);
+    }
+    false
 }
 
 /// The conversation lane the monitor tracks prompt caching in. Subagents share
@@ -1495,14 +1509,26 @@ async fn dispatch_request(
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_ANTHROPIC_REQUEST_BYTES).await
+    {
         Ok(bytes) => bytes,
         Err(err) => {
-            let response = json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!("Invalid JSON: {err}"),
-            );
+            // A body stopped for its size is not a malformed one: saying
+            // "invalid JSON" here would send the caller after a parse error
+            // that never happened.
+            let response = if body_exceeded_limit(&err) {
+                json_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_too_large",
+                    "Request body exceeded the size limit",
+                )
+            } else {
+                json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("Invalid JSON: {err}"),
+                )
+            };
             log_request_completed(
                 &log,
                 RequestLogContext {
