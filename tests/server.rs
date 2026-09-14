@@ -4,8 +4,10 @@ use axum::http::{Method, Request, StatusCode};
 use axum::response::IntoResponse;
 use claude_code_mux::{
     MessagesRequest,
+    anthropic::MAX_ANTHROPIC_REQUEST_BYTES,
     config::AliasProvider,
     monitor::{MonitorHandle, RequestStatus, UsageQuality},
+    openai_compat::MAX_OPENAI_REQUEST_BYTES,
     provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
     registry::Registry,
     request_identity::ConversationIdentity,
@@ -541,6 +543,125 @@ async fn missing_model_returns_400() {
         .unwrap();
     let error_type = body["error"]["type"].as_str().unwrap_or("");
     assert_eq!(error_type, "invalid_request_error");
+}
+
+/// A well-formed Anthropic request body of exactly `bytes` bytes, grown to
+/// length by a padding field. It names no model on purpose: a body that clears
+/// the size gate is answered by model validation, which is how a test tells the
+/// two apart.
+fn padded_messages_body(bytes: usize) -> Body {
+    const PREFIX: &str = r#"{"messages":[{"role":"user","content":"hello"}],"padding":""#;
+    const SUFFIX: &str = r#""}"#;
+    let padding = bytes
+        .checked_sub(PREFIX.len() + SUFFIX.len())
+        .expect("a body long enough to hold the padding field");
+    let text = format!("{PREFIX}{}{SUFFIX}", "a".repeat(padding));
+    assert_eq!(text.len(), bytes);
+    Body::from(text)
+}
+
+async fn post_anthropic(uri: &str, body: Body) -> (StatusCode, Value) {
+    let response = app(Arc::new(Registry::with_default_alias()))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let value: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap();
+    (status, value)
+}
+
+/// An image-heavy Claude Code history runs past the limit the
+/// OpenAI-compatible routes use. A body over it reaches model validation, and
+/// that answer is the proof it was read whole rather than cut short.
+#[tokio::test]
+async fn an_anthropic_body_over_the_openai_limit_is_read_whole() {
+    let (status, body) = post_anthropic(
+        "/v1/messages",
+        padded_messages_body(MAX_OPENAI_REQUEST_BYTES + 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(message.starts_with("Missing \"model\""), "{message}");
+}
+
+#[tokio::test]
+async fn an_anthropic_body_at_the_limit_is_read_whole() {
+    let (status, body) = post_anthropic(
+        "/v1/messages",
+        padded_messages_body(MAX_ANTHROPIC_REQUEST_BYTES),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(message.starts_with("Missing \"model\""), "{message}");
+}
+
+/// Past the limit the body is refused for its size, on both Anthropic routes,
+/// and says so in the shape an Anthropic client parses. Reporting it as invalid
+/// JSON would send the caller looking at the wrong thing.
+#[tokio::test]
+async fn an_oversized_anthropic_body_is_refused_as_too_large() {
+    for uri in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let (status, body) =
+            post_anthropic(uri, padded_messages_body(MAX_ANTHROPIC_REQUEST_BYTES + 1)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+        assert_eq!(body["type"].as_str(), Some("error"), "{uri}");
+        assert_eq!(
+            body["error"]["type"].as_str(),
+            Some("request_too_large"),
+            "{uri}"
+        );
+        assert_eq!(
+            body["error"]["message"].as_str(),
+            Some("Request body exceeded the size limit"),
+            "{uri}"
+        );
+    }
+}
+
+/// The OpenAI-compatible surfaces keep the limit they had; only the Anthropic
+/// routes were raised.
+#[tokio::test]
+async fn the_openai_compatible_route_keeps_its_own_body_limit() {
+    let response = app_with_features(
+        Arc::new(Registry::with_default_alias()),
+        None,
+        AppFeatures {
+            responses_api: true,
+            images_api: false,
+            transcriptions_api: false,
+        },
+    )
+    .oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(padded_messages_body(MAX_OPENAI_REQUEST_BYTES + 1))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body: Value = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap();
+    assert_eq!(body["error"]["code"].as_str(), Some("request_too_large"));
 }
 
 #[test]
