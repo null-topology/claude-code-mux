@@ -44,6 +44,11 @@ pub fn apply_summary_route(body: &mut MessagesRequest, model: &str) {
         .insert("output_config".to_string(), json!({"effort": "low"}));
 }
 
+/// Claude Code puts the label prompt in the closing text block of the last user
+/// message, on its own. Other callers quote a subagent's transcript into the
+/// message they send, so the same sentence turns up inside a much longer block
+/// that asks for something else; matching it there answers the wrong request.
+/// The prompt has to open the block, not merely appear somewhere in it.
 pub fn is_agent_summary_request(body: &MessagesRequest) -> bool {
     let Some(last) = body.messages.last() else {
         return false;
@@ -51,7 +56,8 @@ pub fn is_agent_summary_request(body: &MessagesRequest) -> bool {
     if last.role != "user" {
         return false;
     }
-    message_text(&last.content).contains(SUMMARY_PROMPT_MARKER)
+    last_text_block(&last.content)
+        .is_some_and(|text| text.trim_start().starts_with(SUMMARY_PROMPT_MARKER))
 }
 
 /// A label for what the agent is doing, taken from the last tool call it made.
@@ -183,15 +189,16 @@ pub fn local_response(body: &MessagesRequest, text: &str) -> (Response, u64) {
     (response, output_tokens)
 }
 
-fn message_text(content: &Value) -> String {
+/// The closing text of a message: the whole thing when the content is a plain
+/// string, otherwise the last text block, past the tool results that precede it.
+fn last_text_block(content: &Value) -> Option<&str> {
     match content {
-        Value::String(text) => text.clone(),
+        Value::String(text) => Some(text.as_str()),
         Value::Array(blocks) => blocks
             .iter()
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+            .rev()
+            .find_map(|block| block.get("text").and_then(Value::as_str)),
+        _ => None,
     }
 }
 
@@ -239,6 +246,45 @@ mod tests {
             None
         )));
         assert!(!is_agent_summary_request(&request("user", "", None)));
+    }
+
+    /// Other callers quote a transcript into the message they send, and a
+    /// transcript of a subagent contains the label prompt verbatim. Answering
+    /// one of those with a three-word label gives the caller nothing it can
+    /// parse. The prompt has to be what the message asks for, not a line
+    /// somewhere inside it.
+    #[test]
+    fn the_prompt_must_be_the_message_rather_than_a_line_quoted_inside_it() {
+        let quoted = format!(
+            "Here is the transcript to judge:\n\
+             assistant: I will read a file\n\
+             user: {SUMMARY_PROMPT_MARKER} using present tense (-ing).\n\
+             assistant: Reading server.rs\n\
+             Answer with a verdict."
+        );
+        assert!(!is_agent_summary_request(&request("user", &quoted, None)));
+
+        // The genuine request is the prompt itself, and stays recognised even
+        // when the client indents it or adds its own trailing sentence.
+        assert!(is_agent_summary_request(&request(
+            "user",
+            "  Describe your most recent action in 3-5 words using present tense (-ing).",
+            None
+        )));
+
+        // Claude Code sends the prompt as the last block of a message that also
+        // carries the tool result the label should describe.
+        let with_tool_result: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6-astra",
+            "max_tokens": 64000,
+            "stream": true,
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "..."},
+                {"type": "text", "text": SUMMARY_PROMPT_MARKER}
+            ]}]
+        }))
+        .unwrap();
+        assert!(is_agent_summary_request(&with_tool_result));
     }
 
     #[test]

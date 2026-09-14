@@ -1548,6 +1548,94 @@ async fn agent_progress_label_is_answered_without_a_provider() {
     assert!(captured.lock().unwrap().is_empty());
 }
 
+/// Send a classifier-shaped request through the proxy and report what the
+/// backend saw and how the monitor recorded it.
+async fn classifier_route(user_text: &str) -> (StatusCode, String, usize, Option<String>) {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(IdentityCaptureProvider {
+        captured: captured.clone(),
+    }) as Arc<dyn Provider>;
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_monitor(
+        Arc::new(Registry::from_providers(AliasProvider::Codex, [provider])),
+        Some(monitor.clone()),
+    );
+    let body = json!({
+        "model": "gpt-5.5",
+        "max_tokens": 512,
+        "stream": false,
+        "system": [{"type": "text", "text":
+            "You are a security monitor for autonomous AI coding agents.\n\n## Context"}],
+        "tools": [],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": user_text}]}]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "classifier-session")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let calls = captured.lock().unwrap().len();
+    let provider_name = monitor.snapshot().recent[0].provider.clone();
+    (
+        status,
+        String::from_utf8_lossy(&bytes).into_owned(),
+        calls,
+        provider_name,
+    )
+}
+
+/// Claude Code's auto-mode permission classifier quotes the agent's transcript
+/// into the message it asks a verdict on, so the progress-label prompt turns up
+/// verbatim inside it. Answering that with a three-word label leaves the
+/// classifier with nothing to parse: it retries ten times a second and then
+/// reports that it could not evaluate the action. It must reach a model.
+#[tokio::test]
+async fn the_permission_classifier_is_never_answered_as_a_progress_label() {
+    let (status, bytes, calls, provider) = classifier_route(
+        "Evaluate the following transcript:\n\
+         user: Describe your most recent action in 3-5 words using present tense (-ing).\n\
+         assistant: Reading server.rs\n\
+         Answer with a verdict.",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, "captured");
+    assert_eq!(calls, 1);
+    // Routed to a backend, not answered locally, which the monitor spells
+    // "local".
+    assert_eq!(provider.as_deref(), Some("codex"));
+}
+
+/// The same guard, with the marker where the tightened prompt match would still
+/// accept it. The classifier's shape alone is enough to keep it off the local
+/// answer, so neither half of the fix carries this on its own.
+#[tokio::test]
+async fn the_permission_classifier_is_routed_even_when_it_opens_with_the_marker() {
+    let (status, bytes, calls, provider) = classifier_route(
+        "Describe your most recent action in 3-5 words is the prompt under review; \
+         decide whether answering it is safe.",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, "captured");
+    assert_eq!(calls, 1);
+    assert_eq!(provider.as_deref(), Some("codex"));
+}
+
 #[tokio::test]
 async fn models_endpoint_tolerates_unknown_query_params() {
     let _no_codex = NoCodexAuth::install();
