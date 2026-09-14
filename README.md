@@ -312,7 +312,90 @@ is that Codex models behave like a Claude subscription:
 `Retry-After` is deliberately not sent: clients sleep for its full value, and
 here that value is hours.
 
-## Prompt cache in the monitor
+## What the monitor counts
+
+Every count carries how well it is known. The four counts a request costs —
+uncached input, cache read, cache write, output — are each `missing` until
+something reports them, `opening` while they hold a provisional value, and
+`exact` once a final report closes them. The Codex translator estimates the
+whole prompt on a stream's first event, so its input starts as `opening` and
+the backend's own count replaces it at the end. A zero a final report carries
+is exact, and a count nobody reported is missing rather than zero: Codex
+reports no cache writes, so that count stays missing on Codex. A request
+finishing, well or badly, closes nothing; only a report does.
+
+A request that already answered with HTTP 200 can still be recorded as
+`failed`. An Anthropic Messages stream ends with `message_stop`, so a relayed
+or translated stream that ends with an `error` event, or simply stops before
+its terminal event, is recorded as failed with that reason. The status stays
+the one the client received — the headers left long before the body did — and
+the first failure observed wins, so a connection breaking after an error was
+already named keeps the named reason.
+
+Totals outlive the request list. The monitor keeps the last two hundred
+requests in full and one small numeric record per request behind them, so
+session, conversation and model figures stay right when counts arrive late,
+which the live Codex path needs: it hands the response to the client before the
+stream ends. Those records hold numbers and a little metadata, never prompts or
+bodies, and they live until the proxy restarts, so their memory grows with the
+number of requests served.
+
+Per-model figures are keyed by backend and by the model that actually ran. The
+id the client asked for is recorded as its request named it, `[1m]` suffix
+included, before the summary, classifier and alias rewrites. The model a
+provider put on the wire is recorded only when a real upstream request was
+prepared, and that one decides which rollup the tokens land on, alongside a
+count of the ids that asked for it. A model named there means the request was
+prepared, not that the backend answered. Requests the proxy answers itself name
+none, because none ran: the local `count_tokens` estimates, an agent summary
+answered from the transcript, Cursor's tool bridge. The Claude route's
+`count_tokens` is a real relay and does name one. Requests that belong to no
+conversation get a rollup of their own rather than being left as the difference
+between the others.
+
+One kind of number is kept beside those four instead of folded into them. When
+a backend reports the whole prompt without saying how much of it came from
+cache, that total is kept as the prompt size and not as a fifth cost.
+Anthropic's five-minute and one-hour cache-creation buckets are a breakdown of
+the cache write rather than tokens beside it: they are held apart only as
+evidence and remain part of the write total. Neither is inferred from the write
+it is part of, from the other bucket or from the lifetime the response named.
+A response can report them at a different moment than the write, so they need
+not add up to it.
+
+`count_tokens` requests count a prompt the real request counts again, and a
+request the proxy answered itself never reached a model. Both are shown per
+request, with their own numbers and request counts, and both stay out of the
+token totals.
+
+The monitor shows all of this rather than only recording it. A request row
+names the model that ran; a model the request only asked for or was routed to
+is prefixed `?`, and a request the proxy answered itself reads `local answer`
+in place of a model. Token cells carry their own evidence: `~` in front of a
+provisional count, `n/a` where nothing was ever reported. The request detail
+spells out `requested … · executed …`, states what those two marks mean, and
+lists the cache write's five-minute and one-hour buckets as parts reported
+separately rather than as a split of the write.
+
+The Sessions pane leads each session with a `Σ` row for the session as a whole.
+The conversations under it are those same requests grouped another way, never
+parts to add up to that row; the session's own thread is named `main thread`,
+and a conversation whose named parent the session never saw hangs at the top
+level behind a `^`. Where a session ran more than one backend or more than one
+model, those cells read `mixed` and the count instead of naming the last one.
+The session detail lists one `models` line per backend and model that ran — the
+ids that asked for it as `asked: …`, the four counts with their marks, requests
+and errors — an `unattributed` line for the requests belonging to no
+conversation, and an `evidence` line counting, for each of the four categories,
+how many requests reported it exactly, held only an estimate, or never reported
+it at all. A row nothing was ever metered for — answers the proxy gave itself,
+or token estimates — reads `no tokens counted` in place of those four counts,
+which is not the same as four counts nobody reported. In the `asked: …` list a
+caller that named no model at all is counted as `unnamed`. Selection follows the
+row rather than its position, and a pane whose selected row is gone says
+`(selection reset)` in its title.
+
+### Prompt cache
 
 Both backends cache the growing prefix of a conversation, and a cached token
 costs a fraction of a fresh one. The monitor shows how much of each prompt came
@@ -321,7 +404,8 @@ response without changing it) and for Codex models.
 
 - **In** is the part of the prompt the backend processed at full price, as
   Anthropic reports `input_tokens`. Cache reads and cache writes are counted
-  separately; the prompt size is the sum of the three.
+  separately; the prompt size is the sum of the three, unless the backend
+  reported a full prompt total of its own, which takes precedence over the sum.
 - **Hit** is the share of the prompt served from the cache.
 - **Ctx** is the prompt size of the session's latest main-conversation request,
   with the peak in the session detail. Every request re-reads the whole
@@ -364,9 +448,6 @@ conversation:
 
 Switching a conversation to another model is not labelled as a miss. The new
 model starts its own cache, so its first request processes the whole context.
-
-`count_tokens` requests are local estimates of a prompt the real request counts
-again, so they are shown per request but left out of the session totals.
 
 ## How it works
 
