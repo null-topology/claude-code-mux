@@ -1602,7 +1602,14 @@ async fn dispatch_request(
     // label every half minute, resending that subagent's whole context each
     // time. Answer it here: the label is in the transcript already, and on a
     // subscription every one of those requests is billed as a full context.
-    let agent_summary = !count_tokens && crate::agent_summary::is_agent_summary_request(&body);
+    //
+    // The permission classifier is judged first and never as a label: it quotes
+    // the agent's transcript into the message it wants a verdict on, so the
+    // label prompt can appear inside it, and a three-word answer leaves it with
+    // nothing to parse. It goes on to the auto-review route below instead.
+    let agent_summary = !count_tokens
+        && !is_claude_auto_review_request(&body)
+        && crate::agent_summary::is_agent_summary_request(&body);
     if agent_summary && !crate::config::agent_summary_local() {
         // Kept for the case where a label really must come from a model: the
         // provider's junior model at the lowest effort, never the subagent's.
