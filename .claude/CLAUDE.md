@@ -422,9 +422,20 @@ requests otherwise look like a normal subagent turn, with its tools and history.
 
 Codex ends a stream with an `error` event of type `usage_limit_reached` when a
 window is spent, and emits a `codex.rate_limits` event during healthy streams.
-The live WebSocket path answers a spent window once, without retrying, with
+Every transport answers a spent window once, without retrying, with
 `x-should-retry: false` plus `anthropic-ratelimit-unified-status: rejected`,
-`-reset` and `-representative-claim`. `Retry-After` is deliberately not sent
+`-reset` and `-representative-claim`: the live WebSocket and live HTTP
+streams, a non-2xx startup status whose body or `X-Codex-*` response headers
+carry the limit, the buffered paths (`usage_limit_from_response` runs ahead of
+`first_retryable_failure`, so a buffered WebSocket relay shares the branch),
+and an opt-in server compaction request, which aborts instead of spending the
+normal request as well. Only the explicit `usage_limit_reached` type is
+terminal; a transient 429 that happens to carry a reset clock stays retryable.
+The representative claim is published only for a window duration that
+`claimable_window` in `rate_limits.rs` recognises (around 300 minutes for the
+five hour window, around 10080 for the weekly one; Codex has reported 299),
+and an ambiguous reset clock yields neither a substituted header clock nor a
+claim. `Retry-After` is deliberately not sent
 because clients sleep for its full value, which here is hours. Healthy
 readings become `-5h-utilization` / `-5h-reset` / `-7d-*`, and a window past
 its threshold (`CCP_CODEX_QUOTA_WARN_AT`, defaults 0.9 session / 0.75 weekly)
@@ -435,8 +446,8 @@ Codex CLI session logs reserialise the same data as `resets_at` /
 `resets_in_seconds`. Both spellings are read. If quota headers ever stop
 appearing, compare against a fresh traffic capture before anything else.
 
-Not covered: the buffered HTTP path (`client.rs`, `first_retryable_failure`)
-and a 429 on the WebSocket handshake.
+Not covered: a 429 on the WebSocket handshake, which
+`retryable_live_start_codex_error` still retries up to ten times.
 
 ## Naming and distribution
 
