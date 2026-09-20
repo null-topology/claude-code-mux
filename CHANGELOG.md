@@ -1,3 +1,17 @@
+## v0.9.0 (2026-09-20)
+
+- A Codex completion that ends without any output is no longer re-issued
+  ten times. Those retries added up to almost 200 seconds during which the
+  client received no bytes at all and usually gave up on response headers
+  before the 503 was sent. Both the live-stream and the buffered paths now
+  stop after two retries, so the 503 reaches the client within seconds and
+  its own retry policy applies. Other retryable errors keep their budget.
+- The server accepts `POST /messages` and `POST /messages/count_tokens`
+  next to the `/v1` spellings, for gateways that address a custom upstream
+  with either form. The path is folded back to the canonical `/v1` path
+  before the Anthropic relay, with the query string kept verbatim, so the
+  alias never reaches the upstream.
+
 ## v0.8.1 (2026-09-14)
 
 - A spent Codex window is answered once on every transport. The buffered
