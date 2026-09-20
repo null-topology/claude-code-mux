@@ -301,6 +301,11 @@ pub fn app_with_features(
         .route("/healthz", get(healthz))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
+        // Compatibility contract: some gateways address a custom upstream
+        // as `<base>/messages` for one request and `<base>/v1/messages` for
+        // the next. Both spellings are served by the same handlers.
+        .route("/messages", post(handler_messages))
+        .route("/messages/count_tokens", post(handler_count_tokens))
         .route("/v1/models", get(handler_models));
     let router = if features.responses_api {
         router
@@ -1925,10 +1930,7 @@ async fn dispatch_request(
         passthrough: Some(crate::provider::Passthrough {
             raw_body: body_bytes,
             headers,
-            path_and_query: uri
-                .path_and_query()
-                .map(|pq| pq.as_str().to_string())
-                .unwrap_or_else(|| path.clone()),
+            path_and_query: passthrough_path_and_query(&uri, count_tokens),
         }),
     };
 
@@ -2292,6 +2294,22 @@ fn headers_to_record(headers: &http::HeaderMap) -> Value {
         }
     }
     Value::Object(out)
+}
+
+/// The path a passthrough provider appends to its base URL. The router also
+/// accepts `/messages` and `/messages/count_tokens` as aliases of the `/v1`
+/// routes, but an upstream only knows the `/v1` spelling, so the alias is
+/// folded back here while the caller's query string is kept verbatim.
+fn passthrough_path_and_query(uri: &http::Uri, count_tokens: bool) -> String {
+    let path = if count_tokens {
+        "/v1/messages/count_tokens"
+    } else {
+        "/v1/messages"
+    };
+    match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    }
 }
 
 fn redacted_query(uri: &http::Uri) -> Value {

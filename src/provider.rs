@@ -331,7 +331,9 @@ pub struct Passthrough {
     pub raw_body: axum::body::Bytes,
     /// Original client request headers (carry Authorization + anthropic-beta).
     pub headers: axum::http::HeaderMap,
-    /// Original path and query, e.g. `/v1/messages?beta=true`.
+    /// Canonical upstream path (`/v1/messages` or
+    /// `/v1/messages/count_tokens`) followed by the original query,
+    /// e.g. `/v1/messages?beta=true`.
     pub path_and_query: String,
 }
 
