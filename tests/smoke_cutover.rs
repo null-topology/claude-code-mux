@@ -1161,6 +1161,182 @@ async fn smoke_codex_http_messages_uses_mock_upstream() {
     assert_eq!(sent["stream"], true);
 }
 
+/// `POST /messages` is an alias of `/v1/messages` for gateways that append
+/// only `/messages` to a custom upstream.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_messages_alias_without_v1_prefix_routes_like_v1_messages() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let upstream = spawn_http_upstream(|_body: Value| {
+        concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"codex alias ok\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+        )
+        .as_bytes()
+        .to_vec()
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+
+    let body = json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "messages": [{"role":"user","content":"hello"}]
+    });
+    let response = app(Arc::new(Registry::with_default_alias()))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "smoke-session")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["content"][0]["text"], "codex alias ok");
+}
+
+/// The alias must not leak upstream: a passthrough provider only knows
+/// `/v1/messages`, so a request that arrived as `/messages?beta=true` is
+/// relayed as `/v1/messages?beta=true`.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_messages_alias_is_relayed_upstream_with_the_v1_prefix() {
+    let _guard = env_lock();
+    const UPSTREAM_SSE: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":11,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let seen_path: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let upstream_app = axum::Router::new().fallback({
+        let seen_path = seen_path.clone();
+        move |uri: axum::http::Uri| {
+            let seen_path = seen_path.clone();
+            async move {
+                *seen_path.lock().unwrap() = Some(uri.to_string());
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(UPSTREAM_SSE))
+                    .unwrap()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+    let _base_url_env = EnvGuard::set("CCP_ANTHROPIC_BASE_URL", &upstream);
+    let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+
+    let body = json!({
+        "model": "claude-opus-5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    });
+    let response = app(Arc::new(Registry::with_default_alias()))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/messages?beta=true")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "smoke-session")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = drain_stream(response).await;
+    assert_eq!(text, UPSTREAM_SSE, "the relay must stay byte-exact");
+    assert_eq!(
+        seen_path.lock().unwrap().as_deref(),
+        Some("/v1/messages?beta=true"),
+        "the alias must be folded back to the /v1 path upstream"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_count_tokens_alias_is_relayed_upstream_with_the_v1_prefix() {
+    let _guard = env_lock();
+    const UPSTREAM_BODY: &str = r#"{"input_tokens":42}"#;
+    let seen_path: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let upstream_app = axum::Router::new().fallback({
+        let seen_path = seen_path.clone();
+        move |uri: axum::http::Uri| {
+            let seen_path = seen_path.clone();
+            async move {
+                *seen_path.lock().unwrap() = Some(uri.to_string());
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(UPSTREAM_BODY))
+                    .unwrap()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.ok();
+    });
+    let _base_url_env = EnvGuard::set("CCP_ANTHROPIC_BASE_URL", &upstream);
+    let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+
+    let body = json!({
+        "model": "claude-opus-5",
+        "messages": [{"role":"user","content":"hello"}]
+    });
+    let response = app(Arc::new(Registry::with_default_alias()))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/messages/count_tokens?beta=true")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "smoke-session")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = drain_stream(response).await;
+    assert_eq!(text, UPSTREAM_BODY, "the relay must stay byte-exact");
+    assert_eq!(
+        seen_path.lock().unwrap().as_deref(),
+        Some("/v1/messages/count_tokens?beta=true"),
+        "the count_tokens alias must be folded back to the /v1 path upstream"
+    );
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_native_responses_preserves_parallel_tool_calls() {
@@ -1527,7 +1703,7 @@ async fn smoke_codex_http_empty_completions_exhaust_to_service_unavailable() {
     // Initial attempt plus MAX_EMPTY_COMPLETION_RETRIES retries.
     assert_eq!(
         attempts.load(std::sync::atomic::Ordering::SeqCst),
-        11,
+        3,
         "retry loop must stay bounded"
     );
 }
@@ -3087,10 +3263,10 @@ async fn smoke_codex_websocket_empty_completions_exhaust_to_service_unavailable(
         body_text.contains("Codex completed without producing output"),
         "unexpected exhaustion body: {body_text}"
     );
-    // Initial attempt plus MAX_RETRYABLE_LIVE_STREAM_RETRIES full-context retries.
+    // Initial attempt plus MAX_EMPTY_COMPLETION_RETRIES full-context retries.
     assert_eq!(
         request_count.load(std::sync::atomic::Ordering::SeqCst),
-        11,
+        3,
         "retry loop must stay bounded"
     );
 

@@ -62,7 +62,10 @@ use self::translate::request::{
 };
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
-const MAX_EMPTY_COMPLETION_RETRIES: u32 = 10;
+// Every re-issue of a completion that ended without output keeps the client
+// waiting with no bytes on the wire. Stop early so the client can apply its
+// own retry policy instead of timing out on response headers.
+const MAX_EMPTY_COMPLETION_RETRIES: u32 = 2;
 const EMPTY_CODEX_COMPLETION_DETAIL: &str = "empty_codex_completion";
 const LIVE_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 use self::translate::stream::translate_stream_bytes_with_traffic;
@@ -866,7 +869,13 @@ async fn live_stream_response(
                     attempt += 1;
                     continue;
                 }
-                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
+                let max_retries = if error.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL)
+                {
+                    MAX_EMPTY_COMPLETION_RETRIES
+                } else {
+                    MAX_RETRYABLE_LIVE_STREAM_RETRIES
+                };
+                if attempt >= max_retries {
                     cleanup.abort();
                     return map_codex_error_to_response(&error);
                 }
