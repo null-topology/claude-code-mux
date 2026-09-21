@@ -86,9 +86,14 @@ Neither upstream project has these; the details and the evidence are in
 - **A richer `/v1/models`.** Every row carries its `provider`, a top-level
   `providers[]` block says where each group's rows came from and whether the
   listing succeeded, and `?provider=` asks one backend and fails loudly.
-- **Codex quota as `anthropic-ratelimit-unified-*` headers**, including the
-  spent-window answer with `x-should-retry: false` instead of a bare 429 after
-  every retry was burned.
+- **Codex quota as `anthropic-ratelimit-unified-*` utilization headers** on
+  every healthy response, so Claude Code's usage warning works on Codex models.
+  The spent-window answer with `x-should-retry: false` started here as well and
+  has since been merged into the original project.
+- **One attempt per Codex request.** The proxy does not retry a failed Codex
+  request, and an empty completion is an ordinary end of turn. The client,
+  which has its own retry policy, decides; both upstreams retry a live stream
+  and an empty completion up to ten times each.
 - **Deferred tool loading on the Codex route**, mapped onto the backend's own
   tool search so the cached prompt prefix survives a tool load.
 - **Local answers for Claude Code's subagent progress label**, with
@@ -387,7 +392,10 @@ flowchart LR
   `~/.codex/auth.json`. When the token is refreshed it is written back so the
   Codex CLI keeps working. `previous_response_id` continuation state is kept
   per conversation as well, but it is off unless
-  `CCP_CODEX_PREVIOUS_RESPONSE_ID` turns it on.
+  `CCP_CODEX_PREVIOUS_RESPONSE_ID` turns it on. Tool schemas lose their JSON
+  Schema `pattern` keywords on the way, because OpenAI rejects some of the
+  patterns Claude Code sends, such as Unicode property escapes; literal values
+  and property names are kept.
 - **Conversations come from Claude Code's headers.** The proxy reads
   `x-claude-code-session-id`, `x-claude-code-agent-id` and
   `x-claude-code-parent-agent-id`: the session plus the agent id identify a
@@ -650,7 +658,11 @@ most 512 characters, printable ASCII with no comma; anything else makes the
 request conversationless rather than mis-grouped. Everything else on the Claude
 route, authorization included, is forwarded untouched.
 
-**Headers the proxy emits.** Codex responses carry the
+**Headers the proxy emits.** Every Messages response, `count_tokens` included,
+carries `request-id`: the proxy's own id for the request, unless the backend
+already sent one, which is how the Claude route relays Anthropic's. Claude Code
+records it in the transcript as `requestId`, and tools that de-duplicate
+transcripts key on it. Codex responses also carry the
 `anthropic-ratelimit-unified-*` family described in
 [Rate limits](#rate-limits), and a spent window also carries
 `x-should-retry: false`.
@@ -677,9 +689,10 @@ is that Codex models behave like a Claude subscription:
 here that value is hours.
 
 A reading whose reset time has already passed is dropped rather than published.
-This handling lives on the WebSocket transport, which is the default; the
-buffered HTTP transport still retries a spent window (see
-[Troubleshooting](#troubleshooting)).
+Both Codex transports behave the same way. On HTTP the live stream also reads
+the window length and the reset clock from the response headers when the limit
+event itself does not carry them. A 429 on the WebSocket handshake is the one
+exception: it reaches the client as a plain 429.
 
 ## Configuration
 
@@ -809,9 +822,9 @@ This is the complete list of variables the proxy reads.
 | `CCP_CODEX_CLIENT_VERSION` | from `~/.codex/models_cache.json`, else built-in | `client_version` sent on the Codex model listing call. |
 | `CCP_CODEX_ORIGINATOR` | built-in | The `originator` the ChatGPT backend sees. A compatibility contract; changing it changes what the server is told. |
 | `CCP_CODEX_USER_AGENT` | built-in | Same, for the `User-Agent`. |
-| `CCP_CODEX_TRANSPORT` | `websocket` | `websocket`, `http`, or `auto`. Rate-limit handling is implemented on the WebSocket path. |
-| `CCP_CODEX_EFFORT` | unset | Reasoning effort sent to Codex, e.g. `high`. |
-| `CCP_COMPACT_EFFORT` | `low` | Effort cap for compaction turns only; the cap never raises a request's effort. `off` disables the cap, `none` asks for no reasoning. |
+| `CCP_CODEX_TRANSPORT` | `websocket` | `websocket`, `http`, or `auto`. Rate-limit handling is the same on each. |
+| `CCP_CODEX_EFFORT` | unset | Reasoning effort sent to Codex, e.g. `high`. `none` is sent as is, and then no reasoning summary and no encrypted reasoning are requested. |
+| `CCP_COMPACT_EFFORT` | `low` | Effort cap for compaction turns only. It never raises an effort the request named, and a compaction turn that names no effort gets the cap. `off` disables the cap, `none` asks for no reasoning. |
 | `CCP_CODEX_SERVICE_TIER` | unset | Service tier for every Codex request: `fast`, `priority` or `flex`. `-fast` ids request priority per call. |
 | `CCP_CODEX_REASONING_SUMMARY` | unset | Reasoning summary mode requested from Codex, e.g. `auto`. |
 | `CCP_CODEX_MODEL` | unset | Send this Codex model regardless of what the client asked for. |
@@ -920,13 +933,18 @@ saved Kimi, Grok or Cursor login.
 
 ### Retries and quota
 
-Retryable upstream failures — 429, 500, 502, 503, 504 — are retried at most
-three times, with a wait that starts at a few seconds and doubles each attempt.
-A `Retry-After` the upstream sent is used instead of that wait, unless it asks
-for more than 30 seconds, in which case the request fails rather than sleeping
-that long. A Codex window
-that is actually spent is *not* retried: it is recognized and answered once
-(see [Rate limits](#rate-limits)), which is the whole point of that handling.
+The Codex route makes one attempt per request and hands a failure to the
+client, which owns the retry policy. Claude Code already retries on its own, so
+a loop in the proxy would only multiply full-context requests against the
+subscription. An empty completion is an ordinary end of turn, not an error. The
+only resends left repair the proxy's own state: a `previous_response_id` the
+backend no longer knows is replaced by the full history once, and a 401
+refreshes the Codex token once. A Codex window that is actually spent is
+recognized and answered once (see [Rate limits](#rate-limits)).
+
+The Kimi backend retries a 429 up to three times, with a wait that starts at a
+second and a half and doubles each attempt, or the upstream's `Retry-After`
+capped at 30 seconds.
 
 ## Responses lanes and parallel tool calls
 
@@ -1033,10 +1051,6 @@ after every retry. There is nothing to configure; switch to a Claude model or
 wait for the reset. `GET /v1/models` still answers while a window is spent, so
 it is a usable liveness check.
 
-**A spent Codex window retried anyway.** The handling lives on the WebSocket
-transport, which is the default. If `CCP_CODEX_TRANSPORT=http` is set, the
-buffered path still treats a spent window as retryable.
-
 **Requests are much larger than expected.** Claude Code disables lazy tool
 loading behind a non-Anthropic base URL. Set `ENABLE_TOOL_SEARCH=true`; the
 proxy forwards `tool_reference` blocks on the Claude route and maps them onto
@@ -1072,6 +1086,11 @@ tool input, tool output and file contents in the clear. `scripts/debug-proxy`
 turns capture on. Keep them local, never paste them into an issue or a bug
 report, and delete them after a debugging session.
 
+JSON captures replace Codex's `encrypted_content` and the proxy's own
+`ccp:codex:v1:` reasoning signatures with a `[redacted len=N]` marker; any
+other signature is kept. The raw SSE and raw byte captures are written as
+received and are not redacted at all.
+
 `proxy.log` redacts known credential keys — authorization headers, access and
 refresh tokens, id tokens, authorization codes and verifiers, account ids,
 cookies — but it is a key list, not a content scanner, so a secret pasted into
@@ -1086,9 +1105,8 @@ The proxy never prints the contents of `~/.codex/auth.json`;
   Esc during a tool use, then switching and continuing) can fail, because the
   next model cannot verify reasoning that came from the other plan. Starting
   the next step fresh avoids it.
-- Codex rate limits are handled on the WebSocket transport, which is the
-  default. The HTTP transport still retries a spent window, and a 429 on the
-  WebSocket handshake itself is not covered either.
+- A 429 on the Codex WebSocket handshake reaches the client as a plain 429
+  rather than as the spent-window answer.
 - Codex models are not in Claude Code's built-in catalog, so without a
   `modelPicker` row Claude Code assumes a 200k context window for them.
 - The monitor's per-request ledger grows with the number of requests served
@@ -1106,7 +1124,8 @@ backend was contacted.
 | Codex authentication | its own browser, device and PKCE login | reads the Codex CLI's `auth.json`; `codex auth login` points at `codex login` | same as fcakyon |
 | Codex model inventory | compiled-in lists | compiled-in lists | live listing from the Codex backend, never cached |
 | `/v1/models` shape | flat list from the compiled-in registry | same | per-row `provider`, a `providers[]` block with auth/source/status, `?provider=` with a 502 on failure |
-| Codex quota as rate-limit headers | not recognized | not recognized | `anthropic-ratelimit-unified-*`, `usage_limit_reached` answered once with `x-should-retry: false` |
+| Codex quota as rate-limit headers | `usage_limit_reached` answered once with `x-should-retry: false`, status, reset and claim; no utilization on healthy responses | not recognized | the same spent-window answer, plus `-5h-*` / `-7d-*` utilization and `-surpassed-threshold` on every healthy response |
+| Codex retries | a live stream and an empty completion retried up to 10 times each, the buffered transport up to 3 | same | one attempt; the client owns the retry policy |
 | Deferred tool loading | `tool_reference` blocks dropped in the grok translator | same | mapped onto Codex's native tool search |
 | Subagent progress label | not handled | not handled | answered locally, or sent to a junior model |
 | Prompt-cache scope per subagent | the bare session id, so a subagent shares the main thread's scope and routing bucket | same | a derived id per conversation, sent as both the request's `prompt_cache_key` and the `session_id` header |
@@ -1116,7 +1135,7 @@ backend was contacted.
 | Docs site / Nix | Astro docs site, `flake.nix` | no docs site, `flake.nix` | neither |
 | Crate name / `publish` key | `claude-code-proxy`, `publish = false` | `claude-codex`, no `publish` key | `claude-code-mux`, no `publish` key |
 | Release artifacts | prebuilt binaries, 6 targets | prebuilt binaries, 6 targets | prebuilt binaries, 6 targets |
-| Size (`.rs` lines under `src/`) | ~66.6k | ~59.7k | ~74.5k |
+| Size (`.rs` lines under `src/`) | ~69.1k | ~59.7k | ~75.3k |
 
 Compared at `raine/claude-code-proxy` `ba8cd70` (0.1.39),
 `fcakyon/claude-code-with-codex` `2c34184` (0.3.1) and this fork's `main` at
