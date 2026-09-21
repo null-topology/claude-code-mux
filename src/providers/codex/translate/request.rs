@@ -349,6 +349,14 @@ fn reasoning_summary_requested(summary: Option<&str>) -> bool {
     !matches!(summary, Some("off" | "none"))
 }
 
+/// Whether the resolved effort asks the upstream for reasoning output.
+/// `Effort::None` still names the effort so the wire request overrides the
+/// upstream default, but it must not request a summary or encrypted
+/// continuation content, which are reasoning artifacts.
+fn reasoning_requested(effort: Option<&Effort>) -> bool {
+    effort.is_some_and(|effort| *effort != Effort::None)
+}
+
 // ---------------------------------------------------------------------------
 // Compaction fast path
 // ---------------------------------------------------------------------------
@@ -393,8 +401,22 @@ pub(crate) fn is_compact_messages_request(request: &MessagesRequest) -> bool {
 /// native Claude Code compacts without extended thinking, so burning
 /// medium/high reasoning on a 200k-token summary only adds latency. The cap
 /// never raises effort — a request already below it is left alone.
+///
+/// A request naming no effort at all also takes the cap. Left unset it would
+/// run at the upstream default, which is the effort level the cap exists to
+/// avoid.
 fn compact_effort_cap() -> Option<Effort> {
     compact_effort_cap_from(std::env::var("CCP_COMPACT_EFFORT").ok().as_deref())
+}
+
+/// Applies the cap to a request's resolved effort. A missing effort takes
+/// the cap; an explicit effort at or below it is preserved.
+fn apply_compact_effort_cap(resolved: Option<Effort>, cap: Option<Effort>) -> Option<Effort> {
+    match (resolved, cap) {
+        (resolved, None) => resolved,
+        (Some(effort), Some(cap)) if effort <= cap => Some(effort),
+        (_, Some(cap)) => Some(cap),
+    }
 }
 
 fn compact_effort_cap_from(raw: Option<&str>) -> Option<Effort> {
@@ -606,15 +628,12 @@ fn translate_request_inner(
     } else {
         codex_effort
     };
-    if apply_codex_config
-        && is_compact
-        && let Some(cap) = compact_effort_cap()
-        && resolved_effort.as_ref().is_some_and(|e| *e > cap)
-    {
-        resolved_effort = Some(cap);
+    if apply_codex_config && is_compact {
+        resolved_effort = apply_compact_effort_cap(resolved_effort, compact_effort_cap());
     }
+    let wants_reasoning = reasoning_requested(resolved_effort.as_ref());
     if resolved_effort.is_some() || opts.use_responses_lite {
-        let summary = if resolved_effort.is_some()
+        let summary = if wants_reasoning
             && (!apply_codex_config
                 || reasoning_summary_requested(config::codex_reasoning_summary().as_deref()))
         {
@@ -628,7 +647,7 @@ fn translate_request_inner(
             context: opts.use_responses_lite.then_some("all_turns".to_string()),
         });
     }
-    if resolved_effort.is_some() {
+    if wants_reasoning {
         out.include = Some(vec!["reasoning.encrypted_content".to_string()]);
     }
 
@@ -2019,6 +2038,54 @@ mod tests {
             compact_effort_cap_from(Some("bogus")),
             Some(Effort::Low)
         ));
+    }
+
+    #[test]
+    fn compact_effort_cap_defaults_a_missing_effort() {
+        // No effort named: take the cap instead of the upstream default.
+        assert!(matches!(
+            apply_compact_effort_cap(None, Some(Effort::Low)),
+            Some(Effort::Low)
+        ));
+        assert!(matches!(
+            apply_compact_effort_cap(None, Some(Effort::None)),
+            Some(Effort::None)
+        ));
+        // An explicit effort at or below the cap survives.
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::None), Some(Effort::Low)),
+            Some(Effort::None)
+        ));
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::Low), Some(Effort::Low)),
+            Some(Effort::Low)
+        ));
+        // Above the cap is lowered.
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::High), Some(Effort::Low)),
+            Some(Effort::Low)
+        ));
+        // Cap disabled: the request is left exactly as it asked.
+        assert!(apply_compact_effort_cap(None, None).is_none());
+        assert!(matches!(
+            apply_compact_effort_cap(Some(Effort::High), None),
+            Some(Effort::High)
+        ));
+    }
+
+    #[test]
+    fn only_a_non_none_effort_requests_reasoning_artifacts() {
+        assert!(!reasoning_requested(None));
+        assert!(!reasoning_requested(Some(&Effort::None)));
+        for effort in [
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::Xhigh,
+            Effort::Max,
+        ] {
+            assert!(reasoning_requested(Some(&effort)));
+        }
     }
 
     #[test]
