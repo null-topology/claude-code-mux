@@ -446,8 +446,10 @@ Codex CLI session logs reserialise the same data as `resets_at` /
 `resets_in_seconds`. Both spellings are read. If quota headers ever stop
 appearing, compare against a fresh traffic capture before anything else.
 
-Not covered: a 429 on the WebSocket handshake, which
-`retryable_live_start_codex_error` still retries up to ten times.
+The proxy does not retry a failed Codex request: one attempt, then the error
+goes to the client, which owns the retry policy. The only resends left repair
+the proxy's own state (a forgotten `previous_response_id`, a 401 token refresh).
+A 429 on the WebSocket handshake reaches the client as a plain 429.
 
 ## Naming and distribution
 
