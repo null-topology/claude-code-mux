@@ -1283,23 +1283,6 @@ async fn smoke_codex_native_responses_preserves_parallel_tool_calls() {
     assert_eq!(sent["parallel_tool_calls"], false);
 }
 
-/// Resets the retry-delay override even when the test panics, so later tests
-/// in this process keep real backoff behavior.
-struct ZeroRetryDelayGuard;
-
-impl ZeroRetryDelayGuard {
-    fn enable() -> Self {
-        claude_code_mux::retry::set_zero_retry_delay_for_tests(true);
-        ZeroRetryDelayGuard
-    }
-}
-
-impl Drop for ZeroRetryDelayGuard {
-    fn drop(&mut self) {
-        claude_code_mux::retry::set_zero_retry_delay_for_tests(false);
-    }
-}
-
 fn empty_completion_sse() -> Vec<u8> {
     concat!(
         "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_empty\",",
@@ -1435,7 +1418,6 @@ async fn smoke_codex_http_usage_limit_event_fast_fails_buffered_request() {
 #[tokio::test]
 async fn smoke_codex_http_empty_completion_is_an_end_turn() {
     let _guard = env_lock();
-    let _delay_guard = ZeroRetryDelayGuard::enable();
     let config = TempDir::new().unwrap();
     let _codex_auth = write_codex_auth(config.path());
 
@@ -1474,7 +1456,6 @@ async fn smoke_codex_http_empty_completion_is_an_end_turn() {
 #[tokio::test]
 async fn smoke_codex_http_empty_message_completion_is_an_end_turn() {
     let _guard = env_lock();
-    let _delay_guard = ZeroRetryDelayGuard::enable();
     let config = TempDir::new().unwrap();
     let _codex_auth = write_codex_auth(config.path());
 
@@ -1509,7 +1490,6 @@ async fn smoke_codex_http_empty_message_completion_is_an_end_turn() {
 #[tokio::test]
 async fn smoke_codex_http_stream_empty_completion_is_an_end_turn() {
     let _guard = env_lock();
-    let _delay_guard = ZeroRetryDelayGuard::enable();
     let config = TempDir::new().unwrap();
     let _codex_auth = write_codex_auth(config.path());
 
@@ -2385,7 +2365,7 @@ async fn smoke_codex_http_reports_overload_status_after_one_attempt() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_cancels_retry_backoff_when_request_drops() {
+async fn smoke_codex_http_failed_attempt_is_never_followed_by_another() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
@@ -2399,12 +2379,12 @@ async fn smoke_codex_http_cancels_retry_backoff_when_request_drops() {
             if attempt == 0 {
                 concat!(
                     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cancel\"}}\n\n",
-                    "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"overloaded_error\",\"message\":\"cancel during retry backoff\",\"retry_after\":0.1}}}\n\n"
+                    "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded once\",\"retry_after\":0.1}}}\n\n"
                 )
                 .as_bytes()
                 .to_vec()
             } else {
-                panic!("request cancellation must prevent another upstream attempt");
+                panic!("the proxy must not send another upstream attempt");
             }
         }
     })
@@ -2990,7 +2970,6 @@ async fn smoke_codex_websocket_stream_retries_empty_close_with_full_context() {
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_empty_completion_is_an_end_turn() {
     let _guard = env_lock();
-    let _delay_guard = ZeroRetryDelayGuard::enable();
     let config = TempDir::new().unwrap();
     let _codex_auth = write_codex_auth(config.path());
     clear_codex_websocket_pool_for_tests();

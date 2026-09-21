@@ -1515,6 +1515,15 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
                 response
             }
         }
+        // A 4xx the backend answered with describes the request, and its
+        // text is what lets the user fix it.
+        status @ (400..=499) if err.origin != client::CodexErrorOrigin::WebSocketHandshake => {
+            json_error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                "api_error",
+                codex_error_message(err),
+            )
+        }
         status @ (400..=599) => {
             let response = client_error(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -2264,6 +2273,30 @@ mod tests {
         assert_eq!(
             body.pointer("/error/message").and_then(|v| v.as_str()),
             Some("Internal server error")
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_request_error_keeps_its_own_text() {
+        let detail = "Invalid tool name: codex_search";
+        let err = client::CodexError {
+            status: 400,
+            message: detail.to_string(),
+            detail: Some(detail.to_string()),
+            retry_after: None,
+            usage_limit: None,
+            origin: client::CodexErrorOrigin::BufferedHttp,
+        };
+
+        let response = map_codex_error_to_response(&err);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body.pointer("/error/message").and_then(|v| v.as_str()),
+            Some(detail)
         );
     }
 
