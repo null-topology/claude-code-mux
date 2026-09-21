@@ -756,9 +756,15 @@ fn function_tool(tool: &Value) -> ResponsesFunctionTool {
 }
 
 /// Claude Code's `ToolSearch` function as the backend's client-executed
-/// `tool_search`: same description, same parameters, so the model's
-/// arguments are exactly what `ToolSearch` accepts.
+/// `tool_search`: same description, same parameters less any `pattern`
+/// constraint (see `strip_tool_schema_patterns`), so the model's arguments
+/// are exactly what `ToolSearch` accepts.
 fn tool_search_spec(tool: &Value) -> ResponsesToolSearchTool {
+    let mut parameters = tool
+        .get("input_schema")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+    strip_tool_schema_patterns(&mut parameters);
     ResponsesToolSearchTool {
         kind: "tool_search".to_string(),
         execution: TOOL_SEARCH_EXECUTION.to_string(),
@@ -766,10 +772,7 @@ fn tool_search_spec(tool: &Value) -> ResponsesToolSearchTool {
             .get("description")
             .and_then(Value::as_str)
             .map(str::to_string),
-        parameters: tool
-            .get("input_schema")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({"type": "object"})),
+        parameters,
     }
 }
 
@@ -789,7 +792,54 @@ fn codex_tool_description(name: &str, description: Option<String>) -> Option<Str
     Some(format!("{base}\n\n{}", read_offset_guidance()))
 }
 
+// OpenAI's regex dialect differs from schemas emitted by clients. Drop pattern
+// constraints rather than guessing backend compatibility with a local regex engine.
+// This relaxes tool argument validation, including otherwise compatible patterns.
+// Only visit schema-bearing keywords: defaults, examples and other literal data
+// must remain intact, as must names in property and definition maps.
+fn strip_tool_schema_patterns(schema: &mut Value) {
+    let Some(schema) = schema.as_object_mut() else {
+        return;
+    };
+    schema.remove("pattern");
+
+    for (keyword, value) in schema {
+        match keyword.as_str() {
+            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas"
+            | "dependencies" => {
+                if let Some(schemas) = value.as_object_mut() {
+                    for schema in schemas.values_mut() {
+                        strip_tool_schema_patterns(schema);
+                    }
+                }
+            }
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" | "items" => {
+                if let Some(schemas) = value.as_array_mut() {
+                    for schema in schemas {
+                        strip_tool_schema_patterns(schema);
+                    }
+                } else if keyword == "items" {
+                    strip_tool_schema_patterns(value);
+                }
+            }
+            "additionalProperties"
+            | "additionalItems"
+            | "unevaluatedProperties"
+            | "unevaluatedItems"
+            | "contains"
+            | "propertyNames"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "contentSchema" => strip_tool_schema_patterns(value),
+            _ => {}
+        }
+    }
+}
+
 fn codex_tool_parameters(name: &str, mut parameters: Value) -> Value {
+    strip_tool_schema_patterns(&mut parameters);
     if name != "Read" {
         return parameters;
     }
@@ -1585,6 +1635,151 @@ mod tests {
     }
 
     #[test]
+    fn translate_artifact_tool_strips_exact_incompatible_pattern() {
+        let req: MessagesRequest = serde_json::from_str(
+            r#"{
+                "model": "gpt-5.5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "name": "Artifact",
+                    "description": "Manage artifacts.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "field": {
+                                "type": "string",
+                                "pattern": "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$",
+                                "minLength": 1,
+                                "maxLength": 200
+                            }
+                        },
+                        "required": ["field"],
+                        "additionalProperties": false
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+        let original_tools = req.extra["tools"].clone();
+        assert_eq!(
+            original_tools[0]["input_schema"]["properties"]["field"]["pattern"],
+            r#"^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}"\\./[\]]{1,200}$"#
+        );
+        let mut expected = original_tools[0]["input_schema"].clone();
+        expected["properties"]["field"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pattern");
+
+        let normal = translate_request(&req, opts()).unwrap();
+        let lite = translate_request(
+            &req,
+            TranslateOptions {
+                use_responses_lite: true,
+                ..opts()
+            },
+        )
+        .unwrap();
+        for out in [normal, lite] {
+            let wire = serde_json::to_value(out).unwrap();
+            let tool = if wire["tools"].is_array() {
+                &wire["tools"][0]
+            } else {
+                &wire["input"][0]["tools"][0]
+            };
+            assert_eq!(
+                tool,
+                &json!({
+                    "type": "function",
+                    "name": "Artifact",
+                    "description": "Manage artifacts.",
+                    "parameters": expected,
+                    "strict": false
+                })
+            );
+        }
+        assert_eq!(req.extra["tools"], original_tools);
+    }
+
+    #[test]
+    fn tool_schema_patterns_are_removed_only_from_schema_locations() {
+        let literal = json!({
+            "pattern": "literal pattern",
+            "properties": {"pattern": {"pattern": "also literal"}},
+            "items": [{"pattern": "literal item"}]
+        });
+        let leaf = json!({
+            "type": "string",
+            "pattern": "^[a-z]+$",
+            "description": "Keep metadata and literal data.",
+            "default": literal,
+            "examples": [literal],
+            "const": literal,
+            "enum": [literal],
+            "x-custom": literal
+        });
+        let mut clean_leaf = leaf.clone();
+        clean_leaf.as_object_mut().unwrap().remove("pattern");
+
+        let mut schema = json!({"pattern": "^root$", "required": ["pattern"]});
+        let mut expected = json!({"required": ["pattern"]});
+        for keyword in [
+            "properties",
+            "patternProperties",
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+            "dependencies",
+        ] {
+            schema[keyword] = json!({
+                "pattern": leaf,
+                "properties": {"properties": {"pattern": leaf}},
+                "booleanSchema": false
+            });
+            expected[keyword] = json!({
+                "pattern": clean_leaf,
+                "properties": {"properties": {"pattern": clean_leaf}},
+                "booleanSchema": false
+            });
+        }
+        for keyword in ["allOf", "anyOf", "oneOf", "prefixItems", "items"] {
+            schema[keyword] = json!([leaf, true, false]);
+            expected[keyword] = json!([clean_leaf, true, false]);
+        }
+        for keyword in [
+            "additionalProperties",
+            "additionalItems",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+            "contains",
+            "propertyNames",
+            "not",
+            "if",
+            "then",
+            "else",
+            "contentSchema",
+        ] {
+            schema[keyword] = leaf.clone();
+            expected[keyword] = clean_leaf.clone();
+        }
+        schema["dependencies"]["literalDependency"] = json!(["pattern"]);
+        expected["dependencies"]["literalDependency"] = json!(["pattern"]);
+        schema["$ref"] = json!("#/$defs/pattern");
+        expected["$ref"] = json!("#/$defs/pattern");
+        assert_eq!(codex_tool_parameters("Custom", schema), expected);
+
+        let nested = json!({"items": {"properties": {"pattern": leaf}}});
+        let expected = json!({"items": {"properties": {"pattern": clean_leaf}}});
+        assert_eq!(codex_tool_parameters("Custom", nested), expected);
+        for unchanged in [json!({}), json!(true), json!(false)] {
+            assert_eq!(
+                codex_tool_parameters("Custom", unchanged.clone()),
+                unchanged
+            );
+        }
+    }
+
+    #[test]
     fn translate_read_tool_adds_codex_offset_guidance() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",
@@ -1595,7 +1790,7 @@ mod tests {
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "file_path": {"type": "string"},
+                        "file_path": {"type": "string", "pattern": "^/"},
                         "offset": {"type": "integer", "description": "old offset"},
                         "limit": {"type": "integer", "description": "old limit"}
                     },
@@ -1619,6 +1814,7 @@ mod tests {
             .get("properties")
             .and_then(Value::as_object)
             .unwrap();
+        assert_eq!(props["file_path"], json!({"type": "string"}));
         assert_eq!(
             props
                 .get("offset")
@@ -2704,6 +2900,79 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect();
         assert!(head_names.contains(&"CronList"));
+    }
+
+    fn with_tool_schema(mut req: MessagesRequest, name: &str, schema: Value) -> MessagesRequest {
+        let tool = req
+            .extra
+            .get_mut("tools")
+            .and_then(Value::as_array_mut)
+            .and_then(|tools| tools.iter_mut().find(|tool| tool["name"] == name))
+            .expect("tool in request");
+        tool["input_schema"] = schema;
+        req
+    }
+
+    #[test]
+    fn loaded_tool_spec_in_search_output_strips_patterns() {
+        let req = with_tool_schema(
+            tool_search_request(true, cron_reference()),
+            "CronList",
+            json!({
+                "type": "object",
+                "properties": {"job_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}
+            }),
+        );
+        let original_tools = req.extra["tools"].clone();
+        for use_responses_lite in [true, false] {
+            let out = translate_request(&req, lane_opts(use_responses_lite)).unwrap();
+            let output = items_json(&out)
+                .into_iter()
+                .find(|item| item["type"] == "tool_search_output")
+                .expect("search output");
+            assert_eq!(output["tools"][0]["name"], "CronList");
+            assert_eq!(
+                output["tools"][0]["parameters"],
+                json!({"type": "object", "properties": {"job_id": {"type": "string"}}})
+            );
+        }
+        assert_eq!(req.extra["tools"], original_tools);
+    }
+
+    #[test]
+    fn tool_search_tool_parameters_strip_patterns() {
+        let req = with_tool_schema(
+            tool_search_request(false, Value::Null),
+            "ToolSearch",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "pattern": "^[^\\p{Cc}]+$"},
+                    "max_results": {"type": "number"}
+                },
+                "required": ["query", "max_results"]
+            }),
+        );
+        let original_tools = req.extra["tools"].clone();
+        for use_responses_lite in [true, false] {
+            let out = translate_request(&req, lane_opts(use_responses_lite)).unwrap();
+            let search = head_tools(&out)
+                .into_iter()
+                .find(|tool| tool["type"] == "tool_search")
+                .expect("tool_search in head");
+            assert_eq!(
+                search["parameters"],
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "max_results": {"type": "number"}
+                    },
+                    "required": ["query", "max_results"]
+                })
+            );
+        }
+        assert_eq!(req.extra["tools"], original_tools);
     }
 
     #[test]
