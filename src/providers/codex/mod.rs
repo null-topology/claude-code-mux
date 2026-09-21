@@ -35,7 +35,6 @@ use crate::provider::{
 };
 use crate::registry;
 use crate::request_identity::ConversationIdentity;
-use crate::retry::{compute_backoff_delay, sleep};
 
 use self::auth::token_store::file_store;
 use self::client::CodexHttpClient;
@@ -61,12 +60,6 @@ use self::translate::request::{
     TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
 };
 
-const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
-// Every re-issue of a completion that ended without output keeps the client
-// waiting with no bytes on the wire. Stop early so the client can apply its
-// own retry policy instead of timing out on response headers.
-const MAX_EMPTY_COMPLETION_RETRIES: u32 = 2;
-const EMPTY_CODEX_COMPLETION_DETAIL: &str = "empty_codex_completion";
 const LIVE_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 use self::translate::stream::translate_stream_bytes_with_traffic;
 
@@ -392,57 +385,33 @@ impl CodexProvider {
         }
 
         let request_continuation = continuation.clone();
-        let mut continuation = Some(continuation);
-        let mut attempt = 0_u32;
-        let upstream = loop {
-            let response = match client
-                .post_codex_for_owner(&translated, &ctx, continuation.as_ref())
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    log.warn(
-                        "codex_upstream_request_failed",
-                        Some(serde_json::Map::from_iter([
-                            ("reqId".to_string(), serde_json::json!(&req_id)),
-                            ("transport".to_string(), serde_json::json!(transport)),
-                            ("status".to_string(), serde_json::json!(e.status)),
-                            (
-                                "origin".to_string(),
-                                serde_json::json!(format!("{:?}", e.origin)),
-                            ),
-                            ("error".to_string(), serde_json::json!(&e.message)),
-                            (
-                                "ms".to_string(),
-                                serde_json::json!(upstream_started_at.elapsed().as_millis()),
-                            ),
-                        ])),
-                    );
-                    abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
-                    abort_continuation_for_owner(&request_continuation);
-                    return map_codex_error_to_response(&e);
-                }
-            };
-            if !is_empty_codex_success_completion(&response.body) {
-                break response;
-            }
-            // A successful terminal event with no output would translate into
-            // an empty end_turn; retry with full context instead.
-            let error = empty_buffered_completion_error();
-            drop_live_continuation_for_retry(&mut continuation);
-            if attempt >= MAX_EMPTY_COMPLETION_RETRIES {
+        let upstream = match client
+            .post_codex_for_owner(&translated, &ctx, Some(&continuation))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log.warn(
+                    "codex_upstream_request_failed",
+                    Some(serde_json::Map::from_iter([
+                        ("reqId".to_string(), serde_json::json!(&req_id)),
+                        ("transport".to_string(), serde_json::json!(transport)),
+                        ("status".to_string(), serde_json::json!(e.status)),
+                        (
+                            "origin".to_string(),
+                            serde_json::json!(format!("{:?}", e.origin)),
+                        ),
+                        ("error".to_string(), serde_json::json!(&e.message)),
+                        (
+                            "ms".to_string(),
+                            serde_json::json!(upstream_started_at.elapsed().as_millis()),
+                        ),
+                    ])),
+                );
                 abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
                 abort_continuation_for_owner(&request_continuation);
-                return map_codex_error_to_response(&error);
+                return map_codex_error_to_response(&e);
             }
-            let delay = compute_backoff_delay(attempt, None);
-            if delay.exceeds_budget {
-                abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
-                abort_continuation_for_owner(&request_continuation);
-                return map_codex_error_to_response(&error);
-            }
-            attempt += 1;
-            sleep(delay.wait_ms).await;
         };
         log.info(
             "codex_upstream_response_received",
@@ -777,7 +746,6 @@ async fn live_stream_response(
         ctx.session_id.clone(),
         compaction.attempt,
     );
-    let mut attempt = 0_u32;
     let mut continuation = Some(continuation);
 
     loop {
@@ -804,27 +772,14 @@ async fn live_stream_response(
         };
         let upstream_events = match upstream_events {
             Ok(events) => events,
-            Err(err) if err.origin == client::CodexErrorOrigin::Http => {
-                cleanup.abort();
-                return map_codex_error_to_response(&err);
-            }
-            Err(err) if retryable_live_start_codex_error(&err) => {
-                let dropped = drop_live_continuation_for_retry(&mut continuation);
-                if dropped && is_missing_previous_response_error(&err) {
-                    attempt += 1;
-                    continue;
-                }
-                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&err);
-                }
-                let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
-                if delay.exceeds_budget {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&err);
-                }
-                attempt += 1;
-                sleep(delay.wait_ms).await;
+            // The continuation is the proxy's own state, so a request the
+            // backend no longer remembers is resent once with full context.
+            // Every other failure goes to the client, which owns the retries.
+            Err(err)
+                if err.origin != client::CodexErrorOrigin::Http
+                    && is_missing_previous_response_error(&err)
+                    && drop_live_continuation_for_retry(&mut continuation) =>
+            {
                 continue;
             }
             Err(err) => {
@@ -852,40 +807,15 @@ async fn live_stream_response(
                 error,
                 full_context_retry_attempted,
             } => {
-                // The incremental HTTP reader performs its own bounded
-                // pre-semantic retries so it can stop immediately when the
-                // consumer disappears. Do not multiply that exhausted retry
-                // loop by the provider-level WebSocket retry policy.
-                if error.origin == client::CodexErrorOrigin::Http {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&error);
-                }
-                let dropped = drop_live_continuation_for_retry(&mut continuation);
-                if full_context_retry_attempted && client::is_continuation_retry_error(&error) {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&error);
-                }
-                if dropped && is_missing_previous_response_error(&error) {
-                    attempt += 1;
+                if error.origin != client::CodexErrorOrigin::Http
+                    && !full_context_retry_attempted
+                    && is_missing_previous_response_error(&error)
+                    && drop_live_continuation_for_retry(&mut continuation)
+                {
                     continue;
                 }
-                let max_retries = if error.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL)
-                {
-                    MAX_EMPTY_COMPLETION_RETRIES
-                } else {
-                    MAX_RETRYABLE_LIVE_STREAM_RETRIES
-                };
-                if attempt >= max_retries {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&error);
-                }
-                let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
-                if delay.exceeds_budget {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&error);
-                }
-                attempt += 1;
-                sleep(delay.wait_ms).await;
+                cleanup.abort();
+                return map_codex_error_to_response(&error);
             }
         }
     }
@@ -1007,12 +937,6 @@ async fn live_stream_response_once(
             }
         };
         pending_chunk.extend_from_slice(&chunk);
-        if terminal
-            && is_codex_success_terminal_event(&payload)
-            && !translator.has_semantic_output()
-        {
-            return provider_retry(&upstream_events, empty_live_completion_error());
-        }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
             record_live_stream_progress(&ctx, &mut translator, &pending_chunk);
@@ -1074,17 +998,6 @@ async fn live_stream_response_once(
             origin: client::CodexErrorOrigin::WebSocket,
         },
     )
-}
-
-fn empty_live_completion_error() -> client::CodexError {
-    client::CodexError {
-        status: 503,
-        message: "Codex completed without producing output".to_string(),
-        detail: Some(EMPTY_CODEX_COMPLETION_DETAIL.to_string()),
-        retry_after: None,
-        usage_limit: None,
-        origin: client::CodexErrorOrigin::WebSocket,
-    }
 }
 
 fn codex_generation_event(payload: &serde_json::Value) -> bool {
@@ -1247,7 +1160,7 @@ fn remaining_live_stream_response(
                                 compaction.attempt,
                             );
                             let chunk = translator.error_chunk(
-                                &message,
+                                client_error_text(&message, "api_error"),
                                 "api_error",
                                 ctx.traffic.as_deref(),
                             );
@@ -1304,7 +1217,7 @@ fn remaining_live_stream_response(
                     }
                     let error_type = codex_stream_error_type(&err);
                     let chunk = translator.error_chunk(
-                        codex_error_message(&err),
+                        client_error_text(codex_error_message(&err), error_type),
                         error_type,
                         ctx.traffic.as_deref(),
                     );
@@ -1331,7 +1244,11 @@ fn remaining_live_stream_response(
             return;
         }
         let message = "Upstream event stream closed before terminal Codex response event";
-        let chunk = translator.error_chunk(message, "api_error", ctx.traffic.as_deref());
+        let chunk = translator.error_chunk(
+            client_error_text(message, "api_error"),
+            "api_error",
+            ctx.traffic.as_deref(),
+        );
         outcome.fail(message);
         if !chunk.is_empty() {
             record_live_stream_progress(&ctx, &mut translator, &chunk);
@@ -1369,46 +1286,6 @@ where
     (headers, Body::from_stream(stream)).into_response()
 }
 
-fn empty_buffered_completion_error() -> client::CodexError {
-    client::CodexError {
-        status: 503,
-        message: "Codex completed without producing output".to_string(),
-        detail: Some(EMPTY_CODEX_COMPLETION_DETAIL.to_string()),
-        retry_after: None,
-        usage_limit: None,
-        origin: match config::codex_transport() {
-            config::CodexTransport::Http => client::CodexErrorOrigin::BufferedHttp,
-            _ => client::CodexErrorOrigin::BufferedWebSocket,
-        },
-    }
-}
-
-/// True when the buffered upstream body ended in a successful terminal event
-/// without ever producing semantic output (text, thinking, tool, web search).
-fn is_empty_codex_success_completion(upstream_sse: &[u8]) -> bool {
-    use self::translate::reducer::{ReducerEvent, TERM_COMPLETED, TERM_DONE};
-
-    let Ok(events) = self::translate::reducer::reduce_upstream_bytes(upstream_sse) else {
-        return false;
-    };
-    let mut saw_success_terminal = false;
-    for event in &events {
-        match event {
-            ReducerEvent::TextDelta { text, .. } if !text.is_empty() => return false,
-            ReducerEvent::ThinkingStart { .. }
-            | ReducerEvent::ToolStart { .. }
-            | ReducerEvent::WebSearch { .. } => return false,
-            ReducerEvent::Finish { terminal_type, .. }
-                if terminal_type == TERM_COMPLETED || terminal_type == TERM_DONE =>
-            {
-                saw_success_terminal = true;
-            }
-            _ => {}
-        }
-    }
-    saw_success_terminal
-}
-
 fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
     matches!(
         payload.get("type").and_then(|v| v.as_str()),
@@ -1418,13 +1295,6 @@ fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
             | Some("response.failed")
             | Some("response.error")
             | Some("error")
-    )
-}
-
-fn is_codex_success_terminal_event(payload: &serde_json::Value) -> bool {
-    matches!(
-        payload.get("type").and_then(|v| v.as_str()),
-        Some("response.completed") | Some("response.done")
     )
 }
 
@@ -1621,9 +1491,6 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
     if is_context_window_overflow(message) {
         return map_codex_failure_to_response(message);
     }
-    if err.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL) {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", &err.message);
-    }
 
     match err.status {
         401 => json_error(
@@ -1637,7 +1504,7 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
             err.detail.as_deref().unwrap_or("Permission denied"),
         ),
         429 => {
-            let response = json_error(
+            let response = client_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
                 &err.message,
@@ -1648,8 +1515,17 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
                 response
             }
         }
+        // A 4xx the backend answered with describes the request, and its
+        // text is what lets the user fix it.
+        status @ (400..=499) if err.origin != client::CodexErrorOrigin::WebSocketHandshake => {
+            json_error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                "api_error",
+                codex_error_message(err),
+            )
+        }
         status @ (400..=599) => {
-            let response = json_error(
+            let response = client_error(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                 if status == 529 {
                     "overloaded_error"
@@ -1664,7 +1540,7 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
                 response
             }
         }
-        _ => json_error(
+        _ => client_error(
             StatusCode::BAD_GATEWAY,
             "api_error",
             codex_error_message(err),
@@ -1676,7 +1552,37 @@ fn map_codex_failure_to_response(message: &str) -> Response {
     if is_context_window_overflow(message) {
         json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", message)
     } else {
-        json_error(StatusCode::BAD_GATEWAY, "api_error", message)
+        client_error(StatusCode::BAD_GATEWAY, "api_error", message)
+    }
+}
+
+/// An error for `/v1/messages`. The client expects Anthropic's API, so a text
+/// that names this proxy's transport or its backend is replaced with
+/// Anthropic's own wording for the error type. The native text travels beside
+/// the body, where the request log and the monitor read it.
+fn client_error(status: StatusCode, error_type: &'static str, native: &str) -> Response {
+    let text = client_error_text(native, error_type);
+    let mut response = json_error(status, error_type, text);
+    if text != native {
+        let outcome = ResponseOutcome::default();
+        outcome.fail(native);
+        response.extensions_mut().insert(outcome);
+    }
+    response
+}
+
+fn client_error_text<'a>(native: &'a str, error_type: &str) -> &'a str {
+    let lower = native.to_ascii_lowercase();
+    if !["codex", "websocket", "upstream"]
+        .iter()
+        .any(|name| lower.contains(name))
+    {
+        return native;
+    }
+    match error_type {
+        "overloaded_error" => "Overloaded",
+        "rate_limit_error" => "Rate limited",
+        _ => "Internal server error",
     }
 }
 
@@ -1892,114 +1798,6 @@ mod tests {
             .send(Message::Text(event.to_string()))
             .await
             .unwrap();
-    }
-
-    fn upstream_sse(events: &[serde_json::Value]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        for event in events {
-            bytes.extend_from_slice(format!("data: {event}\n\n").as_bytes());
-        }
-        bytes
-    }
-
-    #[test]
-    fn terminal_only_completed_upstream_is_empty_completion() {
-        let body = upstream_sse(&[serde_json::json!({
-            "type": "response.completed",
-            "response": {"id": "resp_1", "status": "completed", "incomplete_details": null, "usage": {"input_tokens": 5, "output_tokens": 0}}
-        })]);
-        assert!(is_empty_codex_success_completion(&body));
-    }
-
-    #[test]
-    fn terminal_only_done_upstream_is_empty_completion() {
-        let body = upstream_sse(&[serde_json::json!({
-            "type": "response.done",
-            "response": {"id": "resp_1", "usage": {}}
-        })]);
-        assert!(is_empty_codex_success_completion(&body));
-    }
-
-    #[test]
-    fn empty_message_item_is_empty_completion() {
-        let body = upstream_sse(&[
-            serde_json::json!({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {"type": "message", "id": "msg_1"}
-            }),
-            serde_json::json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {"type": "message"}
-            }),
-            serde_json::json!({
-                "type": "response.completed",
-                "response": {"id": "resp_1", "usage": {}}
-            }),
-        ]);
-        assert!(is_empty_codex_success_completion(&body));
-    }
-
-    #[test]
-    fn upstream_with_text_is_not_empty_completion() {
-        let body = upstream_sse(&[
-            serde_json::json!({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {"type": "message", "id": "msg_1"}
-            }),
-            serde_json::json!({
-                "type": "response.output_text.delta",
-                "output_index": 0,
-                "delta": "hello"
-            }),
-            serde_json::json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {"type": "message"}
-            }),
-            serde_json::json!({
-                "type": "response.completed",
-                "response": {"id": "resp_1", "usage": {}}
-            }),
-        ]);
-        assert!(!is_empty_codex_success_completion(&body));
-    }
-
-    #[test]
-    fn upstream_with_tool_call_is_not_empty_completion() {
-        let body = upstream_sse(&[
-            serde_json::json!({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {"type": "function_call", "call_id": "call_1", "name": "Read", "arguments": ""}
-            }),
-            serde_json::json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {"type": "function_call", "call_id": "call_1", "name": "Read", "arguments": "{}"}
-            }),
-            serde_json::json!({
-                "type": "response.completed",
-                "response": {"id": "resp_1", "usage": {}}
-            }),
-        ]);
-        assert!(!is_empty_codex_success_completion(&body));
-    }
-
-    #[test]
-    fn terminal_only_incomplete_upstream_is_not_empty_completion() {
-        let body = upstream_sse(&[serde_json::json!({
-            "type": "response.incomplete",
-            "response": {"id": "resp_1", "incomplete_details": {"reason": "max_output_tokens"}, "usage": {}}
-        })]);
-        assert!(!is_empty_codex_success_completion(&body));
-    }
-
-    #[test]
-    fn upstream_without_terminal_event_is_not_empty_completion() {
-        assert!(!is_empty_codex_success_completion(&upstream_sse(&[])));
     }
 
     fn request_with_tools(tools: serde_json::Value) -> MessagesRequest {
@@ -2443,7 +2241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn statusless_codex_error_returns_source_message() {
+    async fn statusless_codex_error_is_worded_for_the_client_and_keeps_its_source() {
         let err = client::CodexError {
             status: 0,
             message: "WebSocket connect error: HTTP error: 502 Bad Gateway".to_string(),
@@ -2455,26 +2253,50 @@ mod tests {
 
         let response = map_codex_error_to_response(&err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<ResponseOutcome>()
+                .and_then(ResponseOutcome::failure)
+                .as_deref(),
+            Some("WebSocket connect error: HTTP error: 502 Bad Gateway")
+        );
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
+            body.pointer("/error/type").and_then(|v| v.as_str()),
+            Some("api_error")
+        );
+        assert_eq!(
             body.pointer("/error/message").and_then(|v| v.as_str()),
-            Some("WebSocket connect error: HTTP error: 502 Bad Gateway")
+            Some("Internal server error")
         );
     }
 
     #[tokio::test]
-    async fn empty_live_completion_maps_to_explicit_service_unavailable() {
-        let err = empty_live_completion_error();
+    async fn backend_request_error_keeps_its_own_text() {
+        let detail = "Invalid tool name: codex_search";
+        let err = client::CodexError {
+            status: 400,
+            message: detail.to_string(),
+            detail: Some(detail.to_string()),
+            retry_after: None,
+            usage_limit: None,
+            origin: client::CodexErrorOrigin::BufferedHttp,
+        };
 
-        assert_eq!(err.status, 503);
-        assert_eq!(err.detail.as_deref(), Some(EMPTY_CODEX_COMPLETION_DETAIL));
+        let response = map_codex_error_to_response(&err);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
-            map_codex_error_to_response(&err).status(),
-            StatusCode::SERVICE_UNAVAILABLE
+            body.pointer("/error/message").and_then(|v| v.as_str()),
+            Some(detail)
         );
     }
 
@@ -2650,7 +2472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_live_stream_during_retry_backoff_aborts_request_state() {
+    async fn failed_live_attempt_is_reported_without_backoff() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
         let session_id = "live-retry-backoff-cleanup";
@@ -2705,17 +2527,13 @@ mod tests {
         event_sent_rx.await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), socket_closed_rx)
             .await
-            .expect("retry handoff did not close the abandoned attempt socket")
-            .expect("retry handoff socket-close sender dropped");
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !response_task.is_finished(),
-            "logical request must still be waiting in retry backoff"
-        );
-        response_task.abort();
-        assert!(response_task.await.unwrap_err().is_cancelled());
+            .expect("the failed attempt socket was not closed")
+            .expect("socket-close sender dropped");
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), response_task)
+            .await
+            .expect("a failed attempt must be reported without waiting in backoff")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 
         assert!(!continuation::is_current_turn_for_owner(&continuation));
         assert!(!store_compaction(
@@ -2838,11 +2656,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_exhaustion_aborts_live_request_state_after_eleven_attempts() {
+    async fn retryable_live_failure_aborts_request_state_after_one_attempt() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
         let status = run_live_failure_case(
-            "live-retry-exhaustion-cleanup",
+            "live-retryable-failure-cleanup",
             serde_json::json!({
                 "type": "codex.rate_limits",
                 "rate_limits": {
@@ -2851,7 +2669,7 @@ mod tests {
                     "primary": {"reset_after_seconds": 0}
                 }
             }),
-            11,
+            1,
         )
         .await
         .status();
@@ -2897,82 +2715,5 @@ mod tests {
         .await
         .status();
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-    }
-
-    #[tokio::test]
-    async fn cancellation_while_replacement_startup_is_blocked_aborts_request_state() {
-        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
-        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
-        let session_id = "live-blocked-replacement-cleanup";
-        let owner = ConversationIdentity::Main(session_id.to_string());
-        continuation::clear_continuation_for_owner(Some(&owner));
-        websocket::invalidate_codex_websocket_pool_owner(&owner);
-        let request = live_test_request("one");
-        let continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
-        let compaction_attempt = begin_compaction(session_id, &request.model);
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (replacement_accepted_tx, replacement_accepted_rx) = tokio::sync::oneshot::channel();
-        let (release_replacement_tx, release_replacement_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (first_socket, _) = listener.accept().await.unwrap();
-            let mut first_websocket = tokio_tungstenite::accept_async(first_socket).await.unwrap();
-            let _ = next_live_websocket_request(&mut first_websocket).await;
-            emit_live_event(
-                &mut first_websocket,
-                &serde_json::json!({
-                    "type": "codex.rate_limits",
-                    "rate_limits": {
-                        "allowed": false,
-                        "limit_reached": true,
-                        "primary": {"reset_after_seconds": 0}
-                    }
-                }),
-            )
-            .await;
-            drop(first_websocket);
-
-            let (_replacement_socket, _) = listener.accept().await.unwrap();
-            replacement_accepted_tx.send(()).unwrap();
-            let _ = release_replacement_rx.await;
-        });
-        let client = authenticated_live_test_client(format!("http://{addr}/responses"));
-        let task_request = request.clone();
-        let task_continuation = continuation.clone();
-        let response_task = tokio::spawn(async move {
-            let model = task_request.model.clone();
-            live_stream_response(
-                client,
-                "message".to_string(),
-                &model,
-                live_test_context(session_id),
-                task_request,
-                task_continuation,
-                LiveStreamCompaction {
-                    compact_boundary: false,
-                    attempt: Some(compaction_attempt),
-                },
-                config::CodexTransport::WebSocket,
-            )
-            .await
-        });
-
-        tokio::time::timeout(std::time::Duration::from_secs(2), replacement_accepted_rx)
-            .await
-            .expect("replacement startup did not reach the blocked handshake")
-            .expect("replacement startup acknowledgement sender dropped");
-        response_task.abort();
-        assert!(response_task.await.unwrap_err().is_cancelled());
-        let _ = release_replacement_tx.send(());
-        server.await.unwrap();
-
-        assert!(!continuation::is_current_turn_for_owner(&continuation));
-        assert!(!store_compaction(
-            session_id,
-            compaction_attempt,
-            Vec::new()
-        ));
-        websocket::invalidate_codex_websocket_pool_owner(&owner);
     }
 }

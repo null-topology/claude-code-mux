@@ -2091,6 +2091,12 @@ async fn record_failed_response(
     }
 
     let status = response.status();
+    // A provider that reworded its error for the client names the native
+    // reason beside the body.
+    let native_reason = response
+        .extensions()
+        .get::<ResponseOutcome>()
+        .and_then(ResponseOutcome::failure);
     let (parts, body) = response.into_parts();
     let bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -2115,7 +2121,8 @@ async fn record_failed_response(
     };
 
     let response_body = response_body_value(&bytes);
-    let message = error_message_from_response(&response_body)
+    let message = native_reason
+        .or_else(|| error_message_from_response(&response_body))
         .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
     let document = json!({
         "reqId": ctx.req_id,
