@@ -2474,9 +2474,10 @@ async fn smoke_codex_http_body_error_after_semantic_output_preserves_message() {
     );
     assert!(text.contains("event: error"), "stream body: {text}");
     assert!(
-        text.contains("Transport error reading Codex response body"),
+        text.contains("Internal server error"),
         "stream body: {text}"
     );
+    assert!(!text.contains("Codex"), "stream body: {text}");
     assert!(
         !text.contains("\"message\":\"http_response_body\""),
         "stream body: {text}"
@@ -3218,10 +3219,12 @@ async fn smoke_codex_websocket_reset_after_reasoning_is_recorded_as_failed() {
         request.error
     );
     assert_eq!(request.http_status, Some(200));
-    // The reason recorded is the one the client was given, not a guess.
+    // The client is given Anthropic's wording; the monitor keeps the native
+    // reason, which names the transport.
     let reported = sse_error_message(&text).expect("the client received an error event");
-    assert!(!reported.is_empty(), "stream body: {text}");
-    assert_eq!(request.error.as_deref(), Some(reported.as_str()));
+    assert_eq!(reported, "Internal server error", "stream body: {text}");
+    let recorded = request.error.as_deref().unwrap_or_default();
+    assert!(recorded.contains("WebSocket"), "recorded: {recorded}");
     // Output had already reached the client, so the request is not retried.
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     // Nothing closed these counts: the prompt is still this proxy's estimate and

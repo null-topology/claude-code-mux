@@ -1160,7 +1160,7 @@ fn remaining_live_stream_response(
                                 compaction.attempt,
                             );
                             let chunk = translator.error_chunk(
-                                &message,
+                                client_error_text(&message, "api_error"),
                                 "api_error",
                                 ctx.traffic.as_deref(),
                             );
@@ -1217,7 +1217,7 @@ fn remaining_live_stream_response(
                     }
                     let error_type = codex_stream_error_type(&err);
                     let chunk = translator.error_chunk(
-                        codex_error_message(&err),
+                        client_error_text(codex_error_message(&err), error_type),
                         error_type,
                         ctx.traffic.as_deref(),
                     );
@@ -1244,7 +1244,11 @@ fn remaining_live_stream_response(
             return;
         }
         let message = "Upstream event stream closed before terminal Codex response event";
-        let chunk = translator.error_chunk(message, "api_error", ctx.traffic.as_deref());
+        let chunk = translator.error_chunk(
+            client_error_text(message, "api_error"),
+            "api_error",
+            ctx.traffic.as_deref(),
+        );
         outcome.fail(message);
         if !chunk.is_empty() {
             record_live_stream_progress(&ctx, &mut translator, &chunk);
@@ -1500,7 +1504,7 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
             err.detail.as_deref().unwrap_or("Permission denied"),
         ),
         429 => {
-            let response = json_error(
+            let response = client_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
                 &err.message,
@@ -1512,7 +1516,7 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
             }
         }
         status @ (400..=599) => {
-            let response = json_error(
+            let response = client_error(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                 if status == 529 {
                     "overloaded_error"
@@ -1527,7 +1531,7 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
                 response
             }
         }
-        _ => json_error(
+        _ => client_error(
             StatusCode::BAD_GATEWAY,
             "api_error",
             codex_error_message(err),
@@ -1539,7 +1543,37 @@ fn map_codex_failure_to_response(message: &str) -> Response {
     if is_context_window_overflow(message) {
         json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", message)
     } else {
-        json_error(StatusCode::BAD_GATEWAY, "api_error", message)
+        client_error(StatusCode::BAD_GATEWAY, "api_error", message)
+    }
+}
+
+/// An error for `/v1/messages`. The client expects Anthropic's API, so a text
+/// that names this proxy's transport or its backend is replaced with
+/// Anthropic's own wording for the error type. The native text travels beside
+/// the body, where the request log and the monitor read it.
+fn client_error(status: StatusCode, error_type: &'static str, native: &str) -> Response {
+    let text = client_error_text(native, error_type);
+    let mut response = json_error(status, error_type, text);
+    if text != native {
+        let outcome = ResponseOutcome::default();
+        outcome.fail(native);
+        response.extensions_mut().insert(outcome);
+    }
+    response
+}
+
+fn client_error_text<'a>(native: &'a str, error_type: &str) -> &'a str {
+    let lower = native.to_ascii_lowercase();
+    if !["codex", "websocket", "upstream"]
+        .iter()
+        .any(|name| lower.contains(name))
+    {
+        return native;
+    }
+    match error_type {
+        "overloaded_error" => "Overloaded",
+        "rate_limit_error" => "Rate limited",
+        _ => "Internal server error",
     }
 }
 
@@ -2198,7 +2232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn statusless_codex_error_returns_source_message() {
+    async fn statusless_codex_error_is_worded_for_the_client_and_keeps_its_source() {
         let err = client::CodexError {
             status: 0,
             message: "WebSocket connect error: HTTP error: 502 Bad Gateway".to_string(),
@@ -2210,14 +2244,26 @@ mod tests {
 
         let response = map_codex_error_to_response(&err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<ResponseOutcome>()
+                .and_then(ResponseOutcome::failure)
+                .as_deref(),
+            Some("WebSocket connect error: HTTP error: 502 Bad Gateway")
+        );
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
+            body.pointer("/error/type").and_then(|v| v.as_str()),
+            Some("api_error")
+        );
+        assert_eq!(
             body.pointer("/error/message").and_then(|v| v.as_str()),
-            Some("WebSocket connect error: HTTP error: 502 Bad Gateway")
+            Some("Internal server error")
         );
     }
 
