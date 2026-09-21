@@ -35,7 +35,6 @@ use crate::provider::{
 };
 use crate::registry;
 use crate::request_identity::ConversationIdentity;
-use crate::retry::{compute_backoff_delay, sleep};
 
 use self::auth::token_store::file_store;
 use self::client::CodexHttpClient;
@@ -61,7 +60,6 @@ use self::translate::request::{
     TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
 };
 
-const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 10;
 const LIVE_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 use self::translate::stream::translate_stream_bytes_with_traffic;
 
@@ -748,7 +746,6 @@ async fn live_stream_response(
         ctx.session_id.clone(),
         compaction.attempt,
     );
-    let mut attempt = 0_u32;
     let mut continuation = Some(continuation);
 
     loop {
@@ -775,27 +772,14 @@ async fn live_stream_response(
         };
         let upstream_events = match upstream_events {
             Ok(events) => events,
-            Err(err) if err.origin == client::CodexErrorOrigin::Http => {
-                cleanup.abort();
-                return map_codex_error_to_response(&err);
-            }
-            Err(err) if retryable_live_start_codex_error(&err) => {
-                let dropped = drop_live_continuation_for_retry(&mut continuation);
-                if dropped && is_missing_previous_response_error(&err) {
-                    attempt += 1;
-                    continue;
-                }
-                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&err);
-                }
-                let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
-                if delay.exceeds_budget {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&err);
-                }
-                attempt += 1;
-                sleep(delay.wait_ms).await;
+            // The continuation is the proxy's own state, so a request the
+            // backend no longer remembers is resent once with full context.
+            // Every other failure goes to the client, which owns the retries.
+            Err(err)
+                if err.origin != client::CodexErrorOrigin::Http
+                    && is_missing_previous_response_error(&err)
+                    && drop_live_continuation_for_retry(&mut continuation) =>
+            {
                 continue;
             }
             Err(err) => {
@@ -823,34 +807,15 @@ async fn live_stream_response(
                 error,
                 full_context_retry_attempted,
             } => {
-                // The incremental HTTP reader performs its own bounded
-                // pre-semantic retries so it can stop immediately when the
-                // consumer disappears. Do not multiply that exhausted retry
-                // loop by the provider-level WebSocket retry policy.
-                if error.origin == client::CodexErrorOrigin::Http {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&error);
-                }
-                let dropped = drop_live_continuation_for_retry(&mut continuation);
-                if full_context_retry_attempted && client::is_continuation_retry_error(&error) {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&error);
-                }
-                if dropped && is_missing_previous_response_error(&error) {
-                    attempt += 1;
+                if error.origin != client::CodexErrorOrigin::Http
+                    && !full_context_retry_attempted
+                    && is_missing_previous_response_error(&error)
+                    && drop_live_continuation_for_retry(&mut continuation)
+                {
                     continue;
                 }
-                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&error);
-                }
-                let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
-                if delay.exceeds_budget {
-                    cleanup.abort();
-                    return map_codex_error_to_response(&error);
-                }
-                attempt += 1;
-                sleep(delay.wait_ms).await;
+                cleanup.abort();
+                return map_codex_error_to_response(&error);
             }
         }
     }
@@ -2428,7 +2393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_live_stream_during_retry_backoff_aborts_request_state() {
+    async fn failed_live_attempt_is_reported_without_backoff() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
         let session_id = "live-retry-backoff-cleanup";
@@ -2483,17 +2448,13 @@ mod tests {
         event_sent_rx.await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), socket_closed_rx)
             .await
-            .expect("retry handoff did not close the abandoned attempt socket")
-            .expect("retry handoff socket-close sender dropped");
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !response_task.is_finished(),
-            "logical request must still be waiting in retry backoff"
-        );
-        response_task.abort();
-        assert!(response_task.await.unwrap_err().is_cancelled());
+            .expect("the failed attempt socket was not closed")
+            .expect("socket-close sender dropped");
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), response_task)
+            .await
+            .expect("a failed attempt must be reported without waiting in backoff")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 
         assert!(!continuation::is_current_turn_for_owner(&continuation));
         assert!(!store_compaction(
@@ -2616,11 +2577,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_exhaustion_aborts_live_request_state_after_eleven_attempts() {
+    async fn retryable_live_failure_aborts_request_state_after_one_attempt() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
         let status = run_live_failure_case(
-            "live-retry-exhaustion-cleanup",
+            "live-retryable-failure-cleanup",
             serde_json::json!({
                 "type": "codex.rate_limits",
                 "rate_limits": {
@@ -2629,7 +2590,7 @@ mod tests {
                     "primary": {"reset_after_seconds": 0}
                 }
             }),
-            11,
+            1,
         )
         .await
         .status();
@@ -2675,82 +2636,5 @@ mod tests {
         .await
         .status();
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-    }
-
-    #[tokio::test]
-    async fn cancellation_while_replacement_startup_is_blocked_aborts_request_state() {
-        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
-        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
-        let session_id = "live-blocked-replacement-cleanup";
-        let owner = ConversationIdentity::Main(session_id.to_string());
-        continuation::clear_continuation_for_owner(Some(&owner));
-        websocket::invalidate_codex_websocket_pool_owner(&owner);
-        let request = live_test_request("one");
-        let continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
-        let compaction_attempt = begin_compaction(session_id, &request.model);
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (replacement_accepted_tx, replacement_accepted_rx) = tokio::sync::oneshot::channel();
-        let (release_replacement_tx, release_replacement_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (first_socket, _) = listener.accept().await.unwrap();
-            let mut first_websocket = tokio_tungstenite::accept_async(first_socket).await.unwrap();
-            let _ = next_live_websocket_request(&mut first_websocket).await;
-            emit_live_event(
-                &mut first_websocket,
-                &serde_json::json!({
-                    "type": "codex.rate_limits",
-                    "rate_limits": {
-                        "allowed": false,
-                        "limit_reached": true,
-                        "primary": {"reset_after_seconds": 0}
-                    }
-                }),
-            )
-            .await;
-            drop(first_websocket);
-
-            let (_replacement_socket, _) = listener.accept().await.unwrap();
-            replacement_accepted_tx.send(()).unwrap();
-            let _ = release_replacement_rx.await;
-        });
-        let client = authenticated_live_test_client(format!("http://{addr}/responses"));
-        let task_request = request.clone();
-        let task_continuation = continuation.clone();
-        let response_task = tokio::spawn(async move {
-            let model = task_request.model.clone();
-            live_stream_response(
-                client,
-                "message".to_string(),
-                &model,
-                live_test_context(session_id),
-                task_request,
-                task_continuation,
-                LiveStreamCompaction {
-                    compact_boundary: false,
-                    attempt: Some(compaction_attempt),
-                },
-                config::CodexTransport::WebSocket,
-            )
-            .await
-        });
-
-        tokio::time::timeout(std::time::Duration::from_secs(2), replacement_accepted_rx)
-            .await
-            .expect("replacement startup did not reach the blocked handshake")
-            .expect("replacement startup acknowledgement sender dropped");
-        response_task.abort();
-        assert!(response_task.await.unwrap_err().is_cancelled());
-        let _ = release_replacement_tx.send(());
-        server.await.unwrap();
-
-        assert!(!continuation::is_current_turn_for_owner(&continuation));
-        assert!(!store_compaction(
-            session_id,
-            compaction_attempt,
-            Vec::new()
-        ));
-        websocket::invalidate_codex_websocket_pool_owner(&owner);
     }
 }

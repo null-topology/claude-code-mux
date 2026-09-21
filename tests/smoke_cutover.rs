@@ -379,7 +379,7 @@ async fn spawn_truncated_http_upstream(body: &'static [u8]) -> String {
 }
 
 #[allow(clippy::await_holding_lock)]
-async fn assert_codex_http_presemantic_retry(first_response: Vec<u8>) {
+async fn assert_codex_http_presemantic_failure_is_reported(first_response: Vec<u8>) {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
@@ -419,20 +419,21 @@ async fn assert_codex_http_presemantic_retry(first_response: Vec<u8>) {
     }))
     .await;
 
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let body = tokio::time::timeout(
         Duration::from_secs(2),
         axum::body::to_bytes(response.into_body(), usize::MAX),
     )
     .await
-    .expect("retried stream must finish")
+    .expect("failed stream must finish")
     .unwrap();
     let text = String::from_utf8_lossy(&body);
-    assert_eq!(attempts.load(Ordering::SeqCst), 2, "stream body: {text}");
-    assert!(text.contains("retry succeeded"), "stream body: {text}");
-    assert!(!text.contains("event: error"), "stream body: {text}");
-    assert_eq!(text.matches("event: message_start").count(), 1);
-    assert_eq!(text.matches("event: message_stop").count(), 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "stream body: {text}");
+    assert!(!text.contains("retry succeeded"), "stream body: {text}");
+    assert!(
+        !status.is_success() || text.contains("event: error"),
+        "status {status}, stream body: {text}"
+    );
 }
 
 /// Spawn a mock WebSocket server that accepts one connection, captures the
@@ -2103,8 +2104,8 @@ async fn smoke_codex_http_stream_returns_before_upstream_completion() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_retries_overload_after_control_events() {
-    assert_codex_http_presemantic_retry(
+async fn smoke_codex_http_reports_overload_after_control_events() {
+    assert_codex_http_presemantic_failure_is_reported(
         concat!(
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\"}}\n\n",
             "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_failed\"}}\n\n",
@@ -2118,8 +2119,8 @@ async fn smoke_codex_http_retries_overload_after_control_events() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_retries_rate_limit_after_control_events() {
-    assert_codex_http_presemantic_retry(
+async fn smoke_codex_http_reports_rate_limit_after_control_events() {
+    assert_codex_http_presemantic_failure_is_reported(
         concat!(
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_limited\"}}\n\n",
             "data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":0}}}\n\n"
@@ -2132,14 +2133,15 @@ async fn smoke_codex_http_retries_rate_limit_after_control_events() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_retries_transient_rate_limit_with_reset_clock() {
-    assert_codex_http_presemantic_retry(codex_usage_limit_sse("rate_limit_exceeded")).await;
+async fn smoke_codex_http_reports_transient_rate_limit_with_reset_clock() {
+    assert_codex_http_presemantic_failure_is_reported(codex_usage_limit_sse("rate_limit_exceeded"))
+        .await;
 }
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_retries_transient_failure_after_control_events() {
-    assert_codex_http_presemantic_retry(
+async fn smoke_codex_http_reports_transient_failure_after_control_events() {
+    assert_codex_http_presemantic_failure_is_reported(
         concat!(
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_transient\"}}\n\n",
             "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"status\":503,\"message\":\"temporarily unavailable\",\"retry_after\":0}}}\n\n"
@@ -2152,8 +2154,8 @@ async fn smoke_codex_http_retries_transient_failure_after_control_events() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_retries_presemantic_eof() {
-    assert_codex_http_presemantic_retry(
+async fn smoke_codex_http_reports_presemantic_eof() {
+    assert_codex_http_presemantic_failure_is_reported(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_truncated\"}}\n\n"
             .as_bytes()
             .to_vec(),
@@ -2220,7 +2222,7 @@ async fn smoke_codex_http_usage_limit_status_fast_fails_live_request() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_bounds_initial_status_retries() {
+async fn smoke_codex_http_reports_initial_status_without_retrying() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
@@ -2260,19 +2262,19 @@ async fn smoke_codex_http_bounds_initial_status_retries() {
     .await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_retries_presemantic_invalid_json() {
-    assert_codex_http_presemantic_retry(b"data: not-json\n\n".to_vec()).await;
+async fn smoke_codex_http_reports_presemantic_invalid_json() {
+    assert_codex_http_presemantic_failure_is_reported(b"data: not-json\n\n".to_vec()).await;
 }
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_retries_presemantic_invalid_utf8() {
-    assert_codex_http_presemantic_retry(b"data: \xff\n\n".to_vec()).await;
+async fn smoke_codex_http_reports_presemantic_invalid_utf8() {
+    assert_codex_http_presemantic_failure_is_reported(b"data: \xff\n\n".to_vec()).await;
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -2333,7 +2335,7 @@ async fn smoke_codex_http_does_not_retry_overload_after_semantic_output() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_stops_after_retry_limit() {
+async fn smoke_codex_http_reports_overload_status_after_one_attempt() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
@@ -2374,7 +2376,7 @@ async fn smoke_codex_http_stops_after_retry_limit() {
     .expect("exhausted stream must terminate")
     .unwrap();
     let text = String::from_utf8_lossy(&body);
-    assert_eq!(attempts.load(Ordering::SeqCst), 4, "stream body: {text}");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "stream body: {text}");
     assert!(
         text.contains("overloaded until retry limit"),
         "stream body: {text}"

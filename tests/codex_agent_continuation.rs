@@ -1541,7 +1541,7 @@ async fn missing_and_dead_origin_retry_full_context_once_and_republish_for_both_
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rate_limited_live_retry_republishes_successful_continuation() {
+async fn client_retry_after_rate_limit_republishes_successful_continuation() {
     let _environment_lock = env_lock();
     let mut harness = TestHarness::start().await;
     let case = unique("rate-limit-retry");
@@ -1560,13 +1560,28 @@ async fn rate_limited_live_retry_republishes_successful_continuation() {
     assert_eq!(first_attempt.captured.socket_ordinal, 1);
     assert_full_input(&first_attempt.captured, &[("user", &first_message)]);
     first_attempt.respond_rate_limited().await;
+    let rejected = tokio::time::timeout(REQUEST_TIMEOUT, request)
+        .await
+        .expect("rate-limited request timed out")
+        .expect("rate-limited request task failed");
+    assert_eq!(
+        rejected.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "downstream body: {}",
+        rejected.body
+    );
 
+    // The proxy reports the failure; the retry is the client's own request.
+    let retry = harness.start_request(
+        messages_body(true, vec![message("user", &first_message)]),
+        headers.clone(),
+    );
     let replacement = harness.pending(&first_message, &headers).await;
     assert_eq!(replacement.captured.socket_ordinal, 2);
     assert_full_input(&replacement.captured, &[("user", &first_message)]);
     let replacement = resolve_request(
         replacement,
-        request,
+        retry,
         "resp-retry-success",
         &first_reply,
         false,
@@ -1597,70 +1612,6 @@ async fn rate_limited_live_retry_republishes_successful_continuation() {
     );
     assert_eq!(replacement.socket_ordinal, 2);
     assert_eq!(harness.upstream.snapshot().len(), 3);
-
-    harness.shutdown().await;
-}
-
-#[allow(clippy::await_holding_lock)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn consecutive_rate_limit_handoffs_are_attempt_local() {
-    let _environment_lock = env_lock();
-    let mut harness = TestHarness::start().await;
-    let case = unique("consecutive-rate-limit-retry");
-    let session = tagged(&case, "session");
-    let agent = tagged(&case, "agent");
-    let headers = IdentityHeaders::agent(&session, &agent, None);
-    let first_message = tagged(&case, "first-message");
-    let first_reply = tagged(&case, "first-reply");
-    let appended_message = tagged(&case, "appended-message");
-
-    let request = harness.start_request(
-        messages_body(true, vec![message("user", &first_message)]),
-        headers.clone(),
-    );
-    for expected_socket in 1..=2 {
-        let attempt = harness.pending(&first_message, &headers).await;
-        assert_eq!(attempt.captured.socket_ordinal, expected_socket);
-        assert_full_input(&attempt.captured, &[("user", &first_message)]);
-        attempt.respond_rate_limited().await;
-    }
-
-    let replacement = harness.pending(&first_message, &headers).await;
-    assert_eq!(replacement.captured.socket_ordinal, 3);
-    assert_full_input(&replacement.captured, &[("user", &first_message)]);
-    let replacement = resolve_request(
-        replacement,
-        request,
-        "resp-consecutive-retry-success",
-        &first_reply,
-        false,
-    )
-    .await;
-
-    let appended = harness
-        .round_trip(
-            messages_body(
-                true,
-                vec![
-                    message("user", &first_message),
-                    message("assistant", &first_reply),
-                    message("user", &appended_message),
-                ],
-            ),
-            headers,
-            &appended_message,
-            &tagged(&case, "resp-appended"),
-            &tagged(&case, "appended-reply"),
-        )
-        .await;
-    assert_delta_input(
-        &appended,
-        "resp-consecutive-retry-success",
-        replacement.socket_ordinal,
-        &appended_message,
-    );
-    assert_eq!(replacement.socket_ordinal, 3);
-    assert_eq!(harness.upstream.snapshot().len(), 4);
 
     harness.shutdown().await;
 }

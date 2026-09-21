@@ -6,7 +6,7 @@ use crate::config;
 use crate::logging::create_logger;
 use crate::provider::RequestContext;
 use crate::request_identity::ConversationIdentity;
-use crate::retry::{compute_backoff_delay, should_retry_status, sleep};
+use crate::retry::should_retry_status;
 use crate::traffic::TrafficCapture;
 
 use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIGINATOR};
@@ -392,14 +392,6 @@ struct DecodedHttpSseEvent {
 struct HttpEventStreamState {
     resp: reqwest::Response,
     started_at: Instant,
-    body_json: String,
-    auth: StoredAuth,
-    auth_refresh_attempted: bool,
-    use_responses_lite: bool,
-    retries: u32,
-    /// `prompt_cache_key` of the request, so a retry keeps the same cache
-    /// scope and routing headers as the first attempt.
-    cache_scope: Option<String>,
 }
 
 impl HttpSseDecoder {
@@ -535,8 +527,6 @@ impl std::ops::Deref for OwnerAwareCodexResponse {
 // Client
 // ---------------------------------------------------------------------------
 
-const MAX_BUFFERED_TRANSPORT_RETRIES: u32 = 3;
-const MAX_BUFFERED_TRANSPORT_ATTEMPTS: u32 = MAX_BUFFERED_TRANSPORT_RETRIES + 1;
 const HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS: u64 = 300_000;
 const IMAGE_HEADER_TIMEOUT_MS: u64 = 300_000;
 
@@ -1129,7 +1119,6 @@ impl CodexHttpClient {
             origin: CodexErrorOrigin::Http,
         })?;
         let mut auth_refresh_attempted = false;
-        let mut retries = 0_u32;
 
         loop {
             let response = self.attempt_post_search(&auth, &body_json, ctx).await?;
@@ -1140,22 +1129,6 @@ impl CodexHttpClient {
                     .force_refresh(&auth.access)
                     .await
                     .map_err(auth_refresh_error)?;
-                continue;
-            }
-            if should_retry_codex_status(response.status)
-                && retries < MAX_BUFFERED_TRANSPORT_RETRIES
-            {
-                let retry_after = response
-                    .headers
-                    .iter()
-                    .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
-                    .map(|(_, value)| value.as_str());
-                let delay = compute_backoff_delay(retries, retry_after);
-                if delay.exceeds_budget {
-                    return Err(codex_status_error(response));
-                }
-                retries += 1;
-                sleep(delay.wait_ms).await;
                 continue;
             }
             if !(200..300).contains(&response.status) {
@@ -1195,48 +1168,18 @@ impl CodexHttpClient {
         })?;
         let mut auth_refresh_attempted = false;
         let use_responses_lite = body.client_metadata.is_some();
-        let mut retries = 0_u32;
-        let (resp, started_at) = loop {
-            match self
-                .start_http_event_attempt(
-                    &mut auth,
-                    &body_json,
-                    ctx,
-                    use_responses_lite,
-                    &mut auth_refresh_attempted,
-                    body.prompt_cache_key.as_deref(),
-                )
-                .await
-            {
-                Ok(attempt) => break attempt,
-                Err(error) if retryable_http_stream_error(&error) => {
-                    if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
-                        return Err(error);
-                    }
-                    let delay = compute_backoff_delay(retries, error.retry_after.as_deref());
-                    if delay.exceeds_budget {
-                        return Err(error);
-                    }
-                    retries += 1;
-                    sleep(delay.wait_ms).await;
-                }
-                Err(error) => return Err(error),
-            }
-        };
-
-        Ok(self.spawn_http_event_stream(
-            HttpEventStreamState {
-                resp,
-                started_at,
-                body_json,
-                auth,
-                auth_refresh_attempted,
+        let (resp, started_at) = self
+            .start_http_event_attempt(
+                &mut auth,
+                &body_json,
+                ctx,
                 use_responses_lite,
-                retries,
-                cache_scope: body.prompt_cache_key.clone(),
-            },
-            ctx.clone(),
-        ))
+                &mut auth_refresh_attempted,
+                body.prompt_cache_key.as_deref(),
+            )
+            .await?;
+
+        Ok(self.spawn_http_event_stream(HttpEventStreamState { resp, started_at }, ctx.clone()))
     }
 
     pub(crate) async fn stream_codex_http_events_for_owner(
@@ -1348,15 +1291,8 @@ impl CodexHttpClient {
     ) -> CodexHttpEventReceiver {
         let HttpEventStreamState {
             mut resp,
-            mut started_at,
-            body_json,
-            mut auth,
-            mut auth_refresh_attempted,
-            use_responses_lite,
-            mut retries,
-            cache_scope,
+            started_at,
         } = state;
-        let client = self.clone();
         let body_idle_timeout_ms = self.body_idle_timeout_ms;
         let req_id = ctx.req_id.clone();
         let traffic = ctx.traffic.clone();
@@ -1377,14 +1313,14 @@ impl CodexHttpClient {
                 return;
             }
 
-            'attempts: loop {
+            {
                 let mut decoder = HttpSseDecoder::default();
                 let mut body_bytes = 0_u64;
                 let mut body_chunks = 0_u64;
                 let mut event_count = 0_u64;
                 let mut pending_events = Vec::new();
 
-                let mut retry_error = 'read_attempt: loop {
+                let stream_error = 'read_attempt: loop {
                     let chunk = tokio::select! {
                         _ = tx.closed() => {
                             log_http_stream_end(
@@ -1584,48 +1520,9 @@ impl CodexHttpClient {
                     }
                 };
 
-                loop {
-                    if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
-                        let _ = tx.send(Err(retry_error)).await;
-                        return;
-                    }
-                    let delay = compute_backoff_delay(retries, retry_error.retry_after.as_deref());
-                    if delay.exceeds_budget {
-                        let _ = tx.send(Err(retry_error)).await;
-                        return;
-                    }
-                    retries += 1;
-                    tokio::select! {
-                        _ = tx.closed() => return,
-                        _ = sleep(delay.wait_ms) => {}
-                    }
-
-                    let next_attempt = tokio::select! {
-                        _ = tx.closed() => return,
-                        result = client.start_http_event_attempt(
-                            &mut auth,
-                            &body_json,
-                            &ctx,
-                            use_responses_lite,
-                            &mut auth_refresh_attempted,
-                            cache_scope.as_deref(),
-                        ) => result
-                    };
-                    match next_attempt {
-                        Ok((next_resp, next_started_at)) => {
-                            resp = next_resp;
-                            started_at = next_started_at;
-                            continue 'attempts;
-                        }
-                        Err(error) if retryable_http_stream_error(&error) => {
-                            retry_error = error;
-                        }
-                        Err(error) => {
-                            let _ = tx.send(Err(error)).await;
-                            return;
-                        }
-                    }
-                }
+                // The client owns the retry policy, so a failed stream is
+                // reported to it instead of being reopened here.
+                let _ = tx.send(Err(stream_error)).await;
             }
         });
 
@@ -1662,7 +1559,6 @@ impl CodexHttpClient {
 
         let mut active_continuation = continuation.cloned();
         let mut auth_refresh_attempted = false;
-        let mut transport_failures = 0u32;
         loop {
             let result = match transport {
                 CodexTransport::Http => {
@@ -1821,44 +1717,6 @@ impl CodexHttpClient {
                 && (200..300).contains(&response.status)
                 && let Some(failure) = super::events::first_retryable_failure(&response.body)
             {
-                if transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
-                    let delay =
-                        compute_backoff_delay(transport_failures, failure.retry_after.as_deref());
-                    if delay.exceeds_budget {
-                        return Err(CodexError {
-                            status: failure.status,
-                            message: failure.message.clone(),
-                            detail: Some(failure.message),
-                            retry_after: failure.retry_after,
-                            usage_limit: None,
-                            origin: match response.transport {
-                                ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
-                                ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
-                            },
-                        });
-                    }
-                    log_buffered_retry(
-                        ctx,
-                        transport,
-                        transport_failures + 1,
-                        delay.wait_ms,
-                        failure.status,
-                        "upstream_event",
-                        &failure.message,
-                    );
-                    transport_failures += 1;
-                    active_continuation = full_context_continuation(active_continuation.as_ref());
-                    sleep(delay.wait_ms).await;
-                    continue;
-                }
-
-                log_buffered_retry_exhausted(
-                    ctx,
-                    transport,
-                    failure.status,
-                    "upstream_event",
-                    &failure.message,
-                );
                 return Err(CodexError {
                     status: failure.status,
                     message: failure.message.clone(),
@@ -1898,41 +1756,7 @@ impl CodexHttpClient {
                         .iter()
                         .find(|(k, _)| k.to_lowercase() == "retry-after")
                         .map(|(_, v)| v.clone());
-                    if transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
-                        let delay =
-                            compute_backoff_delay(transport_failures, retry_after.as_deref());
-                        if delay.exceeds_budget {
-                            let detail = String::from_utf8_lossy(&response.body).to_string();
-                            return Err(CodexError {
-                                status: 429,
-                                message: "Rate limited".to_string(),
-                                detail: Some(detail),
-                                retry_after,
-                                usage_limit: None,
-                                origin: CodexErrorOrigin::Http,
-                            });
-                        }
-                        log_buffered_retry(
-                            ctx,
-                            transport,
-                            transport_failures + 1,
-                            delay.wait_ms,
-                            response.status,
-                            "upstream",
-                            "rate limited",
-                        );
-                        transport_failures += 1;
-                        sleep(delay.wait_ms).await;
-                        continue;
-                    }
                     let detail = String::from_utf8_lossy(&response.body).to_string();
-                    log_buffered_retry_exhausted(
-                        ctx,
-                        transport,
-                        response.status,
-                        "upstream",
-                        "rate limited",
-                    );
                     return Err(CodexError {
                         status: 429,
                         message: "Rate limited".to_string(),
@@ -1941,39 +1765,6 @@ impl CodexHttpClient {
                         usage_limit: None,
                         origin: CodexErrorOrigin::Http,
                     });
-                }
-                Ok(response) if should_retry_codex_status(response.status) => {
-                    if transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
-                        let retry_after = response
-                            .headers
-                            .iter()
-                            .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
-                            .map(|(_, value)| value.as_str());
-                        let delay = compute_backoff_delay(transport_failures, retry_after);
-                        if delay.exceeds_budget {
-                            return Err(codex_status_error(response.into_response()));
-                        }
-                        log_buffered_retry(
-                            ctx,
-                            transport,
-                            transport_failures + 1,
-                            delay.wait_ms,
-                            response.status,
-                            "upstream",
-                            "retryable upstream status",
-                        );
-                        transport_failures += 1;
-                        sleep(delay.wait_ms).await;
-                        continue;
-                    }
-                    log_buffered_retry_exhausted(
-                        ctx,
-                        transport,
-                        response.status,
-                        "upstream",
-                        "retryable upstream status",
-                    );
-                    return Err(codex_status_error(response.into_response()));
                 }
                 Ok(response) if !(200..300).contains(&response.status) => {
                     return Err(codex_status_error(response.into_response()));
@@ -1985,39 +1776,7 @@ impl CodexHttpClient {
                     active_continuation = full_context_continuation(active_continuation.as_ref());
                     continue;
                 }
-                Err(err) => {
-                    // Determine if retryable
-                    let retryable = is_retryable_transport_error(&err);
-                    if retryable && transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
-                        let delay =
-                            compute_backoff_delay(transport_failures, err.retry_after.as_deref());
-                        if delay.exceeds_budget {
-                            return Err(err);
-                        }
-                        log_buffered_retry(
-                            ctx,
-                            transport,
-                            transport_failures + 1,
-                            delay.wait_ms,
-                            err.status,
-                            codex_error_origin_name(err.origin),
-                            &err.message,
-                        );
-                        transport_failures += 1;
-                        sleep(delay.wait_ms).await;
-                        continue;
-                    }
-                    if retryable {
-                        log_buffered_retry_exhausted(
-                            ctx,
-                            transport,
-                            err.status,
-                            codex_error_origin_name(err.origin),
-                            &err.message,
-                        );
-                    }
-                    return Err(err);
-                }
+                Err(err) => return Err(err),
             }
         }
     }
@@ -2928,62 +2687,6 @@ fn should_retry_codex_status(status: u16) -> bool {
     should_retry_status(status) || status == 529
 }
 
-fn codex_error_origin_name(origin: CodexErrorOrigin) -> &'static str {
-    match origin {
-        CodexErrorOrigin::Http => "http",
-        CodexErrorOrigin::WebSocket => "websocket",
-        CodexErrorOrigin::WebSocketHandshake => "websocket_handshake",
-        CodexErrorOrigin::Auth => "auth",
-        CodexErrorOrigin::BufferedHttp => "buffered_http",
-        CodexErrorOrigin::BufferedWebSocket => "buffered_websocket",
-    }
-}
-
-fn log_buffered_retry(
-    ctx: &RequestContext,
-    transport: crate::config::CodexTransport,
-    failed_attempt: u32,
-    delay_ms: u64,
-    status: u16,
-    origin: &str,
-    reason: &str,
-) {
-    let mut fields = serde_json::Map::new();
-    fields.insert("reqId".into(), serde_json::json!(ctx.req_id));
-    fields.insert("transport".into(), serde_json::json!(transport.as_str()));
-    fields.insert("failedAttempt".into(), serde_json::json!(failed_attempt));
-    fields.insert("nextAttempt".into(), serde_json::json!(failed_attempt + 1));
-    fields.insert(
-        "maxAttempts".into(),
-        serde_json::json!(MAX_BUFFERED_TRANSPORT_ATTEMPTS),
-    );
-    fields.insert("delayMs".into(), serde_json::json!(delay_ms));
-    fields.insert("status".into(), serde_json::json!(status));
-    fields.insert("origin".into(), serde_json::json!(origin));
-    fields.insert("reason".into(), serde_json::json!(reason));
-    create_logger("codex").warn("buffered_transport_retry", Some(fields));
-}
-
-fn log_buffered_retry_exhausted(
-    ctx: &RequestContext,
-    transport: crate::config::CodexTransport,
-    status: u16,
-    origin: &str,
-    reason: &str,
-) {
-    let mut fields = serde_json::Map::new();
-    fields.insert("reqId".into(), serde_json::json!(ctx.req_id));
-    fields.insert("transport".into(), serde_json::json!(transport.as_str()));
-    fields.insert(
-        "attempts".into(),
-        serde_json::json!(MAX_BUFFERED_TRANSPORT_ATTEMPTS),
-    );
-    fields.insert("status".into(), serde_json::json!(status));
-    fields.insert("origin".into(), serde_json::json!(origin));
-    fields.insert("reason".into(), serde_json::json!(reason));
-    create_logger("codex").warn("buffered_transport_retry_exhausted", Some(fields));
-}
-
 fn is_retryable_transport_error(err: &CodexError) -> bool {
     if err.origin == CodexErrorOrigin::WebSocketHandshake {
         if err.detail.as_deref() == Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL) {
@@ -3619,7 +3322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_stream_bounds_initial_status_retries() {
+    async fn http_stream_returns_initial_status_without_retrying() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -3646,15 +3349,15 @@ mod tests {
             .stream_codex_http_events(&buffered_test_request(), &http_test_context())
             .await
         {
-            Ok(_) => panic!("retryable status must exhaust with an error"),
+            Ok(_) => panic!("a failing status must surface as an error"),
             Err(error) => error,
         };
 
         assert_eq!(error.status, 503);
         assert_eq!(
             server.await.unwrap(),
-            MAX_BUFFERED_TRANSPORT_ATTEMPTS,
-            "initial status failures must share the HTTP stream retry budget"
+            1,
+            "a failing status goes back to the client without a second attempt"
         );
     }
 
@@ -4637,29 +4340,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buffered_http_retries_retryable_status() {
+    async fn buffered_http_returns_retryable_status_without_retrying() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for attempt in 0..2 {
-                let (mut stream, _) = listener.accept().await.unwrap();
+            let mut attempts = 0_u32;
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+            {
                 let mut request = [0_u8; 16 * 1024];
                 assert!(stream.read(&mut request).await.unwrap() > 0);
-                let (status, body): (&str, &[u8]) = if attempt == 0 {
-                    ("503 Service Unavailable", b"retry")
-                } else {
-                    ("200 OK", b"data: keep\n\n")
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nretry-after: 0\r\nconnection: close\r\n\r\n",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-                stream.write_all(body).await.unwrap();
+                attempts += 1;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 5\r\nretry-after: 7\r\nconnection: close\r\n\r\nretry",
+                    )
+                    .await
+                    .unwrap();
             }
+            attempts
         });
 
-        let response = authenticated_http_test_client(format!("http://{addr}/responses"))
+        let error = match authenticated_http_test_client(format!("http://{addr}/responses"))
             .post_codex_with_transport(
                 &buffered_test_request(),
                 &http_test_context(),
@@ -4667,10 +4369,13 @@ mod tests {
                 crate::config::CodexTransport::Http,
             )
             .await
-            .unwrap();
-        server.await.unwrap();
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, b"data: keep\n\n");
+        {
+            Ok(_) => panic!("a failing status must surface as an error"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, 503);
+        assert_eq!(error.retry_after.as_deref(), Some("7"));
+        assert_eq!(server.await.unwrap(), 1);
     }
 
     #[tokio::test]
