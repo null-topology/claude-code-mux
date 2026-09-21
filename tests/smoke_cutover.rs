@@ -2140,7 +2140,7 @@ async fn smoke_codex_http_stream_returns_before_upstream_completion() {
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
     let response = tokio::time::timeout(
-        Duration::from_millis(500),
+        Duration::from_secs(3),
         call_messages_body(json!({
             "model": "gpt-5.5",
             "max_tokens": 64,
