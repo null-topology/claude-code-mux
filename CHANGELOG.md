@@ -1,3 +1,26 @@
+## v0.9.1 (2026-09-21)
+
+- A Codex completion with no output is a normal end of turn. The backend
+  answers this way when the model has nothing to add after a tool result, and
+  the answer is the same however often the request is repeated. It used to be
+  resent and then reported as a 503, which the client retried in turn, so one
+  such turn became dozens of full-context requests. It now reaches the client
+  as `200` with `stop_reason: end_turn` after exactly one upstream request.
+- The Codex route no longer retries a failed request. A 429, a 5xx, a stream
+  that drops before its first output and a transport error are reported after
+  one attempt, with the status and `Retry-After` the backend sent, and the
+  client applies its own retry policy. Still repaired by the proxy, because
+  they concern its own state: one full-context resend when the backend no
+  longer knows the previous response, the token refresh after a 401, and the
+  WebSocket to HTTP fallback in `auto` transport.
+- Errors on `/v1/messages` are worded the way the Anthropic API words them. A
+  text that names the backend or the transport becomes `Internal server
+  error`, `Overloaded` or `Rate limited` by error type, in the JSON body and
+  in a mid-stream `event: error`; the native reason is what `proxy.log`, the
+  error capture and the monitor record. Sign-in errors, the spent-window
+  response, context-window overflow and any other backend 4xx keep their own
+  text.
+
 ## v0.9.0 (2026-09-20)
 
 - A Codex completion that ends without any output is no longer re-issued
