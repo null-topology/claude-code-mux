@@ -428,10 +428,17 @@ listening, which is the way to look around without sending a request.
 ### Panes and key bindings
 
 The screen holds four panes — **Sessions** (a tree: a `Σ` row per session with
-its conversations under it), **Active requests**, **Recent requests** and
-**Events** (the failed and 4xx/5xx requests out of the recent list) — under a
-header bar showing the listen URL, uptime, and the session and active-request
-counts. `Enter` on a Sessions or Recent row opens a detail view for it.
+its conversations under it), **Active requests**, **Recent requests** and a
+bottom pane with two tabs, **Events** (the failed and 4xx/5xx requests out of
+the recent list) and **Stats** (one row per backend and model since the proxy
+started) — under a header bar showing the listen URL, uptime, and the session
+and active-request counts. `Enter` on a Sessions or Recent row opens a detail
+view for it.
+
+Sessions are ordered by their latest request, newest first, whichever model or
+conversation made it; a session with a request in flight sits above the idle
+ones. The conversations under a session keep their tree order, and the
+selected row stays selected when the order changes.
 
 | key | what it does |
 | --- | --- |
@@ -439,11 +446,14 @@ counts. `Enter` on a Sessions or Recent row opens a detail view for it.
 | `Ctrl-C` | begin shutdown at once, no confirmation; again while shutting down force-quits |
 | `?` | toggle the shortcuts overlay |
 | `b` | toggle the setup overlay |
-| `Tab` | move focus between the Sessions and Recent panes |
-| `←` / `→` | focus the Sessions / Recent pane |
-| `↑` / `↓`, `k` / `j` | move the selection within the focused pane |
+| `Tab` | move focus Sessions → Recent → bottom pane → Sessions |
+| `←` / `→` | focus the Sessions / Recent pane; in the bottom pane, switch between its Events and Stats tabs |
+| `↑` / `↓`, `k` / `j` | move the selection within the focused pane; in the bottom pane, scroll its rows |
 | `Enter` | open the detail view for the selected row |
 | `Esc` | close the overlay, then the detail view |
+
+The bottom pane's title names both tabs and brackets the one shown, as in
+`[Events] Stats`.
 
 The setup overlay (`b`) prints the log and config paths, how many models each
 backend lists, and ready-to-paste `export` lines for a client. It is a
@@ -468,6 +478,17 @@ Recent requests: `Finished`, `Code` (the HTTP status the client got),
 `Project`, `Session`, `Provider`, `Model`, `Endpoint`, `Latency`, `Rate`,
 `Hit`, `Miss`, `In`, `Out`, `Details`.
 
+Stats: `Model` (backend and the model that ran, `provider/model`), `Reqs`,
+`Fail`, `Prompt` (uncached input plus cache read plus cache write), `Hit`
+(cache read over prompt), `In` (uncached input), `Write` (cache write; `n/a`
+on a backend that never reports one, Codex among them), `Miss ttl/exp` (cache
+misses judged within the cache lifetime / after it expired, with `+N?` for
+misses whose lifetime was unknown), `Out`, `Lat(rec)` and `tok/s(rec)`. The
+rows are summed over every session since the proxy started and sorted by
+prompt tokens, biggest first. The two `(rec)` columns are medians over the
+completed requests of that row still in the recent list, not over the whole
+run; the other columns are lifetime sums.
+
 Marks that carry meaning:
 
 | mark | where | meaning |
@@ -481,6 +502,8 @@ Marks that carry meaning:
 | `^` | Sessions | a conversation whose named parent this session never saw |
 | `/side` | conversation labels | a side call: a request carrying no client tool with an `input_schema` (session titles, the auto-mode classifier, the isolated web-search call) |
 | `mixed N` | Sessions | the session ran N different backends or models, rather than the last one |
+| `[Events]`, `[Stats]` | bottom pane title | the tab the pane is showing |
+| `(rec)` | Stats headers | a median over the recent-request window, not a lifetime figure |
 | `no tokens counted` | detail views | the row was never metered at all, which is not the same as four counts nobody reported |
 | `(selection reset)` | pane titles | the selected row is gone; selection follows the row, not its position |
 

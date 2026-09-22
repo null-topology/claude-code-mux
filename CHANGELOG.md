@@ -1,3 +1,21 @@
+## Unreleased
+
+- The monitor's Sessions pane is ordered by activity: sessions with a request
+  in flight first, then by their latest request, newest first, whichever model
+  or subagent conversation made it. Conversations keep their tree order under
+  the session and the selected row stays selected when the order changes.
+  Rows were sorted by session id before, which buried a new session among
+  the one-off ones.
+- The bottom pane of the monitor is tabbed: `Events` as before and a new
+  `Stats` tab with one row per backend and model over every session since
+  the proxy started (requests and failures, prompt tokens, cache hit rate,
+  uncached input, cache write, cache misses split within-lifetime / expired,
+  output, and median latency and output rate over the recent-request window).
+  `Tab` now reaches the bottom pane; `Left`/`Right` switch its tabs while it
+  has focus and keep their meaning elsewhere. Every count carries its quality
+  mark the way the other panes do, and a Codex row shows its cache write as
+  `n/a`, since that backend never reports one.
+
 ## v0.10.0 (2026-09-23)
 
 - Claude Code's subagent progress label is forwarded natively by default

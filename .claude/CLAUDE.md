@@ -357,6 +357,27 @@ selection by row identity so a re-render keeps it (`(selection reset)` in the
 pane title when the row is gone). Meaning is never carried by color alone.
 The `demo` command shows all of it from `src/monitor/mock.rs`.
 
+`session_summaries` orders sessions by activity: sessions with a request in
+flight first, then by `last_seen` descending, then by `first_seen_rank`
+descending as the tie-break, whichever model or conversation made the latest
+request; the conversations under a session keep `order_conversations`' tree
+order. The bottom pane is tabbed (`BottomTab`: `Events`, `Stats`); Tab cycles
+`FocusPane` Sessions → Recent → Bottom, and while Bottom has focus Left/Right
+switch the tab (`MonitorApp::navigate`) and Up/Down/j/k scroll it, with no
+row identity to keep. The title brackets the shown tab (`[Events] Stats`).
+The Stats tab renders `MonitorState::model_stats`: one `ModelStats` per
+(provider, effective model), the session `models` rollups summed across every
+session, with `local` rows left out. Its cache miss tally is `CacheMissTally`
+on `ModelUsage`, fed by `Contribution.miss` from the `CacheMiss` a request's
+evaluation stored on its record, so a per-model miss is counted exactly once
+and detached with the record like every other number; the judging itself is
+unchanged. Prompt is `input + read + write` (no `reported_prompt_tokens` at
+this level), hit % is `totals_cache_hit_ratio`, a Codex row's cache write stays
+`Missing` (`n/a`) rather than zero, and `Lat(rec)` / `tok/s(rec)` are medians
+over the row's completed requests still in `recent`, so they cover the
+recent window only and the header says so. Rows sort by prompt tokens
+descending.
+
 Deferred and non-blocking: `RequestRecord::model_key` and the requested-model
 histogram allocate `String`s on every ledger update.
 

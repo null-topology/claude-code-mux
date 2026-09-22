@@ -11,7 +11,7 @@ mod usage;
 
 use accounting::{AbsorbedRequest, Ledger, SessionRecord};
 pub use accounting::{
-    LOCAL_PROVIDER, ModelUsage, QualityCoverage, UnattributedUsage, UsageEvidence,
+    CacheMissTally, LOCAL_PROVIDER, ModelUsage, QualityCoverage, UnattributedUsage, UsageEvidence,
 };
 pub use mock::{MockMonitor, mock_state};
 pub use usage::{
@@ -401,6 +401,148 @@ pub struct MonitorState {
     pub sessions: Vec<SessionSummary>,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<CompletedRequest>,
+}
+
+impl MonitorState {
+    /// What every backend and model that ran cost since the proxy started, one
+    /// row per pair, added up over every session, largest prompt total first.
+    ///
+    /// The counts are the session rollups summed, so they outlive the recent
+    /// list the way the sessions do. The two timing figures are the exception:
+    /// a median is read off the requests still in view, so they cover the
+    /// recent window only and say so in the row.
+    pub fn model_stats(&self) -> Vec<ModelStats> {
+        let mut rows: Vec<ModelStats> = Vec::new();
+        // Answers the proxy gave itself ran on no model, so they have no row.
+        for usage in self
+            .sessions
+            .iter()
+            .flat_map(|session| &session.models)
+            .filter(|usage| usage.provider.as_deref() != Some(LOCAL_PROVIDER))
+        {
+            let row = match rows
+                .iter_mut()
+                .find(|row| row.provider == usage.provider && row.model == usage.model)
+            {
+                Some(row) => row,
+                None => {
+                    rows.push(ModelStats {
+                        provider: usage.provider.clone(),
+                        model: usage.model.clone(),
+                        ..ModelStats::default()
+                    });
+                    rows.last_mut().expect("row just pushed")
+                }
+            };
+            row.active_count = row.active_count.saturating_add(usage.active_count);
+            row.request_count = row.request_count.saturating_add(usage.request_count);
+            row.failure_count = row.failure_count.saturating_add(usage.failure_count);
+            row.input_tokens = row.input_tokens.saturating_add(usage.input_tokens);
+            row.output_tokens = row.output_tokens.saturating_add(usage.output_tokens);
+            row.cache_read_tokens = row
+                .cache_read_tokens
+                .saturating_add(usage.cache_read_tokens);
+            row.cache_write_tokens = row
+                .cache_write_tokens
+                .saturating_add(usage.cache_write_tokens);
+            row.evidence.add(&usage.evidence);
+            row.misses.add(&usage.misses);
+            for (requested, count) in &usage.requested_models {
+                match row
+                    .requested_models
+                    .iter_mut()
+                    .find(|(known, _)| known == requested)
+                {
+                    Some((_, total)) => *total = total.saturating_add(*count),
+                    None => row.requested_models.push((requested.clone(), *count)),
+                }
+            }
+        }
+        for row in &mut rows {
+            let window: Vec<&CompletedRequest> = self
+                .recent
+                .iter()
+                .filter(|request| {
+                    request.status == RequestStatus::Completed
+                        && request.provider == row.provider
+                        && request.effective_model == row.model
+                })
+                .collect();
+            row.recent_requests = window.len();
+            row.median_latency = median(window.iter().map(|request| request.latency));
+            row.median_output_rate =
+                median(window.iter().filter_map(|request| match request.rate() {
+                    Throughput::TokensPerSecond(rate) => Some(rate),
+                    _ => None,
+                }));
+        }
+        rows.sort_by(|left, right| {
+            right
+                .prompt_tokens()
+                .cmp(&left.prompt_tokens())
+                .then_with(|| right.request_count.cmp(&left.request_count))
+                .then_with(|| left.provider.cmp(&right.provider))
+                .then_with(|| left.model.cmp(&right.model))
+        });
+        rows
+    }
+}
+
+/// The middle value of a sample, or the lower of the two middle values.
+fn median<T: Copy + PartialOrd>(values: impl Iterator<Item = T>) -> Option<T> {
+    let mut values: Vec<T> = values.collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    Some(values[(values.len() - 1) / 2])
+}
+
+/// What one backend and one model that ran cost over every session, and how
+/// its recent requests performed. Every count means what a session's does.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelStats {
+    pub provider: Option<String>,
+    /// The model on the wire, or `None` where none was observed.
+    pub model: Option<String>,
+    pub active_count: usize,
+    pub request_count: usize,
+    pub failure_count: usize,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub evidence: UsageEvidence,
+    pub misses: CacheMissTally,
+    /// The ids the clients asked for, with how many requests each fed in,
+    /// summed over the session rollups.
+    pub requested_models: Vec<(Option<String>, usize)>,
+    /// Completed requests of the row still in the recent list: what the two
+    /// medians below are read off.
+    pub recent_requests: usize,
+    pub median_latency: Option<Duration>,
+    /// Median output tokens per second over the same requests, counting only
+    /// the ones with a measured generation interval.
+    pub median_output_rate: Option<f64>,
+}
+
+impl ModelStats {
+    /// The prompt tokens of every request of the row: uncached input plus the
+    /// cache reads and writes.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+    }
+
+    /// Share of the row's prompt tokens served from cache.
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        totals_cache_hit_ratio(
+            self.input_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1625,12 +1767,23 @@ fn order_conversations(conversations: Vec<ConversationSummary>) -> Vec<Conversat
 
 /// The rows of every session the process has served, built from what the
 /// ledger kept rather than from the requests the recent list still holds.
+///
+/// Newest activity first: a session with a request in flight leads, and the
+/// rest follow by the time of their latest request, whichever model or
+/// conversation of the session made it. Two sessions last seen in the same
+/// instant keep the newer one on top.
 fn session_summaries(ledger: &Ledger) -> Vec<SessionSummary> {
     let mut out: Vec<_> = ledger
         .sessions()
         .map(|(session_id, record)| session_summary(session_id.clone(), record))
         .collect();
-    out.sort_by_key(SessionSummary::label);
+    out.sort_by_key(|session| {
+        (
+            session.active_count == 0,
+            std::cmp::Reverse(session.last_seen),
+            std::cmp::Reverse(session.first_seen_rank),
+        )
+    });
     out
 }
 
@@ -2359,44 +2512,277 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert_eq!(state.sessions[0].output_tokens, 25);
     }
 
-    #[test]
-    fn session_order_is_stable_across_activity() {
-        let monitor = MonitorHandle::new(10);
+    fn session_labels(state: &MonitorState) -> Vec<String> {
+        state.sessions.iter().map(SessionSummary::label).collect()
+    }
+
+    fn finish_request(monitor: &MonitorHandle, request_id: &str, session: &str, model: &str) {
         monitor.request_started(
-            "r1",
-            Some("session-b".to_string()),
-            Some(1),
+            request_id,
+            Some(session.to_string()),
+            None,
             EndpointKind::Messages,
         );
-        monitor.request_started(
-            "r2",
-            Some("session-a".to_string()),
-            Some(1),
-            EndpointKind::Messages,
+        monitor.provider_selected(request_id, "codex", model, None);
+        monitor.request_completed(request_id, 200, Some(100), Some(10));
+    }
+
+    /// A session with a request in flight leads; the rest follow by their
+    /// latest request, whichever model or conversation made it.
+    #[test]
+    fn sessions_are_ordered_by_latest_activity_with_active_ones_on_top() {
+        let monitor = MonitorHandle::new(10);
+        finish_request(&monitor, "r1", "session-a", "gpt-5.6-sol");
+        std::thread::sleep(Duration::from_millis(2));
+        finish_request(&monitor, "r2", "session-b", "gpt-5.6-sol");
+        assert_eq!(
+            session_labels(&monitor.snapshot()),
+            ["session-b", "session-a"]
         );
 
-        let first: Vec<_> = monitor
-            .snapshot()
-            .sessions
-            .iter()
-            .map(SessionSummary::label)
-            .collect();
-        monitor.request_completed("r1", 200, None, None);
+        // The older session's subagent, on another model, is its newest
+        // activity and takes the whole session to the top; its conversations
+        // keep their tree order.
+        std::thread::sleep(Duration::from_millis(2));
         monitor.request_started(
             "r3",
-            Some("session-b".to_string()),
-            Some(2),
+            Some("session-a".to_string()),
+            None,
             EndpointKind::Messages,
         );
-        let second: Vec<_> = monitor
-            .snapshot()
-            .sessions
-            .iter()
-            .map(SessionSummary::label)
-            .collect();
+        monitor.conversation_resolved("r3", "agent-1", None);
+        monitor.provider_selected("r3", "codex", "gpt-5.6-terra", None);
+        monitor.request_completed("r3", 200, Some(100), Some(10));
+        std::thread::sleep(Duration::from_millis(2));
+        monitor.request_started(
+            "r4",
+            Some("session-a".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.conversation_resolved("r4", "main", None);
+        monitor.provider_selected("r4", "codex", "gpt-5.6-sol", None);
+        monitor.request_completed("r4", 200, Some(100), Some(10));
+        let state = monitor.snapshot();
+        assert_eq!(session_labels(&state), ["session-a", "session-b"]);
+        assert_eq!(
+            state.sessions[0]
+                .conversations
+                .iter()
+                .map(|conversation| conversation.conversation.as_str())
+                .collect::<Vec<_>>(),
+            ["main", "agent-1"]
+        );
 
-        assert_eq!(first, vec!["session-a", "session-b"]);
-        assert_eq!(second, first);
+        // A request still running keeps its session above one that finished
+        // a request more recently.
+        std::thread::sleep(Duration::from_millis(2));
+        monitor.request_started(
+            "r5",
+            Some("session-c".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        finish_request(&monitor, "r6", "session-b", "gpt-5.6-sol");
+        assert_eq!(
+            session_labels(&monitor.snapshot()),
+            ["session-c", "session-b", "session-a"]
+        );
+        monitor.request_completed("r5", 200, None, None);
+        assert_eq!(
+            session_labels(&monitor.snapshot()),
+            ["session-c", "session-b", "session-a"]
+        );
+    }
+
+    fn stats_row<'a>(rows: &'a [ModelStats], provider: &str, model: &str) -> &'a ModelStats {
+        rows.iter()
+            .find(|row| {
+                row.provider.as_deref() == Some(provider) && row.model.as_deref() == Some(model)
+            })
+            .unwrap_or_else(|| panic!("row {provider}/{model} in {rows:?}"))
+    }
+
+    fn finish_with_usage(
+        monitor: &MonitorHandle,
+        request_id: &str,
+        session: &str,
+        provider: &str,
+        model: &str,
+        usage: UsageReport,
+    ) {
+        monitor.request_started(
+            request_id,
+            Some(session.to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.conversation_resolved(request_id, "main", None);
+        monitor.provider_selected(request_id, provider, model, None);
+        monitor.model_resolved(request_id, model);
+        monitor.usage_reported(request_id, usage);
+        monitor.request_completed(request_id, 200, None, None);
+    }
+
+    /// One row per backend and model, summed over every session; the hit rate
+    /// is the read share of the prompt, and a count no backend reported stays
+    /// missing rather than becoming a zero.
+    #[test]
+    fn model_stats_sum_the_session_rollups_per_backend_and_model() {
+        let monitor = MonitorHandle::new(10);
+        finish_with_usage(
+            &monitor,
+            "a1",
+            "s1",
+            "anthropic",
+            "claude-opus-5",
+            closing_usage(1_000, 8_000, 1_000, 100),
+        );
+        finish_with_usage(
+            &monitor,
+            "a2",
+            "s2",
+            "anthropic",
+            "claude-opus-5",
+            closing_usage(3_000, 6_000, 1_000, 300),
+        );
+        // Codex reports no cache write at all.
+        finish_with_usage(
+            &monitor,
+            "c1",
+            "s2",
+            "codex",
+            "gpt-5.6-sol",
+            UsageReport {
+                closing: UsageFields {
+                    input_tokens: Some(500),
+                    cache_read_tokens: Some(1_500),
+                    output_tokens: Some(50),
+                    ..UsageFields::default()
+                },
+                ..UsageReport::default()
+            },
+        );
+        let rows = monitor.snapshot().model_stats();
+        assert_eq!(rows.len(), 2);
+
+        let opus = stats_row(&rows, "anthropic", "claude-opus-5");
+        assert_eq!(opus.request_count, 2);
+        assert_eq!(opus.input_tokens, 4_000);
+        assert_eq!(opus.cache_read_tokens, 14_000);
+        assert_eq!(opus.cache_write_tokens, 2_000);
+        assert_eq!(opus.output_tokens, 400);
+        assert_eq!(opus.prompt_tokens(), 20_000);
+        assert_eq!(opus.cache_hit_ratio(), Some(0.7));
+        assert!(opus.evidence.cache_write.is_exact());
+        assert_eq!(opus.evidence.cache_write.exact, 2);
+
+        let sol = stats_row(&rows, "codex", "gpt-5.6-sol");
+        assert_eq!(sol.prompt_tokens(), 2_000);
+        assert_eq!(sol.cache_hit_ratio(), Some(0.75));
+        assert_eq!(sol.evidence.cache_write.missing, 1);
+        assert_eq!(sol.evidence.cache_write.exact, 0);
+
+        // Largest prompt total first.
+        assert_eq!(rows[0].model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(rows[1].model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    /// Misses are tallied on the row of the model that ran the request, with
+    /// the cause the lane evaluation gave them.
+    #[test]
+    fn model_stats_count_misses_per_model_with_their_cause() {
+        let monitor = MonitorHandle::new(10);
+        // An expiry on the opus lane: idle longer than the reported lifetime.
+        start_anthropic_request(&monitor, "o1", "claude-opus-5");
+        monitor.model_resolved("o1", "claude-opus-5");
+        backdate(&monitor, "o1", Duration::from_secs(2 * 60 * 60));
+        monitor.usage_reported(
+            "o1",
+            UsageReport {
+                cache_ttl: Some(Duration::from_secs(60 * 60)),
+                ..closing_usage(2, 0, 40_000, 10)
+            },
+        );
+        monitor.request_completed("o1", 200, None, None);
+        start_anthropic_request(&monitor, "o2", "claude-opus-5");
+        monitor.model_resolved("o2", "claude-opus-5");
+        monitor.usage_reported("o2", closing_usage(3, 0, 40_100, 10));
+        monitor.request_completed("o2", 200, None, None);
+
+        // A miss within the lifetime on the codex lane of another session.
+        finish_with_usage(
+            &monitor,
+            "c1",
+            "s2",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(40_000, 0, 0, 10),
+        );
+        finish_with_usage(
+            &monitor,
+            "c2",
+            "s2",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(40_100, 0, 0, 10),
+        );
+
+        let rows = monitor.snapshot().model_stats();
+        let opus = stats_row(&rows, "anthropic", "claude-opus-5");
+        assert_eq!(opus.misses.expired, 1);
+        assert_eq!(opus.misses.within_ttl, 0);
+        let sol = stats_row(&rows, "codex", "gpt-5.6-sol");
+        assert_eq!(sol.misses.within_ttl, 1);
+        assert_eq!(sol.misses.expired, 0);
+        assert_eq!(sol.misses.total(), 1);
+    }
+
+    /// The timing figures are medians over the completed requests still in the
+    /// recent list, per row.
+    #[test]
+    fn model_stats_take_median_latency_and_rate_from_the_recent_window() {
+        let recent: VecDeque<CompletedRequest> = [
+            completed_request(
+                "r1",
+                "s1",
+                100,
+                Duration::from_secs(1),
+                Some(Duration::from_secs(1)),
+            ),
+            completed_request(
+                "r2",
+                "s1",
+                300,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(1)),
+            ),
+            completed_request(
+                "r3",
+                "s2",
+                200,
+                Duration::from_secs(3),
+                Some(Duration::from_secs(1)),
+            ),
+            completed_request("r4", "s2", 50, Duration::from_secs(9), None),
+        ]
+        .into_iter()
+        .collect();
+        let state = MonitorState {
+            started_at: SystemTime::UNIX_EPOCH,
+            sessions: session_summaries_for_requests(&recent),
+            active: Vec::new(),
+            recent: recent.into_iter().collect(),
+        };
+        let rows = state.model_stats();
+        let sol = stats_row(&rows, "codex", "gpt-5.6-sol");
+        assert_eq!(sol.request_count, 4);
+        assert_eq!(sol.recent_requests, 4);
+        // Latencies 1, 3, 5, 9: the lower middle value.
+        assert_eq!(sol.median_latency, Some(Duration::from_secs(3)));
+        // Rates 100, 300, 200 tok/s; the request without an interval has none.
+        assert_eq!(sol.median_output_rate, Some(200.0));
     }
 
     fn closing_usage(input: u64, read: u64, write: u64, output: u64) -> UsageReport {
@@ -3235,7 +3621,9 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert_eq!(state.recent.len(), 1);
         assert_eq!(state.sessions.len(), 2);
 
-        let first = &state.sessions[0];
+        // The other process finished last, so its session sits on top.
+        assert_eq!(session_labels(&state), ["s2", "s1"]);
+        let first = &state.sessions[1];
         assert_eq!(first.label(), "s1");
         assert_eq!(first.project.as_deref(), Some("example"));
         assert_eq!(first.request_count, 2);
@@ -3255,7 +3643,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert_eq!(agent.cache_read_tokens, 1_000);
         assert_eq!(conversation(first, "main").request_count, 1);
 
-        let second = &state.sessions[1];
+        let second = &state.sessions[0];
         assert_eq!(second.label(), "s2");
         assert_eq!(second.request_count, 1);
         assert_eq!(second.input_tokens, 700);
