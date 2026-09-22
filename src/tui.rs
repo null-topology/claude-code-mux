@@ -201,6 +201,8 @@ fn run_monitor_events(
         // work over: what a pane picked is looked up in them once a frame.
         let rows = session_rows(&state.sessions);
         app.sync_selection(&rows, &state.recent);
+        let bottom_rows = app.bottom_row_count(&state);
+        app.fit_bottom_scroll(bottom_rows);
         app.tick = app.tick.wrapping_add(1);
         terminal.draw(|frame| render(frame, app, &state))?;
         if app.shutdown_is_complete() {
@@ -233,7 +235,6 @@ fn run_monitor_events(
                     | KeyCode::Right
                     | KeyCode::Left
                     | KeyCode::Char('j' | 'k') => {
-                        let bottom_rows = app.bottom_row_count(&state);
                         app.navigate(key.code, &rows, &state.recent, bottom_rows);
                     }
                     KeyCode::Enter => {
@@ -613,6 +614,14 @@ impl MonitorApp {
             BottomTab::Events => event_requests(&state.recent).len(),
             BottomTab::Stats => state.model_stats().len(),
         }
+    }
+
+    /// Keep the bottom pane's scroll on a row its tab still has. A tab's rows
+    /// can shrink between snapshots, and an offset past them would leave Up
+    /// scrolling over rows that are gone instead of returning to the Recent
+    /// pane from the top.
+    fn fit_bottom_scroll(&mut self, bottom_rows: usize) {
+        self.bottom_scroll = self.bottom_scroll.min(bottom_rows.saturating_sub(1));
     }
 
     /// One navigation key. Tab cycles the panes; the arrows and j/k move
@@ -2691,7 +2700,9 @@ fn stats_columns(tier: LayoutTier) -> Vec<ColumnSpec<StatsColumn>> {
 }
 
 /// The quality of a row's prompt total, from the counts it is the sum of. A
-/// write nobody reported is the Codex norm and leaves the total exact.
+/// write nobody reported is the Codex norm and leaves the total exact; an
+/// input or cache read nobody reported leaves it short of a part, which is
+/// never exact, however firmly the other part is known.
 fn stats_prompt_quality(evidence: &UsageEvidence) -> UsageQuality {
     let input = coverage_quality(evidence.input);
     let read = coverage_quality(evidence.cache_read);
@@ -2699,7 +2710,9 @@ fn stats_prompt_quality(evidence: &UsageEvidence) -> UsageQuality {
     if input == UsageQuality::Missing && read == UsageQuality::Missing {
         return UsageQuality::Missing;
     }
-    if [input, read, write].contains(&UsageQuality::Opening) {
+    if [input, read].contains(&UsageQuality::Missing)
+        || [input, read, write].contains(&UsageQuality::Opening)
+    {
         return UsageQuality::Opening;
     }
     UsageQuality::Exact
@@ -3243,8 +3256,8 @@ fn detail_line<'a>(label: &'static str, value: impl Into<String>, value_color: C
     ])
 }
 
-fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) {
-    let spans = vec![
+fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &MonitorApp) {
+    let mut spans = vec![
         Span::raw(" "),
         Span::styled("q", Style::default().fg(TEAL)),
         Span::styled(" quit  ", Style::default().fg(DIM)),
@@ -3256,11 +3269,19 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) 
         Span::styled(" navigate  ", Style::default().fg(DIM)),
         Span::styled("Tab", Style::default().fg(TEAL)),
         Span::styled(" pane  ", Style::default().fg(DIM)),
-        Span::styled("←/→", Style::default().fg(TEAL)),
-        Span::styled(" tab  ", Style::default().fg(DIM)),
+    ];
+    // Left and Right switch the tab only in the bottom pane; elsewhere they
+    // pick the Sessions or Recent pane, which the arrows hint already covers.
+    if app.focus == FocusPane::Bottom {
+        spans.extend([
+            Span::styled("←/→", Style::default().fg(TEAL)),
+            Span::styled(" tab  ", Style::default().fg(DIM)),
+        ]);
+    }
+    spans.extend([
         Span::styled("Enter", Style::default().fg(TEAL)),
         Span::styled(" open", Style::default().fg(DIM)),
-    ];
+    ]);
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(BG)),
         area,
@@ -4447,6 +4468,8 @@ mod tests {
     /// in a fresh snapshot, then draw the screen that comes out.
     fn draw_monitor(app: &mut MonitorApp, state: &MonitorState, width: u16, height: u16) -> String {
         app.sync_selection(&session_rows(&state.sessions), &state.recent);
+        let bottom_rows = app.bottom_row_count(state);
+        app.fit_bottom_scroll(bottom_rows);
         buffer_text(&draw(width, height, |frame| render(frame, app, state)))
     }
 
@@ -5696,6 +5719,46 @@ mod tests {
     }
 
     #[test]
+    fn a_bottom_tab_that_lost_rows_keeps_its_scroll_on_them_and_up_leaves_from_the_top() {
+        let state = navigable_state();
+        let rows = session_rows(&state.sessions);
+        let mut app = monitor_app(FocusPane::Bottom);
+        app.sync_selection(&rows, &state.recent);
+        app.bottom_tab = BottomTab::Stats;
+        app.navigate(KeyCode::Char('j'), &rows, &state.recent, 3);
+        app.navigate(KeyCode::Char('j'), &rows, &state.recent, 3);
+        assert_eq!(app.bottom_scroll, 2);
+
+        // Later snapshots hold fewer rows on the tab: the scroll stays on the
+        // last one there is.
+        app.fit_bottom_scroll(2);
+        assert_eq!(app.bottom_scroll, 1);
+        app.fit_bottom_scroll(0);
+        assert_eq!(app.bottom_scroll, 0);
+        // At the top, Up goes back to the Recent pane rather than scrolling
+        // through rows that are gone.
+        app.navigate(KeyCode::Up, &rows, &state.recent, 0);
+        assert_eq!(app.focus, FocusPane::Recent);
+        assert_eq!(app.recent_selected.row(), Some(state.recent.len() - 1));
+    }
+
+    #[test]
+    fn the_footer_offers_the_tab_keys_only_while_the_bottom_pane_has_focus() {
+        for (focus, offered) in [
+            (FocusPane::Sessions, false),
+            (FocusPane::Recent, false),
+            (FocusPane::Bottom, true),
+        ] {
+            let app = monitor_app(focus);
+            let footer = buffer_text(&draw(120, 1, |frame| {
+                render_footer(frame, frame.area(), &app)
+            }));
+            assert_eq!(footer.contains("←/→"), offered, "{focus:?}: {footer}");
+            assert_eq!(footer.contains(" tab "), offered, "{focus:?}: {footer}");
+        }
+    }
+
+    #[test]
     fn the_stats_tab_renders_one_row_per_backend_and_model_with_quality_marks() {
         let state = mock_state();
         let stats = state.model_stats();
@@ -5755,6 +5818,62 @@ mod tests {
         }));
         assert!(text.contains("Events [Stats]"), "{text}");
         assert!(text.contains("No requests yet"), "{text}");
+    }
+
+    #[test]
+    fn a_stats_prompt_missing_its_input_or_cache_read_is_not_exact() {
+        let exact = QualityCoverage {
+            exact: 1,
+            ..QualityCoverage::default()
+        };
+        let missing = QualityCoverage {
+            missing: 1,
+            ..QualityCoverage::default()
+        };
+        let evidence = |input, cache_read, cache_write| UsageEvidence {
+            input,
+            cache_read,
+            cache_write,
+            ..UsageEvidence::default()
+        };
+        // One of the two parts was never reported: the total lacks it, and a
+        // closed zero on the other part does not make the sum exact.
+        assert_eq!(
+            stats_prompt_quality(&evidence(missing, exact, missing)),
+            UsageQuality::Opening
+        );
+        assert_eq!(
+            stats_prompt_quality(&evidence(exact, missing, missing)),
+            UsageQuality::Opening
+        );
+        // Neither was: there is no total at all.
+        assert_eq!(
+            stats_prompt_quality(&evidence(missing, missing, missing)),
+            UsageQuality::Missing
+        );
+        // An unreported write is the Codex norm and leaves the total exact.
+        assert_eq!(
+            stats_prompt_quality(&evidence(exact, exact, missing)),
+            UsageQuality::Exact
+        );
+
+        // On screen, a closed zero read beside an input nobody reported is a
+        // provisional prompt, not an exact 0.
+        let row = ModelStats {
+            provider: Some("codex".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+            request_count: 1,
+            evidence: evidence(missing, exact, missing),
+            ..ModelStats::default()
+        };
+        let text = buffer_text(&draw(180, 6, |frame| {
+            render_stats(frame, frame.area(), &[row], "Events [Stats]", true, 0)
+        }));
+        let line = text
+            .lines()
+            .find(|line| line.contains("codex/gpt-5.6-sol"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(line.contains(&format!("{OPENING_TOKENS_MARK}0")), "{line}");
     }
 
     #[test]

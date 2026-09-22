@@ -487,7 +487,8 @@ misses whose lifetime was unknown), `Out`, `Lat(rec)` and `tok/s(rec)`. The
 rows are summed over every session since the proxy started and sorted by
 prompt tokens, biggest first. The two `(rec)` columns are medians over the
 completed requests of that row still in the recent list, not over the whole
-run; the other columns are lifetime sums.
+run, and an even number of requests gives the mean of the two middle values;
+the other columns are lifetime sums.
 
 Marks that carry meaning:
 

@@ -469,12 +469,19 @@ impl MonitorState {
                 })
                 .collect();
             row.recent_requests = window.len();
-            row.median_latency = median(window.iter().map(|request| request.latency));
-            row.median_output_rate =
-                median(window.iter().filter_map(|request| match request.rate() {
+            row.median_latency = median(
+                window.iter().map(|request| request.latency),
+                // Half the gap added to the lower value cannot overflow the
+                // way a sum of the two can.
+                |low, high| low + (high - low) / 2,
+            );
+            row.median_output_rate = median(
+                window.iter().filter_map(|request| match request.rate() {
                     Throughput::TokensPerSecond(rate) => Some(rate),
                     _ => None,
-                }));
+                }),
+                |low, high| (low + high) / 2.0,
+            );
         }
         rows.sort_by(|left, right| {
             right
@@ -488,14 +495,23 @@ impl MonitorState {
     }
 }
 
-/// The middle value of a sample, or the lower of the two middle values.
-fn median<T: Copy + PartialOrd>(values: impl Iterator<Item = T>) -> Option<T> {
+/// The middle value of a sample, or the `mean` of the two middle values, lower
+/// first, when the sample has an even size.
+fn median<T: Copy + PartialOrd>(
+    values: impl Iterator<Item = T>,
+    mean: impl FnOnce(T, T) -> T,
+) -> Option<T> {
     let mut values: Vec<T> = values.collect();
     if values.is_empty() {
         return None;
     }
     values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    Some(values[(values.len() - 1) / 2])
+    let upper = values.len() / 2;
+    Some(if values.len().is_multiple_of(2) {
+        mean(values[upper - 1], values[upper])
+    } else {
+        values[upper]
+    })
 }
 
 /// What one backend and one model that ran cost over every session, and how
@@ -2779,9 +2795,44 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         let sol = stats_row(&rows, "codex", "gpt-5.6-sol");
         assert_eq!(sol.request_count, 4);
         assert_eq!(sol.recent_requests, 4);
-        // Latencies 1, 3, 5, 9: the lower middle value.
-        assert_eq!(sol.median_latency, Some(Duration::from_secs(3)));
+        // Latencies 1, 3, 5, 9: the mean of the two middle values.
+        assert_eq!(sol.median_latency, Some(Duration::from_secs(4)));
         // Rates 100, 300, 200 tok/s; the request without an interval has none.
+        assert_eq!(sol.median_output_rate, Some(200.0));
+    }
+
+    /// An even-sized sample has two middle values, and its median is their
+    /// mean, for the latency and the output rate alike.
+    #[test]
+    fn model_stats_medians_of_an_even_sample_average_the_two_middle_values() {
+        let recent: VecDeque<CompletedRequest> = [
+            completed_request(
+                "r1",
+                "s1",
+                100,
+                Duration::from_secs(1),
+                Some(Duration::from_secs(1)),
+            ),
+            completed_request(
+                "r2",
+                "s1",
+                300,
+                Duration::from_secs(9),
+                Some(Duration::from_secs(1)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let state = MonitorState {
+            started_at: SystemTime::UNIX_EPOCH,
+            sessions: session_summaries_for_requests(&recent),
+            active: Vec::new(),
+            recent: recent.into_iter().collect(),
+        };
+        let rows = state.model_stats();
+        let sol = stats_row(&rows, "codex", "gpt-5.6-sol");
+        assert_eq!(sol.recent_requests, 2);
+        assert_eq!(sol.median_latency, Some(Duration::from_secs(5)));
         assert_eq!(sol.median_output_rate, Some(200.0));
     }
 

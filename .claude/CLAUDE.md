@@ -374,9 +374,9 @@ and detached with the record like every other number; the judging itself is
 unchanged. Prompt is `input + read + write` (no `reported_prompt_tokens` at
 this level), hit % is `totals_cache_hit_ratio`, a Codex row's cache write stays
 `Missing` (`n/a`) rather than zero, and `Lat(rec)` / `tok/s(rec)` are medians
-over the row's completed requests still in `recent`, so they cover the
-recent window only and the header says so. Rows sort by prompt tokens
-descending.
+over the row's completed requests still in `recent` (the mean of the two
+middle values for an even count), so they cover the recent window only and
+the header says so. Rows sort by prompt tokens descending.
 
 Deferred and non-blocking: `RequestRecord::model_key` and the requested-model
 histogram allocate `String`s on every ledger update.
