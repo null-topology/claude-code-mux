@@ -1,3 +1,20 @@
+## Unreleased
+
+- Claude Code's subagent progress label is forwarded natively by default
+  (`CCP_AGENT_SUMMARY=native`): the request is routed and relayed like any
+  other for its model, with no rewrite. A native label reports its real usage
+  to the client; the local answer reported zero input tokens, so anything
+  reading usage saw a request of the wrong size. `CCP_AGENT_SUMMARY=local`
+  (or `agentSummary: "local"` in `config.json`) brings back the previous
+  behavior, and `upstream` still pins the provider's junior model.
+- A natively forwarded label can fail like any request (429, 5xx, a spent
+  Codex window), which it never did while it was answered locally.
+- A label request whose prompt is followed by a trailing system message, as
+  Claude Code sends mid-conversation to carry reminders, is now recognized.
+  Before, such requests went upstream unrecognized even in `local` mode.
+- An empty or unrecognized `CCP_AGENT_SUMMARY` is skipped in favor of
+  `config.json` and then `native`. Values are trimmed and case-sensitive.
+
 ## v0.9.2 (2026-09-22)
 
 - Deferred tools stay out of the Codex tools head, the placeholder included.
