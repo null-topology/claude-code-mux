@@ -1,14 +1,20 @@
-//! Claude Code's background-agent status line, answered without an upstream call.
+//! Claude Code's background-agent status line.
 //!
 //! While a subagent runs, Claude Code re-sends that subagent's whole context
 //! every half minute and asks for a three-to-five word label for its progress
-//! line. The label never reaches the model's actual work, but on a subscription
-//! backend the request costs a full context pass: in a measured capture a
-//! quarter of all Codex requests were these labels, each carrying tens of
-//! thousands of tokens. The proxy recognises the prompt and answers it from the
-//! transcript instead, so the label still appears and no tokens are spent.
+//! line. `CCP_AGENT_SUMMARY` (`agentSummary` in `config.json`) decides what the
+//! proxy does with it:
 //!
-//! `CCP_AGENT_SUMMARY=upstream` sends them to the model again.
+//! - `native`, the default: nothing special. The request is routed and relayed
+//!   like any other for its model, untouched, and the label comes from that
+//!   model.
+//! - `local`: answered from the transcript, built from the last tool call,
+//!   with no upstream call.
+//! - `upstream` (also `model`, `remote`): sent to the provider's junior model
+//!   at the lowest effort, never the subagent's own.
+//!
+//! Native is the default because a local answer reports a turn with no input at
+//! all, so anything reading usage on the way sees a request of the wrong size.
 
 use crate::anthropic::schema::MessagesRequest;
 use axum::response::{IntoResponse, Response};
@@ -45,12 +51,19 @@ pub fn apply_summary_route(body: &mut MessagesRequest, model: &str) {
 }
 
 /// Claude Code puts the label prompt in the closing text block of the last user
-/// message, on its own. Other callers quote a subagent's transcript into the
-/// message they send, so the same sentence turns up inside a much longer block
-/// that asks for something else; matching it there answers the wrong request.
-/// The prompt has to open the block, not merely appear somewhere in it.
+/// message, on its own. It may follow that message with `role: "system"`
+/// messages that carry reminders, so those are skipped first. Other callers
+/// quote a subagent's transcript into the message they send, so the same
+/// sentence turns up inside a much longer block that asks for something else;
+/// matching it there answers the wrong request. The prompt has to open the
+/// block, not merely appear somewhere in it.
 pub fn is_agent_summary_request(body: &MessagesRequest) -> bool {
-    let Some(last) = body.messages.last() else {
+    let Some(last) = body
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role != "system")
+    else {
         return false;
     };
     if last.role != "user" {
@@ -246,6 +259,48 @@ mod tests {
             None
         )));
         assert!(!is_agent_summary_request(&request("user", "", None)));
+    }
+
+    /// Claude Code may send `role: "system"` messages after the label prompt to
+    /// carry reminders. They are skipped, and the rule applies to the last
+    /// message before them.
+    #[test]
+    fn trailing_system_messages_are_skipped() {
+        let system = json!({
+            "role": "system",
+            "content": [{"type": "text", "text": "Reminder: the task list changed."}]
+        });
+        let with_trailing_system = |last_text: &str, trailing: usize| {
+            let mut body = request("user", last_text, None);
+            for _ in 0..trailing {
+                body.messages
+                    .push(serde_json::from_value(system.clone()).unwrap());
+            }
+            body
+        };
+
+        let label = format!("{SUMMARY_PROMPT_MARKER} using present tense (-ing).");
+        assert!(is_agent_summary_request(&with_trailing_system(&label, 1)));
+        assert!(is_agent_summary_request(&with_trailing_system(&label, 2)));
+
+        // An ordinary user turn stays ordinary with a system message after it.
+        assert!(!is_agent_summary_request(&with_trailing_system(
+            "Please review this diff",
+            1
+        )));
+
+        // Only system messages, even one carrying the prompt, is not a label.
+        let only_system: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-6-astra",
+            "max_tokens": 64000,
+            "stream": true,
+            "messages": [
+                system,
+                {"role": "system", "content": [{"type": "text", "text": label}]}
+            ]
+        }))
+        .unwrap();
+        assert!(!is_agent_summary_request(&only_system));
     }
 
     /// Other callers quote a transcript into the message they send, and a

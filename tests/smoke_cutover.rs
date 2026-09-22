@@ -4042,6 +4042,16 @@ async fn smoke_auto_review_keeps_the_requested_model_beside_the_one_that_ran() {
     );
 }
 
+/// An Anthropic stream answering a progress-label request as claude-opus-5.
+const ANTHROPIC_LABEL_SSE: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":11,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n",
+    "event: message_delta\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
 /// The relay forwards the caller's own bytes, so the model that reaches
 /// Anthropic is the one written in them — not the one the proxy pointed the
 /// typed request at. The agent-summary override rewrites the typed model and
@@ -4051,19 +4061,11 @@ async fn smoke_auto_review_keeps_the_requested_model_beside_the_one_that_ran() {
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_anthropic_wire_model_is_the_one_in_the_relayed_bytes() {
     let _guard = env_lock();
-    const UPSTREAM_SSE: &str = concat!(
-        "event: message_start\n",
-        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":11,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n",
-        "event: message_delta\n",
-        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
-        "event: message_stop\n",
-        "data: {\"type\":\"message_stop\"}\n\n",
-    );
     let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-    let upstream = spawn_capturing_http_upstream(captured.clone(), UPSTREAM_SSE).await;
+    let upstream = spawn_capturing_http_upstream(captured.clone(), ANTHROPIC_LABEL_SSE).await;
     let _base_url_env = EnvGuard::set("CCP_ANTHROPIC_BASE_URL", &upstream);
-    // Send the label request to a model instead of answering it locally, which
-    // is what makes the typed model and the relayed bytes disagree.
+    // Send the label request to the provider's junior model, which is what
+    // makes the typed model and the relayed bytes disagree.
     let _summary_env = EnvGuard::set("CCP_AGENT_SUMMARY", "upstream");
 
     let body = json!({
@@ -4077,7 +4079,7 @@ async fn smoke_anthropic_wire_model_is_the_one_in_the_relayed_bytes() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let text = drain_stream(response).await;
-    assert_eq!(text, UPSTREAM_SSE, "the relay must stay byte-exact");
+    assert_eq!(text, ANTHROPIC_LABEL_SSE, "the relay must stay byte-exact");
 
     let relayed = captured
         .lock()
@@ -4110,4 +4112,49 @@ async fn smoke_anthropic_wire_model_is_the_one_in_the_relayed_bytes() {
     assert_eq!(row.request_count, 1);
     assert_eq!(row.input_tokens, 11);
     assert_eq!(row.output_tokens, 4);
+}
+
+/// With no mode set, a label request on the Anthropic route is relayed as the
+/// client wrote it, and the monitor names the one model the client asked for.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_anthropic_progress_label_is_relayed_untouched_by_default() {
+    let _guard = env_lock();
+    let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let upstream = spawn_capturing_http_upstream(captured.clone(), ANTHROPIC_LABEL_SSE).await;
+    let _base_url_env = EnvGuard::set("CCP_ANTHROPIC_BASE_URL", &upstream);
+    let _summary_env = EnvGuard::unset("CCP_AGENT_SUMMARY");
+    let config_dir = TempDir::new().unwrap();
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config_dir.path());
+
+    let body = json!({
+        "model": "claude-opus-5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"Describe your most recent action in 3-5 words"}]
+    });
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_body_with_monitor(monitor.clone(), body.clone()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = drain_stream(response).await;
+    assert_eq!(text, ANTHROPIC_LABEL_SSE, "the relay must stay byte-exact");
+
+    let relayed = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream was called");
+    assert_eq!(
+        relayed,
+        body.to_string().into_bytes(),
+        "the relay must forward the client's bytes verbatim"
+    );
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.provider.as_deref(), Some("anthropic"));
+    assert_eq!(request.model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(request.requested_model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(request.effective_model.as_deref(), Some("claude-opus-5"));
 }

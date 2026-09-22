@@ -195,6 +195,7 @@ type CapturedIdentity = (Option<ConversationIdentity>, Option<String>);
 
 struct IdentityCaptureProvider {
     captured: Arc<Mutex<Vec<CapturedIdentity>>>,
+    bodies: Arc<Mutex<Vec<MessagesRequest>>>,
 }
 
 #[async_trait]
@@ -221,7 +222,7 @@ impl Provider for IdentityCaptureProvider {
 
     async fn handle_messages_with_conversation_identity(
         &self,
-        _body: MessagesRequest,
+        body: MessagesRequest,
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> axum::response::Response {
@@ -229,6 +230,7 @@ impl Provider for IdentityCaptureProvider {
             .lock()
             .unwrap()
             .push((conversation_identity, ctx.session_id));
+        self.bodies.lock().unwrap().push(body);
         (StatusCode::OK, "captured").into_response()
     }
 
@@ -286,6 +288,7 @@ async fn messages_ingress_forwards_only_strict_conversation_identity() {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let provider = Arc::new(IdentityCaptureProvider {
         captured: captured.clone(),
+        bodies: Default::default(),
     }) as Arc<dyn Provider>;
     let app = app(Arc::new(Registry::from_providers(
         AliasProvider::Codex,
@@ -1680,6 +1683,7 @@ async fn monitor_records_a_request_that_named_no_model() {
 /// a request the caller made for a model, and it is counted as one.
 #[tokio::test]
 async fn monitor_records_a_locally_answered_request_without_a_wire_model() {
+    let _mode = PinnedAgentSummary::install(Some("local"));
     let monitor = MonitorHandle::new(10);
     let app = app_with_monitor(
         Arc::new(Registry::with_default_alias()),
@@ -1920,17 +1924,59 @@ async fn models_endpoint_respects_limit() {
     assert_eq!(value["last_id"], data[1]["id"]);
 }
 
-#[tokio::test]
-async fn agent_progress_label_is_answered_without_a_provider() {
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let provider = Arc::new(IdentityCaptureProvider {
-        captured: captured.clone(),
-    }) as Arc<dyn Provider>;
-    let app = app(Arc::new(Registry::from_providers(
-        AliasProvider::Codex,
-        [provider],
-    )));
-    let body = json!({
+static AGENT_SUMMARY_LOCK: Mutex<()> = Mutex::new(());
+
+/// Pin the progress-label mode for the duration of a test: set or clear
+/// `CCP_AGENT_SUMMARY` and point `CCP_CONFIG_DIR` at an empty directory, so
+/// neither the environment nor a `config.json` on the machine picks the mode.
+/// Tests that pin it run one at a time.
+struct PinnedAgentSummary {
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _config_dir: tempfile::TempDir,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl PinnedAgentSummary {
+    fn install(mode: Option<&str>) -> Self {
+        let lock = AGENT_SUMMARY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let config_dir = tempfile::TempDir::new().unwrap();
+        let previous = ["CCP_AGENT_SUMMARY", "CCP_CONFIG_DIR"]
+            .map(|key| (key, std::env::var_os(key)))
+            .to_vec();
+        unsafe {
+            match mode {
+                Some(mode) => std::env::set_var("CCP_AGENT_SUMMARY", mode),
+                None => std::env::remove_var("CCP_AGENT_SUMMARY"),
+            }
+            std::env::set_var("CCP_CONFIG_DIR", config_dir.path());
+        }
+        Self {
+            previous,
+            _config_dir: config_dir,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for PinnedAgentSummary {
+    fn drop(&mut self) {
+        unsafe {
+            for (key, value) in self.previous.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+/// A subagent turn that ends with Claude Code's progress-label prompt, after
+/// the result of its last tool call.
+fn progress_label_body() -> Value {
+    json!({
         "model": "gpt-5.5",
         "max_tokens": 64000,
         "stream": false,
@@ -1945,19 +1991,44 @@ async fn agent_progress_label_is_answered_without_a_provider() {
                 {"type": "text", "text": "Describe your most recent action in 3-5 words using present tense (-ing)."}
             ]}
         ]
-    });
+    })
+}
+
+/// Post a label request to a registry holding only an
+/// `IdentityCaptureProvider`, and return the response with what that provider
+/// received.
+async fn post_progress_label(
+    body: &Value,
+    monitor: Option<MonitorHandle>,
+) -> (axum::response::Response, Arc<Mutex<Vec<MessagesRequest>>>) {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(IdentityCaptureProvider {
+        captured: Default::default(),
+        bodies: bodies.clone(),
+    }) as Arc<dyn Provider>;
+    let app = app_with_monitor(
+        Arc::new(Registry::from_providers(AliasProvider::Codex, [provider])),
+        monitor,
+    );
     let response = app
-        .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/messages")
                 .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "label-session")
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
         .await
         .unwrap();
+    (response, bodies)
+}
+
+#[tokio::test]
+async fn agent_progress_label_is_answered_without_a_provider() {
+    let _mode = PinnedAgentSummary::install(Some("local"));
+    let (response, bodies) = post_progress_label(&progress_label_body(), None).await;
 
     assert_eq!(response.status(), StatusCode::OK);
     // A local answer is still a Messages response and carries its id.
@@ -1968,17 +2039,68 @@ async fn agent_progress_label_is_answered_without_a_provider() {
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["content"][0]["text"], json!("Reading server.rs"));
     assert_eq!(value["usage"]["input_tokens"], json!(0));
-    // The label never reaches a backend, which is the whole point: upstream it
-    // would cost the subagent's full context.
-    assert!(captured.lock().unwrap().is_empty());
+    // In the local mode the label never reaches a backend.
+    assert!(bodies.lock().unwrap().is_empty());
+}
+
+/// Claude Code may follow the label prompt with a `role: "system"` message that
+/// carries reminders. It is still a label request.
+#[tokio::test]
+async fn agent_progress_label_followed_by_a_system_message_is_answered_locally() {
+    let _mode = PinnedAgentSummary::install(Some("local"));
+    let mut body = progress_label_body();
+    body["messages"].as_array_mut().unwrap().push(json!({
+        "role": "system",
+        "content": [{"type": "text", "text": "Reminder: the task list changed."}]
+    }));
+    let (response, bodies) = post_progress_label(&body, None).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["content"][0]["text"], json!("Reading server.rs"));
+    assert!(bodies.lock().unwrap().is_empty());
+}
+
+/// With no mode set, a label request is nothing special: the subagent's own
+/// provider gets it once, with the model and effort the client asked for, and
+/// the monitor names that provider rather than a local answer.
+#[tokio::test]
+async fn agent_progress_label_is_forwarded_untouched_by_default() {
+    let _mode = PinnedAgentSummary::install(None);
+    let monitor = MonitorHandle::new(10);
+    let mut body = progress_label_body();
+    body["output_config"] = json!({"effort": "high"});
+    let (response, bodies) = post_progress_label(&body, Some(monitor.clone())).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), b"captured");
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0].model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(
+        bodies[0].extra.get("output_config"),
+        Some(&json!({"effort": "high"}))
+    );
+    assert_eq!(serde_json::to_value(&bodies[0]).unwrap(), body);
+    let state = monitor.snapshot();
+    assert_eq!(state.recent[0].provider.as_deref(), Some("codex"));
 }
 
 /// Send a classifier-shaped request through the proxy and report what the
-/// backend saw and how the monitor recorded it.
+/// backend saw and how the monitor recorded it. The local mode is pinned, so
+/// the classifier guard is what keeps it off the local answer.
 async fn classifier_route(user_text: &str) -> (StatusCode, String, usize, Option<String>) {
+    let _mode = PinnedAgentSummary::install(Some("local"));
     let captured = Arc::new(Mutex::new(Vec::new()));
     let provider = Arc::new(IdentityCaptureProvider {
         captured: captured.clone(),
+        bodies: Default::default(),
     }) as Arc<dyn Provider>;
     let monitor = MonitorHandle::new(10);
     let app = app_with_monitor(
@@ -2094,6 +2216,7 @@ async fn post_json(app: axum::Router, uri: &str, body: Body) -> axum::response::
 fn capture_app(monitor: Option<MonitorHandle>) -> axum::Router {
     let provider = Arc::new(IdentityCaptureProvider {
         captured: Arc::new(Mutex::new(Vec::new())),
+        bodies: Default::default(),
     }) as Arc<dyn Provider>;
     app_with_monitor(
         Arc::new(Registry::from_providers(AliasProvider::Codex, [provider])),
