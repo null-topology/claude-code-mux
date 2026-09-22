@@ -1871,7 +1871,9 @@ async fn dispatch_request(
         }
     };
 
-    body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
+    // The label route above may already have pinned its junior model; keep that.
+    body.bypass_provider_model_override |=
+        auto_review_route.is_some() && provider.name() == "codex";
 
     if let Some(route) = auto_review_route.as_ref() {
         log.info(

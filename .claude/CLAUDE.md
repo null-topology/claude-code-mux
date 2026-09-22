@@ -413,7 +413,8 @@ transcript, built from the last tool call (provider `local`,
 provider's junior model at `effort: low`, never the subagent's own
 (`CCP_AGENT_SUMMARY_MODEL` overrides it in this mode only;
 `agent_summary_routed`); on the Anthropic route the relayed bytes stay the
-client's own, so only the model the monitor records changes. The junior model
+client's own, so the request Anthropic receives is unchanged and only the
+proxy's own record names the junior model. The junior model
 must still hold the subagent's context, which is why Anthropic's is
 `claude-sonnet-5` and not Haiku (200k would drop the label on a long subagent)
 and Codex's is `gpt-5.6-luna`; a provider without an entry in

@@ -140,6 +140,11 @@ async fn call_messages_body(body: Value) -> Response {
 /// Same request, with a monitor watching, so a test can read what the proxy
 /// recorded about the request next to what the client received.
 async fn call_messages_body_with_monitor(monitor: MonitorHandle, body: Value) -> Response {
+    call_messages_bytes_with_monitor(monitor, body.to_string()).await
+}
+
+/// Send `body` exactly as given, for tests that check the bytes a relay forwards.
+async fn call_messages_bytes_with_monitor(monitor: MonitorHandle, body: String) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
     app_with_monitor(Arc::new(Registry::with_default_alias()), Some(monitor))
         .oneshot(
@@ -148,7 +153,7 @@ async fn call_messages_body_with_monitor(monitor: MonitorHandle, body: Value) ->
                 .uri("/v1/messages")
                 .header("content-type", "application/json")
                 .header("x-claude-code-session-id", "smoke-session")
-                .body(Body::from(body.to_string()))
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await
@@ -4116,6 +4121,8 @@ async fn smoke_anthropic_wire_model_is_the_one_in_the_relayed_bytes() {
 
 /// With no mode set, a label request on the Anthropic route is relayed as the
 /// client wrote it, and the monitor names the one model the client asked for.
+/// The body is spaced and ordered the way no serializer would write it, so a
+/// relay that parsed and rewrote it would not reproduce these bytes.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_anthropic_progress_label_is_relayed_untouched_by_default() {
@@ -4127,14 +4134,12 @@ async fn smoke_anthropic_progress_label_is_relayed_untouched_by_default() {
     let config_dir = TempDir::new().unwrap();
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config_dir.path());
 
-    let body = json!({
-        "model": "claude-opus-5",
-        "max_tokens": 64,
-        "stream": true,
-        "messages": [{"role":"user","content":"Describe your most recent action in 3-5 words"}]
-    });
+    const BODY: &str = r#"{ "stream" : true,
+  "messages": [ { "role": "user",   "content": "Describe your most recent action in 3-5 words" } ],
+  "model":"claude-opus-5",  "max_tokens" :64 }
+"#;
     let monitor = MonitorHandle::new(10);
-    let response = call_messages_body_with_monitor(monitor.clone(), body.clone()).await;
+    let response = call_messages_bytes_with_monitor(monitor.clone(), BODY.to_string()).await;
 
     assert_eq!(response.status(), StatusCode::OK);
     let text = drain_stream(response).await;
@@ -4147,7 +4152,7 @@ async fn smoke_anthropic_progress_label_is_relayed_untouched_by_default() {
         .expect("upstream was called");
     assert_eq!(
         relayed,
-        body.to_string().into_bytes(),
+        BODY.as_bytes(),
         "the relay must forward the client's bytes verbatim"
     );
 

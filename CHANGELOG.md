@@ -14,6 +14,8 @@
   Before, such requests went upstream unrecognized even in `local` mode.
 - An empty or unrecognized `CCP_AGENT_SUMMARY` is skipped in favor of
   `config.json` and then `native`. Values are trimmed and case-sensitive.
+- In `upstream` mode the junior model is now kept when a Codex model override
+  (`CCP_CODEX_MODEL`) is set; before, the override replaced it.
 
 ## v0.9.2 (2026-09-22)
 

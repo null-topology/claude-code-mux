@@ -1927,9 +1927,10 @@ async fn models_endpoint_respects_limit() {
 static AGENT_SUMMARY_LOCK: Mutex<()> = Mutex::new(());
 
 /// Pin the progress-label mode for the duration of a test: set or clear
-/// `CCP_AGENT_SUMMARY` and point `CCP_CONFIG_DIR` at an empty directory, so
-/// neither the environment nor a `config.json` on the machine picks the mode.
-/// Tests that pin it run one at a time.
+/// `CCP_AGENT_SUMMARY`, clear `CCP_AGENT_SUMMARY_MODEL` and point
+/// `CCP_CONFIG_DIR` at an empty directory, so neither the environment nor a
+/// `config.json` on the machine picks the mode or the label model. Tests that
+/// pin it run one at a time.
 struct PinnedAgentSummary {
     previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _config_dir: tempfile::TempDir,
@@ -1942,14 +1943,19 @@ impl PinnedAgentSummary {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let config_dir = tempfile::TempDir::new().unwrap();
-        let previous = ["CCP_AGENT_SUMMARY", "CCP_CONFIG_DIR"]
-            .map(|key| (key, std::env::var_os(key)))
-            .to_vec();
+        let previous = [
+            "CCP_AGENT_SUMMARY",
+            "CCP_AGENT_SUMMARY_MODEL",
+            "CCP_CONFIG_DIR",
+        ]
+        .map(|key| (key, std::env::var_os(key)))
+        .to_vec();
         unsafe {
             match mode {
                 Some(mode) => std::env::set_var("CCP_AGENT_SUMMARY", mode),
                 None => std::env::remove_var("CCP_AGENT_SUMMARY"),
             }
+            std::env::remove_var("CCP_AGENT_SUMMARY_MODEL");
             std::env::set_var("CCP_CONFIG_DIR", config_dir.path());
         }
         Self {
@@ -2090,6 +2096,25 @@ async fn agent_progress_label_is_forwarded_untouched_by_default() {
     assert_eq!(serde_json::to_value(&bodies[0]).unwrap(), body);
     let state = monitor.snapshot();
     assert_eq!(state.recent[0].provider.as_deref(), Some("codex"));
+}
+
+/// In the `upstream` mode the label goes to the provider's junior model at the
+/// lowest effort, and the provider is told to keep that model, so a model
+/// override configured for the provider (`CCP_CODEX_MODEL`) cannot replace it.
+#[tokio::test]
+async fn agent_progress_label_upstream_route_keeps_the_junior_model() {
+    let _mode = PinnedAgentSummary::install(Some("upstream"));
+    let (response, bodies) = post_progress_label(&progress_label_body(), None).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0].model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(
+        bodies[0].extra.get("output_config"),
+        Some(&json!({"effort": "low"}))
+    );
+    assert!(bodies[0].bypass_provider_model_override);
 }
 
 /// Send a classifier-shaped request through the proxy and report what the
