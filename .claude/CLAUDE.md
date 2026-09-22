@@ -587,8 +587,14 @@ currently serves, including `visibility` and `use_responses_lite` per model.
   prompt and costs a full prompt-cache miss on every load (measured: 0 cached
   tokens on the request after a load, versus the whole prefix with the native
   mapping). The mapping is derived from the request alone, so it is
-  byte-stable turn to turn; a deferred tool no search in the history names
-  (the placeholder, or a tool whose search was compacted away) stays in the head.
+  byte-stable turn to turn. A deferred tool no search in the history names
+  (the placeholder, or a tool whose search a compaction or a context manager
+  removed) stays out of the head too, as Anthropic leaves it out of the
+  prompt; only a deferred tool a directed `tool_choice` names goes in
+  (`ToolSearchPlan::keeps_in_head`). Measured live on gpt-5.6-sol: the backend
+  accepts a `function_call` in the history for a tool absent from `tools`, and
+  a request whose search pair was replaced by a summary kept 9216 of 12834
+  prompt tokens cached this way, against 0 when the orphan went into the head.
 - Claude Code's web search is a client-side `WebSearch` function tool. The
   hosted `web_search_20250305` tool only appears inside an isolated, history-free
   inner call, so its `server_tool_use` and `web_search_tool_result` blocks never

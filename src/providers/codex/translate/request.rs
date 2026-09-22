@@ -2609,11 +2609,7 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            vec![
-                ("function", Some("Read")),
-                ("tool_search", None),
-                ("function", Some("DeferredToolPlaceholder")),
-            ]
+            vec![("function", Some("Read")), ("tool_search", None)]
         );
         assert_eq!(head[1]["execution"], "client");
         assert_eq!(
@@ -2695,36 +2691,61 @@ mod tests {
             .expect("search output");
         assert_eq!(output["tools"], json!([]));
 
-        // Nothing was loaded, so the deferred tool Claude Code still lists stays
-        // callable from the head.
+        // Nothing was loaded, and the deferred tool Claude Code still lists stays
+        // out of the head all the same.
         let head_names: Vec<&str> = items[0]["tools"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
-        assert!(head_names.contains(&"CronList"));
+        assert!(!head_names.contains(&"CronList"));
     }
 
     #[test]
-    fn deferred_tool_without_a_search_in_history_stays_in_head() {
+    fn deferred_tool_without_a_search_in_history_stays_out_of_head() {
         // After a compaction Claude Code keeps the loaded tool in `tools` but the
-        // search that loaded it is no longer in the history.
+        // search that loaded it is no longer in the history. The head stays the
+        // one a request without the tool gets, so the cached prefix survives,
+        // and the call left in the history still goes out as it was.
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
-            "messages": [{"role": "user", "content": "Summary of earlier work. Continue."}],
+            "messages": [
+                {"role": "user", "content": "Summary of earlier work. Continue."},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_cron", "name": "CronList", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_cron", "content": "no jobs"}
+                ]}
+            ],
             "tools": claude_code_tools(true),
         }))
         .unwrap();
-        let out = translate_request(&req, lane_opts(true)).unwrap();
-        let items = items_json(&out);
-        let cron = items[0]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|tool| tool["name"] == "CronList")
-            .expect("CronList in head");
-        assert!(cron.get("defer_loading").is_none());
+        let without_tool: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "Start."}],
+            "tools": claude_code_tools(false),
+        }))
+        .unwrap();
+        for lite in [true, false] {
+            let out = translate_request(&req, lane_opts(lite)).unwrap();
+            let names = head_tool_names(&out);
+            assert!(!names.contains(&"CronList".to_string()), "lite={lite}");
+            assert!(
+                !names.contains(&"DeferredToolPlaceholder".to_string()),
+                "lite={lite}"
+            );
+            let reference = translate_request(&without_tool, lane_opts(lite)).unwrap();
+            assert_eq!(head_tools(&out), head_tools(&reference), "lite={lite}");
+            assert!(search_output_tool_names(&out).is_empty(), "lite={lite}");
+            assert!(
+                items_json(&out)
+                    .iter()
+                    .any(|item| item["type"] == "function_call" && item["name"] == "CronList"),
+                "lite={lite}"
+            );
+        }
     }
 
     #[test]
@@ -2877,8 +2898,8 @@ mod tests {
 
     #[test]
     fn tool_search_directed_tool_choice_is_forwarded_when_nothing_loaded_it() {
-        // A deferred tool no search in this history loaded stays in the head, and
-        // the directed choice names it there.
+        // A deferred tool stays out of the head, except the one a directed choice
+        // names: it goes in, so the choice refers to a declared tool.
         let mut req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
             "messages": [{"role": "user", "content": "How many cron jobs are scheduled?"}],
@@ -3013,11 +3034,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 kinds,
-                vec![
-                    ("function", Some("Read")),
-                    ("tool_search", None),
-                    ("function", Some("DeferredToolPlaceholder")),
-                ],
+                vec![("function", Some("Read")), ("tool_search", None)],
                 "lite={lite}"
             );
 

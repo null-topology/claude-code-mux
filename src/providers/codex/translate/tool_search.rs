@@ -15,6 +15,14 @@
 //! changes the first bytes of the prompt and costs a full prompt-cache miss on
 //! every load.
 //!
+//! A deferred tool whose search left the history (a compaction, or a context
+//! manager replacing old turns with a summary) stays in `tools` as Claude Code
+//! sent it. Anthropic does not render such a tool; neither does this
+//! translation, so the head stays the same and the prefix up to the rewritten
+//! turns stays cached. The model loads the tool again with a new search. A
+//! `function_call` for it left in the history is accepted by the backend
+//! without the tool being declared.
+//!
 //! Everything here is derived from the request alone, so the same Claude Code
 //! history always translates to the same bytes.
 
@@ -41,9 +49,10 @@ pub struct ToolSearchPlan {
     pub call_ids: HashSet<String>,
     /// Deferred tools from the request's `tools`, by name, as Claude Code sent them.
     pub deferred_tools: BTreeMap<String, Value>,
-    /// Deferred tools a `ToolSearch` result in the history has loaded. These
-    /// are carried by `tool_search_output` items and stay out of the tools head.
-    pub loaded: HashSet<String>,
+    /// Tool a directed `tool_choice` names when no search in the history loaded
+    /// it. A deferred tool named there stays in the head so the choice refers to
+    /// a declared tool.
+    pub forced_tool: Option<String>,
 }
 
 impl ToolSearchPlan {
@@ -51,16 +60,19 @@ impl ToolSearchPlan {
         self.call_ids.contains(tool_use_id)
     }
 
-    /// Whether a tool belongs in the tools head. Deferred tools loaded by a
-    /// search in this history are delivered by that search's output instead;
-    /// deferred tools no search references (the placeholder, or a tool whose
-    /// search was compacted away) stay in the head so the model can still call them.
+    /// Whether a tool belongs in the tools head. A deferred tool never does,
+    /// unless a directed `tool_choice` names it and no search loaded it: one a
+    /// search in this history loaded arrives with that search's output, and one
+    /// no search references
+    /// (the placeholder, or a tool whose search was compacted away) is left out,
+    /// as Anthropic leaves it out of the prompt. Adding it to the head would
+    /// change the first bytes of the prompt and miss the whole cached prefix.
     pub fn keeps_in_head(&self, tool: &Value) -> bool {
-        if !is_deferred(tool) {
-            return true;
-        }
-        let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-        !self.loaded.contains(name)
+        !is_deferred(tool)
+            || tool
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| self.forced_tool.as_deref() == Some(name))
     }
 
     /// Deferred tools referenced by one `ToolSearch` result, in reference order,
@@ -107,8 +119,16 @@ pub fn plan(req: &MessagesRequest) -> Option<ToolSearchPlan> {
         })
         .collect();
 
+    let forced_tool = req
+        .extra
+        .get("tool_choice")
+        .filter(|choice| choice.get("type").and_then(Value::as_str) == Some("tool"))
+        .and_then(|choice| choice.get("name").and_then(Value::as_str))
+        .map(str::to_string);
+
     let mut plan = ToolSearchPlan {
         deferred_tools,
+        forced_tool,
         ..ToolSearchPlan::default()
     };
 
@@ -125,10 +145,15 @@ pub fn plan(req: &MessagesRequest) -> Option<ToolSearchPlan> {
                     content,
                     ..
                 } if msg.role == "user" && plan.call_ids.contains(&tool_use_id) => {
-                    for name in referenced_tool_names(&content) {
-                        if plan.deferred_tools.contains_key(&name) {
-                            plan.loaded.insert(name);
-                        }
+                    // A search that loaded the chosen tool already delivers its
+                    // spec with its output, so the choice refers to a declared tool.
+                    let loaded = referenced_tool_names(&content);
+                    if plan
+                        .forced_tool
+                        .as_ref()
+                        .is_some_and(|forced| loaded.contains(forced))
+                    {
+                        plan.forced_tool = None;
                     }
                 }
                 _ => {}
@@ -264,12 +289,11 @@ mod tests {
         }));
         let plan = plan(&req).expect("plan");
         assert!(plan.is_tool_search_call("call_s"));
-        assert_eq!(plan.loaded, HashSet::from(["CronList".to_string()]));
 
         let placeholder = json!({"name": "DeferredToolPlaceholder", "defer_loading": true});
         let cron = json!({"name": "CronList", "defer_loading": true});
         let read = json!({"name": "Read"});
-        assert!(plan.keeps_in_head(&placeholder));
+        assert!(!plan.keeps_in_head(&placeholder));
         assert!(!plan.keeps_in_head(&cron));
         assert!(plan.keeps_in_head(&read));
 
@@ -306,7 +330,8 @@ mod tests {
             ]
         }));
         let plan = plan(&req).expect("plan");
-        assert!(plan.loaded.is_empty());
+        assert!(!plan.is_tool_search_call("call_b"));
+        assert!(plan.call_ids.is_empty());
     }
 
     #[test]
@@ -375,9 +400,6 @@ mod tests {
             ]
         }));
         let plan = plan(&req).expect("plan");
-        let mut loaded: Vec<&str> = plan.loaded.iter().map(String::as_str).collect();
-        loaded.sort_unstable();
-        assert_eq!(loaded, vec!["AlphaTool", "CronList", "ZebraTool"]);
 
         // One search's output carries them in reference order, first mention
         // wins; the deferred map is only the lookup, it does not reorder.
@@ -398,7 +420,7 @@ mod tests {
             assert!(!plan.keeps_in_head(&json!({"name": name, "defer_loading": true})));
         }
         assert!(
-            plan.keeps_in_head(&json!({"name": "DeferredToolPlaceholder", "defer_loading": true}))
+            !plan.keeps_in_head(&json!({"name": "DeferredToolPlaceholder", "defer_loading": true}))
         );
     }
 
@@ -434,14 +456,10 @@ mod tests {
         let plan = plan(&req).expect("plan");
         assert!(plan.is_tool_search_call("call_s1"));
         assert!(plan.is_tool_search_call("call_s2"));
-        assert_eq!(
-            plan.loaded,
-            HashSet::from(["CronList".to_string(), "AlphaTool".to_string()])
-        );
         assert!(!plan.keeps_in_head(&json!({"name": "CronList", "defer_loading": true})));
         assert!(!plan.keeps_in_head(&json!({"name": "AlphaTool", "defer_loading": true})));
         assert!(
-            plan.keeps_in_head(&json!({"name": "DeferredToolPlaceholder", "defer_loading": true}))
+            !plan.keeps_in_head(&json!({"name": "DeferredToolPlaceholder", "defer_loading": true}))
         );
 
         // Each search still expands only what it referenced.
@@ -499,8 +517,7 @@ mod tests {
         })))
         .expect("plan");
 
-        assert_eq!(once.loaded, HashSet::from(["CronList".to_string()]));
-        assert_eq!(twice.loaded, once.loaded);
+        assert_eq!(once.call_ids.len(), 1);
         assert_eq!(twice.call_ids.len(), 2);
         for tool in [
             json!({"name": "DeferredToolPlaceholder", "defer_loading": true}),
@@ -546,8 +563,7 @@ mod tests {
         }));
         let plan = plan(&req).expect("plan");
         assert!(plan.is_tool_search_call("call_s"));
-        assert!(plan.loaded.is_empty());
-        assert!(plan.keeps_in_head(&json!({"name": "CronList", "defer_loading": true})));
+        assert!(!plan.keeps_in_head(&json!({"name": "CronList", "defer_loading": true})));
 
         let content = json!([
             {"type": "tool_reference", "tool_name": "NoSuchTool"},
@@ -564,6 +580,53 @@ mod tests {
         // A result that is not a block array carries no references at all.
         assert!(referenced_tool_names(&json!("no deferred tool matched")).is_empty());
         assert!(plan.referenced_deferred_tools(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn only_a_directed_tool_choice_keeps_a_deferred_tool_in_the_head() {
+        let tools = json!([
+            tool_search_tool(),
+            {"name": "DeferredToolPlaceholder", "defer_loading": true, "input_schema": {"type": "object"}},
+            {"name": "CronList", "defer_loading": true, "input_schema": {"type": "object"}},
+            {"name": "Read", "input_schema": {"type": "object"}}
+        ]);
+        let cron = json!({"name": "CronList", "defer_loading": true});
+        let placeholder = json!({"name": "DeferredToolPlaceholder", "defer_loading": true});
+        let unnamed = json!({"defer_loading": true});
+
+        let free = plan(&request(json!({
+            "model": "gpt-5.6-sol",
+            "tools": tools,
+            "messages": [{"role": "user", "content": "go"}]
+        })))
+        .expect("plan");
+        assert_eq!(free.forced_tool, None);
+        assert!(!free.keeps_in_head(&cron));
+        assert!(!free.keeps_in_head(&unnamed));
+
+        let directed = plan(&request(json!({
+            "model": "gpt-5.6-sol",
+            "tools": tools,
+            "tool_choice": {"type": "tool", "name": "CronList"},
+            "messages": [{"role": "user", "content": "go"}]
+        })))
+        .expect("plan");
+        assert_eq!(directed.forced_tool.as_deref(), Some("CronList"));
+        assert!(directed.keeps_in_head(&cron));
+        assert!(!directed.keeps_in_head(&placeholder));
+        assert!(!directed.keeps_in_head(&unnamed));
+        assert!(directed.keeps_in_head(&json!({"name": "Read"})));
+
+        // Any other choice mode names no tool.
+        let any = plan(&request(json!({
+            "model": "gpt-5.6-sol",
+            "tools": tools,
+            "tool_choice": {"type": "any"},
+            "messages": [{"role": "user", "content": "go"}]
+        })))
+        .expect("plan");
+        assert_eq!(any.forced_tool, None);
+        assert!(!any.keeps_in_head(&cron));
     }
 
     #[test]
