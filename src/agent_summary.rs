@@ -5,9 +5,9 @@
 //! line. `CCP_AGENT_SUMMARY` (`agentSummary` in `config.json`) decides what the
 //! proxy does with it:
 //!
-//! - `native`, the default: nothing special. The request is routed and relayed
-//!   like any other for its model, untouched, and the label comes from that
-//!   model.
+//! - `native`, the default: the request is routed and relayed like any other
+//!   for its model, and the label comes from that model. The only change is
+//!   `tool_choice: none` on the Codex route, described below.
 //! - `local`: answered from the transcript, built from the last tool call,
 //!   with no upstream call.
 //! - `upstream` (also `model`, `remote`): sent to the provider's junior model
@@ -15,9 +15,20 @@
 //!
 //! Native is the default because a local answer reports a turn with no input at
 //! all, so anything reading usage on the way sees a request of the wrong size.
+//!
+//! A label routed to Codex, in the native and the upstream mode both, goes out
+//! with `tool_choice: none`. The client attaches the subagent's tools and only
+//! asks in prose not to use them; measured on the ChatGPT backend, Codex
+//! models often answered a label with a tool call, which the client discards.
+//! The mode is accepted by every listed Codex model, enforced, and leaves the
+//! cached prefix intact because the tools stay in the request. The Anthropic
+//! route is untouched: a `tool_choice` change invalidates Anthropic's
+//! messages cache.
 
 use crate::anthropic::schema::MessagesRequest;
+use crate::request_identity::{RequestClass, request_class_from_headers};
 use axum::response::{IntoResponse, Response};
+use http::HeaderMap;
 use serde_json::{Value, json};
 
 /// The instruction Claude Code appends when it wants a progress label. Matching
@@ -41,6 +52,9 @@ pub fn summary_model_for(provider: &str) -> Option<&'static str> {
     }
 }
 
+/// The class Claude Code puts on every side request, the label included.
+pub const AUXILIARY_REQUEST_CLASS: &str = "auxiliary";
+
 /// Point a label request at the cheap model and stop it from reasoning about a
 /// three-word answer.
 pub fn apply_summary_route(body: &mut MessagesRequest, model: &str) {
@@ -48,6 +62,28 @@ pub fn apply_summary_route(body: &mut MessagesRequest, model: &str) {
     body.bypass_provider_model_override = true;
     body.extra
         .insert("output_config".to_string(), json!({"effort": "low"}));
+}
+
+/// A label must come back as text. Tools stay in the request, because taking
+/// them out changes the head of the prompt and costs the cached prefix; the
+/// choice alone rules a call out.
+pub fn forbid_tool_calls(body: &mut MessagesRequest) {
+    body.extra
+        .insert("tool_choice".to_string(), json!({"type": "none"}));
+}
+
+/// Whether Claude Code's own class for a request leaves room for a label. The
+/// header is a guard, not the detector: Claude Code sends `auxiliary` on every
+/// side request (titles, prompt suggestions, the isolated web search call), so
+/// it cannot pick a label out, but a request classed as anything else is not
+/// one however its prompt reads. Older clients send no header and stay
+/// eligible.
+pub fn request_class_allows_label(headers: &HeaderMap) -> bool {
+    match request_class_from_headers(headers) {
+        RequestClass::Absent => true,
+        RequestClass::Named(class) => class == AUXILIARY_REQUEST_CLASS,
+        RequestClass::Invalid => false,
+    }
 }
 
 /// Claude Code puts the label prompt in the closing text block of the last user
@@ -362,6 +398,54 @@ mod tests {
         assert_eq!(body.extra["output_config"], json!({"effort": "low"}));
         // The configured provider override must not pull it back to a big model.
         assert!(body.bypass_provider_model_override);
+    }
+
+    #[test]
+    fn forbidding_tool_calls_sets_the_choice_and_keeps_the_tools() {
+        let mut body = request("user", SUMMARY_PROMPT_MARKER, None);
+        let tools = json!([{"name": "Read", "input_schema": {"type": "object"}}]);
+        body.extra.insert("tools".to_string(), tools.clone());
+        body.extra
+            .insert("tool_choice".to_string(), json!({"type": "auto"}));
+        forbid_tool_calls(&mut body);
+
+        assert_eq!(body.extra["tool_choice"], json!({"type": "none"}));
+        assert_eq!(body.extra["tools"], tools);
+    }
+
+    #[test]
+    fn only_an_absent_or_auxiliary_request_class_allows_a_label() {
+        use http::{HeaderName, HeaderValue};
+        let with_class = |values: &[&str]| {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(
+                    HeaderName::from_static("x-claude-code-request-class"),
+                    HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            headers
+        };
+
+        assert!(request_class_allows_label(&HeaderMap::new()));
+        assert!(request_class_allows_label(&with_class(&["auxiliary"])));
+        assert!(request_class_allows_label(&with_class(&[" auxiliary\t"])));
+
+        // Any other class Claude Code names, and anything unreadable, is not
+        // a label however the prompt reads.
+        for values in [
+            &["main"][..],
+            &["subagent"],
+            &["compaction"],
+            &["Auxiliary"],
+            &[""],
+            &["auxiliary", "auxiliary"],
+        ] {
+            assert!(
+                !request_class_allows_label(&with_class(values)),
+                "class {values:?}"
+            );
+        }
     }
 
     #[test]

@@ -404,7 +404,8 @@ whole context. `CCP_AGENT_SUMMARY` (config key `agentSummary`) picks the mode:
 the first source that parses wins, env then `config.json`, else `native`; an
 empty or unrecognised value is skipped, and values are trimmed and
 case-sensitive. `native`, the default, routes and relays the request like any
-other for its model, with no rewrite (`agent_summary_forwarded`), so the client
+other for its model, with no rewrite beyond `tool_choice: none` on the Codex
+route described below (`agent_summary_forwarded`), so the client
 sees the label's real usage; the local answer reported zero input, so anything
 reading usage saw a request of the wrong size. A native label can fail like any
 request (429, 5xx, a spent Codex window). `local` answers it from the
@@ -422,7 +423,19 @@ and Codex's is `gpt-5.6-luna`; a provider without an entry in
 `SUMMARY_PROMPT_MARKER`: these requests otherwise look like a normal subagent
 turn, with its tools and history. Detection skips trailing `role: "system"`
 messages after the prompt, which Claude Code sends mid-conversation to carry
-reminders.
+reminders. It also consults `x-claude-code-request-class`
+(`request_class_allows_label`): any present value other than `auxiliary` rules
+a request out, and the header alone is not enough because Claude Code sends
+`auxiliary` on every side request (titles, prompt suggestions, the isolated web
+search call); an absent header stays eligible. A label routed to codex, in
+native and upstream mode both, gets `tool_choice: {"type": "none"}`
+(`forbid_tool_calls`, applied in `dispatch_request` once the provider is
+known) with its tools kept: the client only asks in prose, and measured on the
+ChatGPT backend Codex models often answered a label with a tool call;
+`none` is accepted and enforced by every listed Codex model and cache-neutral
+because the tools stay. The Anthropic route is untouched: a `tool_choice`
+change invalidates Anthropic's messages cache and the passthrough is
+byte-exact.
 
 ## Invariants to preserve
 

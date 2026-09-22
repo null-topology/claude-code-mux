@@ -122,17 +122,23 @@ async fn call_messages(model: &str) -> Response {
 }
 
 async fn call_messages_body(body: Value) -> Response {
+    call_messages_body_with_class(body, None).await
+}
+
+/// Same request, with `x-claude-code-request-class` set to `request_class`
+/// when one is given, as Claude Code sends on its own requests.
+async fn call_messages_body_with_class(body: Value, request_class: Option<&str>) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", "smoke-session");
+    if let Some(class) = request_class {
+        request = request.header("x-claude-code-request-class", class);
+    }
     app(Arc::new(Registry::with_default_alias()))
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .header("x-claude-code-session-id", "smoke-session")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap()
 }
@@ -4162,4 +4168,110 @@ async fn smoke_anthropic_progress_label_is_relayed_untouched_by_default() {
     assert_eq!(request.model.as_deref(), Some("claude-opus-5"));
     assert_eq!(request.requested_model.as_deref(), Some("claude-opus-5"));
     assert_eq!(request.effective_model.as_deref(), Some("claude-opus-5"));
+}
+
+/// A progress label routed to Codex reaches the backend with `tool_choice`
+/// `none` and the subagent's tools intact, in the default mode and in the
+/// `upstream` mode on the junior model alike. The same prompt classed
+/// `subagent` by the client is not a label: its request goes out with no tool
+/// choice, and its tools are the reference the label's are compared against.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_progress_label_forbids_tool_calls_and_keeps_tools() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            captured.lock().unwrap().push(body);
+            concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Reading server.rs\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+            )
+            .as_bytes()
+            .to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _mode_env = EnvGuard::unset("CCP_AGENT_SUMMARY");
+    let _summary_model_env = EnvGuard::unset("CCP_AGENT_SUMMARY_MODEL");
+    let label_body = || {
+        json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64000,
+            "stream": false,
+            "tools": [
+                {"name": "Read", "description": "Read a file",
+                 "input_schema": {"type": "object",
+                                  "properties": {"file_path": {"type": "string"}}}},
+                {"name": "Bash", "description": "Run a command",
+                 "input_schema": {"type": "object",
+                                  "properties": {"command": {"type": "string"}}}}
+            ],
+            "messages": [
+                {"role": "user", "content": "do the work"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read",
+                     "input": {"file_path": "/repo/src/server.rs"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "..."},
+                    {"type": "text", "text": "Describe your most recent action in 3-5 words using present tense (-ing). Do not use tools."}
+                ]}
+            ]
+        })
+    };
+
+    for class in [Some("auxiliary"), Some("subagent")] {
+        let response = call_messages_body_with_class(label_body(), class).await;
+        assert_eq!(response.status(), StatusCode::OK, "class {class:?}");
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+    {
+        let _upstream_mode_env = EnvGuard::set("CCP_AGENT_SUMMARY", "upstream");
+        let response = call_messages_body_with_class(label_body(), Some("auxiliary")).await;
+        assert_eq!(response.status(), StatusCode::OK, "upstream mode");
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+
+    let sent = captured.lock().unwrap();
+    assert_eq!(sent.len(), 3);
+    let (label, not_a_label, junior) = (&sent[0], &sent[1], &sent[2]);
+
+    assert_eq!(not_a_label["model"], "gpt-5.6-sol");
+    assert_eq!(
+        not_a_label.get("tool_choice"),
+        None,
+        "a label prompt classed subagent must keep the client's absent tool choice"
+    );
+    let tools = not_a_label["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2, "the subagent's tools go to the backend");
+
+    assert_eq!(label["model"], "gpt-5.6-sol");
+    assert_eq!(label["tool_choice"], "none");
+    assert_eq!(
+        label["tools"], not_a_label["tools"],
+        "forbidding tool calls must not change the tools the label carries"
+    );
+
+    assert_eq!(junior["model"], "gpt-5.6-luna");
+    assert_eq!(junior["tool_choice"], "none");
+    assert_eq!(
+        junior["tools"], not_a_label["tools"],
+        "the junior model gets the same tools with tool calls forbidden"
+    );
 }

@@ -1980,12 +1980,21 @@ impl Drop for PinnedAgentSummary {
 }
 
 /// A subagent turn that ends with Claude Code's progress-label prompt, after
-/// the result of its last tool call.
+/// the result of its last tool call. The subagent's tools come along, as they
+/// do on the wire; the prose is the only restriction the client states.
 fn progress_label_body() -> Value {
     json!({
         "model": "gpt-5.5",
         "max_tokens": 64000,
         "stream": false,
+        "tools": [
+            {"name": "Read", "description": "Read a file",
+             "input_schema": {"type": "object",
+                              "properties": {"file_path": {"type": "string"}}}},
+            {"name": "Bash", "description": "Run a command",
+             "input_schema": {"type": "object",
+                              "properties": {"command": {"type": "string"}}}}
+        ],
         "messages": [
             {"role": "user", "content": "do the work"},
             {"role": "assistant", "content": [
@@ -2002,9 +2011,11 @@ fn progress_label_body() -> Value {
 
 /// Post a label request to a registry holding only an
 /// `IdentityCaptureProvider`, and return the response with what that provider
-/// received.
+/// received. `request_class` is sent as `x-claude-code-request-class` when
+/// given; older clients send none.
 async fn post_progress_label(
     body: &Value,
+    request_class: Option<&str>,
     monitor: Option<MonitorHandle>,
 ) -> (axum::response::Response, Arc<Mutex<Vec<MessagesRequest>>>) {
     let bodies = Arc::new(Mutex::new(Vec::new()));
@@ -2016,16 +2027,16 @@ async fn post_progress_label(
         Arc::new(Registry::from_providers(AliasProvider::Codex, [provider])),
         monitor,
     );
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", "label-session");
+    if let Some(class) = request_class {
+        request = request.header("x-claude-code-request-class", class);
+    }
     let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .header("x-claude-code-session-id", "label-session")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap();
     (response, bodies)
@@ -2034,7 +2045,7 @@ async fn post_progress_label(
 #[tokio::test]
 async fn agent_progress_label_is_answered_without_a_provider() {
     let _mode = PinnedAgentSummary::install(Some("local"));
-    let (response, bodies) = post_progress_label(&progress_label_body(), None).await;
+    let (response, bodies) = post_progress_label(&progress_label_body(), None, None).await;
 
     assert_eq!(response.status(), StatusCode::OK);
     // A local answer is still a Messages response and carries its id.
@@ -2059,7 +2070,7 @@ async fn agent_progress_label_followed_by_a_system_message_is_answered_locally()
         "role": "system",
         "content": [{"type": "text", "text": "Reminder: the task list changed."}]
     }));
-    let (response, bodies) = post_progress_label(&body, None).await;
+    let (response, bodies) = post_progress_label(&body, None, None).await;
 
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -2070,16 +2081,19 @@ async fn agent_progress_label_followed_by_a_system_message_is_answered_locally()
     assert!(bodies.lock().unwrap().is_empty());
 }
 
-/// With no mode set, a label request is nothing special: the subagent's own
-/// provider gets it once, with the model and effort the client asked for, and
-/// the monitor names that provider rather than a local answer.
+/// With no mode set, a label request goes to the subagent's own provider once,
+/// with the model, effort and tools the client asked for, and the monitor
+/// names that provider rather than a local answer. On the codex route the one
+/// rewrite is the tool choice: a label must come back as text, so `none`
+/// replaces whatever the client sent, tools kept.
 #[tokio::test]
-async fn agent_progress_label_is_forwarded_untouched_by_default() {
+async fn agent_progress_label_is_forwarded_with_tool_calls_forbidden_by_default() {
     let _mode = PinnedAgentSummary::install(None);
     let monitor = MonitorHandle::new(10);
     let mut body = progress_label_body();
     body["output_config"] = json!({"effort": "high"});
-    let (response, bodies) = post_progress_label(&body, Some(monitor.clone())).await;
+    body["tool_choice"] = json!({"type": "auto"});
+    let (response, bodies) = post_progress_label(&body, None, Some(monitor.clone())).await;
 
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -2093,7 +2107,10 @@ async fn agent_progress_label_is_forwarded_untouched_by_default() {
         bodies[0].extra.get("output_config"),
         Some(&json!({"effort": "high"}))
     );
-    assert_eq!(serde_json::to_value(&bodies[0]).unwrap(), body);
+    assert_eq!(bodies[0].extra.get("tools"), Some(&body["tools"]));
+    let mut expected = body.clone();
+    expected["tool_choice"] = json!({"type": "none"});
+    assert_eq!(serde_json::to_value(&bodies[0]).unwrap(), expected);
     let state = monitor.snapshot();
     assert_eq!(state.recent[0].provider.as_deref(), Some("codex"));
 }
@@ -2101,10 +2118,12 @@ async fn agent_progress_label_is_forwarded_untouched_by_default() {
 /// In the `upstream` mode the label goes to the provider's junior model at the
 /// lowest effort, and the provider is told to keep that model, so a model
 /// override configured for the provider (`CCP_CODEX_MODEL`) cannot replace it.
+/// The junior model is forbidden tool calls like the subagent's own would be.
 #[tokio::test]
 async fn agent_progress_label_upstream_route_keeps_the_junior_model() {
     let _mode = PinnedAgentSummary::install(Some("upstream"));
-    let (response, bodies) = post_progress_label(&progress_label_body(), None).await;
+    let body = progress_label_body();
+    let (response, bodies) = post_progress_label(&body, None, None).await;
 
     assert_eq!(response.status(), StatusCode::OK);
     let bodies = bodies.lock().unwrap();
@@ -2115,6 +2134,98 @@ async fn agent_progress_label_upstream_route_keeps_the_junior_model() {
         Some(&json!({"effort": "low"}))
     );
     assert!(bodies[0].bypass_provider_model_override);
+    assert_eq!(
+        bodies[0].extra.get("tool_choice"),
+        Some(&json!({"type": "none"}))
+    );
+    assert_eq!(bodies[0].extra.get("tools"), Some(&body["tools"]));
+}
+
+/// Claude Code classes every side request `auxiliary`, the label included,
+/// and older clients send no class at all. Both are labels.
+#[tokio::test]
+async fn agent_progress_label_classed_auxiliary_or_unclassed_is_a_label() {
+    let _mode = PinnedAgentSummary::install(None);
+    for class in [Some("auxiliary"), None] {
+        let mut body = progress_label_body();
+        body["tool_choice"] = json!({"type": "auto"});
+        let (response, bodies) = post_progress_label(&body, class, None).await;
+
+        assert_eq!(response.status(), StatusCode::OK, "class {class:?}");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "class {class:?}");
+        assert_eq!(
+            bodies[0].extra.get("tool_choice"),
+            Some(&json!({"type": "none"})),
+            "class {class:?}"
+        );
+    }
+}
+
+/// A request Claude Code classes as anything else is not a label, however its
+/// prompt reads: it keeps the tool choice it named on the codex route, and in
+/// the local mode it is not answered from the transcript.
+#[tokio::test]
+async fn a_label_prompt_under_another_request_class_is_not_a_label() {
+    {
+        let _mode = PinnedAgentSummary::install(None);
+        for class in ["subagent", "main", "compaction", "Auxiliary"] {
+            let mut body = progress_label_body();
+            body["tool_choice"] = json!({"type": "auto"});
+            let (response, bodies) = post_progress_label(&body, Some(class), None).await;
+
+            assert_eq!(response.status(), StatusCode::OK, "class {class}");
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 1, "class {class}");
+            assert_eq!(
+                bodies[0].extra.get("tool_choice"),
+                Some(&json!({"type": "auto"})),
+                "class {class}"
+            );
+        }
+    }
+
+    let _mode = PinnedAgentSummary::install(Some("local"));
+    for class in ["subagent", "main"] {
+        let (response, bodies) =
+            post_progress_label(&progress_label_body(), Some(class), None).await;
+
+        assert_eq!(response.status(), StatusCode::OK, "class {class}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"captured", "class {class}");
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "class {class}");
+        assert_eq!(bodies[0].extra.get("tool_choice"), None, "class {class}");
+    }
+}
+
+/// The class alone is not the detector: an `auxiliary` request whose prompt
+/// asks for something else, a title here, keeps the tool choice it named.
+#[tokio::test]
+async fn an_auxiliary_request_that_is_not_a_label_keeps_its_tool_choice() {
+    let _mode = PinnedAgentSummary::install(None);
+    let mut body = progress_label_body();
+    body["messages"].as_array_mut().unwrap().pop();
+    body["messages"].as_array_mut().unwrap().push(json!({
+        "role": "user",
+        "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "..."},
+            {"type": "text", "text": "Write a short title for this conversation."}
+        ]
+    }));
+    body["tool_choice"] = json!({"type": "auto"});
+    let (response, bodies) = post_progress_label(&body, Some("auxiliary"), None).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(
+        bodies[0].extra.get("tool_choice"),
+        Some(&json!({"type": "auto"}))
+    );
+    assert_eq!(bodies[0].extra.get("tools"), Some(&body["tools"]));
 }
 
 /// Send a classifier-shaped request through the proxy and report what the

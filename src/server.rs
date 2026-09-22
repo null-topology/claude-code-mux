@@ -1648,14 +1648,21 @@ async fn dispatch_request(
     // the agent's transcript into the message it wants a verdict on, so the
     // label prompt can appear inside it, and a three-word answer leaves it with
     // nothing to parse. It goes on to the auto-review route below instead.
+    //
+    // Claude Code's request class is a guard on top of the prompt: a request it
+    // classes as anything but `auxiliary` is not a label, while the class alone
+    // cannot detect one, since every side request carries it.
     let agent_summary = !count_tokens
         && !is_claude_auto_review_request(&body)
+        && crate::agent_summary::request_class_allows_label(&headers)
         && crate::agent_summary::is_agent_summary_request(&body);
     if agent_summary {
         match crate::config::agent_summary_mode() {
             AgentSummaryMode::Native => {
-                // Left untouched, so the passthrough still relays the client's
-                // bytes. Logged only so the labels can be counted.
+                // Nothing is rewritten here, so the passthrough still relays
+                // the client's bytes; a Codex-routed label gets its tool
+                // choice once the provider is known, below. Logged only so
+                // the labels can be counted.
                 let conversation = conversation_identity
                     .as_ref()
                     .map(|identity| monitor_conversation_label(identity, &body));
@@ -1870,6 +1877,16 @@ async fn dispatch_request(
             return with_request_id(response, &req_id);
         }
     };
+
+    // A label sent to Codex, whichever model answers it, must come back as
+    // text: the client asks in prose only, and measured on the ChatGPT backend
+    // Codex models often answered a label with a tool call the client
+    // discards. Tools stay, so the cached prefix does. The Anthropic route is
+    // left alone: a `tool_choice` change would invalidate Anthropic's messages
+    // cache.
+    if agent_summary && provider.name() == "codex" {
+        crate::agent_summary::forbid_tool_calls(&mut body);
+    }
 
     // The label route above may already have pinned its junior model; keep that.
     body.bypass_provider_model_override |=
