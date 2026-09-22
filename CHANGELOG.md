@@ -1,3 +1,39 @@
+## v0.9.2 (2026-09-22)
+
+- Deferred tools stay out of the Codex tools head, the placeholder included.
+  When a compaction or a context manager summarized the turns holding a
+  `ToolSearch` exchange, the tool it had loaded used to be rendered into the
+  head as a plain function. That changed the first bytes of the prompt and
+  cost a full prompt-cache miss, over 100k uncached tokens at a time; the
+  prefix before the rewritten turns now stays cached. A deferred tool that a
+  directed `tool_choice` names while no search loaded it still goes into the
+  head. The head changes once with this release, so a conversation cached
+  under an older build misses the cache on its first request after the
+  upgrade.
+- Every `/v1/messages` and `count_tokens` response carries a `request-id`
+  header: the proxy's own id, unless the backend already sent one. Claude
+  Code records it as `requestId`, and transcript consumers that de-duplicate
+  on it no longer count repeated records twice.
+- Tool schemas sent to Codex lose their JSON Schema `pattern` keywords,
+  because OpenAI rejects some patterns Claude Code sends, such as Unicode
+  property escapes. Literal values and property names are kept.
+- The compaction effort cap (`CCP_COMPACT_EFFORT`, default `low`) also
+  applies when a compaction request names no effort, and it still never
+  raises an effort the request named. An effort of `none` goes on the wire
+  as is but asks for no reasoning summary and no encrypted reasoning.
+- On the live HTTP stream a spent Codex window takes its length and reset
+  time from the response headers when the limit event carries only a
+  relative reset, as the WebSocket path already did.
+- JSON traffic captures replace `encrypted_content` and the proxy's own
+  reasoning signatures with their length. Raw SSE and byte captures are
+  unchanged.
+- The installer recognizes an installed binary whose version has no leading
+  `v`.
+
+The request-id, capture, schema, compaction effort, quota header and
+installer changes are adapted from the original project, with their authors
+credited as co-authors.
+
 ## v0.9.1 (2026-09-21)
 
 - A Codex completion with no output is a normal end of turn. The backend

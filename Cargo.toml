@@ -1,6 +1,6 @@
 [package]
 name = "claude-code-mux"
-version = "0.9.1"
+version = "0.9.2"
 description = "Local multiplexer that runs Claude Code on several subscriptions and providers at once, routed per model name"
 edition = "2024"
 authors = ["Claude Code Proxy contributors"]
