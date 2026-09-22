@@ -15,6 +15,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          awk -v heading="## ${VERSION} (" '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "CHANGELOG.md has no entries under a '## ${VERSION} (YYYY-MM-DD)' heading" >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-notes
+          path: release-notes.md
       - uses: dtolnay/rust-toolchain@stable
       - name: Test
         run: cargo test --locked -- --test-threads=1
@@ -131,6 +148,7 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: release-notes.md
           generate_release_notes: true
           files: |
             *.tar.gz
