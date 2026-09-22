@@ -1960,6 +1960,8 @@ async fn agent_progress_label_is_answered_without_a_provider() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    // A local answer is still a Messages response and carries its id.
+    assert!(!request_id(&response).is_empty());
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2065,4 +2067,261 @@ async fn models_endpoint_tolerates_unknown_query_params() {
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, _) = get_models(app, "/v1/models?limit=1000&after_id=x").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// The `request-id` header a response carries, or "" when it has none.
+fn request_id(response: &axum::response::Response) -> &str {
+    response
+        .headers()
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+}
+
+async fn post_json(app: axum::Router, uri: &str, body: Body) -> axum::response::Response {
+    app.oneshot(
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+fn capture_app(monitor: Option<MonitorHandle>) -> axum::Router {
+    let provider = Arc::new(IdentityCaptureProvider {
+        captured: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn Provider>;
+    app_with_monitor(
+        Arc::new(Registry::from_providers(AliasProvider::Codex, [provider])),
+        monitor,
+    )
+}
+
+fn messages_body(model: &str) -> Body {
+    Body::from(
+        json!({
+            "model": model,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+        .to_string(),
+    )
+}
+
+/// Claude Code records this header as the transcript's `requestId`, and
+/// transcript readers de-duplicate on it. Each response names the request the
+/// proxy logged it under, and two requests never share one.
+#[tokio::test]
+async fn successful_messages_responses_carry_their_own_request_id() {
+    let monitor = MonitorHandle::new(10);
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let response = post_json(
+            capture_app(Some(monitor.clone())),
+            "/v1/messages",
+            messages_body("gpt-5.5"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let id = request_id(&response).to_string();
+        assert!(!id.is_empty());
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1]);
+    let logged: Vec<String> = monitor
+        .snapshot()
+        .recent
+        .iter()
+        .map(|request| request.request_id.clone())
+        .collect();
+    for id in &ids {
+        assert!(logged.contains(id), "{id} not in {logged:?}");
+    }
+}
+
+/// Every Anthropic route goes through the same dispatch, so the token counter
+/// and the bare `/messages` aliases carry the header as well.
+#[tokio::test]
+async fn every_messages_route_carries_a_request_id() {
+    for uri in [
+        "/v1/messages/count_tokens",
+        "/messages",
+        "/messages/count_tokens",
+    ] {
+        let response = post_json(capture_app(None), uri, messages_body("gpt-5.5")).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert!(!request_id(&response).is_empty(), "{uri}");
+    }
+}
+
+/// Requests refused before any provider is involved still get an id.
+#[tokio::test]
+async fn rejected_messages_requests_carry_a_request_id() {
+    let cases = [
+        (
+            "malformed json",
+            Body::from("{not json"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "oversized body",
+            padded_messages_body(MAX_ANTHROPIC_REQUEST_BYTES + 1),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            "missing model",
+            body_string(r#"{"messages":[{"role":"user","content":"hi"}]}"#),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "unknown model",
+            messages_body("not-a-model"),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (case, body, status) in cases {
+        let response = post_json(capture_app(None), "/v1/messages", body).await;
+        assert_eq!(response.status(), status, "{case}");
+        assert!(!request_id(&response).is_empty(), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn provider_failure_response_carries_a_request_id() {
+    let response = post_json(
+        app(routed_registry()),
+        "/v1/messages",
+        messages_body("kimi-k2.6"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(!request_id(&response).is_empty());
+}
+
+/// Answers with an event stream that sends one event and then stays open.
+struct OpenStreamProvider;
+
+#[async_trait]
+impl Provider for OpenStreamProvider {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec!["gpt-5.5".to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        let first = futures_util::stream::once(async {
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(
+                b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            ))
+        });
+        let open = futures_util::StreamExt::chain(first, futures_util::stream::pending());
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(open))
+            .unwrap()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+}
+
+/// A streamed response carries the id in its head, which the client reads
+/// while the body is still open.
+#[tokio::test]
+async fn a_streaming_response_carries_the_request_id_before_the_body_ends() {
+    use http_body_util::BodyExt;
+
+    let provider = Arc::new(OpenStreamProvider) as Arc<dyn Provider>;
+    let app = app(Arc::new(Registry::from_providers(
+        AliasProvider::Codex,
+        [provider],
+    )));
+    let body = Body::from(
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+        .to_string(),
+    );
+    let within = std::time::Duration::from_secs(5);
+    let response = tokio::time::timeout(within, post_json(app, "/v1/messages", body))
+        .await
+        .expect("the head arrives while the stream is open");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!request_id(&response).is_empty());
+
+    let mut body = response.into_body();
+    let frame = tokio::time::timeout(within, body.frame())
+        .await
+        .expect("the first event arrives")
+        .expect("the stream has a first frame")
+        .unwrap();
+    let data = frame.into_data().unwrap();
+    assert!(data.starts_with(b"event: message_start"));
+}
+
+/// Anthropic sends its own `request-id`, and that is the id Claude Code must
+/// record for a passthrough request, not one the proxy made up.
+#[tokio::test]
+async fn an_upstream_request_id_is_kept_on_the_anthropic_route() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = axum::Router::new().fallback(|| async {
+        (
+            [
+                ("request-id", "req_upstream"),
+                ("content-type", "application/json"),
+            ],
+            r#"{"type":"message","content":[]}"#,
+        )
+    });
+    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+    // The provider reads its base URL once, when it is built.
+    let previous = std::env::var_os("CCP_ANTHROPIC_BASE_URL");
+    unsafe {
+        std::env::set_var("CCP_ANTHROPIC_BASE_URL", format!("http://{address}"));
+    }
+    let provider = Arc::new(claude_code_mux::providers::anthropic::AnthropicProvider::new())
+        as Arc<dyn Provider>;
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("CCP_ANTHROPIC_BASE_URL", value),
+            None => std::env::remove_var("CCP_ANTHROPIC_BASE_URL"),
+        }
+    }
+    let app = app(Arc::new(Registry::from_providers(
+        AliasProvider::Anthropic,
+        [provider],
+    )));
+
+    let response = post_json(app, "/v1/messages", messages_body("claude-opus-5")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(request_id(&response), "req_upstream");
 }

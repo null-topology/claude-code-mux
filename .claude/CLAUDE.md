@@ -128,7 +128,12 @@ Request path:
    pick a provider via the registry, apply the auto-review override (Claude
    Code's non-streaming, tool-free security classifier is rerouted to
    `CCP_AUTO_REVIEW_MODEL`, default `gpt-5.6-luna` on codex), then call the
-   provider and record log, monitor and traffic capture.
+   provider and record log, monitor and traffic capture. Every response it
+   returns, early rejections and the local agent-summary answer included,
+   carries a `request-id` header with the proxy's `req_id` unless the upstream
+   already set one (the passthrough relays Anthropic's); Claude Code records it
+   as `requestId` in transcripts. The stamping lives in `dispatch_request`, not
+   in `monitor_response_body`, so the OpenAI-compatible surfaces do not get it.
    `handler_models` (`/v1/models`) calls `Provider::list_models` on every
    registered provider (or the one named by `?provider=`), tags each row with
    `provider`, and adds a top-level `providers[]` block with `auth`, `source`,
@@ -429,7 +434,11 @@ streams, a non-2xx startup status whose body or `X-Codex-*` response headers
 carry the limit, the buffered paths (`usage_limit_from_response` runs ahead of
 `first_retryable_failure`, so a buffered WebSocket relay shares the branch),
 and an opt-in server compaction request, which aborts instead of spending the
-normal request as well. Only the explicit `usage_limit_reached` type is
+normal request as well. The live HTTP stream hands its response headers to
+`usage_limit_from_event_with_headers`, so a limit event that carries only a
+relative reset still gets its window from the `X-Codex-*` headers; a header
+inside the event payload wins over the HTTP one. Only the explicit
+`usage_limit_reached` type is
 terminal; a transient 429 that happens to carry a reset clock stays retryable.
 The representative claim is published only for a window duration that
 `claimable_window` in `rate_limits.rs` recognises (around 300 minutes for the
@@ -597,6 +606,22 @@ currently serves, including `visibility` and `use_responses_lite` per model.
 - `MODEL_ALIASES` in the codex allowlist still maps Claude alias names to codex
   models. That only matters when `CCP_ALIAS_PROVIDER=codex`; the default keeps
   Claude names on Anthropic.
+- Tool schemas sent to Codex lose every JSON Schema `pattern` keyword
+  (`strip_tool_schema_patterns` in `providers/codex/translate/request.rs`),
+  because OpenAI rejects some patterns Claude Code sends, such as Unicode
+  property escapes. Only schema positions are touched: `default`, `enum`,
+  `const`, examples, extensions and property names stay. It runs in
+  `codex_tool_parameters` and `tool_search_spec`, so head tools, tools loaded
+  by a search and the ToolSearch tool are all covered. The OpenAI-compatible
+  routes are not: Codex `/v1/responses` is relayed natively and Codex chat
+  completions refuse `tools`.
+- The compaction cap (`CCP_COMPACT_EFFORT`, default `low`) also applies when a
+  compaction request names no effort (`apply_compact_effort_cap`); it still
+  never raises an effort the request named. An effort of `none`, from that cap
+  or from `CCP_CODEX_EFFORT=none`, goes on the wire as `effort: none` but
+  requests no reasoning summary and no `reasoning.encrypted_content`
+  (`reasoning_requested`). That last rule applies to every request, not only
+  compaction.
 
 ## Known limitation
 
@@ -612,6 +637,12 @@ Traffic captures and the `errors/` directory under the state dir contain
 prompts, tool input, tool output and file contents in the clear. Keep them
 local, never paste them into an issue, and delete them after a debugging
 session. Never print or commit `auth.json` contents, tokens or account ids.
+
+JSON captures (`write_json`, `write_json_event`) pass through
+`redact_traffic_with_depth` in `traffic.rs`, which replaces `encrypted_content`
+and proxy-owned `ccp:codex:v1:` reasoning signatures with `[redacted len=N]`
+and keeps any other signature. The raw SSE and raw byte captures
+(`write_text`, `write_bytes`) are not redacted at all.
 
 ## Style
 

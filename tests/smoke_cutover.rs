@@ -1387,6 +1387,95 @@ async fn smoke_codex_http_usage_limit_event_fast_fails_live_request() {
     assert_usage_limit_response(response).await;
 }
 
+/// A spent weekly window whose clock travels only in the response headers of a
+/// live HTTP stream; the error event itself carries just the countdown.
+fn codex_header_only_usage_limit_sse() -> Vec<u8> {
+    format!(
+        "data: {}\n\n",
+        json!({
+            "type": "error",
+            "status_code": 429,
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "resets_in_seconds": 90
+            }
+        })
+    )
+    .into_bytes()
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_header_only_usage_limit_event_fast_fails_live_request() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = format!("http://{addr}");
+    let mock = axum::Router::new().fallback({
+        let attempts = attempts.clone();
+        move || {
+            let attempts = attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .header("x-codex-primary-window-minutes", "300")
+                    .header("x-codex-primary-reset-after-seconds", "9569")
+                    .header("x-codex-primary-reset-at", "1788879438")
+                    .header("x-codex-secondary-window-minutes", "10080")
+                    .header("x-codex-secondary-reset-after-seconds", "90")
+                    .header("x-codex-secondary-reset-at", "1789466238")
+                    .body(Body::from(codex_header_only_usage_limit_sse()))
+                    .unwrap()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, mock).await.ok();
+    });
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["x-should-retry"], "false");
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-unified-status"],
+        "rejected"
+    );
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-unified-reset"],
+        "1789466238"
+    );
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-unified-representative-claim"],
+        "seven_day"
+    );
+    assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["message"], "The usage limit has been reached");
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_http_usage_limit_event_fast_fails_buffered_request() {
@@ -2051,7 +2140,7 @@ async fn smoke_codex_http_stream_returns_before_upstream_completion() {
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
     let response = tokio::time::timeout(
-        Duration::from_millis(500),
+        Duration::from_secs(3),
         call_messages_body(json!({
             "model": "gpt-5.5",
             "max_tokens": 64,

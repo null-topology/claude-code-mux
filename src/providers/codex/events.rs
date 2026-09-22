@@ -174,6 +174,22 @@ pub(crate) fn usage_limit_from_event(payload: &Value) -> Option<CodexUsageLimit>
     usage_limit_from_payload(payload)
 }
 
+/// Read a quota exhaustion event from a live HTTP stream. Codex may send the
+/// clock only in the stream's response headers, so those are consulted for any
+/// `X-Codex-*` value the event payload does not carry.
+pub(crate) fn usage_limit_from_event_with_headers(
+    payload: &Value,
+    headers: &[(String, String)],
+) -> Option<CodexUsageLimit> {
+    if !matches!(
+        payload.get("type").and_then(Value::as_str),
+        Some("response.failed" | "response.error" | "error")
+    ) {
+        return None;
+    }
+    usage_limit_from_payload_with_headers(payload, headers)
+}
+
 /// Read quota exhaustion from either a JSON error response or an SSE event
 /// body. HTTP response headers are included because Codex does not always
 /// mirror its quota clocks into the error payload.
@@ -185,13 +201,30 @@ pub(crate) fn usage_limit_from_response(
     let events = crate::anthropic::sse::parse_sse_events(body)
         .into_iter()
         .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok());
-    direct.chain(events).find_map(|mut payload| {
-        attach_response_headers(&mut payload, headers);
-        usage_limit_from_payload(&payload)
+    direct.chain(events).find_map(|payload| {
+        // Only an actual quota event consults the headers; they are not copied
+        // into every parsed event.
+        is_usage_limit_payload(&payload)
+            .then(|| usage_limit_from_payload_with_headers(&payload, headers))
+            .flatten()
     })
 }
 
+fn is_usage_limit_payload(payload: &Value) -> bool {
+    event_error(payload)
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        == Some("usage_limit_reached")
+}
+
 fn usage_limit_from_payload(payload: &Value) -> Option<CodexUsageLimit> {
+    usage_limit_from_payload_with_headers(payload, &[])
+}
+
+fn usage_limit_from_payload_with_headers(
+    payload: &Value,
+    response_headers: &[(String, String)],
+) -> Option<CodexUsageLimit> {
     let error = event_error(payload)?;
     if error.get("type").and_then(Value::as_str) != Some("usage_limit_reached") {
         return None;
@@ -199,14 +232,23 @@ fn usage_limit_from_payload(payload: &Value) -> Option<CodexUsageLimit> {
 
     let resets_at = numeric_value(error.get("resets_at"));
     let resets_in_seconds = numeric_value(error.get("resets_in_seconds"));
-    let limiting_prefix = limiting_window_prefix(payload, resets_in_seconds, resets_at);
+    let limiting_prefix =
+        limiting_window_prefix(payload, response_headers, resets_in_seconds, resets_at);
     let resets_at = resets_at.or_else(|| {
         let prefix = limiting_prefix?;
-        header_number(payload, &format!("X-Codex-{prefix}-Reset-At"))
+        header_number(
+            payload,
+            response_headers,
+            &format!("X-Codex-{prefix}-Reset-At"),
+        )
     });
     let window = limiting_prefix.and_then(|prefix| {
-        header_number(payload, &format!("X-Codex-{prefix}-Window-Minutes"))
-            .and_then(super::rate_limits::claimable_window)
+        header_number(
+            payload,
+            response_headers,
+            &format!("X-Codex-{prefix}-Window-Minutes"),
+        )
+        .and_then(super::rate_limits::claimable_window)
     });
 
     Some(CodexUsageLimit {
@@ -225,27 +267,36 @@ fn usage_limit_from_payload(payload: &Value) -> Option<CodexUsageLimit> {
 /// error's own clock.
 fn limiting_window_prefix(
     payload: &Value,
+    response_headers: &[(String, String)],
     resets_in_seconds: Option<u64>,
     resets_at: Option<u64>,
 ) -> Option<&'static str> {
     let by_countdown = resets_in_seconds.and_then(|actual| {
         closest_window(
             actual,
-            header_number(payload, "X-Codex-Primary-Reset-After-Seconds"),
-            header_number(payload, "X-Codex-Secondary-Reset-After-Seconds"),
+            header_number(
+                payload,
+                response_headers,
+                "X-Codex-Primary-Reset-After-Seconds",
+            ),
+            header_number(
+                payload,
+                response_headers,
+                "X-Codex-Secondary-Reset-After-Seconds",
+            ),
         )
     });
     let by_epoch = resets_at.and_then(|actual| {
         closest_window(
             actual,
-            header_number(payload, "X-Codex-Primary-Reset-At"),
-            header_number(payload, "X-Codex-Secondary-Reset-At"),
+            header_number(payload, response_headers, "X-Codex-Primary-Reset-At"),
+            header_number(payload, response_headers, "X-Codex-Secondary-Reset-At"),
         )
     });
     by_countdown.or(by_epoch).or_else(|| {
         match (
-            window_headers_present(payload, "Primary"),
-            window_headers_present(payload, "Secondary"),
+            window_headers_present(payload, response_headers, "Primary"),
+            window_headers_present(payload, response_headers, "Secondary"),
         ) {
             (true, false) => Some("Primary"),
             (false, true) => Some("Secondary"),
@@ -277,39 +328,45 @@ fn closest_window(
     }
 }
 
-fn window_headers_present(payload: &Value, prefix: &str) -> bool {
+fn window_headers_present(
+    payload: &Value,
+    response_headers: &[(String, String)],
+    prefix: &str,
+) -> bool {
     ["Reset-After-Seconds", "Reset-At", "Window-Minutes"]
         .into_iter()
-        .any(|suffix| header_number(payload, &format!("X-Codex-{prefix}-{suffix}")).is_some())
+        .any(|suffix| {
+            header_number(
+                payload,
+                response_headers,
+                &format!("X-Codex-{prefix}-{suffix}"),
+            )
+            .is_some()
+        })
 }
 
-fn attach_response_headers(payload: &mut Value, headers: &[(String, String)]) {
-    let Some(payload) = payload.as_object_mut() else {
-        return;
-    };
-    let header_values = payload
-        .entry("headers")
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    let Some(header_values) = header_values.as_object_mut() else {
-        return;
-    };
-    for (name, value) in headers {
-        if !header_values
-            .keys()
-            .any(|present| present.eq_ignore_ascii_case(name))
-        {
-            header_values.insert(name.clone(), Value::String(value.clone()));
-        }
-    }
-}
-
-fn header_number(payload: &Value, name: &str) -> Option<u64> {
+/// A header mirrored into the event payload wins; the HTTP response headers
+/// are the fallback for a value the payload does not carry.
+fn header_number(
+    payload: &Value,
+    response_headers: &[(String, String)],
+    name: &str,
+) -> Option<u64> {
     payload
-        .get("headers")?
-        .as_object()?
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .and_then(|(_, value)| numeric_value(Some(value)))
+        .get("headers")
+        .and_then(Value::as_object)
+        .and_then(|headers| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .and_then(|(_, value)| numeric_value(Some(value)))
+        })
+        .or_else(|| {
+            response_headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .and_then(|(_, value)| value.parse().ok())
+        })
 }
 
 fn numeric_value(value: Option<&Value>) -> Option<u64> {
@@ -556,6 +613,109 @@ mod tests {
         assert_eq!(limit.message, "weekly limit reached");
         assert_eq!(limit.resets_at, Some(1789466238));
         assert_eq!(limit.window, Some(CodexLimitWindow::SevenDay));
+    }
+
+    fn http_headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// A usage limit event with no mirrored `headers` object, as a live HTTP
+    /// stream delivers it when the clock travels in the response headers.
+    fn header_less_limit(error: Value) -> Value {
+        serde_json::json!({"type": "error", "status_code": 429, "error": error})
+    }
+
+    #[test]
+    fn parses_header_only_sse_quota_metadata_without_byte_matching() {
+        let body = br#"data: {"type":"error","error":{"type":"usage_limit_reached","message":"weekly \"limit\" reached","resets_in_seconds":90}}
+
+"#;
+        let headers = http_headers(&[
+            ("X-Codex-Secondary-Reset-After-Seconds", "90"),
+            ("X-Codex-Secondary-Reset-At", "1789466238"),
+            ("X-Codex-Secondary-Window-Minutes", "10080"),
+        ]);
+
+        let limit = usage_limit_from_response(body, &headers).expect("usage limit");
+        assert_eq!(limit.message, "weekly \"limit\" reached");
+        assert_eq!(limit.resets_at, Some(1789466238));
+        assert_eq!(limit.window, Some(CodexLimitWindow::SevenDay));
+    }
+
+    #[test]
+    fn payload_header_wins_over_response_header() {
+        let mut payload = spent_five_hour_window();
+        payload["error"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resets_at");
+        let headers = http_headers(&[
+            ("x-codex-primary-reset-at", "1"),
+            ("x-codex-primary-window-minutes", "60"),
+        ]);
+
+        let limit = usage_limit_from_event_with_headers(&payload, &headers).expect("usage limit");
+        assert_eq!(limit.resets_at, Some(1788879438));
+        assert_eq!(limit.window, Some(CodexLimitWindow::FiveHour));
+
+        let body = format!("data: {payload}\n\n");
+        let limit = usage_limit_from_response(body.as_bytes(), &headers).expect("usage limit");
+        assert_eq!(limit.resets_at, Some(1788879438));
+        assert_eq!(limit.window, Some(CodexLimitWindow::FiveHour));
+    }
+
+    #[test]
+    fn ambiguous_response_header_clocks_substitute_nothing() {
+        let headers = http_headers(&[
+            ("x-codex-primary-reset-after-seconds", "100"),
+            ("x-codex-primary-reset-at", "100"),
+            ("x-codex-primary-window-minutes", "300"),
+            ("x-codex-secondary-reset-after-seconds", "200"),
+            ("x-codex-secondary-reset-at", "200"),
+            ("x-codex-secondary-window-minutes", "10080"),
+        ]);
+
+        // The body epoch sits between both header clocks: it is kept, and no
+        // window is claimed.
+        let payload = header_less_limit(serde_json::json!({
+            "type": "usage_limit_reached",
+            "message": "The usage limit has been reached",
+            "resets_at": 150u64
+        }));
+        let limit = usage_limit_from_event_with_headers(&payload, &headers).expect("usage limit");
+        assert_eq!(limit.resets_at, Some(150));
+        assert_eq!(limit.window, None);
+
+        // A countdown that matches neither window gets no header reset either.
+        let payload = header_less_limit(serde_json::json!({
+            "type": "usage_limit_reached",
+            "message": "The usage limit has been reached",
+            "resets_in_seconds": 150u64
+        }));
+        let limit = usage_limit_from_event_with_headers(&payload, &headers).expect("usage limit");
+        assert_eq!(limit.resets_at, None);
+        assert_eq!(limit.window, None);
+    }
+
+    #[test]
+    fn response_header_reset_is_kept_for_unknown_window_length() {
+        let payload = header_less_limit(serde_json::json!({
+            "type": "usage_limit_reached",
+            "message": "The usage limit has been reached",
+            "resets_in_seconds": 90u64
+        }));
+        let headers = http_headers(&[
+            ("x-codex-secondary-reset-after-seconds", "90"),
+            ("x-codex-secondary-reset-at", "1789466238"),
+            ("x-codex-secondary-window-minutes", "60"),
+        ]);
+
+        let limit = usage_limit_from_event_with_headers(&payload, &headers).expect("usage limit");
+        assert_eq!(limit.resets_at, Some(1789466238));
+        assert_eq!(limit.window, None);
     }
 
     #[test]
