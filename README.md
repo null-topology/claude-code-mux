@@ -193,6 +193,15 @@ the Codex backend which models your ChatGPT login may use and print exactly
 that, so a model Codex starts serving is available without a proxy release
 (see [Listing models](#listing-models)).
 
+Routing follows the same listing, and nothing has to call `/v1/models`
+first. When `serve` starts it asks every backend it holds a login for which
+models it serves, in the background, and a request for a model it does not
+recognise makes it ask once more before it answers `Unknown model`. That
+second ask runs at most once every 30 seconds, so a mistyped id does not
+reach the backend on every request. Once a backend has answered, its list is
+what routes: a model it stops listing stops routing, and until it has
+answered, the list built into the proxy is used.
+
 Two suffixes are understood on any id:
 
 - `-fast` (for example `gpt-5.6-sol-fast`) requests Codex's priority service

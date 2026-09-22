@@ -166,9 +166,11 @@ Request path:
 3. `src/registry.rs`: model to provider. `ANTHROPIC_STYLE_ALIASES` and any
    `claude-*` id go to the alias provider (`CCP_ALIAS_PROVIDER`, default
    anthropic); `cursor:` prefixes go to cursor; anything else must match a
-   provider's model list exactly, or be a slug the Codex backend named in its
-   last successful listing (`providers::codex::models::is_discovered_model`,
-   `-fast` included); unknown ids return 400 listing the catalog.
+   provider's catalog exactly: the ids its last successful listing named
+   (`LISTED_MODELS`), else its compiled-in list until a listing has arrived;
+   a `-fast` suffix on a listed Codex id also routes. An id nothing routes
+   refreshes the listings once (`provider_for_model_or_refresh`, see "Codex
+   model inventory"), then unknown ids return 400 listing the catalog.
    The `CODEX_MODELS`, `KIMI_MODELS`, `GROK_MODELS` lists here are duplicated
    in each provider's `translate/model_allowlist.rs`. Keep them in sync.
 4. `src/provider.rs`: the `Provider` trait, `RequestContext` (request id,
@@ -589,6 +591,34 @@ lane for every model and ignores that flag entirely
 across calls or restarts, deliberately: a consumer that reads the listing as
 the truth about available models must see changes, not a stale fallback.
 
+Routing reads a process-wide catalog in `src/registry.rs` (`LISTED_MODELS`):
+per provider, the ids of its last successful listing from a backend
+(`source: upstream`), which replaces that provider's compiled-in list; a
+provider that has not listed yet routes on its compiled-in list, and bundled
+listings (kimi, grok, cursor today) are not recorded. A provider gains a live
+listing by implementing `list_models` alone. The catalog is filled at three
+points, all through `record_listing`:
+
+- every `/v1/models` call (`handler_models`);
+- `serve` start: `main.rs` spawns `Registry::refresh_listings` beside the
+  server, so binding never waits and a failed listing is only logged;
+- a routing miss: a `/v1/messages` or `count_tokens` request for an id that is
+  not a Claude id, an alias or a `cursor:` id and that nothing routes runs
+  `refresh_listings` once, routes again, and otherwise answers the same 400 as
+  before (`provider_for_model_or_refresh`). The refresh is single-flight (a
+  per-registry mutex held across the listing; requests that waited route
+  again first) and at most one starts per `MISS_LISTING_INTERVAL` (30 s),
+  whatever its outcome, so a typo does not reach the backends on every
+  request.
+
+`refresh_listings` asks only providers whose `has_credentials()` holds, a
+local check of the saved login with no network call (the Codex CLI's
+`auth.json`, the kimi and grok token files, the cursor store, which on macOS
+with `CCP_CONFIG_DIR` unset can mean a Keychain read); anthropic has none and
+is never asked. A restart forgets the catalog. Replacing the compiled-in list
+has a cost: a successful but empty Codex listing (a 2xx body without
+`models`) leaves every Codex id unroutable until the next good one.
+
 Hosted web search sits outside the policy: a request carrying the hosted
 `web_search_20250305` tool is forced onto the full lane, and there a non-forced
 `gpt-5.6-luna` is rewritten to `gpt-5.6-sol` (`apply_model_lane_for_request`,
@@ -606,9 +636,9 @@ answers 400 without `client_version`. The version comes from
 `auth.json`, else `CODEX_CLIENT_VERSION` in `auth/constants.rs`.
 
 The compiled-in `CODEX_MODELS` / `ALLOWED_MODELS` lists still exist for
-routing before the first listing and for the OpenAI-compatible surfaces'
-error text. They are no longer what `/v1/models` advertises. Adding a model
-there is optional; when done, keep `src/registry.rs` and
+routing until the first successful listing and for the OpenAI-compatible
+surfaces' error text. They are no longer what `/v1/models` advertises. Adding
+a model there is optional; when done, keep `src/registry.rs` and
 `src/providers/codex/translate/model_allowlist.rs` in sync and update the
 `assert_allowed_model` test.
 

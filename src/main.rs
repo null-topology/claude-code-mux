@@ -98,10 +98,19 @@ fn main() -> Result<()> {
         Commands::Serve { port, no_monitor } => {
             let bind_address = config::bind_address();
             let effective_port = port.unwrap_or_else(config::port);
-            let registry = Registry::with_default_alias();
+            let registry = std::sync::Arc::new(Registry::with_default_alias());
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
+            // Ask every provider that holds credentials once which models it
+            // serves, so one this build does not list routes from the first
+            // request. It runs beside the server: binding never waits for it,
+            // and a failed listing is logged by its provider and otherwise
+            // ignored.
+            let listing_registry = registry.clone();
+            runtime.spawn(async move {
+                listing_registry.refresh_listings().await;
+            });
             match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
                 ServeMode::Plain => {
                     print_server_banner(&bind_address, effective_port, &registry);
@@ -224,7 +233,8 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
     }
 }
 
-/// The compiled-in lists, for the serve banner: no backend is asked at start.
+/// The compiled-in lists, for the serve banner, printed before the startup
+/// listings answer.
 fn print_models(registry: &Registry, full: bool) {
     let grouped = registry.grouped_models();
     for provider in ["codex", "kimi", "grok", "cursor"] {

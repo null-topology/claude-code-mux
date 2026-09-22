@@ -76,6 +76,9 @@ impl Provider for GrokProvider {
             .map(|model| (*model).to_string())
             .collect()
     }
+    fn has_credentials(&self) -> bool {
+        matches!(file_store().load_auth(), Ok(Some(_)))
+    }
     fn cli(&self) -> &'static dyn CliHandlers {
         &GROK_CLI
     }

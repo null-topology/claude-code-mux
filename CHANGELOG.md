@@ -15,6 +15,14 @@
   has focus and keep their meaning elsewhere. Every count carries its quality
   mark the way the other panes do, and a Codex row shows its cache write as
   `n/a`, since that backend never reports one.
+- A Codex model that only the backend lists, such as `gpt-6-sol` or
+  `gpt-6-luna`, routes from the first request. A freshly started proxy used to
+  answer `Unknown model` for it until something called `/v1/models`. `serve`
+  now asks every backend it holds a login for which models it serves as it
+  starts, in the background, and a request for an unrecognised model asks once
+  more before the 400; that second ask runs at most once every 30 seconds.
+  Once a backend has answered, its list is what routes, in place of the list
+  built into the proxy.
 
 ## v0.10.0 (2026-09-23)
 

@@ -530,6 +530,10 @@ impl Provider for CodexProvider {
         &CODEX_CLI
     }
 
+    fn has_credentials(&self) -> bool {
+        matches!(file_store().load_auth(), Ok(Some(_)))
+    }
+
     async fn list_models(&self) -> ModelListing {
         match self.client.list_models().await {
             Ok(inventory) => ModelListing {
