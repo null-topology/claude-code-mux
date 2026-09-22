@@ -918,10 +918,8 @@ pub fn codex_model() -> Option<String> {
     None
 }
 
-/// Whether the proxy answers Claude Code's background-agent status line itself
-/// instead of paying a model for it. `upstream` sends those requests on as
-/// before; anything else, including no setting, keeps them local.
-/// An explicit model for status labels, overriding the per-provider choice.
+/// An explicit model for status labels in the `upstream` mode, overriding the
+/// per-provider choice.
 pub fn agent_summary_model() -> Option<String> {
     let env: HashMap<_, _> = std::env::vars().collect();
     env.get("CCP_AGENT_SUMMARY_MODEL")
@@ -929,21 +927,40 @@ pub fn agent_summary_model() -> Option<String> {
         .cloned()
 }
 
-pub fn agent_summary_local() -> bool {
+/// What the proxy does with Claude Code's background-agent status line
+/// requests. `Native` forwards them like any other request, `Local` answers
+/// them from the transcript, `Upstream` sends them to the provider's junior
+/// model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSummaryMode {
+    Native,
+    Local,
+    Upstream,
+}
+
+/// `native`, `local`, or `upstream` (also `model` and `remote`), trimmed and
+/// case-sensitive. Anything else, the empty string included, is skipped.
+fn parse_agent_summary_mode(raw: &str) -> Option<AgentSummaryMode> {
+    match raw.trim() {
+        "native" => Some(AgentSummaryMode::Native),
+        "local" => Some(AgentSummaryMode::Local),
+        "upstream" | "model" | "remote" => Some(AgentSummaryMode::Upstream),
+        _ => None,
+    }
+}
+
+/// `CCP_AGENT_SUMMARY`, then `agentSummary`. The first source that parses
+/// wins; with neither, status line requests are forwarded natively.
+pub fn agent_summary_mode() -> AgentSummaryMode {
     let env: HashMap<_, _> = std::env::vars().collect();
-    let configured = env
-        .get("CCP_AGENT_SUMMARY")
-        .filter(|raw| !raw.is_empty())
-        .cloned()
+    env.get("CCP_AGENT_SUMMARY")
+        .and_then(|raw| parse_agent_summary_mode(raw))
         .or_else(|| {
             read_file_config(&paths::config_dir())
                 .and_then(|file| file.agent_summary)
-                .filter(|value| !value.is_empty())
-        });
-    !matches!(
-        configured.as_deref().map(str::trim),
-        Some("upstream") | Some("model") | Some("remote")
-    )
+                .and_then(|value| parse_agent_summary_mode(&value))
+        })
+        .unwrap_or(AgentSummaryMode::Native)
 }
 
 pub fn auto_review_model() -> Option<String> {
@@ -1097,6 +1114,7 @@ mod tests {
         "CCP_CODEX_IMAGES_BASE_URL",
         "CCP_CODEX_TRANSCRIPTIONS_API",
         "CCP_AUTO_REVIEW_MODEL",
+        "CCP_AGENT_SUMMARY",
     ];
 
     struct ClearedEnv {
@@ -1460,6 +1478,78 @@ mod tests {
 
     fn write_config(config: &tempfile::TempDir, body: &str) {
         std::fs::write(config.path().join("config.json"), body).unwrap();
+    }
+
+    #[test]
+    fn agent_summary_mode_defaults_to_native() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        assert_eq!(agent_summary_mode(), AgentSummaryMode::Native);
+
+        for raw in ["", "native", "  native\n"] {
+            let _env = EnvGuard::set("CCP_AGENT_SUMMARY", raw);
+            assert_eq!(
+                agent_summary_mode(),
+                AgentSummaryMode::Native,
+                "value {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_summary_mode_reads_every_spelling() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+
+        for (raw, expected) in [
+            ("local", AgentSummaryMode::Local),
+            (" local\n", AgentSummaryMode::Local),
+            ("upstream", AgentSummaryMode::Upstream),
+            ("model", AgentSummaryMode::Upstream),
+            ("remote", AgentSummaryMode::Upstream),
+            // Matched case-sensitively: another spelling is not recognised.
+            ("Local", AgentSummaryMode::Native),
+            ("UPSTREAM", AgentSummaryMode::Native),
+        ] {
+            let _env = EnvGuard::set("CCP_AGENT_SUMMARY", raw);
+            assert_eq!(agent_summary_mode(), expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn agent_summary_mode_takes_the_first_source_that_parses() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        // The file alone decides.
+        write_config(&config, r#"{"agentSummary":"local"}"#);
+        assert_eq!(agent_summary_mode(), AgentSummaryMode::Local);
+
+        // A valid env value beats it.
+        for (raw, expected) in [
+            ("upstream", AgentSummaryMode::Upstream),
+            ("native", AgentSummaryMode::Native),
+        ] {
+            let _env = EnvGuard::set("CCP_AGENT_SUMMARY", raw);
+            assert_eq!(agent_summary_mode(), expected, "value {raw:?}");
+        }
+
+        // An empty or unrecognised env value is skipped, so the file decides.
+        for raw in ["", "  ", "lcoal", "Upstream"] {
+            let _env = EnvGuard::set("CCP_AGENT_SUMMARY", raw);
+            assert_eq!(
+                agent_summary_mode(),
+                AgentSummaryMode::Local,
+                "value {raw:?}"
+            );
+        }
+
+        // Unrecognised in both: native.
+        write_config(&config, r#"{"agentSummary":"sometimes"}"#);
+        let _env = EnvGuard::set("CCP_AGENT_SUMMARY", "lcoal");
+        assert_eq!(agent_summary_mode(), AgentSummaryMode::Native);
     }
 
     #[test]

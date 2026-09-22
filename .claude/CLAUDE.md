@@ -129,7 +129,8 @@ Request path:
    Code's non-streaming, tool-free security classifier is rerouted to
    `CCP_AUTO_REVIEW_MODEL`, default `gpt-5.6-luna` on codex), then call the
    provider and record log, monitor and traffic capture. Every response it
-   returns, early rejections and the local agent-summary answer included,
+   returns, early rejections and the local agent-summary answer (with
+   `CCP_AGENT_SUMMARY=local`) included,
    carries a `request-id` header with the proxy's `req_id` unless the upstream
    already set one (the passthrough relays Anthropic's); Claude Code records it
    as `requestId` in transcripts. The stamping lives in `dispatch_request`, not
@@ -312,7 +313,8 @@ effective model (`SessionSummary.models`, `ModelKey`) and carry a histogram of
 the requested ids that fed each row. Paths that build no upstream request name
 no effective model: the local Codex, Kimi and Cursor `count_tokens` estimates,
 the
-locally answered agent summary (provider `local`, whose synthetic counts stay
+locally answered agent summary (with `CCP_AGENT_SUMMARY=local`; provider
+`local`, whose synthetic counts stay
 out of every token total), and Cursor's tool-bridge and auth-failure early
 returns. Anthropic's `count_tokens` is a genuine relay and may name one. Kimi
 names one only once the translated request exists, so a body rejected in
@@ -322,7 +324,8 @@ as evidence of what went on the wire rather than as a one-hour cache marker.
 The TUI renders this. `src/tui.rs` marks every count with its quality (`~`
 opening, `n/a` missing, plain exact, a reported zero included), names the
 executed model on request rows and marks a routed-only one with `?`, labels a
-locally answered request `local answer` in every cell, shows the session root
+locally answered request `local answer` in every cell (an agent summary is
+answered locally only with `CCP_AGENT_SUMMARY=local`), shows the session root
 as `Σ <id>` with `mixed N` when the rollups name more than one model, lists the
 `models` rollups, the `unattributed` row and an `evidence` line in the session
 detail, prints the 5m/1h buckets as parts reported separately, marks a
@@ -394,17 +397,45 @@ Which model to run stays the user's choice, and keeping a stable cached prefix
 is still a legitimate lever: this corpus prices neither a hit nor a miss, so
 nothing here says cache stability is worthless. The proxy preserves cache
 stability and avoids redundant model requests.
-`src/agent_summary.rs` addresses the latter: Claude Code
-asks a running subagent's own model for a three-word progress label every half
-minute, resending the subagent's whole context, which was a quarter of all
-captured Codex requests. The proxy answers it from the transcript on any route;
-`CCP_AGENT_SUMMARY=upstream` sends it to the provider's junior model at
-`effort: low` instead, never to the subagent's own. That model must still hold
-the subagent's context, which is why Anthropic's is `claude-sonnet-5` and not
-Haiku (200k would drop the label on a long subagent) and Codex's is
-`gpt-5.6-luna`; a provider without an entry in `summary_model_for` keeps the
-request's model. Detection is the prompt text, `SUMMARY_PROMPT_MARKER`: these
-requests otherwise look like a normal subagent turn, with its tools and history.
+
+`src/agent_summary.rs` handles the progress label Claude Code asks for
+periodically for each running background subagent, resending the subagent's
+whole context. `CCP_AGENT_SUMMARY` (config key `agentSummary`) picks the mode:
+the first source that parses wins, env then `config.json`, else `native`; an
+empty or unrecognised value is skipped, and values are trimmed and
+case-sensitive. `native`, the default, routes and relays the request like any
+other for its model, with no rewrite beyond `tool_choice: none` on the Codex
+route described below (`agent_summary_forwarded`), so the client
+sees the label's real usage; the local answer reported zero input, so anything
+reading usage saw a request of the wrong size. A native label can fail like any
+request (429, 5xx, a spent Codex window). `local` answers it from the
+transcript, built from the last tool call (provider `local`,
+`agent_summary_answered_locally`). `upstream` (also `model`, `remote`) pins the
+provider's junior model at `effort: low`, never the subagent's own
+(`CCP_AGENT_SUMMARY_MODEL` overrides it in this mode only;
+`agent_summary_routed`); on the Anthropic route the relayed bytes stay the
+client's own, so the request Anthropic receives is unchanged and only the
+proxy's own record names the junior model. The junior model
+must still hold the subagent's context, which is why Anthropic's is
+`claude-sonnet-5` and not Haiku (200k would drop the label on a long subagent)
+and Codex's is `gpt-5.6-luna`; a provider without an entry in
+`summary_model_for` keeps the request's model. Detection is the prompt text,
+`SUMMARY_PROMPT_MARKER`: these requests otherwise look like a normal subagent
+turn, with its tools and history. Detection skips trailing `role: "system"`
+messages after the prompt, which Claude Code sends mid-conversation to carry
+reminders. It also consults `x-claude-code-request-class`
+(`request_class_allows_label`): any present value other than `auxiliary` rules
+a request out, and the header alone is not enough because Claude Code sends
+`auxiliary` on every side request (titles, prompt suggestions, the isolated web
+search call); an absent header stays eligible. A label routed to codex, in
+native and upstream mode both, gets `tool_choice: {"type": "none"}`
+(`forbid_tool_calls`, applied in `dispatch_request` once the provider is
+known) with its tools kept: the client only asks in prose, and measured on the
+ChatGPT backend Codex models often answered a label with a tool call;
+`none` is accepted and enforced by every listed Codex model and cache-neutral
+because the tools stay. The Anthropic route is untouched: a `tool_choice`
+change invalidates Anthropic's messages cache and the passthrough is
+byte-exact.
 
 ## Invariants to preserve
 

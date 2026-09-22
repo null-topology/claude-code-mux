@@ -1,3 +1,37 @@
+## Unreleased
+
+- Claude Code's subagent progress label is forwarded natively by default
+  (`CCP_AGENT_SUMMARY=native`): the request is routed and relayed like any
+  other for its model, with no rewrite beyond the Codex tool choice described
+  below. A native label reports its real usage
+  to the client; the local answer reported zero input tokens, so anything
+  reading usage saw a request of the wrong size. `CCP_AGENT_SUMMARY=local`
+  (or `agentSummary: "local"` in `config.json`) brings back the previous
+  behavior, and `upstream` still pins the provider's junior model.
+- A natively forwarded label can fail like any request (429, 5xx, a spent
+  Codex window), which it never did while it was answered locally.
+- A label request whose prompt is followed by a trailing system message, as
+  Claude Code sends mid-conversation to carry reminders, is now recognized.
+  Before, such requests went upstream unrecognized even in `local` mode.
+- An empty or unrecognized `CCP_AGENT_SUMMARY` is skipped in favor of
+  `config.json` and then `native`. Values are trimmed and case-sensitive.
+- In `upstream` mode the junior model is now kept when a Codex model override
+  (`CCP_CODEX_MODEL`) is set; before, the override replaced it.
+- A progress label routed to Codex, in `native` and `upstream` mode both, now
+  goes out with `tool_choice` set to `none`. The client attaches the
+  subagent's tools and only asks in prose not to use them, and Codex models
+  often answered a label with a tool call, which the client discards. Measured
+  on the ChatGPT backend, the setting is accepted by every listed Codex
+  model, enforced, and leaves the cached prefix intact because the tools stay
+  in the request. The Anthropic route is untouched: a `tool_choice` change
+  invalidates Anthropic's messages cache
+  while the passthrough stays byte-exact.
+- Label detection now also consults Claude Code's `x-claude-code-request-class`
+  header: a request classed as anything other than `auxiliary` is not a label
+  however its prompt reads. The header is a guard, not the detector, because
+  Claude Code sends `auxiliary` on every side request, and a request with no
+  header stays eligible, as older clients send none.
+
 ## v0.9.2 (2026-09-22)
 
 - Deferred tools stay out of the Codex tools head, the placeholder included.

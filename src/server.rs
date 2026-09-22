@@ -1,5 +1,6 @@
 use crate::{
     anthropic::{MAX_ANTHROPIC_REQUEST_BYTES, json_error},
+    config::AgentSummaryMode,
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle, UsageFields, UsageReport},
     openai_compat::{
@@ -1638,77 +1639,109 @@ async fn dispatch_request(
 
     // Claude Code asks a running subagent's own model for a three-word progress
     // label every half minute, resending that subagent's whole context each
-    // time. Answer it here: the label is in the transcript already, and on a
-    // subscription every one of those requests is billed as a full context.
+    // time. By default it goes on like any other request, so the label and the
+    // usage the client reads both come from the model it was sent to.
+    // `CCP_AGENT_SUMMARY` can instead answer it here from the transcript or send
+    // it to the provider's junior model.
     //
     // The permission classifier is judged first and never as a label: it quotes
     // the agent's transcript into the message it wants a verdict on, so the
     // label prompt can appear inside it, and a three-word answer leaves it with
     // nothing to parse. It goes on to the auto-review route below instead.
+    //
+    // Claude Code's request class is a guard on top of the prompt: a request it
+    // classes as anything but `auxiliary` is not a label, while the class alone
+    // cannot detect one, since every side request carries it.
     let agent_summary = !count_tokens
         && !is_claude_auto_review_request(&body)
+        && crate::agent_summary::request_class_allows_label(&headers)
         && crate::agent_summary::is_agent_summary_request(&body);
-    if agent_summary && !crate::config::agent_summary_local() {
-        // Kept for the case where a label really must come from a model: the
-        // provider's junior model at the lowest effort, never the subagent's.
-        let provider = state
-            .registry
-            .provider_for_model(body.model.as_deref().unwrap_or_default(), None);
-        let summary_model = crate::config::agent_summary_model().or_else(|| {
-            provider
-                .as_ref()
-                .and_then(|provider| crate::agent_summary::summary_model_for(provider.name()))
-                .map(str::to_string)
-        });
-        if let Some(summary_model) = summary_model {
-            crate::agent_summary::apply_summary_route(&mut body, &summary_model);
-            log.info(
-                "agent_summary_routed",
-                Some(serde_json::Map::from_iter([
-                    ("reqId".to_string(), json!(&req_id)),
-                    ("model".to_string(), json!(&summary_model)),
-                ])),
-            );
-        }
-    }
-    if agent_summary && crate::config::agent_summary_local() {
-        let text = crate::agent_summary::summary_text(&body);
-        let (response, output_tokens) = crate::agent_summary::local_response(&body, &text);
-        if let Some(monitor) = state.monitor.as_ref() {
-            if let Some(model) = body.model.as_deref() {
-                monitor.provider_selected(&req_id, "local", model, None);
+    if agent_summary {
+        match crate::config::agent_summary_mode() {
+            AgentSummaryMode::Native => {
+                // Nothing is rewritten here, so the passthrough still relays
+                // the client's bytes; a Codex-routed label gets its tool
+                // choice once the provider is known, below. Logged only so
+                // the labels can be counted.
+                let conversation = conversation_identity
+                    .as_ref()
+                    .map(|identity| monitor_conversation_label(identity, &body));
+                log.info(
+                    "agent_summary_forwarded",
+                    Some(serde_json::Map::from_iter([
+                        ("reqId".to_string(), json!(&req_id)),
+                        ("model".to_string(), json!(&body.model)),
+                        ("conversation".to_string(), json!(conversation)),
+                    ])),
+                );
             }
-            // Nothing was sent upstream, so the whole cost of the request is
-            // known here rather than estimated: no prompt, no cache on either
-            // side, and the label the proxy wrote. It is reported as a closing
-            // usage, because the opening path would leave every count reading
-            // as a number a backend may still correct. The lifetime split of a
-            // cache write stays unreported: it is evidence only an Anthropic
-            // response produces, and a write of nothing has no buckets.
-            monitor.usage_reported(
-                &req_id,
-                UsageReport {
-                    closing: UsageFields {
-                        input_tokens: Some(0),
-                        cache_read_tokens: Some(0),
-                        cache_write_tokens: Some(0),
-                        output_tokens: Some(output_tokens),
-                        ..UsageFields::default()
-                    },
-                    ..UsageReport::default()
-                },
-            );
-            monitor.request_completed(&req_id, 200, None, None);
+            AgentSummaryMode::Upstream => {
+                // For the case where a label must come from a cheaper model: the
+                // provider's junior model at the lowest effort, never the
+                // subagent's.
+                let provider = state
+                    .registry
+                    .provider_for_model(body.model.as_deref().unwrap_or_default(), None);
+                let summary_model = crate::config::agent_summary_model().or_else(|| {
+                    provider
+                        .as_ref()
+                        .and_then(|provider| {
+                            crate::agent_summary::summary_model_for(provider.name())
+                        })
+                        .map(str::to_string)
+                });
+                if let Some(summary_model) = summary_model {
+                    crate::agent_summary::apply_summary_route(&mut body, &summary_model);
+                    log.info(
+                        "agent_summary_routed",
+                        Some(serde_json::Map::from_iter([
+                            ("reqId".to_string(), json!(&req_id)),
+                            ("model".to_string(), json!(&summary_model)),
+                        ])),
+                    );
+                }
+            }
+            AgentSummaryMode::Local => {
+                let text = crate::agent_summary::summary_text(&body);
+                let (response, output_tokens) = crate::agent_summary::local_response(&body, &text);
+                if let Some(monitor) = state.monitor.as_ref() {
+                    if let Some(model) = body.model.as_deref() {
+                        monitor.provider_selected(&req_id, "local", model, None);
+                    }
+                    // Nothing was sent upstream, so the whole cost of the
+                    // request is known here rather than estimated: no prompt,
+                    // no cache on either side, and the label the proxy wrote.
+                    // It is reported as a closing usage, because the opening
+                    // path would leave every count reading as a number a
+                    // backend may still correct. The lifetime split of a cache
+                    // write stays unreported: it is evidence only an Anthropic
+                    // response produces, and a write of nothing has no buckets.
+                    monitor.usage_reported(
+                        &req_id,
+                        UsageReport {
+                            closing: UsageFields {
+                                input_tokens: Some(0),
+                                cache_read_tokens: Some(0),
+                                cache_write_tokens: Some(0),
+                                output_tokens: Some(output_tokens),
+                                ..UsageFields::default()
+                            },
+                            ..UsageReport::default()
+                        },
+                    );
+                    monitor.request_completed(&req_id, 200, None, None);
+                }
+                log.info(
+                    "agent_summary_answered_locally",
+                    Some(serde_json::Map::from_iter([
+                        ("reqId".to_string(), json!(&req_id)),
+                        ("model".to_string(), json!(&body.model)),
+                        ("outputTokens".to_string(), json!(output_tokens)),
+                    ])),
+                );
+                return with_request_id(response, &req_id);
+            }
         }
-        log.info(
-            "agent_summary_answered_locally",
-            Some(serde_json::Map::from_iter([
-                ("reqId".to_string(), json!(&req_id)),
-                ("model".to_string(), json!(&body.model)),
-                ("outputTokens".to_string(), json!(output_tokens)),
-            ])),
-        );
-        return with_request_id(response, &req_id);
     }
 
     let model = match body.model.as_deref() {
@@ -1845,7 +1878,19 @@ async fn dispatch_request(
         }
     };
 
-    body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
+    // A label sent to Codex, whichever model answers it, must come back as
+    // text: the client asks in prose only, and measured on the ChatGPT backend
+    // Codex models often answered a label with a tool call the client
+    // discards. Tools stay, so the cached prefix does. The Anthropic route is
+    // left alone: a `tool_choice` change would invalidate Anthropic's messages
+    // cache.
+    if agent_summary && provider.name() == "codex" {
+        crate::agent_summary::forbid_tool_calls(&mut body);
+    }
+
+    // The label route above may already have pinned its junior model; keep that.
+    body.bypass_provider_model_override |=
+        auto_review_route.is_some() && provider.name() == "codex";
 
     if let Some(route) = auto_review_route.as_ref() {
         log.info(

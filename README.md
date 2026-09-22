@@ -59,8 +59,9 @@ Code's own usage warnings and limit messages working for both.
 - **Ships a terminal monitor** with per-session, per-conversation and per-model
   token accounting, cache hit and miss detection, and a conversation tree.
   [The monitor](#the-monitor)
-- **Answers Claude Code's subagent progress label itself**, instead of resending
-  a running subagent's whole context to a model every half minute.
+- **Recognizes Claude Code's subagent progress label** and forwards it natively
+  by default, so the client sees its real usage; it can also be answered from
+  the transcript or pinned to a junior model.
   [Proxy side](#proxy-side)
 - **Maps deferred tool loading onto Codex's native tool search**, so loading a
   tool mid-conversation does not rewrite the head of the prompt.
@@ -96,8 +97,9 @@ Neither upstream project has these; the details and the evidence are in
   and an empty completion up to ten times each.
 - **Deferred tool loading on the Codex route**, mapped onto the backend's own
   tool search so the cached prompt prefix survives a tool load.
-- **Local answers for Claude Code's subagent progress label**, with
-  `CCP_AGENT_SUMMARY=upstream` to send them to a junior model instead.
+- **A switch for Claude Code's subagent progress label**: forwarded natively by
+  default, answered from the transcript with `CCP_AGENT_SUMMARY=local`, or
+  pinned to a junior model with `CCP_AGENT_SUMMARY=upstream`.
 - **A per-conversation prompt-cache scope** on Codex: the session id for a main
   thread, a derived id for each subagent.
 - **The monitor's token accounting** — the cache read and write split, evidence
@@ -518,7 +520,8 @@ prepared, and that one decides which rollup the tokens land on, alongside a
 count of the ids that asked for it. A model named there means the request was
 prepared, not that the backend answered. Requests the proxy answers itself name
 none, because none ran: the local `count_tokens` estimates, an agent summary
-answered from the transcript, Cursor's tool bridge. The Claude route's
+answered from the transcript (with `CCP_AGENT_SUMMARY=local`), Cursor's tool
+bridge. The Claude route's
 `count_tokens` is a real relay and does name one. Requests that belong to no
 conversation get a rollup of their own rather than being left as the difference
 between the others.
@@ -803,8 +806,8 @@ This is the complete list of variables the proxy reads.
 | `CCP_CONFIG_DIR` | per platform | Move the config directory. It does **not** move the state directory. |
 | `CCP_ALIAS_PROVIDER` | `anthropic` | Backend for the Claude aliases: `anthropic`, `codex` or `kimi`. Leave it alone unless you want `opus` to stop meaning Claude. |
 | `CCP_AUTO_REVIEW_MODEL` | unset | Model for Claude Code's background security classifier. Unset, the classifier goes to `gpt-5.6-luna` only when it would have reached Codex anyway; set, it applies on any route. |
-| `CCP_AGENT_SUMMARY` | `local` | While a subagent runs, Claude Code asks for a three-to-five-word progress label every half minute and resends that subagent's whole context with it. The proxy recognizes the prompt and answers it from the transcript. Set to `upstream` (`model` and `remote` do the same) to send those requests to a model again. |
-| `CCP_AGENT_SUMMARY_MODEL` | the provider's junior model | Which model answers a label that is sent upstream. Without it: `claude-sonnet-5` on Anthropic, `gpt-5.6-luna` on Codex, and the request's own model on a backend with no entry. Whenever one of these applies, the label request is pinned to that model at `effort: low`. Ignored while labels are answered locally. |
+| `CCP_AGENT_SUMMARY` | `native` | Claude Code periodically asks for a short progress label for each running background subagent and resends that subagent's whole context with it. The proxy recognizes the prompt, also when trailing system messages follow it, and only when the `x-claude-code-request-class` header is absent or says `auxiliary`; any other class rules the request out. The header alone is not enough, because Claude Code sends `auxiliary` on every side request. `native` routes and relays the request like any other for its model, so the client sees its real usage; like any request it can fail (429, 5xx, a spent Codex window). On the Codex route, in `native` and `upstream` mode both, the label goes out with `tool_choice` set to `none` and its tools kept: the client only asks in prose not to use tools, and Codex models often answered a label with a tool call, which the client discards. Measured on the ChatGPT backend, every listed Codex model accepts and enforces it, and the cached prefix is unaffected. The Anthropic route is untouched, because a `tool_choice` change invalidates Anthropic's messages cache and the passthrough relays the client's bytes as they are. `local` answers it from the transcript, built from the last tool call; the monitor shows provider `local` and the usage reports zero input. `upstream` (`model` and `remote` do the same) pins the provider's junior model at `effort: low`, or `CCP_AGENT_SUMMARY_MODEL` when set; on the Anthropic route the relayed bytes stay the client's own, so the request Anthropic receives is unchanged and only the proxy's own record names the junior model. Values are trimmed and case-sensitive: exactly `native`, `local`, `upstream`, `model` or `remote`. An empty or unrecognized value is skipped, so the setting falls back to `agentSummary` in `config.json`, then to `native`. `proxy.log` records `agent_summary_forwarded` or `agent_summary_answered_locally` for the first two modes, and `agent_summary_routed` only when `upstream` picked a model; on a backend with no junior model and no `CCP_AGENT_SUMMARY_MODEL` the request keeps its own model and none of the three is logged. |
+| `CCP_AGENT_SUMMARY_MODEL` | the provider's junior model | Which model answers a label in `upstream` mode. Without it: `claude-sonnet-5` on Anthropic, `gpt-5.6-luna` on Codex, and the request's own model on a backend with no entry. Ignored in `native` and `local`. |
 | `CCP_USER_AGENT` | per backend | Fallback `User-Agent` for the Codex and Kimi backends when neither has its own override. |
 
 **Anthropic route**
@@ -881,7 +884,7 @@ the default. Ten variables have no key in the file and are environment-only:
   "port": 18765,
   "aliasProvider": "anthropic",
   "autoReviewModel": "gpt-5.6-luna",
-  "agentSummary": "local",
+  "agentSummary": "native",
   "log": { "verbose": false, "stderr": false },
   "codex": {
     "transport": "websocket",
@@ -1127,7 +1130,7 @@ backend was contacted.
 | Codex quota as rate-limit headers | `usage_limit_reached` answered once with `x-should-retry: false`, status, reset and claim; no utilization on healthy responses | not recognized | the same spent-window answer, plus `-5h-*` / `-7d-*` utilization and `-surpassed-threshold` on every healthy response |
 | Codex retries | a live stream and an empty completion retried up to 10 times each, the buffered transport up to 3 | same | one attempt; the client owns the retry policy |
 | Deferred tool loading | `tool_reference` blocks dropped in the grok translator | same | mapped onto Codex's native tool search |
-| Subagent progress label | not handled | not handled | answered locally, or sent to a junior model |
+| Subagent progress label | not handled | not handled | forwarded natively by default; answered locally or sent to a junior model on request |
 | Prompt-cache scope per subagent | the bare session id, so a subagent shares the main thread's scope and routing bucket | same | a derived id per conversation, sent as both the request's `prompt_cache_key` and the `session_id` header |
 | Responses lane policy | compiled-in table only | same | `CCP_CODEX_LANE_POLICY` / `CCP_CODEX_FULL_LANE`, with the backend listing able to decide |
 | Monitor accounting | request list and totals | same | cache read/write split, evidence marks, per-lane cache-miss detection, conversation tree |
@@ -1154,8 +1157,9 @@ not defects.
 
 **What this fork has that neither of them does.** Live Codex model discovery
 and the richer `/v1/models`; Codex quota translated into Anthropic rate-limit
-headers; deferred tool loading mapped onto Codex's tool search; local answers
-for the subagent progress label; a per-conversation prompt-cache scope; the
+headers; deferred tool loading mapped onto Codex's tool search; a native,
+local or junior-model mode for the subagent progress label; a
+per-conversation prompt-cache scope; the
 monitor's token accounting and conversation tree; and the Responses lane as
 configuration.
 

@@ -122,17 +122,23 @@ async fn call_messages(model: &str) -> Response {
 }
 
 async fn call_messages_body(body: Value) -> Response {
+    call_messages_body_with_class(body, None).await
+}
+
+/// Same request, with `x-claude-code-request-class` set to `request_class`
+/// when one is given, as Claude Code sends on its own requests.
+async fn call_messages_body_with_class(body: Value, request_class: Option<&str>) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", "smoke-session");
+    if let Some(class) = request_class {
+        request = request.header("x-claude-code-request-class", class);
+    }
     app(Arc::new(Registry::with_default_alias()))
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .header("x-claude-code-session-id", "smoke-session")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap()
 }
@@ -140,6 +146,11 @@ async fn call_messages_body(body: Value) -> Response {
 /// Same request, with a monitor watching, so a test can read what the proxy
 /// recorded about the request next to what the client received.
 async fn call_messages_body_with_monitor(monitor: MonitorHandle, body: Value) -> Response {
+    call_messages_bytes_with_monitor(monitor, body.to_string()).await
+}
+
+/// Send `body` exactly as given, for tests that check the bytes a relay forwards.
+async fn call_messages_bytes_with_monitor(monitor: MonitorHandle, body: String) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
     app_with_monitor(Arc::new(Registry::with_default_alias()), Some(monitor))
         .oneshot(
@@ -148,7 +159,7 @@ async fn call_messages_body_with_monitor(monitor: MonitorHandle, body: Value) ->
                 .uri("/v1/messages")
                 .header("content-type", "application/json")
                 .header("x-claude-code-session-id", "smoke-session")
-                .body(Body::from(body.to_string()))
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await
@@ -4042,6 +4053,16 @@ async fn smoke_auto_review_keeps_the_requested_model_beside_the_one_that_ran() {
     );
 }
 
+/// An Anthropic stream answering a progress-label request as claude-opus-5.
+const ANTHROPIC_LABEL_SSE: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":11,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n",
+    "event: message_delta\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
 /// The relay forwards the caller's own bytes, so the model that reaches
 /// Anthropic is the one written in them — not the one the proxy pointed the
 /// typed request at. The agent-summary override rewrites the typed model and
@@ -4051,19 +4072,11 @@ async fn smoke_auto_review_keeps_the_requested_model_beside_the_one_that_ran() {
 #[tokio::test(flavor = "multi_thread")]
 async fn smoke_anthropic_wire_model_is_the_one_in_the_relayed_bytes() {
     let _guard = env_lock();
-    const UPSTREAM_SSE: &str = concat!(
-        "event: message_start\n",
-        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":11,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":1}}}\n\n",
-        "event: message_delta\n",
-        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
-        "event: message_stop\n",
-        "data: {\"type\":\"message_stop\"}\n\n",
-    );
     let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-    let upstream = spawn_capturing_http_upstream(captured.clone(), UPSTREAM_SSE).await;
+    let upstream = spawn_capturing_http_upstream(captured.clone(), ANTHROPIC_LABEL_SSE).await;
     let _base_url_env = EnvGuard::set("CCP_ANTHROPIC_BASE_URL", &upstream);
-    // Send the label request to a model instead of answering it locally, which
-    // is what makes the typed model and the relayed bytes disagree.
+    // Send the label request to the provider's junior model, which is what
+    // makes the typed model and the relayed bytes disagree.
     let _summary_env = EnvGuard::set("CCP_AGENT_SUMMARY", "upstream");
 
     let body = json!({
@@ -4077,7 +4090,7 @@ async fn smoke_anthropic_wire_model_is_the_one_in_the_relayed_bytes() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let text = drain_stream(response).await;
-    assert_eq!(text, UPSTREAM_SSE, "the relay must stay byte-exact");
+    assert_eq!(text, ANTHROPIC_LABEL_SSE, "the relay must stay byte-exact");
 
     let relayed = captured
         .lock()
@@ -4110,4 +4123,155 @@ async fn smoke_anthropic_wire_model_is_the_one_in_the_relayed_bytes() {
     assert_eq!(row.request_count, 1);
     assert_eq!(row.input_tokens, 11);
     assert_eq!(row.output_tokens, 4);
+}
+
+/// With no mode set, a label request on the Anthropic route is relayed as the
+/// client wrote it, and the monitor names the one model the client asked for.
+/// The body is spaced and ordered the way no serializer would write it, so a
+/// relay that parsed and rewrote it would not reproduce these bytes.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_anthropic_progress_label_is_relayed_untouched_by_default() {
+    let _guard = env_lock();
+    let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let upstream = spawn_capturing_http_upstream(captured.clone(), ANTHROPIC_LABEL_SSE).await;
+    let _base_url_env = EnvGuard::set("CCP_ANTHROPIC_BASE_URL", &upstream);
+    let _summary_env = EnvGuard::unset("CCP_AGENT_SUMMARY");
+    let config_dir = TempDir::new().unwrap();
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config_dir.path());
+
+    const BODY: &str = r#"{ "stream" : true,
+  "messages": [ { "role": "user",   "content": "Describe your most recent action in 3-5 words" } ],
+  "model":"claude-opus-5",  "max_tokens" :64 }
+"#;
+    let monitor = MonitorHandle::new(10);
+    let response = call_messages_bytes_with_monitor(monitor.clone(), BODY.to_string()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = drain_stream(response).await;
+    assert_eq!(text, ANTHROPIC_LABEL_SSE, "the relay must stay byte-exact");
+
+    let relayed = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream was called");
+    assert_eq!(
+        relayed,
+        BODY.as_bytes(),
+        "the relay must forward the client's bytes verbatim"
+    );
+
+    let state = monitor.snapshot();
+    let request = &state.recent[0];
+    assert_eq!(request.provider.as_deref(), Some("anthropic"));
+    assert_eq!(request.model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(request.requested_model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(request.effective_model.as_deref(), Some("claude-opus-5"));
+}
+
+/// A progress label routed to Codex reaches the backend with `tool_choice`
+/// `none` and the subagent's tools intact, in the default mode and in the
+/// `upstream` mode on the junior model alike. The same prompt classed
+/// `subagent` by the client is not a label: its request goes out with no tool
+/// choice, and its tools are the reference the label's are compared against.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_progress_label_forbids_tool_calls_and_keeps_tools() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_http_upstream({
+        let captured = captured.clone();
+        move |body: Value| {
+            captured.lock().unwrap().push(body);
+            concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_up\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Reading server.rs\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+            )
+            .as_bytes()
+            .to_vec()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let _mode_env = EnvGuard::unset("CCP_AGENT_SUMMARY");
+    let _summary_model_env = EnvGuard::unset("CCP_AGENT_SUMMARY_MODEL");
+    let label_body = || {
+        json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64000,
+            "stream": false,
+            "tools": [
+                {"name": "Read", "description": "Read a file",
+                 "input_schema": {"type": "object",
+                                  "properties": {"file_path": {"type": "string"}}}},
+                {"name": "Bash", "description": "Run a command",
+                 "input_schema": {"type": "object",
+                                  "properties": {"command": {"type": "string"}}}}
+            ],
+            "messages": [
+                {"role": "user", "content": "do the work"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read",
+                     "input": {"file_path": "/repo/src/server.rs"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "..."},
+                    {"type": "text", "text": "Describe your most recent action in 3-5 words using present tense (-ing). Do not use tools."}
+                ]}
+            ]
+        })
+    };
+
+    for class in [Some("auxiliary"), Some("subagent")] {
+        let response = call_messages_body_with_class(label_body(), class).await;
+        assert_eq!(response.status(), StatusCode::OK, "class {class:?}");
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+    {
+        let _upstream_mode_env = EnvGuard::set("CCP_AGENT_SUMMARY", "upstream");
+        let response = call_messages_body_with_class(label_body(), Some("auxiliary")).await;
+        assert_eq!(response.status(), StatusCode::OK, "upstream mode");
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    }
+
+    let sent = captured.lock().unwrap();
+    assert_eq!(sent.len(), 3);
+    let (label, not_a_label, junior) = (&sent[0], &sent[1], &sent[2]);
+
+    assert_eq!(not_a_label["model"], "gpt-5.6-sol");
+    assert_eq!(
+        not_a_label.get("tool_choice"),
+        None,
+        "a label prompt classed subagent must keep the client's absent tool choice"
+    );
+    let tools = not_a_label["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2, "the subagent's tools go to the backend");
+
+    assert_eq!(label["model"], "gpt-5.6-sol");
+    assert_eq!(label["tool_choice"], "none");
+    assert_eq!(
+        label["tools"], not_a_label["tools"],
+        "forbidding tool calls must not change the tools the label carries"
+    );
+
+    assert_eq!(junior["model"], "gpt-5.6-luna");
+    assert_eq!(junior["tool_choice"], "none");
+    assert_eq!(
+        junior["tools"], not_a_label["tools"],
+        "the junior model gets the same tools with tool calls forbidden"
+    );
 }

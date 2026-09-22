@@ -3,6 +3,7 @@ use http::HeaderMap;
 pub const CLAUDE_SESSION_HEADER: &str = "x-claude-code-session-id";
 pub const CLAUDE_AGENT_HEADER: &str = "x-claude-code-agent-id";
 pub const CLAUDE_PARENT_AGENT_HEADER: &str = "x-claude-code-parent-agent-id";
+pub const CLAUDE_REQUEST_CLASS_HEADER: &str = "x-claude-code-request-class";
 
 const MAX_IDENTITY_LEN: usize = 512;
 
@@ -76,6 +77,28 @@ pub fn parent_agent_id_from_headers(headers: &HeaderMap) -> Option<String> {
     match (session.value(), agent.value(), parent.value()) {
         (Some(_), Some(_), Some(parent_id)) => Some(parent_id.to_string()),
         _ => None,
+    }
+}
+
+/// What Claude Code says a request is, from `x-claude-code-request-class`.
+/// Read beside the identity like the parent: it steers nothing the
+/// conversation state or the prompt cache key are keyed on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestClass {
+    /// No header, as older clients send.
+    Absent,
+    /// The class as the client wrote it, trimmed. `main`, `subagent`,
+    /// `compaction` and `auxiliary` have been observed.
+    Named(String),
+    /// A header that is present but not one readable value.
+    Invalid,
+}
+
+pub fn request_class_from_headers(headers: &HeaderMap) -> RequestClass {
+    match read_identity_header(headers, CLAUDE_REQUEST_CLASS_HEADER) {
+        ParsedHeader::Missing => RequestClass::Absent,
+        ParsedHeader::Valid(value) => RequestClass::Named(value.to_string()),
+        ParsedHeader::Invalid => RequestClass::Invalid,
     }
 }
 
@@ -461,6 +484,58 @@ mod tests {
             "agent-a".to_string(),
         );
         assert_ne!(agent.cache_scope(), other_session.cache_scope());
+    }
+
+    #[test]
+    fn request_class_is_read_as_sent_and_never_touches_the_identity() {
+        let cases = [
+            ("absent", vec![], RequestClass::Absent),
+            (
+                "auxiliary",
+                vec![(CLAUDE_REQUEST_CLASS_HEADER, "auxiliary")],
+                RequestClass::Named("auxiliary".to_string()),
+            ),
+            (
+                "outer space and tab",
+                vec![(CLAUDE_REQUEST_CLASS_HEADER, " \tsubagent\t ")],
+                RequestClass::Named("subagent".to_string()),
+            ),
+            (
+                "kept as written",
+                vec![(CLAUDE_REQUEST_CLASS_HEADER, "Auxiliary")],
+                RequestClass::Named("Auxiliary".to_string()),
+            ),
+            (
+                "empty",
+                vec![(CLAUDE_REQUEST_CLASS_HEADER, "")],
+                RequestClass::Invalid,
+            ),
+            (
+                "internal space",
+                vec![(CLAUDE_REQUEST_CLASS_HEADER, "two values")],
+                RequestClass::Invalid,
+            ),
+            (
+                "repeated",
+                vec![
+                    (CLAUDE_REQUEST_CLASS_HEADER, "auxiliary"),
+                    (CLAUDE_REQUEST_CLASS_HEADER, "main"),
+                ],
+                RequestClass::Invalid,
+            ),
+        ];
+
+        for (name, values, expected) in cases {
+            let mut values = values;
+            values.push((CLAUDE_SESSION_HEADER, "session-a"));
+            let headers = headers(&values);
+            assert_eq!(request_class_from_headers(&headers), expected, "{name}");
+            assert_eq!(
+                ConversationIdentity::from_headers(&headers),
+                Some(ConversationIdentity::Main("session-a".to_string())),
+                "{name}"
+            );
+        }
     }
 
     #[test]
