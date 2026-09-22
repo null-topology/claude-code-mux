@@ -56,10 +56,10 @@ Other differences when moving code between the trees:
   `Command::cargo_bin("claude-code-proxy")`. Ported test files need that edit.
 - Never copy one `Cargo.lock` over the other.
 
-The fork's `CHANGELOG.md` top entry records the last upstream release that was
-integrated. `AGENTS.md` at the repo root lists the fork practices (stay close
-to upstream, keep Claude aliases on Anthropic, Codex CLI auth, toy credentials
-in tests).
+`AGENTS.md` at the repo root lists the fork practices (stay close to upstream,
+keep Claude aliases on Anthropic, Codex CLI auth, toy credentials in tests).
+Changes adapted from upstream are credited in the `CHANGELOG.md` entry of the
+release that carries them.
 
 ## Toolchain on this machine
 
@@ -97,11 +97,34 @@ CI (`.github/workflows/ci.yml`) runs `just check-ci`, which is `checkle run all`
 --all`, `cargo test --all`) and then fails if the checks left uncommitted
 changes. The pre-commit hook (`just install-hooks`) runs `checkle pre-commit`.
 
-Release: `just release` bumps a patch version with cargo-release and skips
-publish; pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which
-tests with `--test-threads=1`, builds prebuilt binaries for six targets, and
-verifies `--version` matches the tag. It uses the default `GITHUB_TOKEN` and
-needs no secrets. crates.io publishing is separate.
+## Changelog and releases
+
+`CHANGELOG.md` is the release notes, and keeping it is part of every change.
+A pull request that changes anything a user can notice (routing, what goes on
+the wire, configuration keys and defaults, CLI, monitor, `proxy.log` events,
+install) adds its entry under `## Unreleased` in the same pull request. Write
+each entry for someone upgrading: what changed, what it means for them, and
+how to get the previous behavior back when there is a way. Refactors, tests
+and CI-only changes need no entry.
+
+A release, from an up-to-date `main` after its pull requests are merged:
+
+1. One `build: release X.Y.Z` commit that bumps `version` in `Cargo.toml`,
+   refreshes `Cargo.lock` with a build, and renames `## Unreleased` to
+   `## vX.Y.Z (YYYY-MM-DD)`. A feature bumps the minor version, a fix the
+   patch.
+2. An annotated tag `vX.Y.Z` on that commit. Push `main`, then the tag by
+   name. Never `git push --tags`: the local clone also holds upstream's tags.
+3. The tag runs `.github/workflows/release.yml`. It takes the tag's section
+   out of `CHANGELOG.md` and fails before anything is built when there is
+   none, tests with `--test-threads=1`, builds prebuilt binaries for six
+   targets, verifies `--version` matches the tag, and publishes a GitHub
+   release whose notes are that section followed by the generated list of
+   merged pull requests. It uses the default `GITHUB_TOKEN` and needs no
+   secrets. Nothing is published to crates.io.
+
+`just release` (cargo-release) is not installed here, so the bump is done by
+hand.
 
 Running a build without touching an installed one:
 
