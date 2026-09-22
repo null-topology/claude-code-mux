@@ -1,4 +1,4 @@
-## Unreleased
+## v0.10.0 (2026-09-23)
 
 - Claude Code's subagent progress label is forwarded natively by default
   (`CCP_AGENT_SUMMARY=native`): the request is routed and relayed like any
