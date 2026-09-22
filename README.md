@@ -12,7 +12,7 @@ itself a fork of
 [How this compares with the upstream projects](#how-this-compares-with-the-upstream-projects)
 for what each layer contributed and what differs today.
 
-<img src="meta/claude-code-screenshot-2026-07.webp" alt="The claude-code-mux monitor during a session" />
+<img src="meta/claude-code-screenshot-2026-09.webp" alt="Claude Code next to the claude-code-mux monitor, whose Stats tab sums each backend and model" />
 
 <sub>The monitor in an earlier layout; the panes and columns have changed since
 the screenshot was taken.</sub>
@@ -24,7 +24,7 @@ name says:
 - A **Claude** model goes to Anthropic untouched, on the login Claude Code
   already has. Nothing is translated, no API key is involved, and the proxy
   stores no Claude credentials.
-- A **Codex** model (`gpt-6-astra`, `gpt-5.6-sol`, ...) is translated to the
+- A **Codex** model (`gpt-6-astra`, `gpt-6-sol`, ...) is translated to the
   OpenAI Responses API and sent on the ChatGPT login of the Codex CLI.
 
 So Opus can stay on your Claude plan for the hard parts while a Codex model
@@ -178,7 +178,7 @@ mode in a terminal too.
 **5. Restart Claude Code** and pick a model:
 
 ```text
-/model gpt-5.6-sol
+/model gpt-6-sol
 /model claude-opus-5
 ```
 
@@ -187,7 +187,7 @@ mode in a terminal too.
 ### Model ids
 
 Codex models are addressed by their Codex id, for example `gpt-6-astra`,
-`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, or `gpt-5.5`. The proxy does
+`gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-terra`, or `gpt-5.5`. The proxy does
 not keep that list itself: `claude-code-mux models` and `GET /v1/models` ask
 the Codex backend which models your ChatGPT login may use and print exactly
 that, so a model Codex starts serving is available without a proxy release
@@ -228,9 +228,9 @@ arrow key like the built-in rows, add a `modelPicker` block to
         "behavesAs": "claude-opus-5"
       },
       {
-        "model": "gpt-5.6-sol",
+        "model": "gpt-6-sol",
         "label": "Sol",
-        "description": "GPT-5.6 Sol · Reliable agentic workhorse for everyday tasks",
+        "description": "GPT-6 Sol · Reliable agentic workhorse for everyday tasks",
         "behavesAs": "claude-sonnet-5"
       },
       {
@@ -240,9 +240,9 @@ arrow key like the built-in rows, add a `modelPicker` block to
         "behavesAs": "claude-sonnet-5"
       },
       {
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-luna",
         "label": "Luna",
-        "description": "GPT-5.6 Luna · Fast and affordable agentic coding",
+        "description": "GPT-6 Luna · Fast and affordable agentic coding",
         "behavesAs": "claude-sonnet-5"
       },
       {
@@ -256,7 +256,11 @@ arrow key like the built-in rows, add a `modelPicker` block to
 }
 ```
 
-The rows appear after the built-in lineup. Each field does one thing:
+The rows appear after the built-in lineup:
+
+<img src="meta/claude-code-model-picker-2026-09.webp" alt="Claude Code's model picker listing Astra, Sol, Terra, Luna and GPT-5.5 after the built-in Claude rows" width="460" />
+
+Each field does one thing:
 
 - `model` is sent to the proxy verbatim, so it must be an id the proxy accepts.
 - `label` and `description` are only what the picker shows.
@@ -771,7 +775,7 @@ Claude Code attaches (see [Claude authentication](#claude-authentication)).
 **Codex only, with no Claude login, API key or OAuth token.** Claude Code still
 shows its built-in rows, so point those rows at Codex ids with the client's own
 `ANTHROPIC_DEFAULT_*_MODEL` variables from the table above — for instance the
-Haiku slot at `gpt-5.6-luna`, Sonnet at `gpt-5.6-terra`, Opus at `gpt-5.6-sol`
+Haiku slot at `gpt-6-luna`, Sonnet at `gpt-5.6-terra`, Opus at `gpt-6-sol`
 and Fable at `gpt-6-astra`. That assignment is an example of mapping by role,
 not a recommendation: check what your login actually lists
 (`claude-code-mux models`) before copying it, and check the variable names
