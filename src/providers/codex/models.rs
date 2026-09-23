@@ -240,7 +240,8 @@ fn build_request(
 
 /// Ask the backend which models this login may use. A 401 triggers one token
 /// refresh and one retry, mirroring the completions path. The result of a
-/// successful call is remembered for routing (see [`is_discovered_model`]).
+/// successful call that names at least one model is remembered for routing
+/// (see [`is_discovered_model`]).
 pub async fn fetch_models<S: AuthStorage<StoredAuth>>(
     client: &reqwest::Client,
     auth_manager: &CodexAuthManager<S>,
@@ -307,6 +308,11 @@ struct Discovered {
 static DISCOVERED: Lazy<RwLock<Arc<Discovered>>> = Lazy::new(|| RwLock::new(Arc::default()));
 
 fn remember_discovered(inventory: &ModelInventory) {
+    // A listing that names nothing would make every slug unknown; keep the
+    // previous one instead.
+    if inventory.models.is_empty() {
+        return;
+    }
     let models = inventory
         .models
         .iter()

@@ -5,8 +5,11 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
+use claude_code_mux::logging::log_file;
 use claude_code_mux::providers::codex::continuation::clear_all_continuations_for_tests;
-use claude_code_mux::providers::codex::models::clear_discovered_models_for_tests;
+use claude_code_mux::providers::codex::models::{
+    clear_discovered_models_for_tests, is_discovered_model,
+};
 use claude_code_mux::registry::clear_listed_models_for_tests;
 use claude_code_mux::{registry::Registry, server::app};
 use serde_json::{Value, json};
@@ -751,9 +754,15 @@ async fn assert_unknown_model(response: Response, registry: &Registry, model: &s
 
 /// Toy Codex credentials, a mock backend, and plain HTTP to it: the setup of
 /// every routing test below. The returned guards restore the environment.
+/// A toy Codex login and a mock backend, with HOME and the state dir under
+/// `config` too: a miss refreshes every provider that holds credentials, and
+/// the saved-login lookups fall back to paths under HOME, so the developer's
+/// own logins must be out of reach.
 fn routing_env(config: &TempDir, upstream: &str) -> Vec<EnvGuard> {
     vec![
         write_codex_auth(config.path()),
+        EnvGuard::set("HOME", config.path()),
+        EnvGuard::set("XDG_STATE_HOME", config.path().join("state")),
         EnvGuard::set("CCP_CONFIG_DIR", config.path()),
         EnvGuard::set("CCP_CODEX_BASE_URL", upstream),
         EnvGuard::set("CCP_CODEX_TRANSPORT", "http"),
@@ -891,6 +900,91 @@ async fn concurrent_misses_share_one_listing() {
     }
     assert_eq!(listings(&captured), 1);
     assert_eq!(completions(&captured).len(), 5);
+}
+
+/// The proxy log's events with this message, oldest first.
+fn logged(msg: &str) -> Vec<Value> {
+    std::fs::read_to_string(log_file())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["msg"] == msg)
+        .collect()
+}
+
+/// A listing that names no model counts as no listing: it empties neither
+/// routing nor the set Codex checks a model against, whether a listing came
+/// before it or only the compiled-in list stands. Every listing that is
+/// recorded is logged with its size and how it changed the previous one.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn an_empty_listing_keeps_routing_and_every_recorded_listing_is_logged() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let (full, _) = spawn_codex_upstream(StatusCode::OK, upstream_inventory()).await;
+    let (empty, empty_captured) =
+        spawn_codex_upstream(StatusCode::OK, json!({"unexpected": "shape"})).await;
+    let mut smaller_inventory = upstream_inventory();
+    smaller_inventory["models"].as_array_mut().unwrap().pop();
+    let (smaller, _) = spawn_codex_upstream(StatusCode::OK, smaller_inventory).await;
+
+    // What `/v1/models` lists is what routing uses. The listing is
+    // process-wide; each registry below is built after its environment
+    // because the Codex client reads its base URL when it is created.
+    let env = routing_env(&config, &full);
+    let (status, _) = get_models("/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    let registry = Arc::new(Registry::with_default_alias());
+    let routed = registry.provider_for_model("gpt-7-test", None);
+    assert_eq!(routed.expect("listed by /v1/models").name(), "codex");
+    drop(env);
+
+    // An empty listing after it changes nothing: the model still routes and
+    // Codex still accepts it.
+    let env = routing_env(&config, &empty);
+    let registry = Arc::new(Registry::with_default_alias());
+    registry.refresh_listings().await;
+    assert_eq!(listings(&empty_captured), 1);
+    let routed = registry.provider_for_model("gpt-7-test", None);
+    assert_eq!(routed.expect("kept after an empty listing").name(), "codex");
+    assert!(is_discovered_model("gpt-7-test"));
+    let response = post_through(&registry, "/v1/messages", "gpt-7-test", "empty-listing").await;
+    assert_routed(response, "after an empty listing").await;
+    drop(env);
+
+    let env = routing_env(&config, &smaller);
+    Registry::with_default_alias().refresh_listings().await;
+    drop(env);
+
+    // With nothing listed yet, an empty listing leaves the compiled-in list.
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    let _env = routing_env(&config, &empty);
+    let registry = Registry::with_default_alias();
+    registry.refresh_listings().await;
+    let routed = registry.provider_for_model("gpt-6-astra", None);
+    assert_eq!(routed.expect("compiled-in list").name(), "codex");
+
+    let recorded: Vec<Value> = logged("model listing recorded")
+        .into_iter()
+        .map(|event| event["fields"].clone())
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![
+            json!({"provider": "codex", "models": 3, "previous_models": null, "added": 3, "removed": 0}),
+            json!({"provider": "codex", "models": 2, "previous_models": 3, "added": 0, "removed": 1}),
+        ]
+    );
+    let empties = logged("model listing named no models; routing keeps the previous one");
+    assert_eq!(empties.len(), 2);
+    for event in empties {
+        assert_eq!(event["level"], "warn");
+        assert_eq!(event["fields"], json!({"provider": "codex"}));
+    }
 }
 
 /// Stops the proxy process when the test ends, whether it passed or not.

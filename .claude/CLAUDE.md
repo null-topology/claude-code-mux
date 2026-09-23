@@ -168,7 +168,10 @@ Request path:
    anthropic); `cursor:` prefixes go to cursor; anything else must match a
    provider's catalog exactly: the ids its last successful listing named
    (`LISTED_MODELS`), else its compiled-in list until a listing has arrived;
-   a `-fast` suffix on a listed Codex id also routes. An id nothing routes
+   a `-fast` suffix on a listed Codex id also routes. An id a compiled-in
+   list names belongs to that provider whatever another backend lists; an id
+   only listings name goes to the provider that has listed it the longest,
+   never by map order. An id nothing routes
    refreshes the listings once (`provider_for_model_or_refresh`, see "Codex
    model inventory"), then unknown ids return 400 listing the catalog.
    The `CODEX_MODELS`, `KIMI_MODELS`, `GROK_MODELS` lists here are duplicated
@@ -595,8 +598,14 @@ Routing reads a process-wide catalog in `src/registry.rs` (`LISTED_MODELS`):
 per provider, the ids of its last successful listing from a backend
 (`source: upstream`), which replaces that provider's compiled-in list; a
 provider that has not listed yet routes on its compiled-in list, and bundled
-listings (kimi, grok, cursor today) are not recorded. A provider gains a live
-listing by implementing `list_models` alone. The catalog is filled at three
+listings (kimi, grok, cursor today) are not recorded. `/v1/models` calls
+`list_models` on every provider regardless; being listed automatically, at
+start and on a miss, also needs `has_credentials`, which defaults to false,
+so a provider gains that by implementing both. Ownership never depends on
+name order: an id a compiled-in list names stays with that provider, and its
+own listing only says whether it still serves it; an id only listings name
+goes to the provider whose current listing has named it the longest (the
+catalog numbers each recorded listing). The catalog is filled at three
 points, all through `record_listing`:
 
 - every `/v1/models` call (`handler_models`);
@@ -614,10 +623,19 @@ points, all through `record_listing`:
 `refresh_listings` asks only providers whose `has_credentials()` holds, a
 local check of the saved login with no network call (the Codex CLI's
 `auth.json`, the kimi and grok token files, the cursor store, which on macOS
-with `CCP_CONFIG_DIR` unset can mean a Keychain read); anthropic has none and
-is never asked. A restart forgets the catalog. Replacing the compiled-in list
-has a cost: a successful but empty Codex listing (a 2xx body without
-`models`) leaves every Codex id unroutable until the next good one.
+with `CCP_CONFIG_DIR` unset can mean a Keychain read that blocks for up to
+10 s, so every check runs on tokio's blocking pool); anthropic has none and
+is never asked. A restart forgets the catalog.
+
+A successful listing that names no model, such as a 2xx body without
+`models`, counts as no listing: it is not recorded, the Codex provider's own
+remembered set (`remember_discovered`, which `assert_allowed_model` and the
+lane table read) keeps its previous slugs, and the previous listing or the
+compiled-in list keeps routing. It is logged as a warning, `model listing
+named no models; routing keeps the previous one`. Every recorded listing is
+logged at info as `model listing recorded` with `provider`, `models`,
+`previous_models` (null for the first), `added` and `removed`, and no model
+bodies. `/v1/models` still reports such an empty answer as it came.
 
 Hosted web search sits outside the policy: a request carrying the hosted
 `web_search_20250305` tool is forced onto the full lane, and there a non-forced

@@ -22,7 +22,10 @@
   starts, in the background, and a request for an unrecognised model asks once
   more before the 400; that second ask runs at most once every 30 seconds.
   Once a backend has answered, its list is what routes, in place of the list
-  built into the proxy.
+  built into the proxy. An answer that names no model is ignored and the last
+  good list keeps routing, a model the built-in lists place with one backend
+  stays with it whatever another backend lists, and every list taken over is
+  logged with its size and what changed.
 
 ## v0.10.0 (2026-09-23)
 

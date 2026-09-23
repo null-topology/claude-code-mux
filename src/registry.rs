@@ -1,13 +1,14 @@
 use crate::{
     anthropic::{json_error, schema::MessagesRequest},
     config::AliasProvider,
+    logging::create_logger,
     provider::{CliHandlers, ListingSource, ModelListing, Provider, RequestContext},
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use axum::{http::StatusCode, response::Response};
 use once_cell::sync::Lazy;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -65,8 +66,32 @@ pub const MISS_LISTING_INTERVAL: Duration = Duration::from_secs(30);
 /// only stands in until such a listing arrives. Process-wide like the rest of
 /// the proxy's state, so a listing made through any registry counts; a restart
 /// forgets it.
-static LISTED_MODELS: Lazy<RwLock<BTreeMap<String, HashSet<String>>>> =
-    Lazy::new(|| RwLock::new(BTreeMap::new()));
+static LISTED_MODELS: Lazy<RwLock<Catalog>> = Lazy::new(|| RwLock::new(Catalog::default()));
+
+#[derive(Default)]
+struct Catalog {
+    /// How many listings have been recorded, which numbers the next one.
+    recorded: u64,
+    /// Per provider, each id its last listing named, with the number of the
+    /// listing that first named it; listings that go on naming an id keep it.
+    providers: BTreeMap<String, HashMap<String, u64>>,
+}
+
+impl Catalog {
+    /// The number of the listing since which `provider` has named `model`,
+    /// when its last listing does. Codex serves every model it lists at the
+    /// fast tier too, as `<id>-fast`.
+    fn listed_since(&self, provider: &str, model: &str) -> Option<u64> {
+        let listed = self.providers.get(provider)?;
+        let fast_base = (provider == "codex")
+            .then(|| model.strip_suffix("-fast"))
+            .flatten();
+        listed
+            .get(model)
+            .or_else(|| fast_base.and_then(|base| listed.get(base)))
+            .copied()
+    }
+}
 
 pub struct Registry {
     alias_provider: AliasProvider,
@@ -208,27 +233,27 @@ impl Registry {
         // Exact model-name match reaches a specific backend regardless of the alias
         // target: this is how `ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra` sends the
         // sonnet slot to codex even while aliases default to the Anthropic passthrough.
-        // Once a provider's backend has listed its models, that listing is what
-        // it serves; the compiled-in list stands in until then.
-        for (name, compiled) in &self.models {
-            if name == "anthropic" {
-                continue;
-            }
-            let routes = listed_models_contain(name, &normalized)
-                .unwrap_or_else(|| compiled.iter().any(|candidate| candidate == &normalized));
-            if routes {
-                return self.handlers.get(name).cloned();
-            }
-        }
-
-        // Codex also serves each model it lists at the fast tier, as `<id>-fast`.
-        if let Some(base) = normalized.strip_suffix("-fast")
-            && listed_models_contain("codex", base) == Some(true)
+        // An id a compiled-in list names belongs to that provider whatever another
+        // backend lists. Once the provider's own backend has listed its models,
+        // that listing says whether it still serves the id.
+        let catalog = LISTED_MODELS.read().unwrap_or_else(PoisonError::into_inner);
+        let backends = self.models.iter().filter(|(name, _)| *name != "anthropic");
+        if let Some((name, _)) = backends
+            .clone()
+            .find(|(_, compiled)| compiled.contains(&normalized))
         {
-            return self.handlers.get("codex").cloned();
+            let served = !catalog.providers.contains_key(name)
+                || catalog.listed_since(name, &normalized).is_some();
+            return served.then(|| self.handlers.get(name).cloned()).flatten();
         }
 
-        None
+        // An id only listings name goes to the provider that has listed it the
+        // longest, so another backend that starts listing it later cannot take it
+        // over.
+        backends
+            .filter_map(|(name, _)| Some((catalog.listed_since(name, &normalized)?, name)))
+            .min()
+            .and_then(|(_, name)| self.handlers.get(name).cloned())
     }
 
     /// [`Self::provider_for_model`], and when nothing routes an id, one fresh
@@ -268,11 +293,17 @@ impl Registry {
     /// never fails: a provider whose listing fails logs that itself and keeps
     /// what it had.
     pub async fn refresh_listings(&self) {
-        let listings = self
-            .handlers
-            .values()
-            .filter(|provider| provider.has_credentials())
-            .map(|provider| provider.list_models());
+        // A credentials check reads a saved login and may block (cursor's can
+        // wait on the macOS Keychain), so it runs on the blocking pool.
+        let checks = self.handlers.values().map(|provider| {
+            let provider = Arc::clone(provider);
+            tokio::task::spawn_blocking(move || provider.has_credentials().then_some(provider))
+        });
+        let listings = futures_util::future::join_all(checks)
+            .await
+            .into_iter()
+            .filter_map(|checked| checked.ok().flatten())
+            .map(|provider| async move { provider.list_models().await });
         for listing in futures_util::future::join_all(listings).await {
             record_listing(&listing);
         }
@@ -426,31 +457,68 @@ fn expand_codex_models() -> Vec<String> {
 
 /// Remember the ids of a listing that a provider's backend answered as that
 /// provider's routing catalog. A failed listing, or one that only repeats the
-/// compiled-in list, changes nothing.
+/// compiled-in list, changes nothing. Neither does one that names no model:
+/// an empty answer would make every model of the provider unknown, so the
+/// previous listing, or the compiled-in list, keeps routing.
 pub fn record_listing(listing: &ModelListing) {
     if !listing.is_ok() || listing.source != ListingSource::Upstream {
         return;
     }
-    let ids = listing
+    let ids: HashSet<String> = listing
         .models
         .iter()
         .filter_map(|row| row.get("id").and_then(serde_json::Value::as_str))
         .map(str::to_string)
         .collect();
-    LISTED_MODELS
+    let logger = create_logger("registry");
+    if ids.is_empty() {
+        logger.warn(
+            "model listing named no models; routing keeps the previous one",
+            Some(serde_json::Map::from_iter([(
+                "provider".to_string(),
+                serde_json::json!(listing.provider),
+            )])),
+        );
+        return;
+    }
+    let mut catalog = LISTED_MODELS
         .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(listing.provider.to_string(), ids);
-}
-
-/// Whether `provider`'s last listing names `model`; `None` while no listing
-/// has arrived for it.
-fn listed_models_contain(provider: &str, model: &str) -> Option<bool> {
-    LISTED_MODELS
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(provider)
-        .map(|models| models.contains(model))
+        .unwrap_or_else(PoisonError::into_inner);
+    let number = catalog.recorded;
+    catalog.recorded += 1;
+    let previous = catalog.providers.remove(listing.provider);
+    let (previous_models, added, removed) = match &previous {
+        Some(previous) => (
+            serde_json::json!(previous.len()),
+            ids.iter().filter(|id| !previous.contains_key(*id)).count(),
+            previous.keys().filter(|id| !ids.contains(*id)).count(),
+        ),
+        None => (serde_json::Value::Null, ids.len(), 0),
+    };
+    let models = ids.len();
+    let listed = ids
+        .into_iter()
+        .map(|id| {
+            let since = previous
+                .as_ref()
+                .and_then(|previous| previous.get(&id).copied());
+            (id, since.unwrap_or(number))
+        })
+        .collect();
+    catalog
+        .providers
+        .insert(listing.provider.to_string(), listed);
+    drop(catalog);
+    logger.info(
+        "model listing recorded",
+        Some(serde_json::Map::from_iter([
+            ("provider".to_string(), serde_json::json!(listing.provider)),
+            ("models".to_string(), serde_json::json!(models)),
+            ("previous_models".to_string(), previous_models),
+            ("added".to_string(), serde_json::json!(added)),
+            ("removed".to_string(), serde_json::json!(removed)),
+        ])),
+    );
 }
 
 /// Forget every recorded listing, so routing is back on the compiled-in lists.
@@ -458,6 +526,7 @@ pub fn clear_listed_models_for_tests() {
     LISTED_MODELS
         .write()
         .unwrap_or_else(PoisonError::into_inner)
+        .providers
         .clear();
 }
 
@@ -489,6 +558,8 @@ mod tests {
         compiled: &'static [&'static str],
         listed: &'static [&'static str],
         listings: std::sync::atomic::AtomicUsize,
+        /// The threads the credentials check ran on.
+        checked_on: std::sync::Mutex<Vec<std::thread::ThreadId>>,
     }
 
     impl ListingProvider {
@@ -504,11 +575,16 @@ mod tests {
                 compiled,
                 listed,
                 listings: std::sync::atomic::AtomicUsize::new(0),
+                checked_on: std::sync::Mutex::new(Vec::new()),
             })
         }
 
         fn listings(&self) -> usize {
             self.listings.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn checked_on(&self) -> Vec<std::thread::ThreadId> {
+            self.checked_on.lock().unwrap().clone()
         }
     }
 
@@ -527,6 +603,10 @@ mod tests {
         }
 
         fn has_credentials(&self) -> bool {
+            self.checked_on
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
             self.credentials
         }
 
@@ -592,6 +672,14 @@ mod tests {
         assert_eq!(p.expect("routed after the refresh").name(), "unit-live");
         assert_eq!(live.listings(), 1);
         assert_eq!(offline.listings(), 0, "no credentials, never asked");
+        // The check may block, so it must run on the blocking pool, never on
+        // the thread driving this test's runtime.
+        let runtime_thread = std::thread::current().id();
+        for provider in [&live, &offline] {
+            let checked_on = provider.checked_on();
+            assert_eq!(checked_on.len(), 1, "{}", provider.name);
+            assert_ne!(checked_on[0], runtime_thread, "{}", provider.name);
+        }
 
         let p = registry.provider_for_model("unit-live-new", None);
         assert_eq!(p.expect("the listing is remembered").name(), "unit-live");
@@ -636,6 +724,40 @@ mod tests {
                 .is_none()
         );
         assert_eq!(live.listings(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_listed_id_keeps_its_provider_whatever_the_name_order() {
+        // An id a compiled-in list names stays with that provider even when a
+        // backend whose name sorts first lists it too.
+        let owner = ListingProvider::new("unit-owned-b", false, &["unit-owned-id"], &[]);
+        let rival = ListingProvider::new("unit-owned-a", true, &[], &["unit-owned-id"]);
+        let registry = Registry::from_providers(
+            AliasProvider::Anthropic,
+            [owner.clone() as Arc<dyn Provider>, rival.clone()],
+        );
+        registry.refresh_listings().await;
+        assert_eq!(rival.listings(), 1);
+        let routed = registry.provider_for_model("unit-owned-id", None);
+        assert_eq!(routed.expect("owner").name(), "unit-owned-b");
+
+        // An id only listings name goes to the provider that listed it first,
+        // for as long as that provider keeps listing it.
+        let early = ListingProvider::new("unit-first-b", true, &[], &["unit-first-id"]);
+        let late = ListingProvider::new("unit-first-a", true, &[], &["unit-first-id"]);
+        record_listing(&early.list_models().await);
+        record_listing(&late.list_models().await);
+        record_listing(&late.list_models().await);
+        let registry = Registry::from_providers(
+            AliasProvider::Anthropic,
+            [early.clone() as Arc<dyn Provider>, late.clone()],
+        );
+        let routed = registry.provider_for_model("unit-first-id", None);
+        assert_eq!(routed.expect("first lister").name(), "unit-first-b");
+        let dropped = ListingProvider::new("unit-first-b", true, &[], &["unit-first-other"]);
+        record_listing(&dropped.list_models().await);
+        let routed = registry.provider_for_model("unit-first-id", None);
+        assert_eq!(routed.expect("remaining lister").name(), "unit-first-a");
     }
 
     #[test]

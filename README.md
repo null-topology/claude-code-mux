@@ -200,7 +200,11 @@ recognise makes it ask once more before it answers `Unknown model`. That
 second ask runs at most once every 30 seconds, so a mistyped id does not
 reach the backend on every request. Once a backend has answered, its list is
 what routes: a model it stops listing stops routing, and until it has
-answered, the list built into the proxy is used.
+answered, the list built into the proxy is used. An answer that names no
+model at all is ignored, so the last good list keeps routing, and each list
+the proxy takes over is noted in its log with how many models it names. The
+backends asked this way are the ones that report a saved login; the
+`models` command and `/v1/models` ask every backend regardless.
 
 Two suffixes are understood on any id:
 

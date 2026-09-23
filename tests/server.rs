@@ -495,6 +495,7 @@ async fn empty_body_is_invalid_json() {
 
 #[tokio::test]
 async fn unknown_model_returns_400_with_summary() {
+    let _no_logins = NoSavedLogins::install();
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app
         .oneshot(
@@ -1611,6 +1612,7 @@ async fn monitor_records_invalid_json_failure() {
 
 #[tokio::test]
 async fn monitor_records_unknown_model_failure() {
+    let _no_logins = NoSavedLogins::install();
     let monitor = MonitorHandle::new(10);
     let app = app_with_monitor(
         Arc::new(Registry::with_default_alias()),
@@ -1759,20 +1761,31 @@ async fn get_models(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     (status, value)
 }
 
-/// Point the codex provider at a credential file that does not exist for the
-/// duration of a test, so `/v1/models` reports codex as unauthorized instead
-/// of reading the developer's real Codex login and calling the backend.
-struct NoCodexAuth {
-    previous: Option<std::ffi::OsString>,
+/// Point every saved-login lookup and the state dir at an empty temporary
+/// directory for the duration of a test, so neither `/v1/models` nor the
+/// refresh an unknown model starts can read the developer's real logins,
+/// reach the macOS Keychain or call a backend. Codex then reports itself as
+/// unauthorized.
+struct NoSavedLogins {
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _dir: tempfile::TempDir,
 }
 
-impl NoCodexAuth {
+impl NoSavedLogins {
     fn install() -> Self {
         let dir = tempfile::TempDir::new().unwrap();
-        let previous = std::env::var_os("CCP_CODEX_AUTH_FILE");
-        unsafe {
-            std::env::set_var("CCP_CODEX_AUTH_FILE", dir.path().join("missing-auth.json"));
+        let vars = [
+            ("HOME", dir.path().to_path_buf()),
+            ("CCP_CONFIG_DIR", dir.path().join("config")),
+            ("CCP_CODEX_AUTH_FILE", dir.path().join("missing-auth.json")),
+            ("XDG_STATE_HOME", dir.path().join("state")),
+        ];
+        let previous = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in vars {
+            unsafe { std::env::set_var(key, value) };
         }
         Self {
             previous,
@@ -1781,12 +1794,14 @@ impl NoCodexAuth {
     }
 }
 
-impl Drop for NoCodexAuth {
+impl Drop for NoSavedLogins {
     fn drop(&mut self) {
-        unsafe {
-            match self.previous.take() {
-                Some(value) => std::env::set_var("CCP_CODEX_AUTH_FILE", value),
-                None => std::env::remove_var("CCP_CODEX_AUTH_FILE"),
+        for (key, value) in self.previous.drain(..) {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
             }
         }
     }
@@ -1803,7 +1818,7 @@ fn provider_entry<'a>(value: &'a Value, name: &str) -> &'a Value {
 
 #[tokio::test]
 async fn models_endpoint_tags_rows_and_describes_every_provider() {
-    let _no_codex = NoCodexAuth::install();
+    let _no_logins = NoSavedLogins::install();
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, value) = get_models(app, "/v1/models?limit=1000").await;
 
@@ -1869,7 +1884,7 @@ async fn models_endpoint_tags_rows_and_describes_every_provider() {
 
 #[tokio::test]
 async fn models_endpoint_provider_filter_narrows_rows_and_provider_block() {
-    let _no_codex = NoCodexAuth::install();
+    let _no_logins = NoSavedLogins::install();
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, value) = get_models(app, "/v1/models?provider=kimi").await;
 
@@ -1883,7 +1898,7 @@ async fn models_endpoint_provider_filter_narrows_rows_and_provider_block() {
 
 #[tokio::test]
 async fn models_endpoint_provider_filter_rejects_unknown_provider() {
-    let _no_codex = NoCodexAuth::install();
+    let _no_logins = NoSavedLogins::install();
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, value) = get_models(app, "/v1/models?provider=nope").await;
 
@@ -1896,7 +1911,7 @@ async fn models_endpoint_provider_filter_rejects_unknown_provider() {
 
 #[tokio::test]
 async fn models_endpoint_provider_filter_fails_hard_when_listing_unavailable() {
-    let _no_codex = NoCodexAuth::install();
+    let _no_logins = NoSavedLogins::install();
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, value) = get_models(app, "/v1/models?provider=codex").await;
 
@@ -1913,7 +1928,7 @@ async fn models_endpoint_provider_filter_fails_hard_when_listing_unavailable() {
 
 #[tokio::test]
 async fn models_endpoint_respects_limit() {
-    let _no_codex = NoCodexAuth::install();
+    let _no_logins = NoSavedLogins::install();
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, value) = get_models(app, "/v1/models?limit=2").await;
 
@@ -2321,7 +2336,7 @@ async fn the_permission_classifier_is_routed_even_when_it_opens_with_the_marker(
 
 #[tokio::test]
 async fn models_endpoint_tolerates_unknown_query_params() {
-    let _no_codex = NoCodexAuth::install();
+    let _no_logins = NoSavedLogins::install();
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, _) = get_models(app, "/v1/models?limit=1000&after_id=x").await;
     assert_eq!(status, StatusCode::OK);
@@ -2423,6 +2438,7 @@ async fn every_messages_route_carries_a_request_id() {
 /// Requests refused before any provider is involved still get an id.
 #[tokio::test]
 async fn rejected_messages_requests_carry_a_request_id() {
+    let _no_logins = NoSavedLogins::install();
     let cases = [
         (
             "malformed json",
