@@ -1,4 +1,4 @@
-## Unreleased
+## v0.11.0 (2026-09-23)
 
 - The monitor's Sessions pane is ordered by activity: sessions with a request
   in flight first, then by their latest request, newest first, whichever model
