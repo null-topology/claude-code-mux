@@ -142,7 +142,10 @@ pub trait Provider: Send + Sync {
     /// The models this provider can list right now. The default is the
     /// compiled-in list, marked as such; a provider that holds a login and
     /// whose backend has a listing call overrides this to ask the backend.
-    async fn list_models(&self) -> ModelListing {
+    /// `client_headers` are those of the client request that caused the
+    /// listing (a `/v1/models` call, or a request naming a model nothing
+    /// routes), and `None` when the proxy lists on its own at start.
+    async fn list_models(&self, _client_headers: Option<&axum::http::HeaderMap>) -> ModelListing {
         ModelListing::bundled(self.name(), self.supported_models())
     }
 

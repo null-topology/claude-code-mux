@@ -451,13 +451,46 @@ async fn assert_codex_http_presemantic_failure_is_reported(first_response: Vec<u
 /// first text message, and responds with Codex WebSocket events that
 /// accumulate to `"codex websocket ok"`.
 async fn spawn_websocket_upstream(captured: Arc<Mutex<Option<Value>>>) -> String {
+    spawn_websocket_upstream_with_handshake(captured, Arc::new(Mutex::new(Vec::new()))).await
+}
+
+/// [`spawn_websocket_upstream`] that also records the handshake's request
+/// headers as lowercase `(name, value)` pairs.
+async fn spawn_websocket_upstream_with_handshake(
+    captured: Arc<Mutex<Option<Value>>>,
+    handshake: Arc<Mutex<Vec<(String, String)>>>,
+) -> String {
+    use tokio_tungstenite::tungstenite::handshake::server::{
+        ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
+    };
+
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let addr_str = format!("http://{addr}");
 
+    // tungstenite's own callback type fixes the error response size.
+    #[allow(clippy::result_large_err)]
+    let record_handshake = move |request: &HandshakeRequest,
+                                 response: HandshakeResponse|
+          -> Result<HandshakeResponse, ErrorResponse> {
+        if let Ok(mut guard) = handshake.lock() {
+            *guard = request
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_ascii_lowercase(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+        }
+        Ok(response)
+    };
+
     tokio::spawn(async move {
         if let Ok((stream, _)) = listener.accept().await
-            && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
+            && let Ok(ws) = tokio_tungstenite::accept_hdr_async(stream, record_handshake).await
         {
             let (mut sender, mut receiver) = ws.split();
 
@@ -2682,6 +2715,90 @@ async fn smoke_codex_websocket_messages_uses_mock_upstream() {
     assert_eq!(sent["model"], "gpt-5.5");
     assert!(sent.get("max_output_tokens").is_none());
     assert!(sent.get("stream").is_none());
+}
+
+/// A client header named in `codex.forwardHeaders` reaches the Codex
+/// WebSocket handshake with the client's value, and no traffic capture
+/// records that value.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_forwards_configured_client_header() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+    let config = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    std::fs::write(
+        config.path().join("config.json"),
+        json!({"codex": {"forwardHeaders": ["x-gateway-token"]}}).to_string(),
+    )
+    .unwrap();
+
+    let captured = Arc::new(Mutex::new(None));
+    let handshake = Arc::new(Mutex::new(Vec::new()));
+    let upstream =
+        spawn_websocket_upstream_with_handshake(captured.clone(), handshake.clone()).await;
+
+    let _forward_env = EnvGuard::unset("CCP_CODEX_FORWARD_HEADERS");
+    let _traffic_env = EnvGuard::set("CCP_TRAFFIC_LOG", "1");
+    let _state_env = EnvGuard::set("XDG_STATE_HOME", state.path());
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+    let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    let response = app(Arc::new(Registry::with_default_alias()))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "smoke-session")
+                .header("x-gateway-token", "gw-secret-value")
+                .header("x-other-client", "kept-back")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.5",
+                        "max_tokens": 64,
+                        "messages": [{"role":"user","content":"hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let handshake = handshake.lock().unwrap().clone();
+    assert!(
+        handshake.contains(&("x-gateway-token".into(), "gw-secret-value".into())),
+        "handshake: {handshake:?}"
+    );
+    assert!(
+        !handshake.iter().any(|(name, _)| name == "x-other-client"),
+        "handshake: {handshake:?}"
+    );
+
+    let files = traffic_files(state.path());
+    let texts: Vec<String> = files
+        .iter()
+        .map(|file| String::from_utf8_lossy(&std::fs::read(file).unwrap()).into_owned())
+        .collect();
+    assert!(
+        texts.iter().any(|text| text.contains("x-gateway-token")),
+        "no capture names the header: {files:?}"
+    );
+    for (file, text) in files.iter().zip(&texts) {
+        assert!(
+            !text.contains("gw-secret-value"),
+            "{file:?} records the value"
+        );
+    }
+    clear_codex_websocket_pool_for_tests();
 }
 
 #[allow(clippy::await_holding_lock)]

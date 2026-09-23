@@ -484,7 +484,7 @@ impl Provider for AnthropicProvider {
     /// login may use, and Claude Code already lists its own models; repeating
     /// them here only duplicated the picker. The provider is reported, its
     /// rows are not.
-    async fn list_models(&self) -> ModelListing {
+    async fn list_models(&self, _client_headers: Option<&axum::http::HeaderMap>) -> ModelListing {
         ModelListing::client_side(
             "anthropic",
             "credentials are forwarded from the client; models are routed, not listed",

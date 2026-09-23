@@ -376,6 +376,7 @@ struct ModelsQuery {
 async fn handler_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModelsQuery>,
+    headers: http::HeaderMap,
 ) -> Response {
     let names = state.registry.list_provider_names();
     let selected: Vec<String> = match query.provider.as_deref().map(str::trim) {
@@ -401,7 +402,7 @@ async fn handler_models(
         let Some(provider) = state.registry.provider(name) else {
             continue;
         };
-        let listing = provider.list_models().await;
+        let listing = provider.list_models(Some(&headers)).await;
         record_listing(&listing);
         if query.provider.is_some() && !listing.is_ok() {
             return json_error(
@@ -1804,7 +1805,7 @@ async fn dispatch_request(
         .and_then(|state| state.affinity_provider.as_ref());
     let original_provider = state
         .registry
-        .provider_for_model_or_refresh(&normalized_model, session_affinity)
+        .provider_for_model_or_refresh(&normalized_model, session_affinity, Some(&headers))
         .await;
     let configured_auto_review_model = crate::config::auto_review_model();
     let auto_review_route = original_provider.as_ref().and_then(|provider| {
@@ -1823,7 +1824,7 @@ async fn dispatch_request(
     let provider = if auto_review_route.is_some() {
         state
             .registry
-            .provider_for_model_or_refresh(&normalized_model, None)
+            .provider_for_model_or_refresh(&normalized_model, None, Some(&headers))
             .await
     } else {
         original_provider
@@ -2366,9 +2367,12 @@ fn monitor_failed(
 
 fn headers_to_record(headers: &http::HeaderMap) -> Value {
     let mut out = Map::new();
+    // A header the Codex route forwards is typically a gateway credential.
+    let forwarded = crate::config::codex_forward_headers();
     for (key, value) in headers {
         if let Ok(raw) = value.to_str() {
             let recorded = if REDACT_KEYS.contains(&key.as_str().to_lowercase().as_str())
+                || forwarded.contains(key)
                 || matches!(
                     key.as_str(),
                     CLAUDE_AGENT_HEADER | CLAUDE_PARENT_AGENT_HEADER
