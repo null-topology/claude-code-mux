@@ -1,4 +1,4 @@
-## Unreleased
+## v0.12.0 (2026-09-23)
 
 - Client headers can now reach the Codex backend. `CCP_CODEX_FORWARD_HEADERS`
   (config key `codex.forwardHeaders`) names the headers to pass on, for
