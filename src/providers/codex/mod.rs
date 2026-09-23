@@ -534,8 +534,8 @@ impl Provider for CodexProvider {
         matches!(file_store().load_auth(), Ok(Some(_)))
     }
 
-    async fn list_models(&self) -> ModelListing {
-        match self.client.list_models().await {
+    async fn list_models(&self, client_headers: Option<&axum::http::HeaderMap>) -> ModelListing {
+        match self.client.list_models(client_headers).await {
             Ok(inventory) => ModelListing {
                 provider: "codex",
                 auth: ListingAuth::Proxy,

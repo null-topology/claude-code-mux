@@ -177,7 +177,55 @@ pub fn build_codex_headers(
             header_value("user-agent", &user_agent)?,
         );
     }
+    if let Some(passthrough) = ctx.passthrough.as_ref() {
+        forward_client_headers(
+            &mut headers,
+            &passthrough.headers,
+            &config::codex_forward_headers(),
+        );
+    }
     Ok(headers)
+}
+
+/// Copies the client headers named in `names` (`CCP_CODEX_FORWARD_HEADERS`)
+/// onto a request for the Codex backend, such as a token a gateway in front
+/// of it checks. A header the proxy set itself is never replaced, so the
+/// client's own `authorization` cannot stand in for the Codex login, and a
+/// header that describes the client's connection to the proxy is never
+/// copied. The copies are marked sensitive, which keeps their values out of
+/// traffic captures.
+pub(crate) fn forward_client_headers(
+    headers: &mut http::HeaderMap,
+    client: &http::HeaderMap,
+    names: &[http::HeaderName],
+) {
+    for name in names {
+        if headers.contains_key(name) || is_connection_header(name) {
+            continue;
+        }
+        for value in client.get_all(name) {
+            let mut value = value.clone();
+            value.set_sensitive(true);
+            headers.append(name.clone(), value);
+        }
+    }
+}
+
+fn is_connection_header(name: &http::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "keep-alive"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+            | "accept-encoding"
+    )
 }
 
 pub fn build_native_codex_headers(
@@ -616,6 +664,20 @@ fn native_http_client(proxy_environment: &ProxyEnvironment) -> reqwest::Client {
         .expect("failed to create native Responses HTTP client")
 }
 
+/// A redirect is not followed: on a cross-host redirect reqwest drops only
+/// its own list of credentials, so a header forwarded from the client
+/// (`CCP_CODEX_FORWARD_HEADERS`) would reach the other host.
+fn codex_http_client(proxy_environment: &ProxyEnvironment) -> reqwest::Client {
+    proxy_environment
+        .apply(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none()),
+        )
+        .build()
+        .expect("failed to create HTTP client")
+}
+
 fn proxy_env_value(
     uppercase: &'static str,
     lowercase: &'static str,
@@ -718,10 +780,7 @@ impl CodexHttpClient {
         let timeout_ms = 60_000;
         let proxy_environment = ProxyEnvironment::from_env();
         Self {
-            client: proxy_environment
-                .apply(reqwest::Client::builder().connect_timeout(Duration::from_secs(15)))
-                .build()
-                .expect("failed to create HTTP client"),
+            client: codex_http_client(&proxy_environment),
             native_client: native_http_client(&proxy_environment),
             websocket_client: websocket_http_client(&proxy_environment),
             websocket_proxy_config: proxy_environment.websocket_proxy_config(),
@@ -786,8 +845,15 @@ impl CodexHttpClient {
     /// The models this login may use, straight from the backend.
     pub async fn list_models(
         &self,
+        client_headers: Option<&http::HeaderMap>,
     ) -> Result<super::models::ModelInventory, super::models::ModelsError> {
-        super::models::fetch_models(&self.client, &self.auth_manager, &self.base_url).await
+        super::models::fetch_models(
+            &self.client,
+            &self.auth_manager,
+            &self.base_url,
+            client_headers,
+        )
+        .await
     }
 
     pub fn body_idle_timeout_ms(&self) -> u64 {
@@ -2605,13 +2671,17 @@ fn write_codex_sse_event_capture(traffic: &TrafficCapture, body: &[u8]) {
     }
 }
 
-fn headers_to_json(headers: &http::HeaderMap) -> serde_json::Value {
+/// Headers as a capture records them. A value marked sensitive, such as a
+/// forwarded client header, is replaced by its length.
+pub(super) fn headers_to_json(headers: &http::HeaderMap) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     for (key, value) in headers.iter() {
-        out.insert(
-            key.to_string(),
-            serde_json::Value::String(value.to_str().unwrap_or("").to_string()),
-        );
+        let recorded = if value.is_sensitive() {
+            format!("[redacted len={}]", value.len())
+        } else {
+            value.to_str().unwrap_or("").to_string()
+        };
+        out.insert(key.to_string(), serde_json::Value::String(recorded));
     }
     serde_json::Value::Object(out)
 }
@@ -3509,6 +3579,44 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.bytes().await.unwrap(), b"{}".as_slice());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_client_does_not_follow_redirects() {
+        let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source.local_addr().unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let source_server = tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{target_addr}/stolen\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let client = codex_http_client(&ProxyEnvironment {
+            http_proxy: None,
+            https_proxy: None,
+            all_proxy: None,
+            no_proxy: None,
+            no_proxy_value: None,
+        });
+        let response = client
+            .get(format!("http://{source_addr}/v1/models"))
+            .header("x-gateway-token", "gw-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        source_server.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), target.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -4896,6 +5004,49 @@ mod tests {
         );
         assert!(headers.get("openai-beta").is_none());
         assert!(headers.get("x-codex-beta-features").is_none());
+    }
+
+    #[test]
+    fn forwarded_client_headers_are_sensitive_and_never_replace_the_proxys_own() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, "Bearer tok".parse().unwrap());
+        let mut client = http::HeaderMap::new();
+        client.insert(
+            http::header::AUTHORIZATION,
+            "Bearer client".parse().unwrap(),
+        );
+        client.insert("x-gateway-token", "gw-secret".parse().unwrap());
+        client.append("x-multi", "one".parse().unwrap());
+        client.append("x-multi", "two".parse().unwrap());
+        client.insert(http::header::HOST, "127.0.0.1:18765".parse().unwrap());
+        client.insert(http::header::CONTENT_LENGTH, "42".parse().unwrap());
+        let names = [
+            "authorization",
+            "x-gateway-token",
+            "x-multi",
+            "x-absent",
+            "host",
+            "content-length",
+        ]
+        .map(http::HeaderName::from_static);
+
+        forward_client_headers(&mut headers, &client, &names);
+
+        assert_eq!(
+            headers.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer tok"
+        );
+        assert!(headers.get(http::header::HOST).is_none());
+        assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
+        let token = headers.get("x-gateway-token").unwrap();
+        assert_eq!(token, "gw-secret");
+        assert!(token.is_sensitive());
+        assert_eq!(headers.get_all("x-multi").iter().count(), 2);
+        assert!(headers.get("x-absent").is_none());
+        assert_eq!(
+            headers_to_json(&headers)["x-gateway-token"],
+            "[redacted len=9]"
+        );
     }
 
     #[test]

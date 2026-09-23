@@ -821,6 +821,80 @@ async fn a_model_only_the_backend_lists_routes_on_its_first_request() {
     );
 }
 
+/// A header named in `CCP_CODEX_FORWARD_HEADERS` goes from the client request
+/// to every Codex call that request causes: the listing a miss runs, the
+/// completion, and the listing `/v1/models` asks for. Unnamed client headers
+/// and unusable names in the list stay behind.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_forwarded_client_header_reaches_every_codex_call_it_causes() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let (upstream, captured) = spawn_codex_upstream(StatusCode::OK, upstream_inventory()).await;
+    let _env = routing_env(&config, &upstream);
+    let _forward = EnvGuard::set("CCP_CODEX_FORWARD_HEADERS", " x-gateway-token ,not a name");
+    let registry = Arc::new(Registry::with_default_alias());
+
+    let response = app(registry.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", "forward-1")
+                .header("x-gateway-token", "gw-1")
+                .header("x-other-client", "kept-back")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-7-test",
+                        "max_tokens": 64,
+                        "messages": [{"role":"user","content":"hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_routed(response, "forwarded header").await;
+    assert_eq!(listings(&captured), 1, "one listing for the miss");
+    let listing = captured.lock().unwrap().headers.clone();
+    assert_eq!(
+        listing.get("x-gateway-token").map(String::as_str),
+        Some("gw-1")
+    );
+    let completion = &completions(&captured)[0];
+    assert_eq!(
+        completion
+            .headers
+            .get("x-gateway-token")
+            .map(String::as_str),
+        Some("gw-1")
+    );
+    assert!(!completion.headers.contains_key("x-other-client"));
+
+    let response = app(registry.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/models?provider=codex")
+                .header("x-gateway-token", "gw-2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let listing = captured.lock().unwrap().headers.clone();
+    assert_eq!(
+        listing.get("x-gateway-token").map(String::as_str),
+        Some("gw-2")
+    );
+}
+
 /// An id the refreshed listing does not name gets the same 400 as before;
 /// a second miss inside the interval does not ask the backend again; and a
 /// refresh that fails changes nothing about the answer.
@@ -946,7 +1020,7 @@ async fn an_empty_listing_keeps_routing_and_every_recorded_listing_is_logged() {
     // Codex still accepts it.
     let env = routing_env(&config, &empty);
     let registry = Arc::new(Registry::with_default_alias());
-    registry.refresh_listings().await;
+    registry.refresh_listings(None).await;
     assert_eq!(listings(&empty_captured), 1);
     let routed = registry.provider_for_model("gpt-7-test", None);
     assert_eq!(routed.expect("kept after an empty listing").name(), "codex");
@@ -956,7 +1030,7 @@ async fn an_empty_listing_keeps_routing_and_every_recorded_listing_is_logged() {
     drop(env);
 
     let env = routing_env(&config, &smaller);
-    Registry::with_default_alias().refresh_listings().await;
+    Registry::with_default_alias().refresh_listings(None).await;
     drop(env);
 
     // With nothing listed yet, an empty listing leaves the compiled-in list.
@@ -964,7 +1038,7 @@ async fn an_empty_listing_keeps_routing_and_every_recorded_listing_is_logged() {
     clear_listed_models_for_tests();
     let _env = routing_env(&config, &empty);
     let registry = Registry::with_default_alias();
-    registry.refresh_listings().await;
+    registry.refresh_listings(None).await;
     let routed = registry.provider_for_model("gpt-6-astra", None);
     assert_eq!(routed.expect("compiled-in list").name(), "codex");
 

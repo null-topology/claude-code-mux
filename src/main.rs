@@ -109,7 +109,7 @@ fn main() -> Result<()> {
             // ignored.
             let listing_registry = registry.clone();
             runtime.spawn(async move {
-                listing_registry.refresh_listings().await;
+                listing_registry.refresh_listings(None).await;
             });
             match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
                 ServeMode::Plain => {
@@ -257,7 +257,7 @@ async fn print_live_models(registry: &Registry, full: bool) {
         let Some(provider) = registry.provider(name) else {
             continue;
         };
-        let listing = provider.list_models().await;
+        let listing = provider.list_models(None).await;
         if listing.auth == ListingAuth::Client {
             println!(
                 "{name}: {}",

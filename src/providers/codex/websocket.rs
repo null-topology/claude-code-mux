@@ -30,6 +30,7 @@ use crate::traffic::TrafficCapture;
 
 use super::client::{
     ActualTransport, CodexError, CodexErrorOrigin, CodexResponse, OwnerAwareCodexResponse,
+    headers_to_json,
 };
 use super::continuation::ContinuationReservation;
 
@@ -657,7 +658,7 @@ pub fn codex_websocket_headers(http_headers: &HeaderMap) -> HeaderMap {
         ) {
             continue;
         }
-        ws.insert(key.clone(), value.clone());
+        ws.append(key.clone(), value.clone());
     }
     // Rewrite openai-beta for WebSocket protocol
     ws.insert("openai-beta", WEBSOCKET_PROTOCOL_HEADER.parse().unwrap());
@@ -2397,17 +2398,6 @@ where
     (reusable, terminal_item)
 }
 
-fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
-    let mut out = serde_json::Map::new();
-    for (key, value) in headers.iter() {
-        out.insert(
-            key.to_string(),
-            serde_json::Value::String(value.to_str().unwrap_or("").to_string()),
-        );
-    }
-    serde_json::Value::Object(out)
-}
-
 fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> serde_json::Value {
     serde_json::json!({
         "bytes": body_json.len(),
@@ -3022,6 +3012,18 @@ mod tests {
             "wss://example.test/codex"
         );
         assert!(to_websocket_url("ftp://example.test/codex").is_err());
+    }
+
+    #[test]
+    fn websocket_headers_keep_every_value_of_a_repeated_header() {
+        let mut http_headers = HeaderMap::new();
+        http_headers.append("x-multi", "one".parse().unwrap());
+        http_headers.append("x-multi", "two".parse().unwrap());
+
+        let ws = codex_websocket_headers(&http_headers);
+
+        let values: Vec<_> = ws.get_all("x-multi").iter().collect();
+        assert_eq!(values, ["one", "two"]);
     }
 
     #[test]

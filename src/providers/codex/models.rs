@@ -24,6 +24,7 @@ use crate::config;
 use super::auth::constants::{CODEX_CLIENT_VERSION, ORIGINATOR};
 use super::auth::manager::CodexAuthManager;
 use super::auth::token_store::{StoredAuth, codex_auth_file};
+use super::client::forward_client_headers;
 
 /// Upper bound for one listing round-trip; Claude Code's own gateway
 /// discovery gives up after five seconds, so the proxy must answer sooner.
@@ -216,11 +217,15 @@ fn body_snippet(body: &[u8]) -> String {
 // Fetch
 // ---------------------------------------------------------------------------
 
+/// `client_headers` are those of the client request that caused this listing,
+/// if one did; the headers `CCP_CODEX_FORWARD_HEADERS` names go on the
+/// listing as on every other Codex request.
 fn build_request(
     client: &reqwest::Client,
     url: &str,
     auth: &StoredAuth,
-) -> reqwest::RequestBuilder {
+    client_headers: Option<&http::HeaderMap>,
+) -> reqwest::Result<reqwest::Request> {
     let mut request = client
         .get(url)
         .timeout(MODELS_TIMEOUT)
@@ -235,7 +240,15 @@ fn build_request(
     if !user_agent.is_empty() {
         request = request.header(http::header::USER_AGENT, user_agent);
     }
-    request
+    let mut request = request.build()?;
+    if let Some(client_headers) = client_headers {
+        forward_client_headers(
+            request.headers_mut(),
+            client_headers,
+            &config::codex_forward_headers(),
+        );
+    }
+    Ok(request)
 }
 
 /// Ask the backend which models this login may use. A 401 triggers one token
@@ -246,6 +259,7 @@ pub async fn fetch_models<S: AuthStorage<StoredAuth>>(
     client: &reqwest::Client,
     auth_manager: &CodexAuthManager<S>,
     base_url: &str,
+    client_headers: Option<&http::HeaderMap>,
 ) -> Result<ModelInventory, ModelsError> {
     let url = format!(
         "{}?client_version={}",
@@ -258,8 +272,10 @@ pub async fn fetch_models<S: AuthStorage<StoredAuth>>(
         .map_err(|error| ModelsError::Unauthorized(error.to_string()))?;
     let mut refresh_attempted = false;
     loop {
-        let response = build_request(client, &url, &auth)
-            .send()
+        let request = build_request(client, &url, &auth, client_headers)
+            .map_err(|error| ModelsError::Unreachable(error.to_string()))?;
+        let response = client
+            .execute(request)
             .await
             .map_err(|error| ModelsError::Unreachable(error.to_string()))?;
         let status = response.status();

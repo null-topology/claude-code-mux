@@ -1,3 +1,23 @@
+## Unreleased
+
+- Client headers can now reach the Codex backend. `CCP_CODEX_FORWARD_HEADERS`
+  (config key `codex.forwardHeaders`) names the headers to pass on, for
+  example `x-gateway-token` set through Claude Code's
+  `ANTHROPIC_CUSTOM_HEADERS`, so one gateway credential works on the Claude
+  and the Codex route alike. Until now the Codex route built its own headers
+  and dropped every client header. A named header goes on the WebSocket
+  handshake, HTTP requests, web search, and the model listing a client
+  request triggers (an unknown model, `/v1/models`); the listing at start
+  has no client request and goes without it, and the OpenAI-compatible
+  routes forward nothing. A pooled WebSocket keeps the values it was opened
+  with. The proxy's own headers are never replaced, the client's connection
+  headers (`host`, `content-length`, hop-by-hop) are never forwarded, and
+  forwarded values are redacted in traffic captures. Nothing is forwarded
+  unless a name is listed.
+- The Codex HTTP client no longer follows redirects, as the WebSocket and
+  native Responses clients already did, so a forwarded header cannot reach
+  another host. A redirect now reaches the client as that status.
+
 ## v0.11.0 (2026-09-23)
 
 - The monitor's Sessions pane is ordered by activity: sessions with a request

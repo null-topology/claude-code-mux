@@ -58,6 +58,8 @@ struct CodexConfig {
     pub originator: Option<String>,
     #[serde(rename = "userAgent")]
     pub user_agent: Option<String>,
+    #[serde(rename = "forwardHeaders")]
+    pub forward_headers: Option<Vec<String>>,
     #[serde(rename = "clientVersion")]
     pub client_version: Option<String>,
     #[serde(rename = "previousResponseId")]
@@ -550,6 +552,27 @@ pub fn codex_originator(default: &str) -> String {
         return val;
     }
     default.to_string()
+}
+
+/// Client request headers the Codex route copies onto what it sends the
+/// backend, such as a token a gateway in front of it checks:
+/// `CCP_CODEX_FORWARD_HEADERS` (comma-separated), else `codex.forwardHeaders`.
+/// Empty by default, since the Codex route builds its own headers and sends
+/// none of the client's. A name that is not a valid header name is skipped.
+pub fn codex_forward_headers() -> Vec<http::HeaderName> {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    let names: Vec<String> = if let Some(raw) = env.get("CCP_CODEX_FORWARD_HEADERS") {
+        raw.split(',').map(str::to_string).collect()
+    } else {
+        read_file_config(&paths::config_dir())
+            .and_then(|file| file.codex)
+            .and_then(|codex| codex.forward_headers)
+            .unwrap_or_default()
+    };
+    names
+        .iter()
+        .filter_map(|name| http::HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .collect()
 }
 
 pub fn codex_user_agent(default: &str) -> String {

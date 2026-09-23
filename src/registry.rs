@@ -262,11 +262,13 @@ impl Registry {
     /// first request, whether or not anyone asked `/v1/models`. Claude ids,
     /// aliases and cursor ids never cause a listing. Misses share one refresh
     /// at a time and start at most one per [`MISS_LISTING_INTERVAL`]; a listing
-    /// that fails changes nothing and the id stays unknown.
+    /// that fails changes nothing and the id stays unknown. The listing carries
+    /// `client_headers`, those of the request that missed.
     pub async fn provider_for_model_or_refresh(
         &self,
         raw_model: &str,
         session_affinity: Option<&AliasProvider>,
+        client_headers: Option<&axum::http::HeaderMap>,
     ) -> Option<Arc<dyn Provider>> {
         if let Some(provider) = self.provider_for_model(raw_model, session_affinity) {
             return Some(provider);
@@ -284,15 +286,15 @@ impl Registry {
             return None;
         }
         *last_started = Some(Instant::now());
-        self.refresh_listings().await;
+        self.refresh_listings(client_headers).await;
         self.provider_for_model(raw_model, session_affinity)
     }
 
     /// Ask every provider that holds credentials for its models, all at once,
     /// and remember each successful answer from a backend for routing. It
     /// never fails: a provider whose listing fails logs that itself and keeps
-    /// what it had.
-    pub async fn refresh_listings(&self) {
+    /// what it had. `client_headers` are passed to [`Provider::list_models`].
+    pub async fn refresh_listings(&self, client_headers: Option<&axum::http::HeaderMap>) {
         // A credentials check reads a saved login and may block (cursor's can
         // wait on the macOS Keychain), so it runs on the blocking pool.
         let checks = self.handlers.values().map(|provider| {
@@ -303,7 +305,7 @@ impl Registry {
             .await
             .into_iter()
             .filter_map(|checked| checked.ok().flatten())
-            .map(|provider| async move { provider.list_models().await });
+            .map(|provider| async move { provider.list_models(client_headers).await });
         for listing in futures_util::future::join_all(listings).await {
             record_listing(&listing);
         }
@@ -610,7 +612,10 @@ mod tests {
             self.credentials
         }
 
-        async fn list_models(&self) -> ModelListing {
+        async fn list_models(
+            &self,
+            _client_headers: Option<&axum::http::HeaderMap>,
+        ) -> ModelListing {
             self.listings
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             ModelListing {
@@ -667,7 +672,7 @@ mod tests {
         assert!(registry.provider_for_model("unit-live-new", None).is_none());
 
         let p = registry
-            .provider_for_model_or_refresh("unit-live-new[1m]", None)
+            .provider_for_model_or_refresh("unit-live-new[1m]", None, None)
             .await;
         assert_eq!(p.expect("routed after the refresh").name(), "unit-live");
         assert_eq!(live.listings(), 1);
@@ -708,7 +713,7 @@ mod tests {
         ] {
             assert!(
                 registry
-                    .provider_for_model_or_refresh(model, None)
+                    .provider_for_model_or_refresh(model, None, None)
                     .await
                     .is_none(),
                 "{model}: no provider registered for it"
@@ -719,7 +724,7 @@ mod tests {
         // Any other unknown id does refresh, so the zero above is not vacuous.
         assert!(
             registry
-                .provider_for_model_or_refresh("unit-guard-typo", None)
+                .provider_for_model_or_refresh("unit-guard-typo", None, None)
                 .await
                 .is_none()
         );
@@ -736,7 +741,7 @@ mod tests {
             AliasProvider::Anthropic,
             [owner.clone() as Arc<dyn Provider>, rival.clone()],
         );
-        registry.refresh_listings().await;
+        registry.refresh_listings(None).await;
         assert_eq!(rival.listings(), 1);
         let routed = registry.provider_for_model("unit-owned-id", None);
         assert_eq!(routed.expect("owner").name(), "unit-owned-b");
@@ -745,9 +750,9 @@ mod tests {
         // for as long as that provider keeps listing it.
         let early = ListingProvider::new("unit-first-b", true, &[], &["unit-first-id"]);
         let late = ListingProvider::new("unit-first-a", true, &[], &["unit-first-id"]);
-        record_listing(&early.list_models().await);
-        record_listing(&late.list_models().await);
-        record_listing(&late.list_models().await);
+        record_listing(&early.list_models(None).await);
+        record_listing(&late.list_models(None).await);
+        record_listing(&late.list_models(None).await);
         let registry = Registry::from_providers(
             AliasProvider::Anthropic,
             [early.clone() as Arc<dyn Provider>, late.clone()],
@@ -755,7 +760,7 @@ mod tests {
         let routed = registry.provider_for_model("unit-first-id", None);
         assert_eq!(routed.expect("first lister").name(), "unit-first-b");
         let dropped = ListingProvider::new("unit-first-b", true, &[], &["unit-first-other"]);
-        record_listing(&dropped.list_models().await);
+        record_listing(&dropped.list_models(None).await);
         let routed = registry.provider_for_model("unit-first-id", None);
         assert_eq!(routed.expect("remaining lister").name(), "unit-first-a");
     }
