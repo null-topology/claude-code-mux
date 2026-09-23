@@ -32,10 +32,11 @@ use tokio::sync::oneshot;
 
 use crate::{
     monitor::{
-        ActiveRequest, CacheWriteQuality, CompletedRequest, ConversationSummary, LOCAL_PROVIDER,
-        MockMonitor, ModelUsage, MonitorHandle, MonitorState, QualityCoverage, QualityFields,
-        RequestCache, SESSION_TOKEN_BUCKET_SECS, SIDE_CONVERSATION_SUFFIX, SessionCacheStats,
-        SessionSummary, UnattributedUsage, UsageEvidence, UsageQuality,
+        ActiveRequest, CacheMissTally, CacheWriteQuality, CompletedRequest, ConversationSummary,
+        LOCAL_PROVIDER, MockMonitor, ModelStats, ModelUsage, MonitorHandle, MonitorState,
+        QualityCoverage, QualityFields, RequestCache, SESSION_TOKEN_BUCKET_SECS,
+        SIDE_CONVERSATION_SUFFIX, SessionCacheStats, SessionSummary, UnattributedUsage,
+        UsageEvidence, UsageQuality,
     },
     paths,
     registry::Registry,
@@ -166,6 +167,8 @@ fn run_monitor_loop(
         show_help: false,
         detail: None,
         focus: FocusPane::Sessions,
+        bottom_tab: BottomTab::Events,
+        bottom_scroll: 0,
         selected: Selection::default(),
         recent_selected: Selection::default(),
         tick: 0,
@@ -198,6 +201,8 @@ fn run_monitor_events(
         // work over: what a pane picked is looked up in them once a frame.
         let rows = session_rows(&state.sessions);
         app.sync_selection(&rows, &state.recent);
+        let bottom_rows = app.bottom_row_count(&state);
+        app.fit_bottom_scroll(bottom_rows);
         app.tick = app.tick.wrapping_add(1);
         terminal.draw(|frame| render(frame, app, &state))?;
         if app.shutdown_is_complete() {
@@ -224,13 +229,14 @@ fn run_monitor_events(
                     KeyCode::Char('q') => app.request_shutdown_confirmation(),
                     KeyCode::Char('?') => app.show_help = !app.show_help,
                     KeyCode::Char('b') => app.show_setup = !app.show_setup,
-                    KeyCode::Tab => app.focus = app.focus.next(),
-                    KeyCode::Down => app.move_down(&rows, &state.recent, true),
-                    KeyCode::Char('j') => app.move_down(&rows, &state.recent, false),
-                    KeyCode::Up => app.move_up(&rows, &state.recent, true),
-                    KeyCode::Char('k') => app.move_up(&rows, &state.recent, false),
-                    KeyCode::Right => app.focus = FocusPane::Recent,
-                    KeyCode::Left => app.focus = FocusPane::Sessions,
+                    KeyCode::Tab
+                    | KeyCode::Down
+                    | KeyCode::Up
+                    | KeyCode::Right
+                    | KeyCode::Left
+                    | KeyCode::Char('j' | 'k') => {
+                        app.navigate(key.code, &rows, &state.recent, bottom_rows);
+                    }
                     KeyCode::Enter => {
                         // A detail pane is opened for a selected row, which a
                         // pane holding none has nothing to show for.
@@ -266,14 +272,66 @@ fn run_monitor_events(
 enum FocusPane {
     Sessions,
     Recent,
+    /// The tabbed pane at the bottom, whichever tab it shows.
+    Bottom,
 }
 
 impl FocusPane {
     fn next(self) -> Self {
         match self {
             Self::Sessions => Self::Recent,
-            Self::Recent => Self::Sessions,
+            Self::Recent => Self::Bottom,
+            Self::Bottom => Self::Sessions,
         }
+    }
+}
+
+/// What the bottom pane shows. The tabs sit in its title and the Left and
+/// Right keys move between them while the pane has focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BottomTab {
+    Events,
+    Stats,
+}
+
+impl BottomTab {
+    const ALL: [Self; 2] = [Self::Events, Self::Stats];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Events => "Events",
+            Self::Stats => "Stats",
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Events => Self::Events,
+            Self::Stats => Self::Events,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Events => Self::Stats,
+            Self::Stats => Self::Stats,
+        }
+    }
+
+    /// The pane title naming every tab, with the one shown in brackets so
+    /// the choice reads without color.
+    fn title(self) -> String {
+        Self::ALL
+            .iter()
+            .map(|tab| {
+                if *tab == self {
+                    format!("[{}]", tab.name())
+                } else {
+                    tab.name().to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -448,6 +506,10 @@ struct MonitorApp {
     show_help: bool,
     detail: Option<DetailView>,
     focus: FocusPane,
+    bottom_tab: BottomTab,
+    /// The first row the bottom pane's tab shows. No row identity to keep
+    /// here: the tabs are scrolled, not picked from.
+    bottom_scroll: usize,
     selected: Selection<SessionRowKey>,
     recent_selected: Selection<String>,
     tick: usize,
@@ -546,10 +608,65 @@ impl MonitorApp {
         }
     }
 
+    /// How many rows the bottom pane's current tab has to scroll over.
+    fn bottom_row_count(&self, state: &MonitorState) -> usize {
+        match self.bottom_tab {
+            BottomTab::Events => event_requests(&state.recent).len(),
+            BottomTab::Stats => state.model_stats().len(),
+        }
+    }
+
+    /// Keep the bottom pane's scroll on a row its tab still has. A tab's rows
+    /// can shrink between snapshots, and an offset past them would leave Up
+    /// scrolling over rows that are gone instead of returning to the Recent
+    /// pane from the top.
+    fn fit_bottom_scroll(&mut self, bottom_rows: usize) {
+        self.bottom_scroll = self.bottom_scroll.min(bottom_rows.saturating_sub(1));
+    }
+
+    /// One navigation key. Tab cycles the panes; the arrows and j/k move
+    /// within the focused pane, the arrows crossing into the next pane at its
+    /// edge. Left and Right pick the Sessions or Recent pane, except in the
+    /// bottom pane, where they switch its tab instead.
+    fn navigate(
+        &mut self,
+        key: KeyCode,
+        sessions: &[SessionRow<'_>],
+        recent: &[CompletedRequest],
+        bottom_rows: usize,
+    ) {
+        match key {
+            KeyCode::Tab => self.focus = self.focus.next(),
+            KeyCode::Down => self.move_down(sessions, recent, bottom_rows, true),
+            KeyCode::Char('j') => self.move_down(sessions, recent, bottom_rows, false),
+            KeyCode::Up => self.move_up(sessions, recent, true),
+            KeyCode::Char('k') => self.move_up(sessions, recent, false),
+            KeyCode::Right if self.focus == FocusPane::Bottom => {
+                self.show_bottom_tab(self.bottom_tab.next());
+            }
+            KeyCode::Left if self.focus == FocusPane::Bottom => {
+                self.show_bottom_tab(self.bottom_tab.previous());
+            }
+            KeyCode::Right => self.focus = FocusPane::Recent,
+            KeyCode::Left => self.focus = FocusPane::Sessions,
+            _ => {}
+        }
+    }
+
+    /// A tab starts at its top: the rows of one say nothing about where the
+    /// other was scrolled to.
+    fn show_bottom_tab(&mut self, tab: BottomTab) {
+        if tab != self.bottom_tab {
+            self.bottom_tab = tab;
+            self.bottom_scroll = 0;
+        }
+    }
+
     fn move_down(
         &mut self,
         sessions: &[SessionRow<'_>],
         recent: &[CompletedRequest],
+        bottom_rows: usize,
         switch_panes: bool,
     ) {
         match self.focus {
@@ -572,11 +689,24 @@ impl MonitorApp {
                     None => self.select_session(0, sessions),
                 }
             }
-            FocusPane::Recent => {
-                let row = self.recent_selected.row().map_or(0, |row| {
-                    row.saturating_add(1).min(recent.len().saturating_sub(1))
-                });
-                self.select_recent(row, recent);
+            FocusPane::Recent => match self.recent_selected.row() {
+                Some(row) if switch_panes && row + 1 >= recent.len() && bottom_rows > 0 => {
+                    self.focus = FocusPane::Bottom;
+                    self.bottom_scroll = 0;
+                }
+                Some(row) => {
+                    self.select_recent(
+                        row.saturating_add(1).min(recent.len().saturating_sub(1)),
+                        recent,
+                    );
+                }
+                None => self.select_recent(0, recent),
+            },
+            FocusPane::Bottom => {
+                self.bottom_scroll = self
+                    .bottom_scroll
+                    .saturating_add(1)
+                    .min(bottom_rows.saturating_sub(1));
             }
         }
     }
@@ -602,6 +732,14 @@ impl MonitorApp {
                         .row()
                         .map_or(0, |row| row.saturating_sub(1));
                     self.select_recent(row, recent);
+                }
+            }
+            FocusPane::Bottom => {
+                if switch_panes && self.bottom_scroll == 0 && !recent.is_empty() {
+                    self.focus = FocusPane::Recent;
+                    self.select_recent(recent.len().saturating_sub(1), recent);
+                } else {
+                    self.bottom_scroll = self.bottom_scroll.saturating_sub(1);
                 }
             }
         }
@@ -684,7 +822,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
         app.recent_selected.view(),
         app.focus == FocusPane::Recent,
     );
-    render_events(frame, root[4], &state.recent);
+    render_bottom(frame, root[4], state, app);
     render_footer(frame, root[5], app);
 
     if app.show_setup {
@@ -2379,18 +2517,58 @@ fn event_columns(tier: LayoutTier) -> Vec<ColumnSpec<EventColumn>> {
     }
 }
 
-fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[CompletedRequest]) {
-    let events = recent
+/// The bottom pane: the tab the app shows, titled with every tab it could.
+fn render_bottom(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    state: &MonitorState,
+    app: &MonitorApp,
+) {
+    let title = app.bottom_tab.title();
+    let focused = app.focus == FocusPane::Bottom;
+    match app.bottom_tab {
+        BottomTab::Events => render_events(
+            frame,
+            area,
+            &state.recent,
+            &title,
+            focused,
+            app.bottom_scroll,
+        ),
+        BottomTab::Stats => render_stats(
+            frame,
+            area,
+            &state.model_stats(),
+            &title,
+            focused,
+            app.bottom_scroll,
+        ),
+    }
+}
+
+/// The requests the Events tab lists: the ones that failed, newest first.
+fn event_requests(recent: &[CompletedRequest]) -> Vec<&CompletedRequest> {
+    recent
         .iter()
         .filter(|request| {
             request.status == crate::monitor::RequestStatus::Failed
                 || request.http_status.is_some_and(|status| status >= 400)
                 || request.error.is_some()
         })
-        .take(12)
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn render_events(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    recent: &[CompletedRequest],
+    title: &str,
+    focused: bool,
+    scroll: usize,
+) {
+    let events = event_requests(recent);
     if events.is_empty() {
-        render_empty_table_state(frame, area, "Events", false, "No events");
+        render_empty_table_state(frame, area, title, focused, "No events");
         return;
     }
 
@@ -2432,8 +2610,206 @@ fn render_events(frame: &mut ratatui::Frame<'_>, area: Rect, recent: &[Completed
     });
     let table = Table::new(rows, widths.clone())
         .header(column_header(&columns))
-        .block(panel("Events", false));
-    frame.render_widget(table, area);
+        .block(panel(title, focused));
+    frame.render_stateful_widget(table, area, &mut TableState::default().with_offset(scroll));
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatsColumn {
+    Model,
+    Requests,
+    Failures,
+    Prompt,
+    Hit,
+    Input,
+    CacheWrite,
+    Misses,
+    Output,
+    /// Median latency over the recent window, which the header says.
+    Latency,
+    /// Median output rate over the recent window, which the header says.
+    Rate,
+}
+
+/// The header of a Stats column read off the recent window rather than the
+/// whole run, so the two are not mistaken for lifetime figures.
+const STATS_LATENCY_HEADER: &str = "Lat(rec)";
+const STATS_RATE_HEADER: &str = "tok/s(rec)";
+const STATS_MISSES_HEADER: &str = "Miss ttl/exp";
+const STATS_REQUESTS_WIDTH: u16 = 6;
+const STATS_FAILURES_WIDTH: u16 = 5;
+const STATS_MISSES_WIDTH: u16 = 12;
+
+fn stats_columns(tier: LayoutTier) -> Vec<ColumnSpec<StatsColumn>> {
+    use StatsColumn as C;
+    match tier {
+        LayoutTier::Wide | LayoutTier::Expanded => vec![
+            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Requests, "Reqs", Alignment::Right, STATS_REQUESTS_WIDTH),
+            ColumnSpec::fixed(C::Failures, "Fail", Alignment::Right, STATS_FAILURES_WIDTH),
+            ColumnSpec::fixed(C::Prompt, "Prompt", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Hit, "Hit", Alignment::Right, HIT_WIDTH),
+            ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::CacheWrite, "Write", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(
+                C::Misses,
+                STATS_MISSES_HEADER,
+                Alignment::Right,
+                STATS_MISSES_WIDTH,
+            ),
+            ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(
+                C::Latency,
+                STATS_LATENCY_HEADER,
+                Alignment::Right,
+                DURATION_WIDTH,
+            ),
+            ColumnSpec::fixed(C::Rate, STATS_RATE_HEADER, Alignment::Right, RATE_WIDTH),
+        ],
+        LayoutTier::Medium => vec![
+            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Requests, "Reqs", Alignment::Right, STATS_REQUESTS_WIDTH),
+            ColumnSpec::fixed(C::Failures, "Fail", Alignment::Right, STATS_FAILURES_WIDTH),
+            ColumnSpec::fixed(C::Prompt, "Prompt", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Hit, "Hit", Alignment::Right, HIT_WIDTH),
+            ColumnSpec::fixed(C::Input, "In", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::CacheWrite, "Write", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(
+                C::Misses,
+                STATS_MISSES_HEADER,
+                Alignment::Right,
+                STATS_MISSES_WIDTH,
+            ),
+            ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
+        ],
+        LayoutTier::Narrow => vec![
+            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Requests, "Reqs", Alignment::Right, STATS_REQUESTS_WIDTH),
+            ColumnSpec::fixed(C::Prompt, "Prompt", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Hit, "Hit", Alignment::Right, HIT_WIDTH),
+            ColumnSpec::fixed(C::Misses, "Miss", Alignment::Right, MISS_WIDTH),
+            ColumnSpec::fixed(C::Output, "Out", Alignment::Right, TOKEN_WIDTH),
+        ],
+        LayoutTier::Emergency => vec![
+            ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
+            ColumnSpec::fixed(C::Requests, "Reqs", Alignment::Right, STATS_REQUESTS_WIDTH),
+            ColumnSpec::fixed(C::Prompt, "Prompt", Alignment::Right, TOKEN_WIDTH),
+            ColumnSpec::fixed(C::Hit, "Hit", Alignment::Right, HIT_WIDTH),
+        ],
+    }
+}
+
+/// The quality of a row's prompt total, from the counts it is the sum of. A
+/// write nobody reported is the Codex norm and leaves the total exact; an
+/// input or cache read nobody reported leaves it short of a part, which is
+/// never exact, however firmly the other part is known.
+fn stats_prompt_quality(evidence: &UsageEvidence) -> UsageQuality {
+    let input = coverage_quality(evidence.input);
+    let read = coverage_quality(evidence.cache_read);
+    let write = coverage_quality(evidence.cache_write);
+    if input == UsageQuality::Missing && read == UsageQuality::Missing {
+        return UsageQuality::Missing;
+    }
+    if [input, read].contains(&UsageQuality::Missing)
+        || [input, read, write].contains(&UsageQuality::Opening)
+    {
+        return UsageQuality::Opening;
+    }
+    UsageQuality::Exact
+}
+
+/// The `Miss ttl/exp` cell: misses judged within the lifetime against misses
+/// judged after it, with any the lane could not judge for want of a lifetime
+/// marked apart.
+fn stats_miss_cell(misses: &CacheMissTally) -> Cell<'static> {
+    if misses.total() == 0 {
+        return muted_cell("-");
+    }
+    let mut label = format!("{}/{}", misses.within_ttl, misses.expired);
+    if misses.unknown_ttl > 0 {
+        label.push_str(&format!(" +{}?", misses.unknown_ttl));
+    }
+    Cell::from(Span::styled(label, Style::default().fg(RED)))
+}
+
+/// The `Model` cell of a Stats row: the backend and the model it ran, or the
+/// one every request asked for behind the routed-only mark when none was
+/// seen on the wire.
+fn model_stats_label(row: &ModelStats) -> String {
+    let requested = match row.requested_models.as_slice() {
+        [(requested, _)] => requested.as_deref(),
+        _ => None,
+    };
+    let model = executed_model_label(
+        row.provider.as_deref(),
+        requested,
+        row.model.as_deref(),
+        None,
+    );
+    format!("{}/{model}", row.provider.as_deref().unwrap_or("-"))
+}
+
+fn stats_rate_label(rate: Option<f64>) -> String {
+    rate.map_or_else(|| "-".to_string(), |rate| format!("{rate:.1} tok/s"))
+}
+
+fn render_stats(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    stats: &[ModelStats],
+    title: &str,
+    focused: bool,
+    scroll: usize,
+) {
+    if stats.is_empty() {
+        render_empty_table_state(frame, area, title, focused, "No requests yet");
+        return;
+    }
+
+    let columns = stats_columns(LayoutTier::for_outer_width(area.width));
+    let widths = column_constraints(&columns);
+    let rows = stats.iter().map(|row| {
+        let cells = columns
+            .iter()
+            .enumerate()
+            .map(|(column_index, column)| {
+                let width = table_column_width(area, &widths, column_index);
+                match column.key {
+                    StatsColumn::Model => model_cell(Some(&model_stats_label(row)), width),
+                    StatsColumn::Requests => number_cell(row.request_count.to_string()),
+                    StatsColumn::Failures => number_cell(row.failure_count.to_string()),
+                    StatsColumn::Prompt => quality_token_cell(
+                        Some(row.prompt_tokens()),
+                        stats_prompt_quality(&row.evidence),
+                    ),
+                    StatsColumn::Hit => hit_cell(row.cache_hit_ratio()),
+                    StatsColumn::Input => quality_token_cell(
+                        Some(row.input_tokens),
+                        coverage_quality(row.evidence.input),
+                    ),
+                    StatsColumn::CacheWrite => quality_token_cell(
+                        Some(row.cache_write_tokens),
+                        coverage_quality(row.evidence.cache_write),
+                    ),
+                    StatsColumn::Misses => stats_miss_cell(&row.misses),
+                    StatsColumn::Output => quality_token_cell(
+                        Some(row.output_tokens),
+                        coverage_quality(row.evidence.output),
+                    ),
+                    StatsColumn::Latency => number_cell(
+                        row.median_latency
+                            .map_or_else(|| "-".to_string(), format_duration),
+                    ),
+                    StatsColumn::Rate => rate_cell(stats_rate_label(row.median_output_rate)),
+                }
+            })
+            .collect::<Vec<_>>();
+        Row::new(cells).style(Style::default().bg(PANEL_BG))
+    });
+    let table = Table::new(rows, widths.clone())
+        .header(column_header(&columns))
+        .block(panel(title, focused));
+    frame.render_stateful_widget(table, area, &mut TableState::default().with_offset(scroll));
 }
 
 /// The evidence behind one accumulated count, stated the way a single
@@ -2880,8 +3256,8 @@ fn detail_line<'a>(label: &'static str, value: impl Into<String>, value_color: C
     ])
 }
 
-fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) {
-    let spans = vec![
+fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &MonitorApp) {
+    let mut spans = vec![
         Span::raw(" "),
         Span::styled("q", Style::default().fg(TEAL)),
         Span::styled(" quit  ", Style::default().fg(DIM)),
@@ -2893,9 +3269,19 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &MonitorApp) 
         Span::styled(" navigate  ", Style::default().fg(DIM)),
         Span::styled("Tab", Style::default().fg(TEAL)),
         Span::styled(" pane  ", Style::default().fg(DIM)),
+    ];
+    // Left and Right switch the tab only in the bottom pane; elsewhere they
+    // pick the Sessions or Recent pane, which the arrows hint already covers.
+    if app.focus == FocusPane::Bottom {
+        spans.extend([
+            Span::styled("←/→", Style::default().fg(TEAL)),
+            Span::styled(" tab  ", Style::default().fg(DIM)),
+        ]);
+    }
+    spans.extend([
         Span::styled("Enter", Style::default().fg(TEAL)),
         Span::styled(" open", Style::default().fg(DIM)),
-    ];
+    ]);
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(BG)),
         area,
@@ -2976,8 +3362,8 @@ fn render_shutdown_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, tick: usi
 }
 
 fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
-    let width = 48.min(area.width.saturating_sub(4)).max(24);
-    let height = 12.min(area.height.saturating_sub(2)).max(8);
+    let width = 52.min(area.width.saturating_sub(4)).max(24);
+    let height = 13.min(area.height.saturating_sub(2)).max(8);
     let popup = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -3000,6 +3386,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
         ("arrows", "navigate rows and panes"),
         ("j / k", "previous / next row"),
         ("Tab", "switch pane"),
+        ("left/right", "Events / Stats tab in the bottom pane"),
         ("Enter", "open detail"),
         ("Esc", "close overlay / detail"),
     ];
@@ -3310,6 +3697,12 @@ mod tests {
         assert!(fixed_budget(&event_columns(LayoutTier::Medium)) <= 88);
         assert!(fixed_budget(&event_columns(LayoutTier::Expanded)) <= 118);
         assert!(fixed_budget(&event_columns(LayoutTier::Wide)) <= 152);
+
+        assert!(fixed_budget(&stats_columns(LayoutTier::Emergency)) <= 75);
+        assert!(fixed_budget(&stats_columns(LayoutTier::Narrow)) <= 76);
+        assert!(fixed_budget(&stats_columns(LayoutTier::Medium)) <= 88);
+        assert!(fixed_budget(&stats_columns(LayoutTier::Expanded)) <= 118);
+        assert!(fixed_budget(&stats_columns(LayoutTier::Wide)) <= 152);
     }
 
     #[test]
@@ -3365,11 +3758,14 @@ mod tests {
             let active = active_columns(tier);
             let recent = recent_columns(tier);
             let events = event_columns(tier);
+            let stats = stats_columns(tier);
 
             assert_eq!(flex_count(&sessions), 1);
             assert_eq!(flex_count(&active), 1);
             assert_eq!(flex_count(&recent), 1);
             assert_eq!(flex_count(&events), 1);
+            assert_eq!(flex_count(&stats), 1);
+            assert!(stats.iter().all(|column| !column.header.is_empty()));
             assert_eq!(
                 sessions
                     .iter()
@@ -3631,7 +4027,9 @@ mod tests {
         assert!(!recent_text.contains("finished"));
         assert!(recent_text.contains("No recent requests"));
 
-        let events = draw(40, 9, |frame| render_events(frame, frame.area(), &[]));
+        let events = draw(40, 9, |frame| {
+            render_events(frame, frame.area(), &[], "[Events] Stats", false, 0)
+        });
         let events_text = buffer_text(&events);
         assert_centered(&events, "No events", 4);
         assert!(!events_text.contains("time"));
@@ -3692,7 +4090,7 @@ mod tests {
         for header in ["Ctx", "Hit", "Miss"] {
             assert!(sessions.contains(header), "{sessions}");
         }
-        assert!(sessions.contains("1/118.2k"), "{sessions}");
+        assert!(sessions.contains("2/130.2k"), "{sessions}");
 
         let recent = buffer_text(&draw(154, 12, |frame| {
             render_recent(
@@ -3806,7 +4204,7 @@ mod tests {
             render_session_detail(frame, frame.area(), &state, session_index)
         }));
         assert!(
-            session_detail.contains("1 miss · 118.2k tokens reprocessed"),
+            session_detail.contains("2 misses · 130.2k tokens reprocessed"),
             "{session_detail}"
         );
         assert!(session_detail.contains("context"), "{session_detail}");
@@ -3871,7 +4269,14 @@ mod tests {
         assert!(!recent_text.contains("No recent requests"));
 
         let events = draw(100, 8, |frame| {
-            render_events(frame, frame.area(), &completed_state.recent)
+            render_events(
+                frame,
+                frame.area(),
+                &completed_state.recent,
+                "[Events] Stats",
+                false,
+                0,
+            )
         });
         assert!(buffer_text(&events).contains("No events"));
     }
@@ -4048,6 +4453,8 @@ mod tests {
             show_help: false,
             detail: None,
             focus,
+            bottom_tab: BottomTab::Events,
+            bottom_scroll: 0,
             selected: Selection::default(),
             recent_selected: Selection::default(),
             tick: 0,
@@ -4061,11 +4468,13 @@ mod tests {
     /// in a fresh snapshot, then draw the screen that comes out.
     fn draw_monitor(app: &mut MonitorApp, state: &MonitorState, width: u16, height: u16) -> String {
         app.sync_selection(&session_rows(&state.sessions), &state.recent);
+        let bottom_rows = app.bottom_row_count(state);
+        app.fit_bottom_scroll(bottom_rows);
         buffer_text(&draw(width, height, |frame| render(frame, app, state)))
     }
 
     fn move_down_in(app: &mut MonitorApp, state: &MonitorState) {
-        app.move_down(&session_rows(&state.sessions), &state.recent, false);
+        app.move_down(&session_rows(&state.sessions), &state.recent, 0, false);
     }
 
     #[test]
@@ -4173,7 +4582,7 @@ mod tests {
     #[test]
     fn the_sessions_pane_keeps_its_row_when_a_session_appears_above_it() {
         let monitor = MonitorHandle::new(10);
-        record_session_request(&monitor, "request-b", "sess-b", "project-b");
+        record_session_request(&monitor, "request-a", "sess-a", "project-a");
         let first = monitor.snapshot();
         let mut app = monitor_app(FocusPane::Sessions);
         draw_monitor(&mut app, &first, 170, 24);
@@ -4181,17 +4590,27 @@ mod tests {
         // touched holds no row of its own and follows the top of the list.
         move_down_in(&mut app, &first);
         let before = draw_monitor(&mut app, &first, 170, 24);
-        assert!(before.contains("> Σ sess-b"), "{before}");
+        assert!(before.contains("> Σ sess-a"), "{before}");
 
-        // Sessions are ordered by id, so a session seen later can arrive above
-        // the selected row. The row that was picked keeps the selection.
-        record_session_request(&monitor, "request-a", "sess-a", "project-a");
+        // Sessions are ordered by their latest request, so a session seen
+        // later arrives above the selected row whatever its id sorts as. The
+        // row that was picked keeps the selection.
+        std::thread::sleep(Duration::from_millis(2));
+        record_session_request(&monitor, "request-b", "sess-b", "project-b");
         let after = monitor.snapshot();
         let text = draw_monitor(&mut app, &after, 170, 24);
 
-        assert!(text.contains("Σ sess-a"), "{text}");
-        assert!(text.contains("> Σ sess-b"), "{text}");
-        assert!(!text.contains("> Σ sess-a"), "{text}");
+        assert_eq!(
+            after
+                .sessions
+                .iter()
+                .map(SessionSummary::label)
+                .collect::<Vec<_>>(),
+            ["sess-b", "sess-a"]
+        );
+        assert_eq!(app.selected.row(), Some(1));
+        assert!(text.contains("> Σ sess-a"), "{text}");
+        assert!(!text.contains("> Σ sess-b"), "{text}");
     }
 
     #[test]
@@ -4568,6 +4987,8 @@ mod tests {
             show_help: false,
             detail: None,
             focus: FocusPane::Sessions,
+            bottom_tab: BottomTab::Events,
+            bottom_scroll: 0,
             selected: Selection::default(),
             recent_selected: Selection::default(),
             tick: 0,
@@ -4576,7 +4997,9 @@ mod tests {
             shutdown_complete: None,
         };
 
-        let buffer = draw(180, 48, |frame| render(frame, &mut app, &state));
+        // Tall enough for every session row: the ones with a request in
+        // flight sit above the idle ones, whose lanes are asserted on below.
+        let buffer = draw(180, 80, |frame| render(frame, &mut app, &state));
         let text = buffer_text(&buffer);
 
         assert!(text.contains("mock://tui-demo"), "{text}");
@@ -5146,7 +5569,14 @@ mod tests {
         let state = monitor.snapshot();
 
         let events = buffer_text(&draw(154, 8, |frame| {
-            render_events(frame, frame.area(), &state.recent)
+            render_events(
+                frame,
+                frame.area(),
+                &state.recent,
+                "[Events] Stats",
+                false,
+                0,
+            )
         }));
         assert!(events.contains("summary transcript empty"), "{events}");
         assert!(events.contains("local answer"), "{events}");
@@ -5161,13 +5591,289 @@ mod tests {
         let state = monitor.snapshot();
 
         let events = draw(100, 8, |frame| {
-            render_events(frame, frame.area(), &state.recent)
+            render_events(
+                frame,
+                frame.area(),
+                &state.recent,
+                "[Events] Stats",
+                false,
+                0,
+            )
         });
         let events_text = buffer_text(&events);
         assert!(events_text.contains("Time"));
         assert!(events_text.contains("502"));
         assert!(events_text.contains("upstream unavailable"));
         assert!(!events_text.contains("No events"));
+    }
+
+    #[test]
+    fn the_bottom_pane_names_both_tabs_and_brackets_the_shown_one() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "r1",
+            Some("sess-1".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.model_requested("r1", "gpt-5.6-sol");
+        monitor.provider_selected("r1", "codex", "gpt-5.6-sol", None);
+        monitor.request_completed("r1", 200, Some(1_000), Some(50));
+        let state = monitor.snapshot();
+        let mut app = monitor_app(FocusPane::Bottom);
+        let events = draw_monitor(&mut app, &state, 170, 40);
+        assert!(events.contains("[Events] Stats"), "{events}");
+        assert!(events.contains("No events"), "{events}");
+
+        app.bottom_tab = BottomTab::Stats;
+        let stats = draw_monitor(&mut app, &state, 170, 40);
+        assert!(stats.contains("Events [Stats]"), "{stats}");
+        // Routed to a model but never seen on the wire: the row says which
+        // one was asked for, with the mark the other panes use.
+        assert!(stats.contains("codex/?gpt-5.6-sol"), "{stats}");
+    }
+
+    #[test]
+    fn tab_reaches_the_bottom_pane_where_left_and_right_switch_its_tabs() {
+        let state = navigable_state();
+        let rows = session_rows(&state.sessions);
+        let mut app = monitor_app(FocusPane::Sessions);
+        app.sync_selection(&rows, &state.recent);
+        let bottom_rows = app.bottom_row_count(&state);
+
+        app.navigate(KeyCode::Tab, &rows, &state.recent, bottom_rows);
+        assert_eq!(app.focus, FocusPane::Recent);
+        app.navigate(KeyCode::Tab, &rows, &state.recent, bottom_rows);
+        assert_eq!(app.focus, FocusPane::Bottom);
+        assert_eq!(app.bottom_tab, BottomTab::Events);
+
+        app.navigate(KeyCode::Right, &rows, &state.recent, bottom_rows);
+        assert_eq!(app.focus, FocusPane::Bottom);
+        assert_eq!(app.bottom_tab, BottomTab::Stats);
+        // The last tab stays put rather than wrapping.
+        app.navigate(KeyCode::Right, &rows, &state.recent, bottom_rows);
+        assert_eq!(app.bottom_tab, BottomTab::Stats);
+        app.navigate(KeyCode::Left, &rows, &state.recent, bottom_rows);
+        assert_eq!(app.bottom_tab, BottomTab::Events);
+        app.navigate(KeyCode::Left, &rows, &state.recent, bottom_rows);
+        assert_eq!(app.focus, FocusPane::Bottom);
+        assert_eq!(app.bottom_tab, BottomTab::Events);
+
+        app.navigate(KeyCode::Tab, &rows, &state.recent, bottom_rows);
+        assert_eq!(app.focus, FocusPane::Sessions);
+    }
+
+    #[test]
+    fn left_and_right_outside_the_bottom_pane_pick_sessions_or_recent() {
+        let state = navigable_state();
+        let rows = session_rows(&state.sessions);
+        let mut app = monitor_app(FocusPane::Sessions);
+        app.sync_selection(&rows, &state.recent);
+        let bottom_rows = app.bottom_row_count(&state);
+
+        app.navigate(KeyCode::Right, &rows, &state.recent, bottom_rows);
+        assert_eq!(app.focus, FocusPane::Recent);
+        assert_eq!(app.bottom_tab, BottomTab::Events);
+        app.navigate(KeyCode::Right, &rows, &state.recent, bottom_rows);
+        assert_eq!(app.focus, FocusPane::Recent);
+        app.navigate(KeyCode::Left, &rows, &state.recent, bottom_rows);
+        assert_eq!(app.focus, FocusPane::Sessions);
+        assert_eq!(app.bottom_tab, BottomTab::Events);
+    }
+
+    #[test]
+    fn up_and_down_scroll_the_bottom_pane_within_its_rows() {
+        let state = navigable_state();
+        let rows = session_rows(&state.sessions);
+        let mut app = monitor_app(FocusPane::Bottom);
+        app.sync_selection(&rows, &state.recent);
+        app.bottom_tab = BottomTab::Stats;
+        // One stats row: the scroll has nowhere to go past it.
+        let bottom_rows = app.bottom_row_count(&state);
+        assert_eq!(bottom_rows, 1);
+        app.navigate(KeyCode::Down, &rows, &state.recent, bottom_rows);
+        assert_eq!(app.bottom_scroll, 0);
+        assert_eq!(app.focus, FocusPane::Bottom);
+
+        // With rows to scroll over, j and k stay in the pane and Up at the
+        // top crosses into the Recent pane.
+        app.navigate(KeyCode::Char('j'), &rows, &state.recent, 3);
+        app.navigate(KeyCode::Char('j'), &rows, &state.recent, 3);
+        app.navigate(KeyCode::Char('j'), &rows, &state.recent, 3);
+        assert_eq!(app.bottom_scroll, 2);
+        app.navigate(KeyCode::Char('k'), &rows, &state.recent, 3);
+        app.navigate(KeyCode::Char('k'), &rows, &state.recent, 3);
+        app.navigate(KeyCode::Char('k'), &rows, &state.recent, 3);
+        assert_eq!(app.bottom_scroll, 0);
+        assert_eq!(app.focus, FocusPane::Bottom);
+        app.navigate(KeyCode::Up, &rows, &state.recent, 3);
+        assert_eq!(app.focus, FocusPane::Recent);
+        assert_eq!(app.recent_selected.row(), Some(state.recent.len() - 1));
+
+        // Switching tabs starts the new tab at its top.
+        app.focus = FocusPane::Bottom;
+        app.bottom_scroll = 2;
+        app.navigate(KeyCode::Left, &rows, &state.recent, 3);
+        assert_eq!(app.bottom_tab, BottomTab::Events);
+        assert_eq!(app.bottom_scroll, 0);
+    }
+
+    #[test]
+    fn a_bottom_tab_that_lost_rows_keeps_its_scroll_on_them_and_up_leaves_from_the_top() {
+        let state = navigable_state();
+        let rows = session_rows(&state.sessions);
+        let mut app = monitor_app(FocusPane::Bottom);
+        app.sync_selection(&rows, &state.recent);
+        app.bottom_tab = BottomTab::Stats;
+        app.navigate(KeyCode::Char('j'), &rows, &state.recent, 3);
+        app.navigate(KeyCode::Char('j'), &rows, &state.recent, 3);
+        assert_eq!(app.bottom_scroll, 2);
+
+        // Later snapshots hold fewer rows on the tab: the scroll stays on the
+        // last one there is.
+        app.fit_bottom_scroll(2);
+        assert_eq!(app.bottom_scroll, 1);
+        app.fit_bottom_scroll(0);
+        assert_eq!(app.bottom_scroll, 0);
+        // At the top, Up goes back to the Recent pane rather than scrolling
+        // through rows that are gone.
+        app.navigate(KeyCode::Up, &rows, &state.recent, 0);
+        assert_eq!(app.focus, FocusPane::Recent);
+        assert_eq!(app.recent_selected.row(), Some(state.recent.len() - 1));
+    }
+
+    #[test]
+    fn the_footer_offers_the_tab_keys_only_while_the_bottom_pane_has_focus() {
+        for (focus, offered) in [
+            (FocusPane::Sessions, false),
+            (FocusPane::Recent, false),
+            (FocusPane::Bottom, true),
+        ] {
+            let app = monitor_app(focus);
+            let footer = buffer_text(&draw(120, 1, |frame| {
+                render_footer(frame, frame.area(), &app)
+            }));
+            assert_eq!(footer.contains("←/→"), offered, "{focus:?}: {footer}");
+            assert_eq!(footer.contains(" tab "), offered, "{focus:?}: {footer}");
+        }
+    }
+
+    #[test]
+    fn the_stats_tab_renders_one_row_per_backend_and_model_with_quality_marks() {
+        let state = mock_state();
+        let stats = state.model_stats();
+        let text = buffer_text(&draw(180, 16, |frame| {
+            render_stats(frame, frame.area(), &stats, "Events [Stats]", true, 0)
+        }));
+        for header in [
+            "Model",
+            "Reqs",
+            "Fail",
+            "Prompt",
+            "Hit",
+            "In",
+            "Write",
+            STATS_MISSES_HEADER,
+            "Out",
+            STATS_LATENCY_HEADER,
+            STATS_RATE_HEADER,
+        ] {
+            assert!(text.contains(header), "{header}: {text}");
+        }
+        let line_of = |needle: &str| {
+            text.lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} in {text}"))
+                .to_string()
+        };
+        // Codex never reports a cache write: the count is missing, not zero,
+        // and its one miss came after the lifetime ran out.
+        let terra = line_of("codex/gpt-5.6-terra");
+        assert!(terra.contains("n/a"), "{terra}");
+        assert!(terra.contains("0/1"), "{terra}");
+        // Anthropic reported the write and its miss fell within the lifetime.
+        let opus = line_of("anthropic/claude-opus-5");
+        assert!(opus.contains("640"), "{opus}");
+        assert!(opus.contains("1/0"), "{opus}");
+        assert!(!opus.contains("n/a"), "{opus}");
+        // A row whose stream never closed keeps the estimate mark.
+        let sol = line_of("codex/gpt-5.6-sol");
+        assert!(sol.contains(OPENING_TOKENS_MARK), "{sol}");
+        // The local answer ran on no model and has no row.
+        assert!(!text.contains("local"), "{text}");
+    }
+
+    #[test]
+    fn stats_tab_says_so_when_nothing_ran_yet() {
+        let state = MonitorHandle::new(10).snapshot();
+        let text = buffer_text(&draw(120, 8, |frame| {
+            render_stats(
+                frame,
+                frame.area(),
+                &state.model_stats(),
+                "Events [Stats]",
+                false,
+                0,
+            )
+        }));
+        assert!(text.contains("Events [Stats]"), "{text}");
+        assert!(text.contains("No requests yet"), "{text}");
+    }
+
+    #[test]
+    fn a_stats_prompt_missing_its_input_or_cache_read_is_not_exact() {
+        let exact = QualityCoverage {
+            exact: 1,
+            ..QualityCoverage::default()
+        };
+        let missing = QualityCoverage {
+            missing: 1,
+            ..QualityCoverage::default()
+        };
+        let evidence = |input, cache_read, cache_write| UsageEvidence {
+            input,
+            cache_read,
+            cache_write,
+            ..UsageEvidence::default()
+        };
+        // One of the two parts was never reported: the total lacks it, and a
+        // closed zero on the other part does not make the sum exact.
+        assert_eq!(
+            stats_prompt_quality(&evidence(missing, exact, missing)),
+            UsageQuality::Opening
+        );
+        assert_eq!(
+            stats_prompt_quality(&evidence(exact, missing, missing)),
+            UsageQuality::Opening
+        );
+        // Neither was: there is no total at all.
+        assert_eq!(
+            stats_prompt_quality(&evidence(missing, missing, missing)),
+            UsageQuality::Missing
+        );
+        // An unreported write is the Codex norm and leaves the total exact.
+        assert_eq!(
+            stats_prompt_quality(&evidence(exact, exact, missing)),
+            UsageQuality::Exact
+        );
+
+        // On screen, a closed zero read beside an input nobody reported is a
+        // provisional prompt, not an exact 0.
+        let row = ModelStats {
+            provider: Some("codex".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+            request_count: 1,
+            evidence: evidence(missing, exact, missing),
+            ..ModelStats::default()
+        };
+        let text = buffer_text(&draw(180, 6, |frame| {
+            render_stats(frame, frame.area(), &[row], "Events [Stats]", true, 0)
+        }));
+        let line = text
+            .lines()
+            .find(|line| line.contains("codex/gpt-5.6-sol"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(line.contains(&format!("{OPENING_TOKENS_MARK}0")), "{line}");
     }
 
     #[test]
@@ -5180,6 +5886,8 @@ mod tests {
             show_help: false,
             detail: None,
             focus: FocusPane::Sessions,
+            bottom_tab: BottomTab::Events,
+            bottom_scroll: 0,
             selected: Selection::default(),
             recent_selected: Selection::default(),
             tick: 0,
@@ -5226,6 +5934,8 @@ mod tests {
             show_help: false,
             detail: None,
             focus: FocusPane::Sessions,
+            bottom_tab: BottomTab::Events,
+            bottom_scroll: 0,
             selected: Selection::default(),
             recent_selected: Selection::default(),
             tick: 0,
@@ -5256,6 +5966,8 @@ mod tests {
             show_help: false,
             detail: None,
             focus: FocusPane::Sessions,
+            bottom_tab: BottomTab::Events,
+            bottom_scroll: 0,
             selected: Selection::default(),
             recent_selected: Selection::default(),
             tick: 0,
@@ -5284,6 +5996,8 @@ mod tests {
             show_help: false,
             detail: None,
             focus: FocusPane::Sessions,
+            bottom_tab: BottomTab::Events,
+            bottom_scroll: 0,
             selected: Selection::default(),
             recent_selected: Selection::default(),
             tick: 0,
@@ -5315,7 +6029,7 @@ mod tests {
         let rows = session_rows(&state.sessions);
         let mut app = monitor_app(FocusPane::Sessions);
         app.sync_selection(&rows, &state.recent);
-        app.move_down(&rows, &state.recent, false);
+        app.move_down(&rows, &state.recent, 0, false);
         assert_eq!(app.selected.row(), Some(1));
         assert_eq!(app.recent_selected.row(), Some(0));
 
@@ -5334,17 +6048,35 @@ mod tests {
         let mut app = monitor_app(FocusPane::Sessions);
         app.sync_selection(&rows, &state.recent);
 
-        app.move_down(&rows, &state.recent, true);
+        app.move_down(&rows, &state.recent, 1, true);
         assert_eq!(app.focus, FocusPane::Sessions);
         assert_eq!(app.selected.row(), Some(1));
 
-        app.move_down(&rows, &state.recent, true);
+        app.move_down(&rows, &state.recent, 1, true);
         assert_eq!(app.focus, FocusPane::Recent);
         assert_eq!(app.recent_selected.row(), Some(0));
 
         app.move_up(&rows, &state.recent, true);
         assert_eq!(app.focus, FocusPane::Sessions);
         assert_eq!(app.selected.row(), Some(1));
+
+        // Past the last recent row the arrow lands in the bottom pane, and
+        // from its top row Up comes back to the last recent row.
+        app.move_down(&rows, &state.recent, 1, true);
+        assert_eq!(app.focus, FocusPane::Recent);
+        for _ in 0..state.recent.len() {
+            app.move_down(&rows, &state.recent, 1, true);
+        }
+        assert_eq!(app.focus, FocusPane::Bottom);
+        assert_eq!(app.bottom_scroll, 0);
+        app.move_up(&rows, &state.recent, true);
+        assert_eq!(app.focus, FocusPane::Recent);
+        assert_eq!(app.recent_selected.row(), Some(state.recent.len() - 1));
+
+        // An empty bottom tab is not a place the arrow goes.
+        app.move_down(&rows, &state.recent, 0, true);
+        assert_eq!(app.focus, FocusPane::Recent);
+        assert_eq!(app.recent_selected.row(), Some(state.recent.len() - 1));
     }
 
     #[test]
@@ -5353,9 +6085,9 @@ mod tests {
         let rows = session_rows(&state.sessions);
         let mut app = monitor_app(FocusPane::Sessions);
         app.sync_selection(&rows, &state.recent);
-        app.move_down(&rows, &state.recent, false);
+        app.move_down(&rows, &state.recent, 1, false);
 
-        app.move_down(&rows, &state.recent, false);
+        app.move_down(&rows, &state.recent, 1, false);
         assert_eq!(app.focus, FocusPane::Sessions);
         assert_eq!(app.selected.row(), Some(1));
 
@@ -5363,5 +6095,15 @@ mod tests {
         app.move_up(&rows, &state.recent, false);
         assert_eq!(app.focus, FocusPane::Recent);
         assert_eq!(app.recent_selected.row(), Some(0));
+
+        app.select_recent(state.recent.len() - 1, &state.recent);
+        app.move_down(&rows, &state.recent, 1, false);
+        assert_eq!(app.focus, FocusPane::Recent);
+        assert_eq!(app.recent_selected.row(), Some(state.recent.len() - 1));
+
+        app.focus = FocusPane::Bottom;
+        app.move_up(&rows, &state.recent, false);
+        assert_eq!(app.focus, FocusPane::Bottom);
+        assert_eq!(app.bottom_scroll, 0);
     }
 }

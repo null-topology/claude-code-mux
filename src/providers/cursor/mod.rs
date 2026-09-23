@@ -66,6 +66,10 @@ impl Provider for CursorProvider {
         model::cursor_supported_models()
     }
 
+    fn has_credentials(&self) -> bool {
+        matches!(load_cursor_auth(), Ok(Some(_)))
+    }
+
     fn cli(&self) -> &'static dyn CliHandlers {
         &CURSOR_CLI
     }

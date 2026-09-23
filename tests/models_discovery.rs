@@ -5,12 +5,17 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
+use claude_code_mux::logging::log_file;
 use claude_code_mux::providers::codex::continuation::clear_all_continuations_for_tests;
-use claude_code_mux::providers::codex::models::clear_discovered_models_for_tests;
+use claude_code_mux::providers::codex::models::{
+    clear_discovered_models_for_tests, is_discovered_model,
+};
+use claude_code_mux::registry::clear_listed_models_for_tests;
 use claude_code_mux::{registry::Registry, server::app};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tower::util::ServiceExt;
@@ -122,6 +127,16 @@ async fn spawn_codex_upstream(
     status: StatusCode,
     body: Value,
 ) -> (String, Arc<Mutex<CapturedTraffic>>) {
+    spawn_codex_upstream_with_delay(status, body, Duration::ZERO).await
+}
+
+/// [`spawn_codex_upstream`] whose listing answers only after `delay`, counted
+/// from its arrival, so requests can pile up behind one listing.
+async fn spawn_codex_upstream_with_delay(
+    status: StatusCode,
+    body: Value,
+    delay: Duration,
+) -> (String, Arc<Mutex<CapturedTraffic>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let captured = Arc::new(Mutex::new(CapturedTraffic::default()));
@@ -138,6 +153,7 @@ async fn spawn_codex_upstream(
                     guard.headers = header_snapshot(&headers);
                     guard.listings += 1;
                 }
+                tokio::time::sleep(delay).await;
                 http::Response::builder()
                     .status(status)
                     .header("content-type", "application/json")
@@ -205,13 +221,26 @@ async fn get_models(uri: &str) -> (StatusCode, Value) {
 
 async fn post_messages(model: &str) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
-    app(Arc::new(Registry::with_default_alias()))
+    let registry = Arc::new(Registry::with_default_alias());
+    post_through(&registry, "/v1/messages", model, "models-session").await
+}
+
+/// A request through a registry the caller keeps, so the registry's own
+/// memory of when it last refreshed carries from one request to the next.
+/// The caller sets `NO_PROXY` before it builds the registry.
+async fn post_through(
+    registry: &Arc<Registry>,
+    path: &str,
+    model: &str,
+    session: &str,
+) -> Response {
+    app(registry.clone())
         .oneshot(
             Request::builder()
                 .method(Method::POST)
-                .uri("/v1/messages")
+                .uri(path)
                 .header("content-type", "application/json")
-                .header("x-claude-code-session-id", "models-session")
+                .header("x-claude-code-session-id", session)
                 .body(Body::from(
                     json!({
                         "model": model,
@@ -381,6 +410,7 @@ fn assert_full_lane(call: &CapturedCompletion, case: &str) {
 async fn models_endpoint_lists_codex_from_the_backend_and_routes_what_it_listed() {
     let _guard = env_lock();
     clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
     let _codex_auth = write_codex_auth(config.path());
@@ -389,10 +419,6 @@ async fn models_endpoint_lists_codex_from_the_backend_and_routes_what_it_listed(
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
     let _version_env = EnvGuard::set("CCP_CODEX_CLIENT_VERSION", "9.9.9");
-
-    // Before any listing, a model this build does not know is unroutable.
-    let response = post_messages("gpt-7-test").await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let (status, value) = get_models("/v1/models?provider=codex").await;
     assert_eq!(status, StatusCode::OK, "{value}");
@@ -470,6 +496,7 @@ async fn models_endpoint_lists_codex_from_the_backend_and_routes_what_it_listed(
     }
 
     clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
     clear_all_continuations_for_tests();
 }
 
@@ -478,6 +505,7 @@ async fn models_endpoint_lists_codex_from_the_backend_and_routes_what_it_listed(
 async fn models_endpoint_reports_codex_unauthorized_on_403_without_rows() {
     let _guard = env_lock();
     clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
     let config = TempDir::new().unwrap();
     let _codex_auth = write_codex_auth(config.path());
     let (upstream, _captured) = spawn_codex_upstream(
@@ -524,6 +552,7 @@ async fn models_endpoint_reports_codex_unauthorized_on_403_without_rows() {
 async fn models_endpoint_reports_codex_unreachable_on_5xx_and_malformed_bodies() {
     let _guard = env_lock();
     clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
     let config = TempDir::new().unwrap();
     let _codex_auth = write_codex_auth(config.path());
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
@@ -586,6 +615,7 @@ async fn models_endpoint_reports_codex_unreachable_on_5xx_and_malformed_bodies()
 async fn codex_lane_on_the_wire_follows_the_policy_then_the_backend_flag() {
     let _guard = env_lock();
     clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
     let _codex_auth = write_codex_auth(config.path());
@@ -609,7 +639,7 @@ async fn codex_lane_on_the_wire_follows_the_policy_then_the_backend_flag() {
     assert_eq!(
         listings(&backend),
         0,
-        "a message must not fetch the inventory on its own"
+        "a message for a model that routes must not fetch the inventory"
     );
     assert_lite_lane(&calls[0], "bundled flag, before any listing");
 
@@ -632,8 +662,8 @@ async fn codex_lane_on_the_wire_follows_the_policy_then_the_backend_flag() {
     assert_full_lane(&calls[1], "backend listed use_responses_lite: false");
 
     // 3) The next successful listing flips the flag back, and the next request
-    //    follows it. A listing is the only thing that changes the answer: the
-    //    messages themselves never ask the backend for an inventory.
+    //    follows it. A listing is the only thing that changes the answer: a
+    //    message for a model that routes never asks the backend for one.
     drop(base_url_env);
     let (upstream, backend) = spawn_codex_upstream(StatusCode::OK, lane_inventory(true)).await;
     let base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
@@ -668,6 +698,7 @@ async fn codex_lane_on_the_wire_follows_the_policy_then_the_backend_flag() {
 
     drop(base_url_env);
     clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
     clear_all_continuations_for_tests();
 }
 
@@ -683,4 +714,376 @@ async fn assert_answered(response: Response, case: &str) {
     .unwrap();
     assert_eq!(body["content"][0]["text"], "discovered ok", "{case}");
     assert_eq!(body["model"], LANE_MODEL, "{case}");
+}
+
+/// The mock backend answered the request.
+async fn assert_routed(response: Response, case: &str) {
+    assert_eq!(response.status(), StatusCode::OK, "{case}");
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["content"][0]["text"], "discovered ok", "{case}");
+}
+
+/// The 400 an unknown model gets, byte for byte as before any listing existed.
+async fn assert_unknown_model(response: Response, registry: &Registry, model: &str) {
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{model}");
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": format!(
+                    "Unknown model \"{model}\". {}",
+                    registry.unknown_model_message()
+                ),
+            }
+        })
+    );
+}
+
+/// Toy Codex credentials, a mock backend, and plain HTTP to it: the setup of
+/// every routing test below. The returned guards restore the environment.
+/// A toy Codex login and a mock backend, with HOME and the state dir under
+/// `config` too: a miss refreshes every provider that holds credentials, and
+/// the saved-login lookups fall back to paths under HOME, so the developer's
+/// own logins must be out of reach.
+fn routing_env(config: &TempDir, upstream: &str) -> Vec<EnvGuard> {
+    vec![
+        write_codex_auth(config.path()),
+        EnvGuard::set("HOME", config.path()),
+        EnvGuard::set("XDG_STATE_HOME", config.path().join("state")),
+        EnvGuard::set("CCP_CONFIG_DIR", config.path()),
+        EnvGuard::set("CCP_CODEX_BASE_URL", upstream),
+        EnvGuard::set("CCP_CODEX_TRANSPORT", "http"),
+        EnvGuard::set("CCP_CODEX_CLIENT_VERSION", "9.9.9"),
+        EnvGuard::set("NO_PROXY", "127.0.0.1,localhost"),
+    ]
+}
+
+/// A model that only the backend's listing names routes on its first
+/// `/v1/messages` request, with nobody calling `/v1/models` first: the miss
+/// refreshes the listing once and routes again. `count_tokens` does the same.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_model_only_the_backend_lists_routes_on_its_first_request() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let (upstream, captured) = spawn_codex_upstream(StatusCode::OK, upstream_inventory()).await;
+    let _env = routing_env(&config, &upstream);
+    let registry = Arc::new(Registry::with_default_alias());
+
+    let response = post_through(&registry, "/v1/messages", "gpt-7-test", "miss-1").await;
+    assert_routed(response, "first request").await;
+    assert_eq!(listings(&captured), 1, "one listing for the miss");
+    assert_eq!(completions(&captured)[0].body["model"], "gpt-7-test");
+
+    // Its fast tier and the next request route from the remembered listing.
+    let response = post_through(&registry, "/v1/messages", "gpt-7-test-fast", "miss-2").await;
+    assert_routed(response, "fast tier").await;
+    let response = post_through(&registry, "/v1/messages", "gpt-7-test", "miss-3").await;
+    assert_routed(response, "second request").await;
+    assert_eq!(listings(&captured), 1, "nothing left to refresh");
+
+    // The listing replaced the compiled-in list, so a compiled-in model it
+    // does not name is unknown now.
+    let response = post_through(&registry, "/v1/messages", "gpt-6-astra", "miss-4").await;
+    assert_unknown_model(response, &registry, "gpt-6-astra").await;
+
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    let registry = Arc::new(Registry::with_default_alias());
+    let response = post_through(
+        &registry,
+        "/v1/messages/count_tokens",
+        "gpt-7-test",
+        "miss-count",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        listings(&captured),
+        2,
+        "count_tokens refreshes the same way"
+    );
+}
+
+/// An id the refreshed listing does not name gets the same 400 as before;
+/// a second miss inside the interval does not ask the backend again; and a
+/// refresh that fails changes nothing about the answer.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn an_unknown_model_keeps_its_400_and_refreshes_at_most_once_per_interval() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let (upstream, captured) = spawn_codex_upstream(StatusCode::OK, upstream_inventory()).await;
+    let env = routing_env(&config, &upstream);
+    let registry = Arc::new(Registry::with_default_alias());
+
+    let response = post_through(&registry, "/v1/messages", "gpt-typo", "typo-1").await;
+    assert_unknown_model(response, &registry, "gpt-typo").await;
+    assert_eq!(listings(&captured), 1, "the miss refreshed once");
+
+    let response = post_through(&registry, "/v1/messages", "gpt-typo-2", "typo-2").await;
+    assert_unknown_model(response, &registry, "gpt-typo-2").await;
+    assert_eq!(
+        listings(&captured),
+        1,
+        "no second listing inside the interval"
+    );
+    assert!(completions(&captured).is_empty());
+    drop(env);
+
+    let (failing, failing_captured) =
+        spawn_codex_upstream(StatusCode::SERVICE_UNAVAILABLE, json!({"error": "down"})).await;
+    let _env = routing_env(&config, &failing);
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    let registry = Arc::new(Registry::with_default_alias());
+    let response = post_through(&registry, "/v1/messages", "gpt-7-test", "typo-3").await;
+    assert_unknown_model(response, &registry, "gpt-7-test").await;
+    assert_eq!(listings(&failing_captured), 1, "the refresh was tried");
+    assert!(completions(&failing_captured).is_empty());
+}
+
+/// Misses that arrive while a refresh is running wait for it instead of
+/// starting their own.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn concurrent_misses_share_one_listing() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let (upstream, captured) = spawn_codex_upstream_with_delay(
+        StatusCode::OK,
+        upstream_inventory(),
+        Duration::from_millis(300),
+    )
+    .await;
+    let _env = routing_env(&config, &upstream);
+    let registry = Arc::new(Registry::with_default_alias());
+
+    let mut requests = tokio::task::JoinSet::new();
+    for n in 0..5 {
+        let registry = registry.clone();
+        requests.spawn(async move {
+            post_through(
+                &registry,
+                "/v1/messages",
+                "gpt-7-test",
+                &format!("concurrent-{n}"),
+            )
+            .await
+            .status()
+        });
+    }
+    while let Some(status) = requests.join_next().await {
+        assert_eq!(status.unwrap(), StatusCode::OK);
+    }
+    assert_eq!(listings(&captured), 1);
+    assert_eq!(completions(&captured).len(), 5);
+}
+
+/// The proxy log's events with this message, oldest first.
+fn logged(msg: &str) -> Vec<Value> {
+    std::fs::read_to_string(log_file())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["msg"] == msg)
+        .collect()
+}
+
+/// A listing that names no model counts as no listing: it empties neither
+/// routing nor the set Codex checks a model against, whether a listing came
+/// before it or only the compiled-in list stands. Every listing that is
+/// recorded is logged with its size and how it changed the previous one.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn an_empty_listing_keeps_routing_and_every_recorded_listing_is_logged() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let (full, _) = spawn_codex_upstream(StatusCode::OK, upstream_inventory()).await;
+    let (empty, empty_captured) =
+        spawn_codex_upstream(StatusCode::OK, json!({"unexpected": "shape"})).await;
+    let mut smaller_inventory = upstream_inventory();
+    smaller_inventory["models"].as_array_mut().unwrap().pop();
+    let (smaller, _) = spawn_codex_upstream(StatusCode::OK, smaller_inventory).await;
+
+    // What `/v1/models` lists is what routing uses. The listing is
+    // process-wide; each registry below is built after its environment
+    // because the Codex client reads its base URL when it is created.
+    let env = routing_env(&config, &full);
+    let (status, _) = get_models("/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    let registry = Arc::new(Registry::with_default_alias());
+    let routed = registry.provider_for_model("gpt-7-test", None);
+    assert_eq!(routed.expect("listed by /v1/models").name(), "codex");
+    drop(env);
+
+    // An empty listing after it changes nothing: the model still routes and
+    // Codex still accepts it.
+    let env = routing_env(&config, &empty);
+    let registry = Arc::new(Registry::with_default_alias());
+    registry.refresh_listings().await;
+    assert_eq!(listings(&empty_captured), 1);
+    let routed = registry.provider_for_model("gpt-7-test", None);
+    assert_eq!(routed.expect("kept after an empty listing").name(), "codex");
+    assert!(is_discovered_model("gpt-7-test"));
+    let response = post_through(&registry, "/v1/messages", "gpt-7-test", "empty-listing").await;
+    assert_routed(response, "after an empty listing").await;
+    drop(env);
+
+    let env = routing_env(&config, &smaller);
+    Registry::with_default_alias().refresh_listings().await;
+    drop(env);
+
+    // With nothing listed yet, an empty listing leaves the compiled-in list.
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    let _env = routing_env(&config, &empty);
+    let registry = Registry::with_default_alias();
+    registry.refresh_listings().await;
+    let routed = registry.provider_for_model("gpt-6-astra", None);
+    assert_eq!(routed.expect("compiled-in list").name(), "codex");
+
+    let recorded: Vec<Value> = logged("model listing recorded")
+        .into_iter()
+        .map(|event| event["fields"].clone())
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![
+            json!({"provider": "codex", "models": 3, "previous_models": null, "added": 3, "removed": 0}),
+            json!({"provider": "codex", "models": 2, "previous_models": 3, "added": 0, "removed": 1}),
+        ]
+    );
+    let empties = logged("model listing named no models; routing keeps the previous one");
+    assert_eq!(empties.len(), 2);
+    for event in empties {
+        assert_eq!(event["level"], "warn");
+        assert_eq!(event["fields"], json!({"provider": "codex"}));
+    }
+}
+
+/// Stops the proxy process when the test ends, whether it passed or not.
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `serve` lists the models of every provider holding credentials as it
+/// starts, so the first request for a model only the backend names routes
+/// without a refresh. The proxy runs as its own process with a cleared
+/// environment: toy Codex credentials, the mock backend, every other backend
+/// on a closed port, and all of its state in a temp dir.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn serve_lists_models_at_start_so_the_first_request_needs_no_refresh() {
+    let _guard = env_lock();
+    let home = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(home.path());
+    let (upstream, captured) = spawn_codex_upstream(StatusCode::OK, upstream_inventory()).await;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let closed = "http://127.0.0.1:9";
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-mux"))
+        .args(["serve", "--no-monitor", "--port", &port.to_string()])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("CCP_CONFIG_DIR", home.path().join("config"))
+        .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
+        .env("XDG_DATA_HOME", home.path().join("xdg-data"))
+        .env("XDG_STATE_HOME", home.path().join("state"))
+        .env("CCP_CODEX_AUTH_FILE", home.path().join("auth.json"))
+        .env("CCP_CODEX_BASE_URL", &upstream)
+        .env("CCP_CODEX_TRANSPORT", "http")
+        .env("CCP_CODEX_CLIENT_VERSION", "9.9.9")
+        .env("CCP_CODEX_IMAGES_BASE_URL", closed)
+        .env("CCP_ANTHROPIC_BASE_URL", closed)
+        .env("CCP_KIMI_BASE_URL", closed)
+        .env("CCP_KIMI_OAUTH_HOST", closed)
+        .env("CCP_GROK_BASE_URL", closed)
+        .env("CCP_CURSOR_BASE_URL", closed)
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _child = ChildGuard(child);
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !client
+        .get(format!("{base}/healthz"))
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
+    {
+        assert!(std::time::Instant::now() < deadline, "proxy never came up");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    while listings(&captured) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no listing reached the backend at start"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The backend counts a listing when it arrives; give the proxy a moment
+    // to read the answer.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let response = client
+        .post(format!("{base}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("x-claude-code-session-id", "startup-session")
+        .body(
+            json!({
+                "model": "gpt-7-test",
+                "max_tokens": 64,
+                "messages": [{"role":"user","content":"hello"}]
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK.as_u16());
+    assert_eq!(
+        listings(&captured),
+        1,
+        "routed from the listing made at start"
+    );
+    assert_eq!(completions(&captured)[0].body["model"], "gpt-7-test");
 }

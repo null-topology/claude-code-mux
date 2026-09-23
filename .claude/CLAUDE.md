@@ -166,9 +166,14 @@ Request path:
 3. `src/registry.rs`: model to provider. `ANTHROPIC_STYLE_ALIASES` and any
    `claude-*` id go to the alias provider (`CCP_ALIAS_PROVIDER`, default
    anthropic); `cursor:` prefixes go to cursor; anything else must match a
-   provider's model list exactly, or be a slug the Codex backend named in its
-   last successful listing (`providers::codex::models::is_discovered_model`,
-   `-fast` included); unknown ids return 400 listing the catalog.
+   provider's catalog exactly: the ids its last successful listing named
+   (`LISTED_MODELS`), else its compiled-in list until a listing has arrived;
+   a `-fast` suffix on a listed Codex id also routes. An id a compiled-in
+   list names belongs to that provider whatever another backend lists; an id
+   only listings name goes to the provider that has listed it the longest,
+   never by map order. An id nothing routes
+   refreshes the listings once (`provider_for_model_or_refresh`, see "Codex
+   model inventory"), then unknown ids return 400 listing the catalog.
    The `CODEX_MODELS`, `KIMI_MODELS`, `GROK_MODELS` lists here are duplicated
    in each provider's `translate/model_allowlist.rs`. Keep them in sync.
 4. `src/provider.rs`: the `Provider` trait, `RequestContext` (request id,
@@ -356,6 +361,27 @@ conversation whose `raw_parent` was never resolved with `^`, and keys the
 selection by row identity so a re-render keeps it (`(selection reset)` in the
 pane title when the row is gone). Meaning is never carried by color alone.
 The `demo` command shows all of it from `src/monitor/mock.rs`.
+
+`session_summaries` orders sessions by activity: sessions with a request in
+flight first, then by `last_seen` descending, then by `first_seen_rank`
+descending as the tie-break, whichever model or conversation made the latest
+request; the conversations under a session keep `order_conversations`' tree
+order. The bottom pane is tabbed (`BottomTab`: `Events`, `Stats`); Tab cycles
+`FocusPane` Sessions → Recent → Bottom, and while Bottom has focus Left/Right
+switch the tab (`MonitorApp::navigate`) and Up/Down/j/k scroll it, with no
+row identity to keep. The title brackets the shown tab (`[Events] Stats`).
+The Stats tab renders `MonitorState::model_stats`: one `ModelStats` per
+(provider, effective model), the session `models` rollups summed across every
+session, with `local` rows left out. Its cache miss tally is `CacheMissTally`
+on `ModelUsage`, fed by `Contribution.miss` from the `CacheMiss` a request's
+evaluation stored on its record, so a per-model miss is counted exactly once
+and detached with the record like every other number; the judging itself is
+unchanged. Prompt is `input + read + write` (no `reported_prompt_tokens` at
+this level), hit % is `totals_cache_hit_ratio`, a Codex row's cache write stays
+`Missing` (`n/a`) rather than zero, and `Lat(rec)` / `tok/s(rec)` are medians
+over the row's completed requests still in `recent` (the mean of the two
+middle values for an even count), so they cover the recent window only and
+the header says so. Rows sort by prompt tokens descending.
 
 Deferred and non-blocking: `RequestRecord::model_key` and the requested-model
 histogram allocate `String`s on every ledger update.
@@ -568,6 +594,49 @@ lane for every model and ignores that flag entirely
 across calls or restarts, deliberately: a consumer that reads the listing as
 the truth about available models must see changes, not a stale fallback.
 
+Routing reads a process-wide catalog in `src/registry.rs` (`LISTED_MODELS`):
+per provider, the ids of its last successful listing from a backend
+(`source: upstream`), which replaces that provider's compiled-in list; a
+provider that has not listed yet routes on its compiled-in list, and bundled
+listings (kimi, grok, cursor today) are not recorded. `/v1/models` calls
+`list_models` on every provider regardless; being listed automatically, at
+start and on a miss, also needs `has_credentials`, which defaults to false,
+so a provider gains that by implementing both. Ownership never depends on
+name order: an id a compiled-in list names stays with that provider, and its
+own listing only says whether it still serves it; an id only listings name
+goes to the provider whose current listing has named it the longest (the
+catalog numbers each recorded listing). The catalog is filled at three
+points, all through `record_listing`:
+
+- every `/v1/models` call (`handler_models`);
+- `serve` start: `main.rs` spawns `Registry::refresh_listings` beside the
+  server, so binding never waits and a failed listing is only logged;
+- a routing miss: a `/v1/messages` or `count_tokens` request for an id that is
+  not a Claude id, an alias or a `cursor:` id and that nothing routes runs
+  `refresh_listings` once, routes again, and otherwise answers the same 400 as
+  before (`provider_for_model_or_refresh`). The refresh is single-flight (a
+  per-registry mutex held across the listing; requests that waited route
+  again first) and at most one starts per `MISS_LISTING_INTERVAL` (30 s),
+  whatever its outcome, so a typo does not reach the backends on every
+  request.
+
+`refresh_listings` asks only providers whose `has_credentials()` holds, a
+local check of the saved login with no network call (the Codex CLI's
+`auth.json`, the kimi and grok token files, the cursor store, which on macOS
+with `CCP_CONFIG_DIR` unset can mean a Keychain read that blocks for up to
+10 s, so every check runs on tokio's blocking pool); anthropic has none and
+is never asked. A restart forgets the catalog.
+
+A successful listing that names no model, such as a 2xx body without
+`models`, counts as no listing: it is not recorded, the Codex provider's own
+remembered set (`remember_discovered`, which `assert_allowed_model` and the
+lane table read) keeps its previous slugs, and the previous listing or the
+compiled-in list keeps routing. It is logged as a warning, `model listing
+named no models; routing keeps the previous one`. Every recorded listing is
+logged at info as `model listing recorded` with `provider`, `models`,
+`previous_models` (null for the first), `added` and `removed`, and no model
+bodies. `/v1/models` still reports such an empty answer as it came.
+
 Hosted web search sits outside the policy: a request carrying the hosted
 `web_search_20250305` tool is forced onto the full lane, and there a non-forced
 `gpt-5.6-luna` is rewritten to `gpt-5.6-sol` (`apply_model_lane_for_request`,
@@ -585,9 +654,9 @@ answers 400 without `client_version`. The version comes from
 `auth.json`, else `CODEX_CLIENT_VERSION` in `auth/constants.rs`.
 
 The compiled-in `CODEX_MODELS` / `ALLOWED_MODELS` lists still exist for
-routing before the first listing and for the OpenAI-compatible surfaces'
-error text. They are no longer what `/v1/models` advertises. Adding a model
-there is optional; when done, keep `src/registry.rs` and
+routing until the first successful listing and for the OpenAI-compatible
+surfaces' error text. They are no longer what `/v1/models` advertises. Adding
+a model there is optional; when done, keep `src/registry.rs` and
 `src/providers/codex/translate/model_allowlist.rs` in sync and update the
 `assert_allowed_model` test.
 

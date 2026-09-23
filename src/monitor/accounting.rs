@@ -27,8 +27,8 @@ use std::{
 };
 
 use super::usage::{
-    CacheMiss, CacheWriteQuality, QualityFields, UsageDelta, UsageQuality, UsageReport, add_signed,
-    caches_implicitly,
+    CacheMiss, CacheMissCause, CacheWriteQuality, QualityFields, UsageDelta, UsageQuality,
+    UsageReport, add_signed, caches_implicitly,
 };
 use super::{
     ActiveRequest, CompletedRequest, EndpointKind, RequestCache, RequestStatus, SessionCacheStats,
@@ -73,6 +73,13 @@ impl QualityCoverage {
         };
         *slot = add_count(*slot, sign);
     }
+
+    /// Fold another row's coverage of the same count into this one.
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.missing = self.missing.saturating_add(other.missing);
+        self.opening = self.opening.saturating_add(other.opening);
+        self.exact = self.exact.saturating_add(other.exact);
+    }
 }
 
 /// The evidence behind one row's four accumulated counts, and the prompt totals
@@ -114,6 +121,58 @@ impl UsageEvidence {
             self.reported_prompt_requests = add_count(self.reported_prompt_requests, sign);
             self.reported_prompt_tokens = add_tokens(self.reported_prompt_tokens, tokens, sign);
         }
+    }
+
+    /// Fold the evidence behind another row into this one, count by count.
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.input.add(&other.input);
+        self.cache_read.add(&other.cache_read);
+        self.cache_write.add(&other.cache_write);
+        self.output.add(&other.output);
+        self.cache_write_5m.add(&other.cache_write_5m);
+        self.cache_write_1h.add(&other.cache_write_1h);
+        self.reported_prompt_requests = self
+            .reported_prompt_requests
+            .saturating_add(other.reported_prompt_requests);
+        self.reported_prompt_tokens = self
+            .reported_prompt_tokens
+            .saturating_add(other.reported_prompt_tokens);
+    }
+}
+
+/// How many requests of a row were judged a cache miss, by cause. A tally of
+/// verdicts already passed on each request against the previous one of its
+/// lane; it judges nothing itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheMissTally {
+    /// The previous request was recent enough for its prefix to be alive.
+    pub within_ttl: u64,
+    /// The lane was idle longer than the cache lifetime.
+    pub expired: u64,
+    /// The provider's cache lifetime is not known.
+    pub unknown_ttl: u64,
+}
+
+impl CacheMissTally {
+    fn note(&mut self, cause: CacheMissCause, sign: i64) {
+        let slot = match cause {
+            CacheMissCause::WithinTtl => &mut self.within_ttl,
+            CacheMissCause::Expired => &mut self.expired,
+            CacheMissCause::UnknownTtl => &mut self.unknown_ttl,
+        };
+        *slot = add_count(*slot, sign);
+    }
+
+    pub fn total(&self) -> u64 {
+        self.within_ttl
+            .saturating_add(self.expired)
+            .saturating_add(self.unknown_ttl)
+    }
+
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.within_ttl = self.within_ttl.saturating_add(other.within_ttl);
+        self.expired = self.expired.saturating_add(other.expired);
+        self.unknown_ttl = self.unknown_ttl.saturating_add(other.unknown_ttl);
     }
 }
 
@@ -158,6 +217,8 @@ pub struct ModelUsage {
     pub cache_write_5m_tokens: u64,
     pub cache_write_1h_tokens: u64,
     pub evidence: UsageEvidence,
+    /// How many of the row's requests were judged a cache miss, by cause.
+    pub misses: CacheMissTally,
     /// The models the callers asked for to get here, and how many requests
     /// each accounts for, by name. A request that named no model is counted
     /// under `None`.
@@ -229,6 +290,8 @@ struct Contribution {
     quality: QualityFields,
     cache_write_quality: CacheWriteQuality,
     reported_prompt_tokens: Option<u64>,
+    /// The verdict its lane evaluation passed, once one did.
+    miss: Option<CacheMissCause>,
 }
 
 /// Where a request sits among the ones the process has served: when the client
@@ -388,6 +451,7 @@ impl RequestRecord {
             quality: self.quality(),
             cache_write_quality: cache_write_quality(&self.cache),
             reported_prompt_tokens: self.cache.reported_prompt_tokens,
+            miss: self.cache.miss.map(|miss| miss.cause),
         }
     }
 }
@@ -443,6 +507,9 @@ struct ModelKey {
 struct ModelRecord {
     rank: u64,
     counts: RowCounts,
+    /// The cache misses judged on the row's requests, by cause. Kept here and
+    /// not on the session, which tallies its misses as its lanes are judged.
+    misses: CacheMissTally,
     /// How many requests of the row each caller model accounts for. A count
     /// rather than a set, so a request leaving the row takes its own entry with
     /// it and nothing else.
@@ -452,6 +519,9 @@ struct ModelRecord {
 impl ModelRecord {
     fn apply(&mut self, contribution: &Contribution, requested: &Option<String>, sign: i64) {
         self.counts.apply(contribution, sign);
+        if let Some(cause) = contribution.miss {
+            self.misses.note(cause, sign);
+        }
         let count = self.requested.entry(requested.clone()).or_insert(0);
         *count = add_count(*count, sign);
         if *count == 0 {
@@ -515,6 +585,7 @@ impl SessionRecord {
                 cache_write_5m_tokens: record.counts.usage.cache_write_5m_tokens,
                 cache_write_1h_tokens: record.counts.usage.cache_write_1h_tokens,
                 evidence: record.counts.evidence,
+                misses: record.misses,
                 requested_models: record
                     .requested
                     .iter()

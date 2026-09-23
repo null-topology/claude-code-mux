@@ -12,7 +12,7 @@ itself a fork of
 [How this compares with the upstream projects](#how-this-compares-with-the-upstream-projects)
 for what each layer contributed and what differs today.
 
-<img src="meta/claude-code-screenshot-2026-07.webp" alt="The claude-code-mux monitor during a session" />
+<img src="meta/claude-code-screenshot-2026-09.webp" alt="Claude Code next to the claude-code-mux monitor, whose Stats tab sums each backend and model" />
 
 <sub>The monitor in an earlier layout; the panes and columns have changed since
 the screenshot was taken.</sub>
@@ -24,7 +24,7 @@ name says:
 - A **Claude** model goes to Anthropic untouched, on the login Claude Code
   already has. Nothing is translated, no API key is involved, and the proxy
   stores no Claude credentials.
-- A **Codex** model (`gpt-6-astra`, `gpt-5.6-sol`, ...) is translated to the
+- A **Codex** model (`gpt-6-astra`, `gpt-6-sol`, ...) is translated to the
   OpenAI Responses API and sent on the ChatGPT login of the Codex CLI.
 
 So Opus can stay on your Claude plan for the hard parts while a Codex model
@@ -178,7 +178,7 @@ mode in a terminal too.
 **5. Restart Claude Code** and pick a model:
 
 ```text
-/model gpt-5.6-sol
+/model gpt-6-sol
 /model claude-opus-5
 ```
 
@@ -187,11 +187,24 @@ mode in a terminal too.
 ### Model ids
 
 Codex models are addressed by their Codex id, for example `gpt-6-astra`,
-`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, or `gpt-5.5`. The proxy does
+`gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-terra`, or `gpt-5.5`. The proxy does
 not keep that list itself: `claude-code-mux models` and `GET /v1/models` ask
 the Codex backend which models your ChatGPT login may use and print exactly
 that, so a model Codex starts serving is available without a proxy release
 (see [Listing models](#listing-models)).
+
+Routing follows the same listing, and nothing has to call `/v1/models`
+first. When `serve` starts it asks every backend it holds a login for which
+models it serves, in the background, and a request for a model it does not
+recognise makes it ask once more before it answers `Unknown model`. That
+second ask runs at most once every 30 seconds, so a mistyped id does not
+reach the backend on every request. Once a backend has answered, its list is
+what routes: a model it stops listing stops routing, and until it has
+answered, the list built into the proxy is used. An answer that names no
+model at all is ignored, so the last good list keeps routing, and each list
+the proxy takes over is noted in its log with how many models it names. The
+backends asked this way are the ones that report a saved login; the
+`models` command and `/v1/models` ask every backend regardless.
 
 Two suffixes are understood on any id:
 
@@ -228,9 +241,9 @@ arrow key like the built-in rows, add a `modelPicker` block to
         "behavesAs": "claude-opus-5"
       },
       {
-        "model": "gpt-5.6-sol",
+        "model": "gpt-6-sol",
         "label": "Sol",
-        "description": "GPT-5.6 Sol · Reliable agentic workhorse for everyday tasks",
+        "description": "GPT-6 Sol · Reliable agentic workhorse for everyday tasks",
         "behavesAs": "claude-sonnet-5"
       },
       {
@@ -240,9 +253,9 @@ arrow key like the built-in rows, add a `modelPicker` block to
         "behavesAs": "claude-sonnet-5"
       },
       {
-        "model": "gpt-5.6-luna",
+        "model": "gpt-6-luna",
         "label": "Luna",
-        "description": "GPT-5.6 Luna · Fast and affordable agentic coding",
+        "description": "GPT-6 Luna · Fast and affordable agentic coding",
         "behavesAs": "claude-sonnet-5"
       },
       {
@@ -256,7 +269,11 @@ arrow key like the built-in rows, add a `modelPicker` block to
 }
 ```
 
-The rows appear after the built-in lineup. Each field does one thing:
+The rows appear after the built-in lineup:
+
+<img src="meta/claude-code-model-picker-2026-09.webp" alt="Claude Code's model picker listing Astra, Sol, Terra, Luna and GPT-5.5 after the built-in Claude rows" width="460" />
+
+Each field does one thing:
 
 - `model` is sent to the proxy verbatim, so it must be an id the proxy accepts.
 - `label` and `description` are only what the picker shows.
@@ -428,10 +445,17 @@ listening, which is the way to look around without sending a request.
 ### Panes and key bindings
 
 The screen holds four panes — **Sessions** (a tree: a `Σ` row per session with
-its conversations under it), **Active requests**, **Recent requests** and
-**Events** (the failed and 4xx/5xx requests out of the recent list) — under a
-header bar showing the listen URL, uptime, and the session and active-request
-counts. `Enter` on a Sessions or Recent row opens a detail view for it.
+its conversations under it), **Active requests**, **Recent requests** and a
+bottom pane with two tabs, **Events** (the failed and 4xx/5xx requests out of
+the recent list) and **Stats** (one row per backend and model since the proxy
+started) — under a header bar showing the listen URL, uptime, and the session
+and active-request counts. `Enter` on a Sessions or Recent row opens a detail
+view for it.
+
+Sessions are ordered by their latest request, newest first, whichever model or
+conversation made it; a session with a request in flight sits above the idle
+ones. The conversations under a session keep their tree order, and the
+selected row stays selected when the order changes.
 
 | key | what it does |
 | --- | --- |
@@ -439,11 +463,14 @@ counts. `Enter` on a Sessions or Recent row opens a detail view for it.
 | `Ctrl-C` | begin shutdown at once, no confirmation; again while shutting down force-quits |
 | `?` | toggle the shortcuts overlay |
 | `b` | toggle the setup overlay |
-| `Tab` | move focus between the Sessions and Recent panes |
-| `←` / `→` | focus the Sessions / Recent pane |
-| `↑` / `↓`, `k` / `j` | move the selection within the focused pane |
+| `Tab` | move focus Sessions → Recent → bottom pane → Sessions |
+| `←` / `→` | focus the Sessions / Recent pane; in the bottom pane, switch between its Events and Stats tabs |
+| `↑` / `↓`, `k` / `j` | move the selection within the focused pane; in the bottom pane, scroll its rows |
 | `Enter` | open the detail view for the selected row |
 | `Esc` | close the overlay, then the detail view |
+
+The bottom pane's title names both tabs and brackets the one shown, as in
+`[Events] Stats`.
 
 The setup overlay (`b`) prints the log and config paths, how many models each
 backend lists, and ready-to-paste `export` lines for a client. It is a
@@ -468,6 +495,18 @@ Recent requests: `Finished`, `Code` (the HTTP status the client got),
 `Project`, `Session`, `Provider`, `Model`, `Endpoint`, `Latency`, `Rate`,
 `Hit`, `Miss`, `In`, `Out`, `Details`.
 
+Stats: `Model` (backend and the model that ran, `provider/model`), `Reqs`,
+`Fail`, `Prompt` (uncached input plus cache read plus cache write), `Hit`
+(cache read over prompt), `In` (uncached input), `Write` (cache write; `n/a`
+on a backend that never reports one, Codex among them), `Miss ttl/exp` (cache
+misses judged within the cache lifetime / after it expired, with `+N?` for
+misses whose lifetime was unknown), `Out`, `Lat(rec)` and `tok/s(rec)`. The
+rows are summed over every session since the proxy started and sorted by
+prompt tokens, biggest first. The two `(rec)` columns are medians over the
+completed requests of that row still in the recent list, not over the whole
+run, and an even number of requests gives the mean of the two middle values;
+the other columns are lifetime sums.
+
 Marks that carry meaning:
 
 | mark | where | meaning |
@@ -481,6 +520,8 @@ Marks that carry meaning:
 | `^` | Sessions | a conversation whose named parent this session never saw |
 | `/side` | conversation labels | a side call: a request carrying no client tool with an `input_schema` (session titles, the auto-mode classifier, the isolated web-search call) |
 | `mixed N` | Sessions | the session ran N different backends or models, rather than the last one |
+| `[Events]`, `[Stats]` | bottom pane title | the tab the pane is showing |
+| `(rec)` | Stats headers | a median over the recent-request window, not a lifetime figure |
 | `no tokens counted` | detail views | the row was never metered at all, which is not the same as four counts nobody reported |
 | `(selection reset)` | pane titles | the selected row is gone; selection follows the row, not its position |
 
@@ -747,7 +788,7 @@ Claude Code attaches (see [Claude authentication](#claude-authentication)).
 **Codex only, with no Claude login, API key or OAuth token.** Claude Code still
 shows its built-in rows, so point those rows at Codex ids with the client's own
 `ANTHROPIC_DEFAULT_*_MODEL` variables from the table above — for instance the
-Haiku slot at `gpt-5.6-luna`, Sonnet at `gpt-5.6-terra`, Opus at `gpt-5.6-sol`
+Haiku slot at `gpt-6-luna`, Sonnet at `gpt-5.6-terra`, Opus at `gpt-6-sol`
 and Fable at `gpt-6-astra`. That assignment is an example of mapping by role,
 not a recommendation: check what your login actually lists
 (`claude-code-mux models`) before copying it, and check the variable names

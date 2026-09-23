@@ -354,11 +354,21 @@ fn mock_state_for_tick(
     orphan.generation_duration = Some(Duration::from_millis(1_500));
     orphan.stream_chunks = 44;
     orphan.streamed_bytes = 5_120;
-    orphan.input_tokens = Some(2_600);
-    orphan.cache.read_tokens = Some(21_800);
+    // Sent while the previous prefix should still have been alive, and most of
+    // it came back uncached anyway: a miss within the lifetime, which is the
+    // other cause a miss can have.
+    orphan.input_tokens = Some(14_600);
+    orphan.cache.read_tokens = Some(9_800);
     orphan.cache.write_tokens = Some(640);
     orphan.cache.write_5m_tokens = Some(640);
     orphan.cache.ttl = Some(Duration::from_secs(5 * 60));
+    orphan.cache.miss = Some(CacheMiss {
+        missed_tokens: 12_000,
+        expected_tokens: 21_800,
+        gap: Duration::from_secs(95),
+        ttl: Some(Duration::from_secs(5 * 60)),
+        cause: CacheMissCause::WithinTtl,
+    });
     orphan.output_tokens = Some(188);
     close_reported_counts(&mut orphan.cache);
     // Anthropic named the five-minute lifetime and said nothing about the

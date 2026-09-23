@@ -146,6 +146,16 @@ pub trait Provider: Send + Sync {
         ModelListing::bundled(self.name(), self.supported_models())
     }
 
+    /// Whether a saved login for this provider exists, read locally with no
+    /// network call. The registry calls [`Self::list_models`] only on
+    /// providers that have one, when `serve` starts and when a request names
+    /// a model nothing routes, on the blocking pool, so a check may block.
+    /// The default, for a provider that holds no credential of its own, is
+    /// `false`.
+    fn has_credentials(&self) -> bool {
+        false
+    }
+
     async fn handle_messages_with_conversation_identity(
         &self,
         body: MessagesRequest,

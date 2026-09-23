@@ -23,7 +23,7 @@ use crate::{
             prepare_transcription, transcription_error_response,
         },
     },
-    registry::{Registry, normalize_incoming_model},
+    registry::{Registry, normalize_incoming_model, record_listing},
     request_identity::{
         CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, ConversationIdentity,
         parent_agent_id_from_headers,
@@ -402,6 +402,7 @@ async fn handler_models(
             continue;
         };
         let listing = provider.list_models().await;
+        record_listing(&listing);
         if query.provider.is_some() && !listing.is_ok() {
             return json_error(
                 StatusCode::BAD_GATEWAY,
@@ -1803,7 +1804,8 @@ async fn dispatch_request(
         .and_then(|state| state.affinity_provider.as_ref());
     let original_provider = state
         .registry
-        .provider_for_model(&normalized_model, session_affinity);
+        .provider_for_model_or_refresh(&normalized_model, session_affinity)
+        .await;
     let configured_auto_review_model = crate::config::auto_review_model();
     let auto_review_route = original_provider.as_ref().and_then(|provider| {
         apply_auto_review_model(
@@ -1819,7 +1821,10 @@ async fn dispatch_request(
     }
 
     let provider = if auto_review_route.is_some() {
-        state.registry.provider_for_model(&normalized_model, None)
+        state
+            .registry
+            .provider_for_model_or_refresh(&normalized_model, None)
+            .await
     } else {
         original_provider
     };

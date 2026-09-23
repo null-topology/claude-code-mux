@@ -54,6 +54,10 @@ impl Provider for KimiProvider {
         KIMI_MODELS.iter().map(|s| s.to_string()).collect()
     }
 
+    fn has_credentials(&self) -> bool {
+        matches!(file_store().load_auth(), Ok(Some(_)))
+    }
+
     fn cli(&self) -> &'static dyn CliHandlers {
         &KIMI_CLI
     }
