@@ -604,7 +604,8 @@ fn mock_state_for_tick(
     }
     // Names from each source a session can have: a rename and an automatic
     // title read from transcripts, and a title seen on the wire. The cursor
-    // session has none and runs in a worktree, so its project stands in.
+    // session has none and runs in a worktree, so its project and worktree
+    // stand in.
     ledger.note_transcript_names(
         "57c7c914-ada4-4f40-9672-985f950fbb66",
         Some("Session names in the monitor".to_string()),
@@ -1103,7 +1104,10 @@ mod tests {
         );
         let cursor = session("cursor-session");
         assert!(cursor.name.is_none());
-        assert_eq!(cursor.display_name(), Some("responsive-layout-lab"));
+        assert_eq!(
+            cursor.display_name().as_deref(),
+            Some("responsive-layout-lab · column-widths")
+        );
         assert_eq!(cursor.worktree.as_deref(), Some("column-widths"));
 
         // The title request sits in its own lane under the thread that made it.

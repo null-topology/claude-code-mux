@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -18,7 +19,10 @@ pub use accounting::{
 pub use mock::{MockMonitor, mock_state};
 pub(crate) use naming::session_title_from_reply;
 pub use naming::{SessionName, SessionNameSource, TranscriptNames, spawn_transcript_reader};
-pub use side::{SideKind, is_session_title_request, is_side_conversation, split_side_conversation};
+pub use side::{
+    SideKind, has_client_tools, is_session_title_side_request, is_side_conversation,
+    split_side_conversation,
+};
 pub use usage::{
     CacheMiss, CacheMissCause, CacheWriteQuality, QualityFields, UsageFields, UsageQuality,
     UsageReport, caches_implicitly, default_cache_ttl, detect_cache_miss,
@@ -785,13 +789,17 @@ impl SessionSummary {
     }
 
     /// What the Sessions pane calls the session: its name, else its project,
-    /// else its worktree. `None` leaves it to the session id.
-    pub fn display_name(&self) -> Option<&str> {
-        self.name
-            .as_ref()
-            .map(|name| name.text.as_str())
-            .or(self.project.as_deref())
-            .or(self.worktree.as_deref())
+    /// as `project · worktree` when it runs in a worktree. `None` leaves it to
+    /// the session id.
+    pub fn display_name(&self) -> Option<Cow<'_, str>> {
+        if let Some(name) = &self.name {
+            return Some(Cow::Borrowed(name.text.as_str()));
+        }
+        let project = self.project.as_deref()?;
+        Some(match self.worktree.as_deref() {
+            Some(worktree) => Cow::Owned(format!("{project} · {worktree}")),
+            None => Cow::Borrowed(project),
+        })
     }
 }
 
@@ -1049,11 +1057,12 @@ impl MonitorHandle {
         });
     }
 
-    /// The ids of the sessions the monitor holds.
-    pub fn session_ids(&self) -> Vec<String> {
+    /// The ids of the sessions the monitor holds, each with a generation that
+    /// changes when a session was dropped and started again under its id.
+    pub fn session_generations(&self) -> Vec<(String, u64)> {
         self.store
             .lock()
-            .map(|store| store.ledger.session_ids())
+            .map(|store| store.ledger.session_generations())
             .unwrap_or_default()
     }
 
@@ -4487,7 +4496,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             let state = monitor.snapshot();
             let session = &state.sessions[0];
             (
-                session.display_name().map(str::to_string),
+                session.display_name().map(Cow::into_owned),
                 session.name.as_ref().map(|name| name.source),
             )
         };
@@ -4497,8 +4506,8 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         };
         monitor.request_started("r1", Some("s1".to_string()), None, EndpointKind::Messages);
         monitor.project_resolved("r1", "repo", Some("wt".to_string()));
-        // Nothing named it yet, so the project stands in.
-        assert_eq!(shown(&monitor), (Some("repo".to_string()), None));
+        // Nothing named it yet, so the project and its worktree stand in.
+        assert_eq!(shown(&monitor), (Some("repo · wt".to_string()), None));
         assert_eq!(
             monitor.snapshot().sessions[0].worktree.as_deref(),
             Some("wt")
@@ -5818,15 +5827,120 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             auto_title: None,
         };
         monitor.transcript_names_read("s-gone", renamed());
-        assert_eq!(monitor.session_ids(), vec!["s-gone".to_string()]);
+        let generations = monitor.session_generations();
+        assert_eq!(generations.len(), 1);
+        assert_eq!(generations[0].0, "s-gone");
 
         advance_clock(&monitor, Duration::from_secs(25 * 60 * 60));
         let _ = monitor.snapshot();
-        assert!(monitor.session_ids().is_empty());
+        assert!(monitor.session_generations().is_empty());
 
         monitor.transcript_names_read("s-gone", renamed());
-        assert!(monitor.session_ids().is_empty());
+        assert!(monitor.session_generations().is_empty());
         assert_eq!(held_requests_and_sessions(&monitor), (0, 0));
+    }
+
+    /// A session dropped as idle and started again under its id before the
+    /// transcript is read again gets the names read before once more, though
+    /// the transcript gained nothing since.
+    #[test]
+    fn a_session_started_again_under_its_id_gets_its_transcript_names_back() {
+        let session = "00000000-0000-4000-8000-000000000002";
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("projects").join("-home-u-repo");
+        std::fs::create_dir_all(&directory).unwrap();
+        let line = serde_json::json!({
+            "type": "custom-title",
+            "customTitle": "Renamed",
+            "sessionId": session
+        });
+        std::fs::write(
+            directory.join(format!("{session}.jsonl")),
+            format!("{line}\n"),
+        )
+        .unwrap();
+        let mut reader = super::naming::TranscriptReader::new(root.path().join("projects"));
+        let monitor = MonitorHandle::new(10);
+        let read = |reader: &mut super::naming::TranscriptReader| {
+            for (id, names) in reader.poll(&monitor.session_generations(), Instant::now()) {
+                monitor.transcript_names_read(id, names);
+            }
+        };
+        let name = || {
+            monitor
+                .snapshot()
+                .sessions
+                .first()
+                .and_then(|session| session.name.clone())
+                .map(|name| name.text)
+        };
+
+        finish_with_usage(
+            &monitor,
+            "old",
+            session,
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(1_000, 0, 0, 10),
+        );
+        read(&mut reader);
+        assert_eq!(name().as_deref(), Some("Renamed"));
+
+        // Dropped and started again by the same request, with no read between.
+        advance_clock(&monitor, Duration::from_secs(25 * 60 * 60));
+        finish_with_usage(
+            &monitor,
+            "new",
+            session,
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(1_000, 0, 0, 10),
+        );
+        assert_eq!(name(), None);
+
+        read(&mut reader);
+        assert_eq!(name().as_deref(), Some("Renamed"));
+        // Handed over once; the next read has nothing to say.
+        assert!(
+            reader
+                .poll(&monitor.session_generations(), Instant::now())
+                .is_empty()
+        );
+    }
+
+    /// The worktree is part of the project statement: a newer statement
+    /// without one clears it, and the older one arriving late brings neither
+    /// back.
+    #[test]
+    fn a_newer_project_statement_replaces_the_worktree_with_the_project() {
+        let monitor = MonitorHandle::new(10);
+        let place = || {
+            let state = monitor.snapshot();
+            let session = &state.sessions[0];
+            (
+                session.project.clone(),
+                session.worktree.clone(),
+                session.display_name().map(Cow::into_owned),
+            )
+        };
+        let owned = |project: &str, worktree: Option<&str>, shown: &str| {
+            (
+                Some(project.to_string()),
+                worktree.map(str::to_string),
+                Some(shown.to_string()),
+            )
+        };
+        monitor.request_started("r1", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.request_started("r2", Some("s1".to_string()), None, EndpointKind::Messages);
+
+        monitor.project_resolved("r1", "repo-a", Some("wt".to_string()));
+        assert_eq!(place(), owned("repo-a", Some("wt"), "repo-a · wt"));
+
+        monitor.project_resolved("r2", "repo-b", None);
+        assert_eq!(place(), owned("repo-b", None, "repo-b"));
+
+        monitor.project_resolved("r1", "repo-a", Some("wt".to_string()));
+        assert_eq!(place(), owned("repo-b", None, "repo-b"));
     }
 
     /// A request for a session dropped as idle starts a new one, even when no

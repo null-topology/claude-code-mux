@@ -4,7 +4,7 @@
 //! share little beyond the system prompt, so no side lane of any kind is judged
 //! for cache misses.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// What a side request is for, read from the markers its body carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,9 +62,23 @@ pub fn is_side_conversation(conversation: &str) -> bool {
     split_side_conversation(conversation).is_some()
 }
 
-/// Whether a request's `output_config` asks for Claude Code's session title: a
-/// JSON schema whose only property is `title`.
-pub fn is_session_title_request(output_config: &Value) -> bool {
+/// Whether a request body carries a client tool, one with an `input_schema`.
+/// A request without one is a side request.
+pub fn has_client_tools(body: &Map<String, Value>) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| tools.iter().any(|tool| tool.get("input_schema").is_some()))
+}
+
+/// Whether a request body is Claude Code's session title request: a side
+/// request whose `output_config` asks for a JSON schema whose only property is
+/// `title`. The `/title` label and the passthrough's capture of the title
+/// reply both go by this.
+pub fn is_session_title_side_request(body: &Map<String, Value>) -> bool {
+    !has_client_tools(body) && body.get("output_config").is_some_and(asks_for_title)
+}
+
+fn asks_for_title(output_config: &Value) -> bool {
     let Some(format) = output_config.get("format") else {
         return false;
     };
@@ -99,6 +113,10 @@ mod tests {
         assert!(!is_side_conversation("main/other"));
     }
 
+    fn body(value: Value) -> Map<String, Value> {
+        value.as_object().cloned().unwrap()
+    }
+
     #[test]
     fn only_a_schema_with_a_single_title_property_asks_for_the_session_title() {
         let title = json!({"format": {"type": "json_schema", "schema": {
@@ -107,16 +125,46 @@ mod tests {
             "required": ["title"],
             "additionalProperties": false
         }}});
-        assert!(is_session_title_request(&title));
+        assert!(is_session_title_side_request(&body(
+            json!({"output_config": title})
+        )));
 
         let wider = json!({"format": {"type": "json_schema", "schema": {
             "properties": {"title": {"type": "string"}, "summary": {"type": "string"}}
         }}});
-        assert!(!is_session_title_request(&wider));
+        assert!(!is_session_title_side_request(&body(
+            json!({"output_config": wider})
+        )));
         let other = json!({"format": {"type": "json_schema", "schema": {
             "properties": {"verdict": {"type": "string"}}
         }}});
-        assert!(!is_session_title_request(&other));
-        assert!(!is_session_title_request(&json!({"effort": "low"})));
+        assert!(!is_session_title_side_request(&body(
+            json!({"output_config": other})
+        )));
+        assert!(!is_session_title_side_request(&body(
+            json!({"output_config": {"effort": "low"}})
+        )));
+    }
+
+    /// A turn that carries client tools is never the title request, whatever
+    /// its `output_config` asks for; a hosted tool alone does not count.
+    #[test]
+    fn a_title_schema_on_a_request_with_client_tools_is_not_the_title_request() {
+        let title = json!({"format": {"type": "json_schema", "schema": {
+            "properties": {"title": {"type": "string"}}
+        }}});
+        let with_tools = body(json!({
+            "output_config": title,
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
+        }));
+        assert!(has_client_tools(&with_tools));
+        assert!(!is_session_title_side_request(&with_tools));
+
+        let hosted_only = body(json!({
+            "output_config": title,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+        }));
+        assert!(!has_client_tools(&hosted_only));
+        assert!(is_session_title_side_request(&hosted_only));
     }
 }

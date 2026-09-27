@@ -3,7 +3,8 @@ use crate::{
     config::AgentSummaryMode,
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{
-        EndpointKind, MonitorHandle, SideKind, UsageFields, UsageReport, is_session_title_request,
+        EndpointKind, MonitorHandle, SideKind, UsageFields, UsageReport, has_client_tools,
+        is_session_title_side_request,
     },
     openai_compat::{
         MAX_OPENAI_REQUEST_BYTES, OpenAiError, OpenAiSurface,
@@ -96,12 +97,7 @@ fn monitor_conversation_label(
         ConversationIdentity::Main(_) => "main",
         ConversationIdentity::Agent(_, agent_id) => agent_id.as_str(),
     };
-    let has_client_tools = body
-        .extra
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|tools| tools.iter().any(|tool| tool.get("input_schema").is_some()));
-    if has_client_tools {
+    if has_client_tools(&body.extra) {
         base.to_string()
     } else {
         format!("{base}{}", side_request_kind(body).suffix())
@@ -125,11 +121,7 @@ fn side_request_kind(body: &crate::anthropic::schema::MessagesRequest) -> SideKi
     });
     if is_claude_auto_review_request(body) || system_starts_with(CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX) {
         SideKind::Classifier
-    } else if body
-        .extra
-        .get("output_config")
-        .is_some_and(is_session_title_request)
-    {
+    } else if is_session_title_side_request(&body.extra) {
         SideKind::Title
     } else if has_hosted_search {
         SideKind::Search

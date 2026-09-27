@@ -8,6 +8,7 @@ use layout::{
 };
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io::{self, Stdout},
     sync::mpsc,
@@ -1914,13 +1915,14 @@ impl SessionRow<'_> {
     }
 
     /// Columns that describe the session as a whole stay on its own row. The
-    /// name falls back to the project, the worktree and last the session id.
-    fn name(&self) -> &str {
+    /// name falls back to the project, with its worktree when it runs in one,
+    /// and last to the session id.
+    fn name(&self) -> Cow<'_, str> {
         match self {
-            Self::Session(session) => session
-                .display_name()
-                .unwrap_or_else(|| display_session_id(session.session_id.as_deref())),
-            Self::Conversation { .. } => "",
+            Self::Session(session) => session.display_name().unwrap_or_else(|| {
+                Cow::Borrowed(display_session_id(session.session_id.as_deref()))
+            }),
+            Self::Conversation { .. } => Cow::Borrowed(""),
         }
     }
 
@@ -2099,7 +2101,7 @@ fn render_sessions(
                             Cell::from(Span::styled(marker, Style::default().fg(TEAL)))
                         }
                         SessionColumn::Id => text_cell(row.id_label(width)),
-                        SessionColumn::Name => text_cell(ellipsize(row.name(), width)),
+                        SessionColumn::Name => text_cell(ellipsize(&row.name(), width)),
                         SessionColumn::Active => number_cell(active_count.to_string()),
                         SessionColumn::Requests => number_cell(request_count.to_string()),
                         SessionColumn::Failures => number_cell(failure_count.to_string()),

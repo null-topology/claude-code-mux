@@ -448,8 +448,9 @@ The screen holds four panes — **Sessions** (a tree: a `Σ` row per session wit
 its conversations under it), **Active requests**, **Recent requests** and a
 bottom pane with two tabs, **Events** (the failed and 4xx/5xx requests out of
 the recent list) and **Stats** (one row per backend and model since the proxy
-started) — under a header bar showing the listen URL, uptime, and the session
-and active-request counts. `Enter` on a Sessions or Recent row opens a detail
+started) — under a header bar showing the listen URL, uptime, the count of
+visible sessions (hidden idle ones are left out) and the count of active
+requests. `Enter` on a Sessions or Recent row opens a detail
 view for it.
 
 Sessions are ordered by their latest request, newest first, whichever model or
@@ -461,7 +462,8 @@ A session with nothing in flight and no request for an hour leaves the
 Sessions pane, whose title counts it (`Sessions (idle hidden: N)`); its figures
 stay, and its next request brings it back with its whole history. After a day
 without a request it is dropped from memory, and a request under the same
-session id then starts a new session from zero. The Stats tab keeps the figures
+session id then starts a new session from zero, whose name is read from its
+transcript again. The Stats tab keeps the figures
 of hidden and dropped sessions alike. Neither period is configurable.
 
 | key | what it does |
@@ -504,13 +506,17 @@ second during generation), a tokens-per-10-seconds sparkline, and `Status`.
    Anthropic route, which names a session whose transcript is not on this
    machine;
 4. the project, derived from the working directory Claude Code states in its
-   system prompt;
-5. the worktree, then the session id.
+   system prompt, shown as `project · worktree` when the session runs in a
+   worktree;
+5. the session id.
 
-Transcripts are looked for under `$CLAUDE_CONFIG_DIR/projects`, else
-`~/.claude/projects`, a few seconds after a session appears, and read in the
-background from where the previous read stopped. Names stay in memory and are
-not written to the log. The session detail spells out where the name came from (`rename`,
+A name is kept to one line of at most 120 characters, and an empty one does not
+count. Transcripts are looked for under `$CLAUDE_CONFIG_DIR/projects`, else
+`~/.claude/projects`, a few seconds after a session appears; where a session's
+transcript is in more than one project directory, the one written to last is
+read. They are read in the background every 5 seconds from where the previous
+read stopped, and never modified. Names stay in memory and are not written to
+the log (see [Sensitive data](#sensitive-data)). The session detail spells out where the name came from (`rename`,
 `auto`, `wire`) and shows the project with its worktree: a checkout under
 `.claude/worktrees/<name>` or a git worktree names its main repository as the
 project and the checkout as the worktree.
@@ -575,9 +581,12 @@ Totals outlive the request list. The monitor keeps the last two hundred
 requests in full and one small numeric record per request behind them, so
 session, conversation and model figures stay right when counts arrive late,
 which the live Codex path needs: it hands the response to the client before the
-stream ends. Those records hold numbers and a little metadata, never prompts or
-bodies, and they live until the proxy restarts, so their memory grows with the
-number of requests served.
+stream ends. Those records hold numbers and a little metadata, the session's
+title among it, never prompts or bodies. They go with their session: once a
+session has been idle for a day with nothing in flight, its records,
+conversations and cache lanes are dropped, and the Stats tab keeps their
+per-model totals. Until then their memory grows with the number of requests
+the session made.
 
 Per-model figures are keyed by backend and by the model that actually ran. The
 id the client asked for is recorded as its request named it, `[1m]` suffix
@@ -871,6 +880,7 @@ This is the complete list of variables the proxy reads.
 | `PORT` | `18765` | Listening port. `claude-code-mux serve --port N` overrides it. |
 | `CCP_BIND_ADDRESS` | `127.0.0.1` | Listening address. |
 | `CCP_CONFIG_DIR` | per platform | Move the config directory. It does **not** move the state directory. |
+| `CLAUDE_CONFIG_DIR` | `$HOME/.claude` | Claude Code's own configuration directory, read the way Claude Code reads it. The monitor looks for session transcripts under its `projects` directory to name sessions. Separate from `CCP_CONFIG_DIR`. |
 | `CCP_ALIAS_PROVIDER` | `anthropic` | Backend for the Claude aliases: `anthropic`, `codex` or `kimi`. Leave it alone unless you want `opus` to stop meaning Claude. |
 | `CCP_AUTO_REVIEW_MODEL` | unset | Model for Claude Code's background security classifier. Unset, the classifier goes to `gpt-5.6-luna` only when it would have reached Codex anyway; set, it applies on any route. |
 | `CCP_AGENT_SUMMARY` | `native` | Claude Code periodically asks for a short progress label for each running background subagent and resends that subagent's whole context with it. The proxy recognizes the prompt, also when trailing system messages follow it, and only when the `x-claude-code-request-class` header is absent or says `auxiliary`; any other class rules the request out. The header alone is not enough, because Claude Code sends `auxiliary` on every side request. `native` routes and relays the request like any other for its model, so the client sees its real usage; like any request it can fail (429, 5xx, a spent Codex window). On the Codex route, in `native` and `upstream` mode both, the label goes out with `tool_choice` set to `none` and its tools kept: the client only asks in prose not to use tools, and Codex models often answered a label with a tool call, which the client discards. Measured on the ChatGPT backend, every listed Codex model accepts and enforces it, and the cached prefix is unaffected. The Anthropic route is untouched, because a `tool_choice` change invalidates Anthropic's messages cache and the passthrough relays the client's bytes as they are. `local` answers it from the transcript, built from the last tool call; the monitor shows provider `local` and the usage reports zero input. `upstream` (`model` and `remote` do the same) pins the provider's junior model at `effort: low`, or `CCP_AGENT_SUMMARY_MODEL` when set; on the Anthropic route the relayed bytes stay the client's own, so the request Anthropic receives is unchanged and only the proxy's own record names the junior model. Values are trimmed and case-sensitive: exactly `native`, `local`, `upstream`, `model` or `remote`. An empty or unrecognized value is skipped, so the setting falls back to `agentSummary` in `config.json`, then to `native`. `proxy.log` records `agent_summary_forwarded` or `agent_summary_answered_locally` for the first two modes, and `agent_summary_routed` only when `upstream` picked a model; on a backend with no junior model and no `CCP_AGENT_SUMMARY_MODEL` the request keeps its own model and none of the three is logged. |
@@ -940,11 +950,11 @@ including the WebSocket transport.
 
 `config.json` in the config directory holds most of the same settings in
 camelCase. An environment variable always wins over the file, and the file over
-the default. Ten variables have no key in the file and are environment-only:
-`CCP_CONFIG_DIR` (it locates the file), `CCP_CODEX_AUTH_FILE`,
-`CCP_ANTHROPIC_BASE_URL`, `CCP_COMPACT_EFFORT`, `CCP_CODEX_QUOTA_WARN_AT`,
-`CCP_GROK_TOOL_IMAGE`, `CCP_CURSOR_AUTH_TOKEN`, `CCP_AGENT_SUMMARY_MODEL`,
-`CCP_USER_AGENT` and `CCP_TRAFFIC_LOG`.
+the default. Eleven variables have no key in the file and are environment-only:
+`CCP_CONFIG_DIR` (it locates the file), `CLAUDE_CONFIG_DIR`,
+`CCP_CODEX_AUTH_FILE`, `CCP_ANTHROPIC_BASE_URL`, `CCP_COMPACT_EFFORT`,
+`CCP_CODEX_QUOTA_WARN_AT`, `CCP_GROK_TOOL_IMAGE`, `CCP_CURSOR_AUTH_TOKEN`,
+`CCP_AGENT_SUMMARY_MODEL`, `CCP_USER_AGENT` and `CCP_TRAFFIC_LOG`.
 
 ```json
 {
@@ -1170,6 +1180,13 @@ a prompt is not covered by it.
 The proxy never prints the contents of `~/.codex/auth.json`;
 `claude-code-mux codex auth status` reports the account and expiry only.
 
+With the monitor on, the proxy reads Claude Code's local session transcripts
+under `$CLAUDE_CONFIG_DIR/projects` (default `~/.claude/projects`) every 5
+seconds, each from where the previous read stopped, to name sessions. It keeps
+only the titles and its read offsets, never modifies the files, sends nothing
+from them upstream and writes no name to `proxy.log`. A traffic capture can
+still contain a title, as part of a recorded title reply.
+
 ## Limitations
 
 - Switching plans in the middle of an active tool call (for example pressing
@@ -1180,8 +1197,10 @@ The proxy never prints the contents of `~/.codex/auth.json`;
   rather than as the spent-window answer.
 - Codex models are not in Claude Code's built-in catalog, so without a
   `modelPicker` row Claude Code assumes a 200k context window for them.
-- The monitor's per-request ledger grows with the number of requests served
-  until the process restarts.
+- The monitor's per-request ledger grows with the number of requests a session
+  makes until the session has been idle for a day with nothing in flight; the
+  session's records, conversations and cache lanes are dropped then, and the
+  Stats tab keeps their per-model totals.
 
 ## How this compares with the upstream projects
 

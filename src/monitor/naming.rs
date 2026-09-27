@@ -7,15 +7,16 @@
 //! Transcripts are read here, in the background and incrementally, never on a
 //! request's path. Names are kept in memory only and go with their session.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 
 use super::MonitorHandle;
+use crate::logging::create_logger;
 
 /// Where a session's name came from, in the order the sources win.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -93,10 +94,19 @@ pub(crate) struct TranscriptReader {
     /// directory, each holding `<session id>.jsonl` files.
     projects: PathBuf,
     sessions: HashMap<String, TranscriptState>,
+    /// Makes the next poll panic, for the test of what the polling task does
+    /// when a poll fails.
+    #[cfg(test)]
+    panic_in_poll: bool,
 }
 
 #[derive(Debug, Default)]
 struct TranscriptState {
+    /// The generation of the monitor's session this state was read for.
+    generation: u64,
+    /// Whether the names already read go to the monitor again on this poll:
+    /// the session was dropped and started again under the same id.
+    republish: bool,
     path: Option<PathBuf>,
     /// Where the next read starts: just past the last complete line read.
     offset: u64,
@@ -110,6 +120,8 @@ impl TranscriptReader {
         Self {
             projects,
             sessions: HashMap::new(),
+            #[cfg(test)]
+            panic_in_poll: false,
         }
     }
 
@@ -127,33 +139,50 @@ impl TranscriptReader {
         Some(Self::new(config.join("projects")))
     }
 
-    /// Read what the transcripts of `session_ids` gained since the previous
-    /// call, and forget every session not listed. Returns the sessions whose
-    /// names changed, with their names now.
+    /// Read what the transcripts of `sessions` gained since the previous call,
+    /// and forget every session not listed. Each session comes with its
+    /// generation, which changes when the monitor dropped it and started it
+    /// again under the same id; such a session gets the names already read
+    /// once more, since the new one holds none. Returns the sessions whose
+    /// names changed or go again, with their names now.
     pub(crate) fn poll(
         &mut self,
-        session_ids: &[String],
+        sessions: &[(String, u64)],
         now: Instant,
     ) -> Vec<(String, TranscriptNames)> {
-        let wanted: HashSet<&str> = session_ids
+        #[cfg(test)]
+        if self.panic_in_poll {
+            panic!("transcript poll failed on purpose");
+        }
+        let wanted: HashMap<&str, u64> = sessions
             .iter()
-            .map(String::as_str)
-            .filter(|id| is_transcript_file_stem(id))
+            .filter(|(id, _)| is_transcript_file_stem(id))
+            .map(|(id, generation)| (id.as_str(), *generation))
             .collect();
-        self.sessions.retain(|id, _| wanted.contains(id.as_str()));
-        for id in &wanted {
-            if !self.sessions.contains_key(*id) {
-                self.sessions
-                    .insert((*id).to_string(), TranscriptState::default());
+        self.sessions
+            .retain(|id, _| wanted.contains_key(id.as_str()));
+        for (id, generation) in wanted {
+            match self.sessions.get_mut(id) {
+                Some(state) => {
+                    if state.generation != generation {
+                        state.generation = generation;
+                        state.republish = true;
+                    }
+                }
+                None => {
+                    let state = TranscriptState {
+                        generation,
+                        ..TranscriptState::default()
+                    };
+                    self.sessions.insert(id.to_string(), state);
+                }
             }
         }
         self.look_up_transcripts(now);
 
         let mut changed = Vec::new();
         for (id, state) in &mut self.sessions {
-            if state.path.is_none() {
-                continue;
-            }
+            let republish = std::mem::take(&mut state.republish);
             let before = state.names.clone();
             if let Err(error) = read_new_lines(state)
                 && error.kind() == io::ErrorKind::NotFound
@@ -163,7 +192,7 @@ impl TranscriptReader {
                 state.offset = 0;
                 state.retry_at = Some(now + TRANSCRIPT_LOOKUP_RETRY);
             }
-            if state.names != before {
+            if state.names != before || (republish && state.names != TranscriptNames::default()) {
                 changed.push((id.clone(), state.names.clone()));
             }
         }
@@ -171,7 +200,8 @@ impl TranscriptReader {
     }
 
     /// Find the transcripts not found yet whose retry is due, with one listing
-    /// of the projects directory for all of them.
+    /// of the projects directory for all of them. A transcript in more than
+    /// one project directory is taken from the one written to last.
     fn look_up_transcripts(&mut self, now: Instant) {
         let due: Vec<String> = self
             .sessions
@@ -184,17 +214,21 @@ impl TranscriptReader {
         if due.is_empty() {
             return;
         }
-        let mut found = HashMap::new();
+        let mut found: HashMap<String, (Option<SystemTime>, PathBuf)> = HashMap::new();
         if let Ok(entries) = std::fs::read_dir(&self.projects) {
             for entry in entries.flatten() {
                 let directory = entry.path();
                 for id in &due {
-                    if found.contains_key(id) {
+                    let candidate = directory.join(format!("{id}.jsonl"));
+                    let Ok(metadata) = std::fs::metadata(&candidate) else {
+                        continue;
+                    };
+                    if !metadata.is_file() {
                         continue;
                     }
-                    let candidate = directory.join(format!("{id}.jsonl"));
-                    if candidate.is_file() {
-                        found.insert(id.clone(), candidate);
+                    let modified = metadata.modified().ok();
+                    if found.get(id).is_none_or(|(newest, _)| modified > *newest) {
+                        found.insert(id.clone(), (modified, candidate));
                     }
                 }
             }
@@ -203,7 +237,7 @@ impl TranscriptReader {
             let Some(state) = self.sessions.get_mut(&id) else {
                 continue;
             };
-            match found.remove(&id) {
+            match found.remove(&id).map(|(_, path)| path) {
                 Some(path) => {
                     state.path = Some(path);
                     state.offset = 0;
@@ -330,29 +364,52 @@ fn note_line(line: &[u8], names: &mut TranscriptNames) {
 /// on the blocking pool, and hand it the names that changed. Runs for the life
 /// of the process.
 pub fn spawn_transcript_reader(monitor: MonitorHandle) {
-    let Some(mut reader) = TranscriptReader::from_environment() else {
+    let Some(reader) = TranscriptReader::from_environment() else {
         return;
     };
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(TRANSCRIPT_POLL_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            let session_ids = monitor.session_ids();
-            let polled = tokio::task::spawn_blocking(move || {
-                let changed = reader.poll(&session_ids, Instant::now());
-                (reader, changed)
-            })
-            .await;
-            let Ok((returned, changed)) = polled else {
-                return;
-            };
-            reader = returned;
-            for (session_id, names) in changed {
-                monitor.transcript_names_read(session_id, names);
+    tokio::spawn(read_transcripts(monitor, reader, TRANSCRIPT_POLL_INTERVAL));
+}
+
+/// The polling loop behind `spawn_transcript_reader`. A poll that fails (it
+/// panicked on the blocking pool) takes the reader's state with it: the loop
+/// starts again with a fresh reader, which reads every transcript from the
+/// start, and logs a warning for the first failure of a run of them. The
+/// warning names no session, title or path.
+async fn read_transcripts(monitor: MonitorHandle, mut reader: TranscriptReader, every: Duration) {
+    let projects = reader.projects.clone();
+    let mut failing = false;
+    let mut ticker = tokio::time::interval(every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let sessions = monitor.session_generations();
+        let polled = tokio::task::spawn_blocking(move || {
+            let changed = reader.poll(&sessions, Instant::now());
+            (reader, changed)
+        })
+        .await;
+        let changed = match polled {
+            Ok((returned, changed)) => {
+                reader = returned;
+                failing = false;
+                changed
             }
+            Err(_) => {
+                if !failing {
+                    create_logger("monitor").warn(
+                        "session transcript read failed; reading the transcripts again from the start",
+                        None,
+                    );
+                }
+                failing = true;
+                reader = TranscriptReader::new(projects.clone());
+                Vec::new()
+            }
+        };
+        for (session_id, names) in changed {
+            monitor.transcript_names_read(session_id, names);
         }
-    });
+    }
 }
 
 #[cfg(test)]
@@ -360,7 +417,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    const SESSION: &str = "5f0c2a4e-1b7d-4c3a-9e2f-8a6b4d1c0e9f";
+    const SESSION: &str = "00000000-0000-4000-8000-000000000001";
 
     fn transcript_dir() -> (tempfile::TempDir, PathBuf) {
         let root = tempfile::tempdir().unwrap();
@@ -397,8 +454,8 @@ mod tests {
         )
     }
 
-    fn sessions() -> Vec<String> {
-        vec![SESSION.to_string()]
+    fn sessions() -> Vec<(String, u64)> {
+        vec![(SESSION.to_string(), 1)]
     }
 
     #[test]
@@ -520,8 +577,115 @@ mod tests {
         reader.poll(&sessions(), Instant::now());
         assert_eq!(reader.held_for_tests(), 1);
 
-        reader.poll(&["../escape".to_string(), String::new()], Instant::now());
+        reader.poll(
+            &[("../escape".to_string(), 1), (String::new(), 1)],
+            Instant::now(),
+        );
         assert_eq!(reader.held_for_tests(), 0);
+    }
+
+    #[test]
+    fn a_new_generation_of_a_session_gets_the_names_read_before_once_more() {
+        let (root, path) = transcript_dir();
+        append(&path, &rename_line("named"));
+        let mut reader = reader_for(&root);
+        let generation = |generation: u64| vec![(SESSION.to_string(), generation)];
+        let named = vec![(
+            SESSION.to_string(),
+            TranscriptNames {
+                renamed: Some("named".to_string()),
+                auto_title: None,
+            },
+        )];
+
+        assert_eq!(reader.poll(&generation(1), Instant::now()), named);
+        assert!(reader.poll(&generation(1), Instant::now()).is_empty());
+
+        // The monitor dropped the session and started it again: the file has
+        // nothing new, and the names still go to the new session, once.
+        assert_eq!(reader.poll(&generation(2), Instant::now()), named);
+        assert!(reader.poll(&generation(2), Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn a_new_generation_of_a_session_with_no_names_hands_over_nothing() {
+        let (root, path) = transcript_dir();
+        append(
+            &path,
+            "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+        );
+        let mut reader = reader_for(&root);
+        let generation = |generation: u64| vec![(SESSION.to_string(), generation)];
+        assert!(reader.poll(&generation(1), Instant::now()).is_empty());
+        assert!(reader.poll(&generation(2), Instant::now()).is_empty());
+    }
+
+    /// With the transcript in two project directories, the one written to last
+    /// names the session, whichever order the directory listing returns them.
+    #[test]
+    fn the_transcript_written_to_last_is_the_one_read() {
+        for newer in ["-home-u-a", "-home-u-b"] {
+            let root = tempfile::tempdir().unwrap();
+            for directory in ["-home-u-a", "-home-u-b"] {
+                let directory_path = root.path().join("projects").join(directory);
+                std::fs::create_dir_all(&directory_path).unwrap();
+                let path = directory_path.join(format!("{SESSION}.jsonl"));
+                append(&path, &rename_line(directory));
+                let modified = if directory == newer {
+                    SystemTime::now()
+                } else {
+                    SystemTime::now() - Duration::from_secs(60 * 60)
+                };
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(modified)
+                    .unwrap();
+            }
+            let mut reader = reader_for(&root);
+            let changed = reader.poll(&sessions(), Instant::now());
+            assert_eq!(changed.len(), 1);
+            assert_eq!(changed[0].1.renamed.as_deref(), Some(newer));
+        }
+    }
+
+    /// A poll that panics on the blocking pool does not end the reading: the
+    /// loop goes on with a fresh reader and the session still gets its name.
+    #[tokio::test]
+    async fn the_reading_goes_on_after_a_poll_panics() {
+        let (root, path) = transcript_dir();
+        append(&path, &rename_line("named"));
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "r1",
+            Some(SESSION.to_string()),
+            None,
+            super::super::EndpointKind::Messages,
+        );
+        let mut reader = reader_for(&root);
+        reader.panic_in_poll = true;
+        let task = tokio::spawn(read_transcripts(
+            monitor.clone(),
+            reader,
+            Duration::from_millis(10),
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let name = loop {
+            let name = monitor
+                .snapshot()
+                .sessions
+                .first()
+                .and_then(|session| session.name.clone())
+                .map(|name| name.text);
+            if name.is_some() || Instant::now() > deadline {
+                break name;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        task.abort();
+        assert_eq!(name.as_deref(), Some("named"));
     }
 
     #[test]

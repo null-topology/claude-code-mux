@@ -330,11 +330,15 @@ conversations, its records and its cache lanes, through
 `Ledger::drop_sessions_idle_since`. It runs on every `snapshot()` and at every
 `RequestStarted` before the ledger sees the request, so a request for a session
 id idle that long starts a new session (fresh counters, a new rank, no old
-cache baseline) whether or not a snapshot ran in between. A later report for a
-dropped request finds no record and changes nothing. So the map grows with the
-requests of the sessions still in use, not with the whole run. Records hold
-numbers and small metadata only — no prompt, no request or response body, no
-output text. Every mutation goes through `Ledger::update`, which detaches a
+cache baseline) whether or not a snapshot ran in between. A later usage report
+for a dropped request finds no record and changes nothing. A terminal event for
+an unknown id still starts a record, because `Ledger::finish` calls `start`
+first; that is the terminal-first path, kept on purpose. So the map grows with
+the requests of the sessions still in use, not with the whole run. Records hold
+numbers and small metadata only — no prompt, no request or response body. The
+one piece of output text they keep is a session title taken from a title reply
+(`RequestRecord::session_title`, `SessionRecord::wire_title`), beside the names
+read from transcripts. Every mutation goes through `Ledger::update`, which detaches a
 record's contribution from the rows it feeds, applies the change, and attaches
 it again, so a row is always the sum of the records attached to it; one signed
 `UsageDelta` path carries the numbers, and a change worth nothing numerically
@@ -342,27 +346,40 @@ still counts, because a missing count arriving as a reported zero moves the
 evidence behind a total. Metadata is ordered by `(started_at, rank)` and a row
 shows the metadata of the request with the greatest order, so a late report for
 an older request cannot take a row's model or status back; a session's project,
-worktree and wire title and a conversation's parent have independent
-watermarks (`project_order`, `worktree_order`, `wire_title_order`,
-`parent_order`) because a request states them separately from being routed. In
-`note_metadata` a `None` never erases a value already known.
+its wire title and a conversation's parent have independent watermarks
+(`project_order`, `wire_title_order`, `parent_order`) because a request states
+them separately from being routed. In `note_metadata` a `None` never erases a
+value already known, with one exception: the worktree is part of the project
+statement and rides on `project_order`, so a newer project statement replaces
+both and one without a worktree clears it.
 
 A session's name (`SessionRecord::name`) is, first available: the last
 `custom-title` line of its Claude Code transcript (`/rename`), the last
 `ai-title` line, then a title seen on the wire; `SessionSummary::display_name`
-falls back to the project, then the worktree, and the TUI to the session id.
+falls back to the project, as `project · worktree` when the session runs in a
+worktree, and the TUI to the session id (`project.rs` only ever names a
+worktree together with a project). Every name is normalised to one line (each
+run of whitespace and control characters becomes one space), an empty one is
+rejected, and it is cut to 120 characters (`clean_session_name`).
 The transcript is `$CLAUDE_CONFIG_DIR` (else `~/.claude`)
-`/projects/*/<session id>.jsonl`, read by `TranscriptReader`
+`/projects/*/<session id>.jsonl`, the one with the newest mtime when several
+project directories hold it, read by `TranscriptReader`
 (`src/monitor/naming.rs`) in a task `serve_listener` spawns when a monitor
-exists: every 5 s, on tokio's blocking pool, for the session ids the ledger
-holds (so the reader forgets a session the ledger dropped), from the offset
-after the last complete line, keeping no line over 16 KiB and parsing only
-lines that mention a title. A missing file is looked for again after a minute;
-a file that shrank is read again from the start. Names reach the ledger as
-`TranscriptNamesRead`, which only fills a session that exists and never
-erases. The wire title comes from Claude Code's session-title request (the
+exists: every 5 s, on tokio's blocking pool, for the sessions the ledger holds
+(`session_generations`), from the offset after the last complete line, keeping
+no line over 16 KiB and parsing only lines that mention a title. The reader
+forgets a session a poll no longer sees; a session dropped and started again
+under the same id between two polls stays, and the new session's rank (its
+generation) tells the reader to hand the names it holds over again. A poll that
+panics loses the reader's state: the loop logs one warning with no name, title
+or path and goes on with a fresh reader. A missing file is looked for again
+after a minute; a file that shrank is read again from the start. Names reach
+the ledger as `TranscriptNamesRead`, which only fills a session that exists and
+never erases. The wire title comes from Claude Code's session-title request (the
 `/title` kind): `UsageObserver` in the Anthropic passthrough keeps up to 4 KiB
-of the reply text, only for a request `sanitize_anthropic_request` flagged,
+of the reply text, only for a request `sanitize_anthropic_request` flagged
+with `is_session_title_side_request` (in `side.rs`, the predicate the `/title`
+label uses too: no client tools and a title-only `output_config` schema),
 and publishes `SessionTitleObserved` once the reply completed with valid
 `{"title": ...}` JSON. It reads the relayed bytes only; the relay stays
 byte-exact. The Codex route observes no title. Names live in memory only and
@@ -838,6 +855,12 @@ JSON captures (`write_json`, `write_json_event`) pass through
 and proxy-owned `ccp:codex:v1:` reasoning signatures with `[redacted len=N]`
 and keeps any other signature. The raw SSE and raw byte captures
 (`write_text`, `write_bytes`) are not redacted at all.
+
+With the monitor on, the proxy reads Claude Code's local session transcripts
+under `$CLAUDE_CONFIG_DIR/projects` every 5 s, incrementally, to name
+sessions. It keeps only titles and read offsets, never modifies the files,
+sends nothing from them upstream and writes no name to `proxy.log`. A traffic
+capture may still contain a title as part of a recorded title reply.
 
 ## Style
 

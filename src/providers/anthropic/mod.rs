@@ -21,7 +21,7 @@ use crate::anthropic::error::json_error;
 use crate::anthropic::schema::MessagesRequest;
 use crate::logging::create_logger;
 use crate::monitor::{
-    MonitorHandle, UsageReport, is_session_title_request, session_title_from_reply,
+    MonitorHandle, UsageReport, is_session_title_side_request, session_title_from_reply,
     usage_report_from_anthropic_body,
 };
 use crate::provider::{CliHandlers, ModelListing, Provider, RequestContext, ResponseOutcome};
@@ -49,7 +49,8 @@ use crate::registry::ANTHROPIC_STYLE_ALIASES;
 /// its typed copy of the request at another model. Reading it here costs nothing:
 /// the parse already happens, and the value is taken before the early return for a
 /// body with no `messages`, so a request that needs no rewrite still reports it.
-/// Whether the body asks for the session title is read from the same parse.
+/// Whether the body is the session title request is read from the same parse, by
+/// the predicate that labels the request `/title`.
 fn sanitize_anthropic_request(raw: &[u8], req_id: &str) -> OutgoingRequest {
     let Ok(mut doc) = serde_json::from_slice::<Value>(raw) else {
         return OutgoingRequest::default();
@@ -60,9 +61,7 @@ fn sanitize_anthropic_request(raw: &[u8], req_id: &str) -> OutgoingRequest {
 
     detect_hosted_web_search_regression(obj, req_id);
     let model = obj.get("model").and_then(Value::as_str).map(str::to_string);
-    let session_title = obj
-        .get("output_config")
-        .is_some_and(is_session_title_request);
+    let session_title = is_session_title_side_request(obj);
 
     let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) else {
         return OutgoingRequest {
@@ -794,6 +793,33 @@ mod tests {
         assert_eq!(sanitize_anthropic_request(b"not json", "req10").model, None);
         let modelless = serde_json::to_vec(&serde_json::json!({"messages": []})).unwrap();
         assert_eq!(sanitize_anthropic_request(&modelless, "req11").model, None);
+    }
+
+    /// The reply is captured as the session title only for the side request
+    /// that asks for it; a turn with client tools that happens to ask for a
+    /// title-only schema is not that request.
+    #[test]
+    fn only_the_title_side_request_is_flagged_for_title_capture() {
+        let title_config = serde_json::json!({"format": {"type": "json_schema", "schema": {
+            "type": "object",
+            "properties": {"title": {"type": "string"}}
+        }}});
+        let side = serde_json::json!({
+            "model": "claude-haiku-5",
+            "output_config": title_config,
+            "messages": [{"role": "user", "content": "name this"}]
+        });
+        let raw = serde_json::to_vec(&side).unwrap();
+        assert!(sanitize_anthropic_request(&raw, "req12").session_title);
+
+        let main_turn = serde_json::json!({
+            "model": "claude-opus-5",
+            "output_config": title_config,
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "go on"}]
+        });
+        let raw = serde_json::to_vec(&main_turn).unwrap();
+        assert!(!sanitize_anthropic_request(&raw, "req13").session_title);
     }
 
     fn observed_monitor(request_id: &str, endpoint: crate::monitor::EndpointKind) -> MonitorHandle {

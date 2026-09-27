@@ -305,7 +305,8 @@ struct Contribution {
 /// arriving late for an older request cannot take a row's model or status back.
 type RequestOrder = (SystemTime, u64);
 
-/// What the monitor keeps about one request until the process restarts.
+/// What the monitor keeps about one request, for as long as its session is
+/// kept.
 #[derive(Debug, Clone)]
 pub(crate) struct RequestRecord {
     /// Where the request sits among the ones seen before it.
@@ -500,9 +501,10 @@ pub(crate) struct SessionRecord {
     /// named after another request moved the row on would be dropped although
     /// a request of the session knows it.
     project_order: Option<RequestOrder>,
-    /// The worktree, ordered on its own like the project.
+    /// The worktree the project was named with, taken together with it: a
+    /// newer project statement replaces both, and one without a worktree
+    /// clears it.
     pub worktree: Option<String>,
-    worktree_order: Option<RequestOrder>,
     /// The names Claude Code wrote into the session's transcript on this
     /// machine: the one `/rename` set and its own title. They belong to the
     /// session rather than to a request, and are set by the transcript reader.
@@ -601,7 +603,6 @@ impl SessionRecord {
             metadata_order: None,
             project_order: None,
             worktree: None,
-            worktree_order: None,
             renamed: None,
             auto_title: None,
             wire_title: None,
@@ -673,17 +674,15 @@ impl SessionRecord {
     /// The project is the exception, and has an order of its own: it is the one
     /// field the request states separately from being routed, so it is the
     /// newest request that named a project that wins, not the newest request.
-    /// The worktree and the title seen on the wire are stated separately too,
-    /// and are ordered the same way.
+    /// The worktree comes with the project as one statement and is replaced
+    /// with it. The title seen on the wire is stated separately too, and is
+    /// ordered the same way.
     fn note_metadata(&mut self, record: &RequestRecord) {
         self.last_seen = self.last_seen.max(record.seen_at());
         self.first_seen = self.first_seen.min(record.started_at);
         if record.project.is_some() && newest_in_row(self.project_order, record) {
             self.project_order = Some(record.order());
             self.project = record.project.clone();
-        }
-        if record.worktree.is_some() && newest_in_row(self.worktree_order, record) {
-            self.worktree_order = Some(record.order());
             self.worktree = record.worktree.clone();
         }
         if record.session_title.is_some() && newest_in_row(self.wire_title_order, record) {
@@ -993,9 +992,7 @@ impl Ledger {
     ) {
         self.update(request_id, |record| {
             record.project = Some(project);
-            if worktree.is_some() {
-                record.worktree = worktree;
-            }
+            record.worktree = worktree;
         });
     }
 
@@ -1025,10 +1022,15 @@ impl Ledger {
         }
     }
 
-    /// The ids of the sessions held, for the reader that names them from their
-    /// transcripts.
-    pub(crate) fn session_ids(&self) -> Vec<String> {
-        self.sessions.keys().flatten().cloned().collect()
+    /// The ids of the sessions held, each with its rank, for the reader that
+    /// names them from their transcripts. The rank is new when a session was
+    /// dropped and started again under the same id, which tells the reader
+    /// the names it read belong on the session once more.
+    pub(crate) fn session_generations(&self) -> Vec<(String, u64)> {
+        self.sessions
+            .iter()
+            .filter_map(|(id, session)| id.clone().map(|id| (id, session.rank)))
+            .collect()
     }
 
     /// The provider and model a request was routed to.
@@ -1469,8 +1471,9 @@ impl Ledger {
     ///
     /// Each record is detached from `measured` as it goes and its figures are
     /// added to `retired` instead, so what Stats sums is the same before and
-    /// after. A report arriving later for a dropped request finds no record and
-    /// changes nothing.
+    /// after. A usage report arriving later for a dropped request finds no
+    /// record and changes nothing; a terminal event for it starts a record, as
+    /// `finish` does for any id it has not seen.
     pub(crate) fn drop_sessions_idle_since(
         &mut self,
         cutoff: SystemTime,
