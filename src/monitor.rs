@@ -7,6 +7,8 @@ use std::{
 
 mod accounting;
 mod mock;
+mod naming;
+mod side;
 mod usage;
 
 use accounting::{AbsorbedRequest, Ledger, SessionRecord};
@@ -14,6 +16,9 @@ pub use accounting::{
     CacheMissTally, LOCAL_PROVIDER, ModelUsage, QualityCoverage, UnattributedUsage, UsageEvidence,
 };
 pub use mock::{MockMonitor, mock_state};
+pub(crate) use naming::session_title_from_reply;
+pub use naming::{SessionName, SessionNameSource, TranscriptNames, spawn_transcript_reader};
+pub use side::{SideKind, is_session_title_request, is_side_conversation, split_side_conversation};
 pub use usage::{
     CacheMiss, CacheMissCause, CacheWriteQuality, QualityFields, UsageFields, UsageQuality,
     UsageReport, caches_implicitly, default_cache_ttl, detect_cache_miss,
@@ -88,9 +93,23 @@ pub enum MonitorEvent {
         session_seq: Option<u64>,
         endpoint: EndpointKind,
     },
+    /// The project the request's working directory belongs to, and the
+    /// worktree of it when the directory is one.
     ProjectResolved {
         request_id: String,
         project: String,
+        worktree: Option<String>,
+    },
+    /// The session title the reply to Claude Code's request for one carried.
+    SessionTitleObserved {
+        request_id: String,
+        title: String,
+    },
+    /// The names the session's transcript on this machine holds, from the
+    /// reader that follows it. A name it did not state is `None`.
+    TranscriptNamesRead {
+        session_id: String,
+        names: TranscriptNames,
     },
     SessionSequenceResolved {
         request_id: String,
@@ -586,7 +605,12 @@ impl ModelStats {
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub session_id: Option<String>,
+    /// What the session is called, from the first source that has a name:
+    /// `/rename`, the transcript's title, the title seen on the wire.
+    pub name: Option<SessionName>,
     pub project: Option<String>,
+    /// The worktree the session's working directory sits in, when it is one.
+    pub worktree: Option<String>,
     /// Where the session sits among the ones seen before it: a stable key for
     /// ordering rows, unaffected by anything that happens later.
     pub first_seen_rank: usize,
@@ -682,7 +706,7 @@ impl ConversationSummary {
     /// Whether the conversation is one of Claude Code's side calls, which do
     /// not extend a transcript.
     pub fn is_side(&self) -> bool {
-        self.conversation.ends_with(SIDE_CONVERSATION_SUFFIX)
+        is_side_conversation(&self.conversation)
     }
 }
 
@@ -759,6 +783,16 @@ impl SessionSummary {
             .clone()
             .unwrap_or_else(|| "no-session".to_string())
     }
+
+    /// What the Sessions pane calls the session: its name, else its project,
+    /// else its worktree. `None` leaves it to the session id.
+    pub fn display_name(&self) -> Option<&str> {
+        self.name
+            .as_ref()
+            .map(|name| name.text.as_str())
+            .or(self.project.as_deref())
+            .or(self.worktree.as_deref())
+    }
 }
 
 #[derive(Debug)]
@@ -808,11 +842,6 @@ fn note_miss(stats: &mut SessionCacheStats, started_at: SystemTime, miss: CacheM
     stats.missed_tokens = stats.missed_tokens.saturating_add(miss.missed_tokens);
     stats.last_miss = Some((started_at, miss));
 }
-
-/// Appended to a conversation label for requests without client tools. They
-/// are side calls that do not extend the transcript, so consecutive ones share
-/// little beyond the system prompt and are not judged for cache misses.
-pub const SIDE_CONVERSATION_SUFFIX: &str = "/side";
 
 /// One conversation's stream of requests to one model: the unit a prompt cache
 /// builds up in. Subagents and side requests get their own lanes.
@@ -993,11 +1022,39 @@ impl MonitorHandle {
         });
     }
 
-    pub fn project_resolved(&self, request_id: impl Into<String>, project: impl Into<String>) {
+    pub fn project_resolved(
+        &self,
+        request_id: impl Into<String>,
+        project: impl Into<String>,
+        worktree: Option<String>,
+    ) {
         self.publish(MonitorEvent::ProjectResolved {
             request_id: request_id.into(),
             project: project.into(),
+            worktree,
         });
+    }
+
+    pub fn session_title_observed(&self, request_id: impl Into<String>, title: impl Into<String>) {
+        self.publish(MonitorEvent::SessionTitleObserved {
+            request_id: request_id.into(),
+            title: title.into(),
+        });
+    }
+
+    pub fn transcript_names_read(&self, session_id: impl Into<String>, names: TranscriptNames) {
+        self.publish(MonitorEvent::TranscriptNamesRead {
+            session_id: session_id.into(),
+            names,
+        });
+    }
+
+    /// The ids of the sessions the monitor holds.
+    pub fn session_ids(&self) -> Vec<String> {
+        self.store
+            .lock()
+            .map(|store| store.ledger.session_ids())
+            .unwrap_or_default()
     }
 
     pub fn session_sequence_resolved(&self, request_id: impl Into<String>, session_seq: u64) {
@@ -1220,11 +1277,20 @@ impl MonitorStore {
             MonitorEvent::ProjectResolved {
                 request_id,
                 project,
+                worktree,
             } => {
-                self.ledger.note_project(&request_id, project.clone());
+                self.ledger
+                    .note_project(&request_id, project.clone(), worktree);
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.project = Some(project);
                 }
+            }
+            MonitorEvent::SessionTitleObserved { request_id, title } => {
+                self.ledger.note_session_title(&request_id, title);
+            }
+            MonitorEvent::TranscriptNamesRead { session_id, names } => {
+                self.ledger
+                    .note_transcript_names(&session_id, names.renamed, names.auto_title);
             }
             MonitorEvent::SessionSequenceResolved {
                 request_id,
@@ -1620,7 +1686,7 @@ impl MonitorStore {
         let side = key
             .conversation
             .as_deref()
-            .is_some_and(|name| name.ends_with(SIDE_CONVERSATION_SUFFIX));
+            .is_some_and(is_side_conversation);
         let judged = judge && !superseded && !side;
         let miss = previous.filter(|_| judged).and_then(|lane| {
             // It was sent before the previous response began, so the entries
@@ -1756,10 +1822,8 @@ fn resolve_parent(conversations: &[ConversationSummary], index: usize) -> Option
             .position(|conversation| conversation.conversation == label)
     };
     let conversation = &conversations[index];
-    conversation
-        .conversation
-        .strip_suffix(SIDE_CONVERSATION_SUFFIX)
-        .and_then(position)
+    split_side_conversation(&conversation.conversation)
+        .and_then(|(base, _)| position(base))
         .or_else(|| conversation.raw_parent.as_deref().and_then(position))
         .filter(|parent| *parent != index)
 }
@@ -1891,7 +1955,9 @@ fn session_summary(session_id: Option<String>, record: &SessionRecord) -> Sessio
         .collect();
     SessionSummary {
         session_id,
+        name: record.name(),
         project: record.project.clone(),
+        worktree: record.worktree.clone(),
         first_seen_rank: count(record.rank),
         active_count: count(record.counts.active_count),
         request_count: count(record.counts.request_count),
@@ -2497,7 +2563,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             Some(1),
             EndpointKind::Messages,
         );
-        monitor.project_resolved("r1", "example");
+        monitor.project_resolved("r1", "example", None);
         monitor.provider_selected("r1", "codex", "gpt-5.5", None);
         monitor.request_completed("r1", 200, Some(10), Some(20));
         monitor.request_started(
@@ -3630,6 +3696,62 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     }
 
     #[test]
+    fn side_calls_of_a_named_kind_are_not_judged_either() {
+        let monitor = MonitorHandle::new(20);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(40_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+
+        for (id, conversation) in [
+            ("q1", "main/recap"),
+            ("q2", "main/recap"),
+            ("w1", "main/search"),
+            ("w2", "main/search"),
+        ] {
+            start_codex_request(&monitor, id, conversation);
+            monitor.usage_reported(id, closing_usage(3_000, 0, 0, 20));
+            monitor.request_completed(id, 200, None, None);
+        }
+
+        let state = monitor.snapshot();
+        for id in ["q2", "w2"] {
+            assert!(recent_by_id(&state, id).cache.evaluated());
+            assert!(recent_by_id(&state, id).cache.miss.is_none());
+        }
+        assert_eq!(state.sessions[0].cache.miss_count, 0);
+        assert_eq!(state.sessions[0].cache.context_tokens, 40_000);
+    }
+
+    #[test]
+    fn side_calls_of_a_named_kind_hang_under_the_conversation_that_made_them() {
+        let monitor = MonitorHandle::new(20);
+        for (request_id, conversation) in [
+            ("f1", "main/fetch"),
+            ("a1", "agent-1"),
+            ("r1", "main"),
+            ("t1", "agent-1/title"),
+            ("c1", "main/classifier"),
+        ] {
+            start_codex_request(&monitor, request_id, conversation);
+            monitor.usage_reported(request_id, closing_usage(1_000, 0, 0, 10));
+            monitor.request_completed(request_id, 200, None, None);
+        }
+
+        let state = monitor.snapshot();
+
+        assert_eq!(
+            conversation_shape(&state.sessions[0]),
+            vec![
+                ("main", None, 0),
+                ("main/fetch", Some("main"), 1),
+                ("main/classifier", Some("main"), 1),
+                ("agent-1", None, 0),
+                ("agent-1/title", Some("agent-1"), 1),
+            ]
+        );
+    }
+
+    #[test]
     fn a_request_sent_before_the_previous_response_began_is_not_a_miss() {
         let monitor = MonitorHandle::new(20);
         start_anthropic_request(&monitor, "r1", "claude-opus-5");
@@ -3746,7 +3868,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     fn session_and_conversation_rows_outlive_the_recent_window() {
         let monitor = MonitorHandle::new(1);
         start_codex_request(&monitor, "r1", "main");
-        monitor.project_resolved("r1", "example");
+        monitor.project_resolved("r1", "example", None);
         monitor.usage_reported("r1", closing_usage(30_000, 0, 0, 50));
         monitor.request_completed("r1", 200, None, None);
         // A subagent of the main thread, whose stream died after the status line.
@@ -4303,7 +4425,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         monitor.provider_selected("r2", "codex", "gpt-5.6-luna", None);
         monitor.request_completed("r2", 200, Some(500), Some(10));
 
-        monitor.project_resolved("r1", "example-project");
+        monitor.project_resolved("r1", "example-project", None);
         monitor.conversation_resolved("r1", "main", None);
         monitor.provider_selected("r1", "codex", "gpt-5.6-sol", None);
 
@@ -4326,8 +4448,8 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         monitor.request_started("r2", Some("s1".to_string()), None, EndpointKind::Messages);
         // The newer request names where it is working, and only then does the
         // older one name the directory it was started in.
-        monitor.project_resolved("r2", "current-project");
-        monitor.project_resolved("r1", "previous-project");
+        monitor.project_resolved("r2", "current-project", None);
+        monitor.project_resolved("r1", "previous-project", None);
 
         let state = monitor.snapshot();
         assert_eq!(
@@ -4348,13 +4470,105 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             store.ledger.backdate_for_tests("r1", same_instant);
             store.ledger.backdate_for_tests("r2", same_instant);
         }
-        monitor.project_resolved("r2", "current-project");
-        monitor.project_resolved("r1", "previous-project");
+        monitor.project_resolved("r2", "current-project", None);
+        monitor.project_resolved("r1", "previous-project", None);
 
         let state = monitor.snapshot();
         assert_eq!(
             state.sessions[0].project.as_deref(),
             Some("current-project")
+        );
+    }
+
+    #[test]
+    fn a_session_is_named_by_rename_then_transcript_title_then_wire_title() {
+        let monitor = MonitorHandle::new(10);
+        let shown = |monitor: &MonitorHandle| {
+            let state = monitor.snapshot();
+            let session = &state.sessions[0];
+            (
+                session.display_name().map(str::to_string),
+                session.name.as_ref().map(|name| name.source),
+            )
+        };
+        let names = |renamed: Option<&str>, auto_title: Option<&str>| TranscriptNames {
+            renamed: renamed.map(str::to_string),
+            auto_title: auto_title.map(str::to_string),
+        };
+        monitor.request_started("r1", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.project_resolved("r1", "repo", Some("wt".to_string()));
+        // Nothing named it yet, so the project stands in.
+        assert_eq!(shown(&monitor), (Some("repo".to_string()), None));
+        assert_eq!(
+            monitor.snapshot().sessions[0].worktree.as_deref(),
+            Some("wt")
+        );
+
+        monitor.request_started("r2", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.conversation_resolved("r2", "main/title", None);
+        monitor.session_title_observed("r2", "Wire title");
+        assert_eq!(
+            shown(&monitor),
+            (
+                Some("Wire title".to_string()),
+                Some(SessionNameSource::Wire)
+            )
+        );
+
+        monitor.transcript_names_read("s1", names(None, Some("Auto title")));
+        assert_eq!(
+            shown(&monitor),
+            (
+                Some("Auto title".to_string()),
+                Some(SessionNameSource::Auto)
+            )
+        );
+
+        // A newer title from the wire never replaces a name the transcript gave.
+        monitor.request_started("r3", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.session_title_observed("r3", "Newer wire title");
+        assert_eq!(
+            shown(&monitor),
+            (
+                Some("Auto title".to_string()),
+                Some(SessionNameSource::Auto)
+            )
+        );
+
+        monitor.transcript_names_read("s1", names(Some("Renamed"), Some("Auto title")));
+        assert_eq!(
+            shown(&monitor),
+            (Some("Renamed".to_string()), Some(SessionNameSource::Rename))
+        );
+
+        // A later rename replaces the earlier one, and a read that names
+        // nothing erases nothing.
+        monitor.transcript_names_read("s1", names(Some("Renamed again"), None));
+        monitor.transcript_names_read("s1", names(None, None));
+        assert_eq!(
+            shown(&monitor),
+            (
+                Some("Renamed again".to_string()),
+                Some(SessionNameSource::Rename)
+            )
+        );
+    }
+
+    #[test]
+    fn the_newest_title_request_names_the_session_however_late_an_older_reply_arrives() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.request_started("r2", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.session_title_observed("r2", "Current title");
+        monitor.session_title_observed("r1", "Previous title");
+
+        let state = monitor.snapshot();
+        assert_eq!(
+            state.sessions[0]
+                .name
+                .as_ref()
+                .map(|name| name.text.as_str()),
+            Some("Current title")
         );
     }
 
@@ -5584,6 +5798,35 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         // The one left is idle too, hidden but held.
         assert!(state.sessions.is_empty());
         assert_eq!(state.idle_sessions, 1);
+    }
+
+    /// A session's name goes with it, and a transcript read that arrives
+    /// after the drop does not bring the session back.
+    #[test]
+    fn a_session_name_is_dropped_with_its_session() {
+        let monitor = MonitorHandle::new(10);
+        finish_with_usage(
+            &monitor,
+            "old",
+            "s-gone",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(1_000, 0, 0, 10),
+        );
+        let renamed = || TranscriptNames {
+            renamed: Some("Renamed".to_string()),
+            auto_title: None,
+        };
+        monitor.transcript_names_read("s-gone", renamed());
+        assert_eq!(monitor.session_ids(), vec!["s-gone".to_string()]);
+
+        advance_clock(&monitor, Duration::from_secs(25 * 60 * 60));
+        let _ = monitor.snapshot();
+        assert!(monitor.session_ids().is_empty());
+
+        monitor.transcript_names_read("s-gone", renamed());
+        assert!(monitor.session_ids().is_empty());
+        assert_eq!(held_requests_and_sessions(&monitor), (0, 0));
     }
 
     /// A request for a session dropped as idle starts a new one, even when no

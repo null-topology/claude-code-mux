@@ -431,6 +431,7 @@ fn mock_state_for_tick(
         Some(201),
     );
     bytes.project = Some("companion-app".to_string());
+    bytes.conversation = Some("main".to_string());
     bytes.provider = Some("grok".to_string());
     bytes.model = Some("grok-4.5".to_string());
     bytes.requested_model = Some("grok-4.5".to_string());
@@ -439,6 +440,33 @@ fn mock_state_for_tick(
     bytes.streamed_bytes = 8_192;
     bytes.stream_chunks = 64;
     recent.push_back(bytes);
+
+    // Claude Code asking for a session title: a tool-free side call that lands
+    // in the title lane under the thread that made it. Its reply is the only
+    // name this session has, as no transcript of it was found.
+    let mut title = completed_request(
+        now,
+        "req-complete-title",
+        Some("mobile-client"),
+        Some(7),
+        EndpointKind::Messages,
+        Duration::from_secs(96),
+        Duration::from_millis(900),
+        RequestStatus::Completed,
+        Some(200),
+    );
+    title.project = Some("companion-app".to_string());
+    title.conversation = Some("main/title".to_string());
+    title.provider = Some("anthropic".to_string());
+    title.model = Some("claude-haiku-4-5".to_string());
+    title.requested_model = Some("claude-haiku-4-5".to_string());
+    title.effective_model = Some("claude-haiku-4-5".to_string());
+    title.input_tokens = Some(1_850);
+    title.cache.read_tokens = Some(0);
+    title.cache.write_tokens = Some(0);
+    title.output_tokens = Some(14);
+    close_reported_counts(&mut title.cache);
+    recent.push_back(title);
 
     let mut events = completed_request(
         now,
@@ -574,6 +602,25 @@ fn mock_state_for_tick(
     for (session_id, samples) in output_buckets {
         ledger.seed_output_history(session_id.clone(), samples);
     }
+    // Names from each source a session can have: a rename and an automatic
+    // title read from transcripts, and a title seen on the wire. The cursor
+    // session has none and runs in a worktree, so its project stands in.
+    ledger.note_transcript_names(
+        "57c7c914-ada4-4f40-9672-985f950fbb66",
+        Some("Session names in the monitor".to_string()),
+        Some("Monitor naming work".to_string()),
+    );
+    ledger.note_transcript_names(
+        "terminal-refactor",
+        None,
+        Some("Refactor the dashboard layout".to_string()),
+    );
+    ledger.note_session_title("req-complete-title", "Offline sync for the app".to_string());
+    ledger.note_project(
+        "req-active-cursor",
+        "responsive-layout-lab".to_string(),
+        Some("column-widths".to_string()),
+    );
     let mut sessions = session_summaries(&ledger);
     let idle_sessions = hide_idle_sessions(&mut sessions, now);
     apply_window_rate(&mut sessions, &active, &recent);
@@ -974,7 +1021,7 @@ fn completed_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::monitor::Throughput;
+    use crate::monitor::{SessionNameSource, Throughput};
 
     #[test]
     fn mock_state_covers_monitor_statuses_and_optional_data() {
@@ -1025,6 +1072,47 @@ mod tests {
                 .iter()
                 .any(|session| session.session_id.is_none())
         );
+    }
+
+    #[test]
+    fn mock_state_names_sessions_from_each_source() {
+        let state = mock_state();
+        let session = |id: &str| {
+            state
+                .sessions
+                .iter()
+                .find(|session| session.session_id.as_deref() == Some(id))
+                .unwrap()
+        };
+        let named = |id: &str| {
+            let name = session(id).name.as_ref().unwrap();
+            (name.text.as_str(), name.source)
+        };
+
+        assert_eq!(
+            named("57c7c914-ada4-4f40-9672-985f950fbb66"),
+            ("Session names in the monitor", SessionNameSource::Rename)
+        );
+        assert_eq!(
+            named("terminal-refactor"),
+            ("Refactor the dashboard layout", SessionNameSource::Auto)
+        );
+        assert_eq!(
+            named("mobile-client"),
+            ("Offline sync for the app", SessionNameSource::Wire)
+        );
+        let cursor = session("cursor-session");
+        assert!(cursor.name.is_none());
+        assert_eq!(cursor.display_name(), Some("responsive-layout-lab"));
+        assert_eq!(cursor.worktree.as_deref(), Some("column-widths"));
+
+        // The title request sits in its own lane under the thread that made it.
+        let titled = session("mobile-client");
+        assert!(titled.conversations.iter().any(|conversation| {
+            conversation.conversation == "main/title"
+                && conversation.parent.as_deref() == Some("main")
+                && conversation.depth == 1
+        }));
     }
 
     #[test]

@@ -281,11 +281,20 @@ start-to-start gap exceeds the lifetime of the previous request's entries
 (Anthropic `cache_creation.ephemeral_1h/5m`, else 5m; Codex 30m), `within ttl`
 otherwise. The store skips judging:
 
-- side lanes: `server::monitor_conversation_label` appends `/side` when a
-  request has no tool with `input_schema` (titles, the auto-mode classifier,
-  the isolated web search call carrying only the hosted `web_search_*` tool).
-  Without this, web search calls on the main model reset the main lane's
-  baseline and set the context size to a few thousand tokens;
+- side lanes: when a request has no tool with `input_schema`,
+  `server::monitor_conversation_label` appends the suffix of its kind
+  (`side_request_kind`, `SideKind` in `src/monitor/side.rs`), first match
+  wins: `/classifier` (the auto-mode classifier, by
+  `is_claude_auto_review_request` or its system prefix), `/title` (an
+  `output_config` JSON schema whose only property is `title`), `/search` (a
+  hosted `web_search_*` tool), `/recap` (the walked-away recap system
+  prefix), `/fetch` (no tools and a last user text ending with the WebFetch
+  lyrics sentence, the weakest marker), else `/side`. Every consumer reads
+  the kind through `split_side_conversation` / `is_side_conversation`, never
+  a literal suffix, and every kind is a side lane alike: not judged, parented
+  to its base conversation, ranked after it in the tree. Without this, web
+  search calls on the main model reset the main lane's baseline and set the
+  context size to a few thousand tokens;
 - a request that started before the lane baseline's response began
   (`readable_from`), since Anthropic entries are readable only from then;
 - a request that started before the baseline itself (it finished late; it
@@ -332,10 +341,40 @@ it again, so a row is always the sum of the records attached to it; one signed
 still counts, because a missing count arriving as a reported zero moves the
 evidence behind a total. Metadata is ordered by `(started_at, rank)` and a row
 shows the metadata of the request with the greatest order, so a late report for
-an older request cannot take a row's model or status back; a session's project
-and a conversation's parent have independent watermarks (`project_order`,
+an older request cannot take a row's model or status back; a session's project,
+worktree and wire title and a conversation's parent have independent
+watermarks (`project_order`, `worktree_order`, `wire_title_order`,
 `parent_order`) because a request states them separately from being routed. In
 `note_metadata` a `None` never erases a value already known.
+
+A session's name (`SessionRecord::name`) is, first available: the last
+`custom-title` line of its Claude Code transcript (`/rename`), the last
+`ai-title` line, then a title seen on the wire; `SessionSummary::display_name`
+falls back to the project, then the worktree, and the TUI to the session id.
+The transcript is `$CLAUDE_CONFIG_DIR` (else `~/.claude`)
+`/projects/*/<session id>.jsonl`, read by `TranscriptReader`
+(`src/monitor/naming.rs`) in a task `serve_listener` spawns when a monitor
+exists: every 5 s, on tokio's blocking pool, for the session ids the ledger
+holds (so the reader forgets a session the ledger dropped), from the offset
+after the last complete line, keeping no line over 16 KiB and parsing only
+lines that mention a title. A missing file is looked for again after a minute;
+a file that shrank is read again from the start. Names reach the ledger as
+`TranscriptNamesRead`, which only fills a session that exists and never
+erases. The wire title comes from Claude Code's session-title request (the
+`/title` kind): `UsageObserver` in the Anthropic passthrough keeps up to 4 KiB
+of the reply text, only for a request `sanitize_anthropic_request` flagged,
+and publishes `SessionTitleObserved` once the reply completed with valid
+`{"title": ...}` JSON. It reads the relayed bytes only; the relay stays
+byte-exact. The Codex route observes no title. Names live in memory only and
+the proxy logs none; a traffic capture holds the title reply only as part of
+the response it records anyway.
+
+`src/project.rs` returns a `ProjectName { project, worktree }`. On disk, a
+`.git` file whose `gitdir` sits under `<main>/.git/worktrees/` names the main
+repository as the project and the checkout's directory as the worktree (a
+submodule's `.git` file gets no worktree). A path that is not on this machine
+and contains `.claude/worktrees/<name>` names the directory before `.claude`
+as the project and `<name>` as the worktree.
 
 Requested and effective model are tracked separately. `ModelRequested` captures
 the id the client's body named, before the agent-summary and auto-review
@@ -362,9 +401,11 @@ opening, `n/a` missing, plain exact, a reported zero included), names the
 executed model on request rows and marks a routed-only one with `?`, labels a
 locally answered request `local answer` in every cell (an agent summary is
 answered locally only with `CCP_AGENT_SUMMARY=local`), shows the session root
-as `Σ <id>` with `mixed N` when the rollups name more than one model, lists the
-`models` rollups, the `unattributed` row and an `evidence` line in the session
-detail, prints the 5m/1h buckets as parts reported separately, marks a
+as `Σ <id>` with `mixed N` when the rollups name more than one model, shows
+the session's display name in the `Session` column, lists the name with its
+source spelled out (`rename`, `auto`, `wire`), the project with its worktree,
+the `models` rollups, the `unattributed` row and an `evidence` line in the
+session detail, prints the 5m/1h buckets as parts reported separately, marks a
 conversation whose `raw_parent` was never resolved with `^`, and keys the
 selection by row identity so a re-render keeps it (`(selection reset)` in the
 pane title when the row is gone). Meaning is never carried by color alone.

@@ -2,7 +2,9 @@ use crate::{
     anthropic::{MAX_ANTHROPIC_REQUEST_BYTES, json_error},
     config::AgentSummaryMode,
     logging::{Logger, REDACT_KEYS, create_logger},
-    monitor::{EndpointKind, MonitorHandle, UsageFields, UsageReport},
+    monitor::{
+        EndpointKind, MonitorHandle, SideKind, UsageFields, UsageReport, is_session_title_request,
+    },
     openai_compat::{
         MAX_OPENAI_REQUEST_BYTES, OpenAiError, OpenAiSurface,
         request::{extract_model, parse_request},
@@ -53,6 +55,12 @@ use uuid::Uuid;
 
 const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
+/// How the system prompt of Claude Code's recap of an agent left running opens.
+const CLAUDE_AGENT_RECAP_SYSTEM_PREFIX: &str =
+    "A user kicked off a Claude Code agent to do a coding task and walked away";
+/// How the prompt WebFetch sends with a fetched page ends. A weaker marker than
+/// the others: it is the tail of the instructions, not a prompt of its own.
+const CLAUDE_WEB_FETCH_PROMPT_SUFFIX: &str = "Never produce or reproduce exact song lyrics.";
 const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-5.6-luna";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,9 +85,9 @@ fn body_exceeded_limit(err: &axum::Error) -> bool {
 
 /// The conversation lane the monitor tracks prompt caching in. Subagents share
 /// the session id, so each agent gets its own lane. A request without client
-/// tools is one of Claude Code's side calls (a title, the auto-mode classifier,
-/// the isolated web search call with only the hosted search tool): it does not
-/// extend the transcript, so it goes to a side lane that is not judged for misses.
+/// tools is one of Claude Code's side calls: it does not extend the transcript,
+/// so it goes to a side lane, named for what it is for and not judged for
+/// misses.
 fn monitor_conversation_label(
     identity: &ConversationIdentity,
     body: &crate::anthropic::schema::MessagesRequest,
@@ -96,7 +104,76 @@ fn monitor_conversation_label(
     if has_client_tools {
         base.to_string()
     } else {
-        format!("{base}{}", crate::monitor::SIDE_CONVERSATION_SUFFIX)
+        format!("{base}{}", side_request_kind(body).suffix())
+    }
+}
+
+/// What a side request is for, from the first marker its body carries: the
+/// auto-mode classifier, the session title, the isolated web search call, the
+/// recap of an agent left running, WebFetch's processing of a page. Anything
+/// else is a plain side request.
+fn side_request_kind(body: &crate::anthropic::schema::MessagesRequest) -> SideKind {
+    let system = system_texts(body);
+    let system_starts_with = |prefix: &str| system.iter().any(|text| text.starts_with(prefix));
+    let tools = body.extra.get("tools").and_then(Value::as_array);
+    let has_hosted_search = tools.is_some_and(|tools| {
+        tools.iter().any(|tool| {
+            tool.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("web_search_"))
+        })
+    });
+    if is_claude_auto_review_request(body) || system_starts_with(CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX) {
+        SideKind::Classifier
+    } else if body
+        .extra
+        .get("output_config")
+        .is_some_and(is_session_title_request)
+    {
+        SideKind::Title
+    } else if has_hosted_search {
+        SideKind::Search
+    } else if system_starts_with(CLAUDE_AGENT_RECAP_SYSTEM_PREFIX) {
+        SideKind::Recap
+    } else if tools.is_none_or(|tools| tools.is_empty())
+        && last_user_text(body)
+            .is_some_and(|text| text.trim_end().ends_with(CLAUDE_WEB_FETCH_PROMPT_SUFFIX))
+    {
+        SideKind::Fetch
+    } else {
+        SideKind::Side
+    }
+}
+
+/// The texts of a request's system prompt, whether it is one string or a list
+/// of blocks.
+fn system_texts(body: &crate::anthropic::schema::MessagesRequest) -> Vec<&str> {
+    match body.extra.get("system") {
+        Some(Value::String(text)) => vec![text.as_str()],
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The text of the last user message: the whole content when it is a string,
+/// else its last text block.
+fn last_user_text(body: &crate::anthropic::schema::MessagesRequest) -> Option<&str> {
+    let message = body
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")?;
+    match &message.content {
+        Value::String(text) => Some(text.as_str()),
+        Value::Array(blocks) => blocks
+            .iter()
+            .rev()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .find_map(|block| block.get("text").and_then(Value::as_str)),
+        _ => None,
     }
 }
 
@@ -208,6 +285,9 @@ pub async fn serve_listener(
             ),
         ])),
     );
+    if let Some(monitor) = monitor.as_ref() {
+        crate::monitor::spawn_transcript_reader(monitor.clone());
+    }
     let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
@@ -1622,12 +1702,12 @@ async fn dispatch_request(
     if let (Some(monitor), Some(model)) = (state.monitor.as_ref(), body.model.as_deref()) {
         monitor.model_requested(&req_id, model);
     }
-    if let Some(project) = project::name_from_request(
+    if let Some(name) = project::name_from_request(
         body.extra.get("system"),
         body.messages.iter().rev().map(|message| &message.content),
     ) && let Some(monitor) = state.monitor.as_ref()
     {
-        monitor.project_resolved(&req_id, project);
+        monitor.project_resolved(&req_id, name.project, name.worktree);
     }
     if let Some(identity) = conversation_identity.as_ref()
         && let Some(monitor) = state.monitor.as_ref()
@@ -2547,9 +2627,10 @@ mod request_id_header_tests {
 mod auto_review_tests {
     use super::{
         apply_auto_review_model, headers_to_record, is_claude_auto_review_request,
-        monitor_conversation_label,
+        monitor_conversation_label, side_request_kind,
     };
     use crate::anthropic::schema::MessagesRequest;
+    use crate::monitor::SideKind;
     use crate::request_identity::{
         CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, ConversationIdentity,
     };
@@ -2570,12 +2651,103 @@ mod auto_review_tests {
             true,
             json!([{"type": "web_search_20250305", "name": "web_search"}]),
         );
-        let title = request("You are Claude Code.", false, json!([]));
+        let plain = request("You are Claude Code.", false, json!([]));
 
         assert_eq!(monitor_conversation_label(&main, &turn), "main");
         assert_eq!(monitor_conversation_label(&agent, &turn), "agent-7");
-        assert_eq!(monitor_conversation_label(&main, &web_search), "main/side");
-        assert_eq!(monitor_conversation_label(&agent, &title), "agent-7/side");
+        assert_eq!(
+            monitor_conversation_label(&main, &web_search),
+            "main/search"
+        );
+        assert_eq!(monitor_conversation_label(&agent, &plain), "agent-7/side");
+        assert_eq!(
+            monitor_conversation_label(&agent, &body(title_body())),
+            "agent-7/title"
+        );
+    }
+
+    fn body(value: serde_json::Value) -> MessagesRequest {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn title_body() -> serde_json::Value {
+        json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 512,
+            "stream": true,
+            "system": [{"type": "text", "text": "Name this coding session."}],
+            "messages": [{"role": "user", "content": "fix the flaky test"}],
+            "tools": [],
+            "output_config": {"format": {"type": "json_schema", "schema": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}},
+                "required": ["title"],
+                "additionalProperties": false
+            }}}
+        })
+    }
+
+    #[test]
+    fn side_requests_are_labelled_by_the_first_marker_they_carry() {
+        let classifier = request(
+            "You are a security monitor for autonomous AI coding agents.\n\n## Context",
+            false,
+            json!([]),
+        );
+        assert_eq!(side_request_kind(&classifier), SideKind::Classifier);
+        // The prefix alone marks it, streamed or not.
+        let streamed_classifier = request(
+            "You are a security monitor for autonomous AI coding agents.",
+            true,
+            json!([]),
+        );
+        assert_eq!(
+            side_request_kind(&streamed_classifier),
+            SideKind::Classifier
+        );
+
+        assert_eq!(side_request_kind(&body(title_body())), SideKind::Title);
+        let mut title_with_classifier = title_body();
+        title_with_classifier["system"] =
+            json!("You are a security monitor for autonomous AI coding agents.");
+        assert_eq!(
+            side_request_kind(&body(title_with_classifier)),
+            SideKind::Classifier
+        );
+
+        let search = request(
+            "You are Claude Code.",
+            true,
+            json!([{"type": "web_search_20250305", "name": "web_search"}]),
+        );
+        assert_eq!(side_request_kind(&search), SideKind::Search);
+
+        let recap = request(
+            "A user kicked off a Claude Code agent to do a coding task and walked away. Summarize.",
+            false,
+            json!([]),
+        );
+        assert_eq!(side_request_kind(&recap), SideKind::Recap);
+
+        let fetch = json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 1024,
+            "stream": true,
+            "system": [{"type": "text", "text": "You are Claude Code."}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Web page content:\n---\n...\n---\nAnswer briefly. Never produce or reproduce exact song lyrics.\n"}
+            ]}]
+        });
+        assert_eq!(side_request_kind(&body(fetch.clone())), SideKind::Fetch);
+        let mut fetch_with_tool = fetch.clone();
+        fetch_with_tool["tools"] = json!([{"type": "text_editor_20250728", "name": "edit"}]);
+        assert_eq!(side_request_kind(&body(fetch_with_tool)), SideKind::Side);
+        let mut other_prompt = fetch;
+        other_prompt["messages"] = json!([{"role": "user", "content": "Summarize this page."}]);
+        assert_eq!(side_request_kind(&body(other_prompt)), SideKind::Side);
+
+        let plain = request("You are Claude Code.", false, json!([]));
+        assert_eq!(side_request_kind(&plain), SideKind::Side);
     }
 
     fn request(system: &str, stream: bool, tools: serde_json::Value) -> MessagesRequest {

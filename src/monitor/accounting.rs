@@ -30,6 +30,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use super::naming::{SessionName, SessionNameSource};
 use super::usage::{
     CacheMiss, CacheMissCause, CacheWriteQuality, QualityFields, UsageDelta, UsageQuality,
     UsageReport, add_signed, caches_implicitly,
@@ -313,6 +314,11 @@ pub(crate) struct RequestRecord {
     pub conversation: Option<String>,
     pub conversation_parent: Option<String>,
     pub project: Option<String>,
+    /// The worktree the request's working directory sits in, when it names one.
+    pub worktree: Option<String>,
+    /// The session title the reply to this request carried, when it was
+    /// Claude Code's request for one.
+    pub session_title: Option<String>,
     pub provider: Option<String>,
     /// The routed model, and the wire model appended once a producer named it:
     /// what the visible row shows. No total is keyed on it.
@@ -356,6 +362,8 @@ impl RequestRecord {
             conversation: None,
             conversation_parent: None,
             project: None,
+            worktree: None,
+            session_title: None,
             provider: None,
             model: None,
             requested_model: None,
@@ -492,6 +500,18 @@ pub(crate) struct SessionRecord {
     /// named after another request moved the row on would be dropped although
     /// a request of the session knows it.
     project_order: Option<RequestOrder>,
+    /// The worktree, ordered on its own like the project.
+    pub worktree: Option<String>,
+    worktree_order: Option<RequestOrder>,
+    /// The names Claude Code wrote into the session's transcript on this
+    /// machine: the one `/rename` set and its own title. They belong to the
+    /// session rather than to a request, and are set by the transcript reader.
+    pub renamed: Option<String>,
+    pub auto_title: Option<String>,
+    /// The title read off the reply to Claude Code's request for one, from the
+    /// newest request that brought one.
+    pub wire_title: Option<String>,
+    wire_title_order: Option<RequestOrder>,
     pub counts: RowCounts,
     /// Requests of the session that named no conversation of their own. They
     /// are counted here rather than derived from what the rows do not explain.
@@ -580,6 +600,12 @@ impl SessionRecord {
             last_status: None,
             metadata_order: None,
             project_order: None,
+            worktree: None,
+            worktree_order: None,
+            renamed: None,
+            auto_title: None,
+            wire_title: None,
+            wire_title_order: None,
             counts: RowCounts::default(),
             unattributed: RowCounts::default(),
             cache: SessionCacheStats::default(),
@@ -589,6 +615,18 @@ impl SessionRecord {
             models: HashMap::new(),
             next_model_rank: 0,
         }
+    }
+
+    /// The session's name from the first source that has one: `/rename`, then
+    /// the transcript's title, then the title seen on the wire.
+    pub(crate) fn name(&self) -> Option<SessionName> {
+        [
+            (&self.renamed, SessionNameSource::Rename),
+            (&self.auto_title, SessionNameSource::Auto),
+            (&self.wire_title, SessionNameSource::Wire),
+        ]
+        .into_iter()
+        .find_map(|(text, source)| text.clone().map(|text| SessionName { text, source }))
     }
 
     /// The figures of the requests that named no conversation.
@@ -635,12 +673,22 @@ impl SessionRecord {
     /// The project is the exception, and has an order of its own: it is the one
     /// field the request states separately from being routed, so it is the
     /// newest request that named a project that wins, not the newest request.
+    /// The worktree and the title seen on the wire are stated separately too,
+    /// and are ordered the same way.
     fn note_metadata(&mut self, record: &RequestRecord) {
         self.last_seen = self.last_seen.max(record.seen_at());
         self.first_seen = self.first_seen.min(record.started_at);
         if record.project.is_some() && newest_in_row(self.project_order, record) {
             self.project_order = Some(record.order());
             self.project = record.project.clone();
+        }
+        if record.worktree.is_some() && newest_in_row(self.worktree_order, record) {
+            self.worktree_order = Some(record.order());
+            self.worktree = record.worktree.clone();
+        }
+        if record.session_title.is_some() && newest_in_row(self.wire_title_order, record) {
+            self.wire_title_order = Some(record.order());
+            self.wire_title = record.session_title.clone();
         }
         if !newest_in_row(self.metadata_order, record) {
             return;
@@ -937,8 +985,50 @@ impl Ledger {
             .map(|row| &mut row.cache)
     }
 
-    pub(crate) fn note_project(&mut self, request_id: &str, project: String) {
-        self.update(request_id, |record| record.project = Some(project));
+    pub(crate) fn note_project(
+        &mut self,
+        request_id: &str,
+        project: String,
+        worktree: Option<String>,
+    ) {
+        self.update(request_id, |record| {
+            record.project = Some(project);
+            if worktree.is_some() {
+                record.worktree = worktree;
+            }
+        });
+    }
+
+    /// The session title the reply to a request carried.
+    pub(crate) fn note_session_title(&mut self, request_id: &str, title: String) {
+        self.update(request_id, |record| record.session_title = Some(title));
+    }
+
+    /// The names a session's transcript holds. They belong to the session, so
+    /// no request is detached for them; a session already dropped, or not yet
+    /// seen, takes nothing. A name the transcript did not state leaves the
+    /// known one in place.
+    pub(crate) fn note_transcript_names(
+        &mut self,
+        session_id: &str,
+        renamed: Option<String>,
+        auto_title: Option<String>,
+    ) {
+        let Some(session) = self.sessions.get_mut(&Some(session_id.to_string())) else {
+            return;
+        };
+        if renamed.is_some() {
+            session.renamed = renamed;
+        }
+        if auto_title.is_some() {
+            session.auto_title = auto_title;
+        }
+    }
+
+    /// The ids of the sessions held, for the reader that names them from their
+    /// transcripts.
+    pub(crate) fn session_ids(&self) -> Vec<String> {
+        self.sessions.keys().flatten().cloned().collect()
     }
 
     /// The provider and model a request was routed to.

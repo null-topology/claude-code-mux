@@ -492,11 +492,28 @@ column that disappeared is a width effect, not a missing value.
 
 ### Columns and marks
 
-Sessions: `A/R/F` (active, total, failed requests), `Project`, `Provider`,
+Sessions: `A/R/F` (active, total, failed requests), `Session`, `Provider`,
 `Model`, `Effort`, `Ctx`, `Hit`, `Miss`, `In`, `Out`, `Rate` (output tokens per
 second during generation), a tokens-per-10-seconds sparkline, and `Status`.
-`Project` is derived from the working directory Claude Code states in its
-system prompt.
+`Session` is the session's name, the first of these that is known:
+
+1. the name given with `/rename`, read from the session's Claude Code
+   transcript (the latest rename wins);
+2. the title Claude Code generated for the session, from the same transcript;
+3. the title Claude Code asked a model for, read from that reply on the
+   Anthropic route, which names a session whose transcript is not on this
+   machine;
+4. the project, derived from the working directory Claude Code states in its
+   system prompt;
+5. the worktree, then the session id.
+
+Transcripts are looked for under `$CLAUDE_CONFIG_DIR/projects`, else
+`~/.claude/projects`, a few seconds after a session appears, and read in the
+background from where the previous read stopped. Names stay in memory and are
+not written to the log. The session detail spells out where the name came from (`rename`,
+`auto`, `wire`) and shows the project with its worktree: a checkout under
+`.claude/worktrees/<name>` or a git worktree names its main repository as the
+project and the checkout as the worktree.
 
 Recent requests: `Finished`, `Code` (the HTTP status the client got),
 `Project`, `Session`, `Provider`, `Model`, `Endpoint`, `Latency`, `Rate`,
@@ -527,7 +544,7 @@ Marks that carry meaning:
 | `Σ` | Sessions | the session as a whole, above its conversations |
 | `main thread` | Sessions | the session's own conversation, the one with no agent id |
 | `^` | Sessions | a conversation whose named parent this session never saw |
-| `/side` | conversation labels | a side call: a request carrying no client tool with an `input_schema` (session titles, the auto-mode classifier, the isolated web-search call) |
+| `/classifier`, `/title`, `/search`, `/recap`, `/fetch`, `/side` | conversation labels | a side call, a request carrying no client tool with an `input_schema`, by kind: the auto-mode classifier, the session-title request, the isolated web-search call, the recap of a subagent left running, a WebFetch summary, anything else |
 | `mixed N` | Sessions | the session ran N different backends or models, rather than the last one |
 | `[Events]`, `[Stats]` | bottom pane title | the tab the pane is showing |
 | `(rec)` | Stats headers | a median over the recent-request window, not a lifetime figure |
