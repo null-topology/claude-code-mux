@@ -63,17 +63,25 @@
   the value `session_id` had (the session id for a main thread, the derived
   id for a subagent), on HTTP and on the WebSocket handshake alike. Within a
   turn the proxy also sends back the first `x-codex-turn-state` value the
-  backend returned in that turn: as a request header over HTTP and inside
-  `client_metadata` of `response.create` over WebSocket. A request whose last
-  user message holds a tool result continues the turn; any other request
-  starts a new one and sends no value. A request without a Claude Code
-  session header, a title request and a subagent progress label take no
-  part, and the value lives in memory only, so a restart forgets it.
-  `prompt_cache_key`, `x-client-request-id`, `x-codex-window-id` and the
-  request body are unchanged. `codex_upstream_request_started` in
-  `proxy.log` gains `newTurn` and `turnStateSent`; the value itself is never
-  logged. There is no setting for this: to send the old `session_id` header
-  and no turn state, stay on 0.13.0.
+  backend returned in that turn. Over HTTP it goes out as a request header
+  and the request body is unchanged. Over WebSocket, `response.create`
+  messages gain a `client_metadata` object holding the `x-codex-turn-state`
+  key when a value is stored; the handshake carries none. The value is taken
+  from the HTTP response header or from a stream event of type
+  `response.metadata` or `codex.response.metadata`, never from another event
+  type or the WebSocket handshake response. A request continues the turn
+  when its last user message holds a tool result and otherwise only tool
+  results and reminder text; any other request, a prompt typed after an
+  interrupt included, starts a new one and sends no value. A request without
+  a Claude Code session header, a title request and a subagent progress
+  label take no part. The store is process-local: it lives in memory, a
+  restart clears it, and a conversation's value is dropped after 30 minutes
+  with no activity on it. `prompt_cache_key`, `x-client-request-id` and
+  `x-codex-window-id` are unchanged. `codex_upstream_request_started` in
+  `proxy.log` gains `newTurn` and `turnStateSent`, never the value itself;
+  opt-in traffic captures (`CCP_TRAFFIC_LOG=1`) can contain it. There is no
+  setting for this: to send the old `session_id` header and no turn state,
+  stay on 0.13.0.
 
 ## v0.13.0 (2026-09-27)
 

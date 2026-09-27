@@ -1,17 +1,24 @@
 //! Echoing the Codex `x-codex-turn-state` token within a turn.
 //!
-//! A Codex response may carry an opaque `x-codex-turn-state` value: as an HTTP
-//! response header, on the WebSocket handshake response, or in the `headers`
-//! of a stream event. The Codex CLI keeps the first value of a turn and sends
-//! it back on every later request of that same turn, as a request header over
-//! HTTP and inside `client_metadata` of `response.create` over WebSocket. It
-//! never carries a value into the next turn. This module does the same, per
-//! conversation.
+//! The echo goes where the Codex CLI puts it: a request header over HTTP and a
+//! key of `client_metadata` in `response.create` over WebSocket. The value is
+//! the first one a turn receives, from the `x-codex-turn-state` header of an
+//! HTTP response or from the `headers` object of a stream event whose type is
+//! `response.metadata` or `codex.response.metadata`. The CLI reads only
+//! `response.metadata`; Codex WebSocket streams carry the value in
+//! `codex.response.metadata`, so reading that type as well goes beyond the
+//! CLI. Events of any other type, `error` included, are never read, and
+//! neither is the WebSocket handshake response.
 //!
-//! The turn comes from Claude Code's history: a request whose last user
-//! message holds a `tool_result` continues the turn in progress, and any other
-//! request starts a new one. Claude Code puts reminder text next to tool
-//! results, so text alone does not mark a boundary.
+//! The turn comes from Claude Code's history. A request continues the turn in
+//! progress when its last user message holds a `tool_result` and every other
+//! block in it is a `tool_result` or reminder text (a text block whose trimmed
+//! text starts with `<system-reminder>`, which Claude Code puts next to tool
+//! results). Any
+//! other request starts a new turn, which drops the stored value before the
+//! request is sent: a prompt typed after an interrupt, or feedback sent next
+//! to a tool result, starts one. Misjudging toward a new turn only loses the
+//! echo. A value is never carried into the next turn.
 //!
 //! Only a conversation's own turns take part. A request with no conversation
 //! identity, a side request without client tools (a title, a search call) and
@@ -20,7 +27,6 @@
 //! one slot per conversation, and a restart clears it.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::Value;
@@ -30,9 +36,18 @@ use crate::request_identity::ConversationIdentity;
 
 pub(crate) const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
-/// A slot left alone this long belongs to a conversation that has ended; it
-/// matches how long continuation state is kept.
+/// The stream events whose `headers` are read.
+const METADATA_EVENT_TYPES: [&str; 2] = ["response.metadata", "codex.response.metadata"];
+
+/// A slot expires after this long with no tracked activity: a request planned
+/// on it, a value stored in it or a value sent from it. Idle time does not
+/// prove that the turn ended; it only bounds how long a slot is kept. A turn
+/// that waits longer than this, or a single request that runs longer than this
+/// after its last tracked activity, loses its value, and its later requests go
+/// out without one. The bound is the one continuation state uses.
 const IDLE_MS: u64 = 30 * 60 * 1000;
+
+const REMINDER_PREFIX: &str = "<system-reminder>";
 
 #[derive(Debug, Default)]
 struct Slot {
@@ -45,16 +60,11 @@ struct Slot {
     /// The value that request sends, fixed when it took the slot so every
     /// resend of the request carries the same one.
     outgoing: Option<String>,
+    /// The last tracked activity on the slot.
     touched_at: u64,
 }
 
 static SLOTS: OnceLock<Mutex<HashMap<ConversationIdentity, Slot>>> = OnceLock::new();
-
-tokio::task_local! {
-    /// The request a WebSocket connect runs for, so the handshake response can
-    /// be read without threading the request through the connect helpers.
-    static HANDSHAKE_REQUEST: String;
-}
 
 fn slots() -> &'static Mutex<HashMap<ConversationIdentity, Slot>> {
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -67,6 +77,12 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// Whether `slot` has had no tracked activity for longer than `IDLE_MS` at
+/// `now`.
+fn expired(slot: &Slot, now: u64) -> bool {
+    now.saturating_sub(slot.touched_at) > IDLE_MS
+}
+
 /// What a request was planned with, for the request log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TurnStatePlan {
@@ -74,8 +90,9 @@ pub(crate) struct TurnStatePlan {
     pub(crate) sent: bool,
 }
 
-/// Whether `body` starts a new turn: its last user message holds no
-/// `tool_result` block.
+/// Whether `body` starts a new turn. It continues the turn in progress only
+/// when its last user message holds at least one `tool_result` and every other
+/// block in it is a `tool_result` or reminder text.
 pub(crate) fn starts_new_turn(body: &MessagesRequest) -> bool {
     let Some(last_user) = body
         .messages
@@ -85,11 +102,25 @@ pub(crate) fn starts_new_turn(body: &MessagesRequest) -> bool {
     else {
         return true;
     };
-    !last_user.content.as_array().is_some_and(|blocks| {
-        blocks
-            .iter()
-            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-    })
+    let Some(blocks) = last_user.content.as_array() else {
+        return true;
+    };
+    let mut has_tool_result = false;
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_result") => has_tool_result = true,
+            Some("text") if is_reminder_text(block) => {}
+            _ => return true,
+        }
+    }
+    !has_tool_result
+}
+
+fn is_reminder_text(block: &Value) -> bool {
+    block
+        .get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| text.trim().starts_with(REMINDER_PREFIX))
 }
 
 fn takes_part(body: &MessagesRequest) -> bool {
@@ -116,7 +147,7 @@ pub(crate) fn plan_request(
         return plan;
     };
     let now = now_ms();
-    slots.retain(|_, slot| now.saturating_sub(slot.touched_at) <= IDLE_MS);
+    slots.retain(|_, slot| !expired(slot, now));
     let slot = slots.entry(identity.clone()).or_default();
     if new_turn {
         slot.value = None;
@@ -129,18 +160,17 @@ pub(crate) fn plan_request(
 }
 
 /// The value `req_id` sends, if it is the current request of a turn that has
-/// stored one.
+/// stored one. Sending counts as activity on the slot.
 pub(crate) fn outgoing(req_id: &str) -> Option<String> {
-    let slots = slots().lock().ok()?;
-    slots
-        .values()
-        .find(|slot| slot.req_id == req_id)?
-        .outgoing
-        .clone()
+    let mut slots = slots().lock().ok()?;
+    let slot = slots.values_mut().find(|slot| slot.req_id == req_id)?;
+    let value = slot.outgoing.clone()?;
+    slot.touched_at = now_ms();
+    Some(value)
 }
 
 /// Keep `value` for the turn `req_id` is the current request of, unless the
-/// turn already has one.
+/// turn already has one. Storing it counts as activity on the slot.
 fn capture(req_id: &str, value: Option<&str>) {
     let Some(value) = value.filter(|value| http::HeaderValue::from_str(value).is_ok()) else {
         return;
@@ -152,6 +182,7 @@ fn capture(req_id: &str, value: Option<&str>) {
         && slot.value.is_none()
     {
         slot.value = Some(value.to_string());
+        slot.touched_at = now_ms();
     }
 }
 
@@ -164,8 +195,16 @@ pub(crate) fn observe_response_headers(req_id: &str, headers: &[(String, String)
     capture(req_id, value);
 }
 
-/// Read the value from the `headers` object of a stream event.
+/// Read the value from the `headers` object of a metadata stream event. Any
+/// other event is ignored, whatever `headers` it carries.
 pub(crate) fn observe_event(req_id: &str, payload: &Value) {
+    let is_metadata = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| METADATA_EVENT_TYPES.contains(&kind));
+    if !is_metadata {
+        return;
+    }
     let value = payload
         .get("headers")
         .and_then(Value::as_object)
@@ -182,28 +221,13 @@ pub(crate) fn observe_event(req_id: &str, payload: &Value) {
 }
 
 /// Read the value from a buffered response: its headers first, then its
-/// events in order.
+/// metadata events in order.
 pub(crate) fn observe_buffered_response(req_id: &str, headers: &[(String, String)], body: &[u8]) {
     observe_response_headers(req_id, headers);
     for event in crate::anthropic::sse::parse_sse_events(body) {
         if let Ok(payload) = serde_json::from_str::<Value>(&event.data) {
             observe_event(req_id, &payload);
         }
-    }
-}
-
-/// Run a WebSocket connect for `req_id`, so its handshake response is read.
-pub(crate) async fn connect_for_request<F: Future>(req_id: &str, connect: F) -> F::Output {
-    HANDSHAKE_REQUEST.scope(req_id.to_string(), connect).await
-}
-
-/// Read the value from a WebSocket handshake response.
-pub(crate) fn observe_handshake(headers: &http::HeaderMap) {
-    let value = headers
-        .get(TURN_STATE_HEADER)
-        .and_then(|value| value.to_str().ok());
-    if value.is_some() {
-        let _ = HANDSHAKE_REQUEST.try_with(|req_id| capture(req_id, value));
     }
 }
 
@@ -267,8 +291,32 @@ mod tests {
         ]))
     }
 
+    /// A request whose last user message holds `blocks`.
+    fn last_user_blocks(blocks: Value) -> MessagesRequest {
+        request(json!([
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "read_chunk", "input": {}}
+            ]},
+            {"role": "user", "content": blocks}
+        ]))
+    }
+
     fn header(value: &str) -> Vec<(String, String)> {
         vec![("X-Codex-Turn-State".to_string(), value.to_string())]
+    }
+
+    fn metadata_event(kind: &str, value: &str) -> Value {
+        json!({"type": kind, "headers": {"x-codex-turn-state": value}})
+    }
+
+    /// Move the slot's last activity `by_ms` into the past and return the new
+    /// time.
+    fn shift_touched_at(identity: &ConversationIdentity, by_ms: u64) -> u64 {
+        let mut slots = slots().lock().unwrap();
+        let slot = slots.get_mut(identity).unwrap();
+        slot.touched_at -= by_ms;
+        slot.touched_at
     }
 
     #[test]
@@ -297,6 +345,41 @@ mod tests {
     }
 
     #[test]
+    fn anything_but_reminders_next_to_a_tool_result_starts_a_new_turn() {
+        let tool_result = json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": "[Request interrupted by user for tool use]"
+        });
+        // A prompt typed after an interrupt arrives next to the tool result.
+        assert!(starts_new_turn(&last_user_blocks(json!([
+            tool_result.clone(),
+            {"type": "text", "text": "stop and look at the tests instead"}
+        ]))));
+        // Reminder text only counts when it opens the block.
+        assert!(starts_new_turn(&last_user_blocks(json!([
+            tool_result.clone(),
+            {"type": "text", "text": "wait\n<system-reminder>note</system-reminder>"}
+        ]))));
+        assert!(starts_new_turn(&last_user_blocks(json!([
+            tool_result.clone(),
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}}
+        ]))));
+        // Reminders alone are not a tool round trip.
+        assert!(starts_new_turn(&last_user_blocks(json!([
+            {"type": "text", "text": "<system-reminder>note</system-reminder>"}
+        ]))));
+        // Several tool results with reminders around them, leading whitespace
+        // included, continue the turn.
+        assert!(!starts_new_turn(&last_user_blocks(json!([
+            {"type": "text", "text": "\n  <system-reminder>before</system-reminder>"},
+            tool_result.clone(),
+            {"type": "tool_result", "tool_use_id": "toolu_2", "content": "chunk"},
+            {"type": "text", "text": "<system-reminder>after</system-reminder>\n"}
+        ]))));
+    }
+
+    #[test]
     fn the_first_value_of_a_turn_wins_and_is_echoed_within_it() {
         let identity = identity();
         let first = plan_request("ts-first", Some(&identity), &new_turn_request());
@@ -311,7 +394,7 @@ mod tests {
         observe_response_headers("ts-first", &header("token-a"));
         observe_event(
             "ts-first",
-            &json!({"type": "codex.response.metadata", "headers": {"x-codex-turn-state": "token-b"}}),
+            &metadata_event("codex.response.metadata", "token-b"),
         );
 
         let second = plan_request("ts-second", Some(&identity), &continuing_request());
@@ -331,6 +414,99 @@ mod tests {
     }
 
     #[test]
+    fn both_metadata_event_types_carry_the_value() {
+        for kind in ["response.metadata", "codex.response.metadata"] {
+            let identity = identity();
+            let (first, second) = (format!("{kind}-1"), format!("{kind}-2"));
+            plan_request(&first, Some(&identity), &new_turn_request());
+            observe_event(&first, &metadata_event(kind, kind));
+            plan_request(&second, Some(&identity), &continuing_request());
+            assert_eq!(outgoing(&second).as_deref(), Some(kind), "type {kind}");
+        }
+    }
+
+    #[test]
+    fn other_events_never_carry_the_value() {
+        let identity = identity();
+        plan_request("other-1", Some(&identity), &new_turn_request());
+        observe_event(
+            "other-1",
+            &json!({
+                "type": "error",
+                "error": {"type": "server_error", "message": "boom"},
+                "headers": {"x-codex-turn-state": "from-error"}
+            }),
+        );
+        for kind in [
+            "response.created",
+            "codex.rate_limits",
+            "response.completed",
+        ] {
+            observe_event("other-1", &metadata_event(kind, kind));
+        }
+        observe_event(
+            "other-1",
+            &json!({"headers": {"x-codex-turn-state": "untyped"}}),
+        );
+        plan_request("other-2", Some(&identity), &continuing_request());
+        assert_eq!(outgoing("other-2"), None);
+
+        // The slot is still open to the metadata event that follows.
+        observe_event(
+            "other-2",
+            &metadata_event("response.metadata", "from-metadata"),
+        );
+        plan_request("other-3", Some(&identity), &continuing_request());
+        assert_eq!(outgoing("other-3").as_deref(), Some("from-metadata"));
+    }
+
+    #[test]
+    fn storing_or_sending_a_value_keeps_the_slot_past_the_plan_time_window() {
+        // Each slot's planning is moved 20 minutes back, still inside the
+        // window, so pruning by a test running alongside cannot drop it.
+        const EARLIER: u64 = 20 * 60 * 1000;
+
+        let filled = identity();
+        plan_request("keep-fill-1", Some(&filled), &new_turn_request());
+        let filled_planned_at = shift_touched_at(&filled, EARLIER);
+        observe_response_headers("keep-fill-1", &header("filled"));
+
+        let sent = identity();
+        plan_request("keep-send-1", Some(&sent), &new_turn_request());
+        observe_response_headers("keep-send-1", &header("sent"));
+        plan_request("keep-send-2", Some(&sent), &continuing_request());
+        let sent_planned_at = shift_touched_at(&sent, EARLIER);
+        assert_eq!(outgoing("keep-send-2").as_deref(), Some("sent"));
+
+        let untouched = identity();
+        plan_request("keep-idle-1", Some(&untouched), &new_turn_request());
+        let untouched_planned_at = shift_touched_at(&untouched, EARLIER);
+        // A value the slot already holds is not stored again.
+        let refilled = identity();
+        plan_request("keep-refill-1", Some(&refilled), &new_turn_request());
+        observe_response_headers("keep-refill-1", &header("first"));
+        plan_request("keep-refill-2", Some(&refilled), &new_turn_request());
+        observe_response_headers("keep-refill-2", &header("second"));
+        let refilled_planned_at = shift_touched_at(&refilled, EARLIER);
+        observe_response_headers("keep-refill-2", &header("third"));
+
+        // Just past the window that opened when each request was planned, the
+        // pruning `plan_request` runs keeps the slots with later activity.
+        let slots = slots().lock().unwrap();
+        assert!(!expired(&slots[&filled], filled_planned_at + IDLE_MS + 1));
+        assert!(!expired(&slots[&sent], sent_planned_at + IDLE_MS + 1));
+        assert!(expired(
+            &slots[&untouched],
+            untouched_planned_at + IDLE_MS + 1
+        ));
+        assert!(expired(
+            &slots[&refilled],
+            refilled_planned_at + IDLE_MS + 1
+        ));
+        assert!(!expired(&slots[&untouched], untouched_planned_at + IDLE_MS));
+    }
+
+    #[test]
     fn a_new_turn_never_sends_the_previous_turns_value() {
         let identity = identity();
         plan_request("nt-1", Some(&identity), &new_turn_request());
@@ -343,7 +519,7 @@ mod tests {
         assert_eq!(outgoing("nt-3"), None);
         observe_event(
             "nt-3",
-            &json!({"type": "codex.response.metadata", "headers": {"x-codex-turn-state": "turn-two"}}),
+            &metadata_event("codex.response.metadata", "turn-two"),
         );
         plan_request("nt-4", Some(&identity), &continuing_request());
         assert_eq!(outgoing("nt-4").as_deref(), Some("turn-two"));
@@ -394,33 +570,17 @@ mod tests {
     }
 
     #[test]
-    fn buffered_responses_are_read_headers_first_then_events() {
+    fn buffered_responses_are_read_headers_first_then_metadata_events() {
         let identity = identity();
         plan_request("buffered-1", Some(&identity), &new_turn_request());
         let body = concat!(
+            "data: {\"type\":\"error\",\"headers\":{\"x-codex-turn-state\":\"from-error\"}}\n\n",
             "data: {\"type\":\"codex.response.metadata\",\"headers\":{\"x-codex-turn-state\":\"from-event\"}}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
         );
         observe_buffered_response("buffered-1", &[], body.as_bytes());
         plan_request("buffered-2", Some(&identity), &continuing_request());
         assert_eq!(outgoing("buffered-2").as_deref(), Some("from-event"));
-    }
-
-    #[tokio::test]
-    async fn the_handshake_response_is_read_for_the_request_that_connects() {
-        let identity = identity();
-        plan_request("handshake-1", Some(&identity), &new_turn_request());
-        let mut headers = http::HeaderMap::new();
-        headers.insert(TURN_STATE_HEADER, "from-handshake".parse().unwrap());
-        // Outside a connect scope there is no request to read it for.
-        observe_handshake(&headers);
-        plan_request("handshake-probe", Some(&identity), &continuing_request());
-        assert_eq!(outgoing("handshake-probe"), None);
-
-        plan_request("handshake-2", Some(&identity), &new_turn_request());
-        connect_for_request("handshake-2", async { observe_handshake(&headers) }).await;
-        plan_request("handshake-3", Some(&identity), &continuing_request());
-        assert_eq!(outgoing("handshake-3").as_deref(), Some("from-handshake"));
     }
 
     #[test]

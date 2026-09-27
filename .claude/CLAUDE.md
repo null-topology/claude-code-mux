@@ -469,42 +469,61 @@ the header says so. Rows sort by prompt tokens descending.
 Deferred and non-blocking: `RequestRecord::model_key` and the requested-model
 histogram allocate `String`s on every ledger update.
 
-What the Codex backend keys its prompt cache on is the request's
-`prompt_cache_key` plus the session header, and the proxy sends
-`ConversationIdentity::cache_scope()` in both: the session id for a main
-thread, a uuid v5 of session plus agent id for a subagent. Claude Code gives a
-subagent its parent's session id, so without this every subagent shared the
-main thread's key and its routing bucket, and OpenAI documents overflow routing
-above about 15 requests per minute on one key. `build_codex_headers` takes the
-scope from the translated body's `prompt_cache_key`, so every transport and
-retry path sends the same value; a request routed without a conversation
-identity (the auto-review classifier) falls back to the session id. The session
-header goes out as `session-id` plus `thread-id` with the same value, the
-spelling of the Codex CLI (`codex-rs/codex-api/src/requests/headers.rs:8-11` at
-rust-v0.157.1); 0.13.0 and earlier sent one `session_id` header instead.
+The proxy sends `ConversationIdentity::cache_scope()` as the request's
+`prompt_cache_key` and in the `session-id` and `thread-id` headers: the session
+id for a main thread, a uuid v5 of session plus agent id for a subagent. Claude
+Code gives a subagent its parent's session id, so without this every subagent
+shared the main thread's key and its routing bucket, and OpenAI documents
+overflow routing above about 15 requests per minute on one key.
+`build_codex_headers` takes the scope from the translated body's
+`prompt_cache_key`, so every transport and retry path sends the same value; a
+request routed without a conversation identity (the auto-review classifier)
+falls back to the session id. `session-id` plus `thread-id` with the same value
+is the Codex CLI's spelling (`codex-rs/codex-api/src/requests/headers.rs:8-11`
+at rust-v0.157.1); 0.13.0 and earlier sent one `session_id` header instead.
+Whether the backend's cache affinity follows these spellings as it follows
+`session_id` has not been established.
 
-Turn state (`providers/codex/turn_state.rs`) follows the Codex CLI, which keeps
-the first `x-codex-turn-state` value of a turn in a per-turn `OnceLock` and
-sends it on every later request of that turn, never across turns
-(`codex-rs/core/src/client.rs:270-298` at rust-v0.157.1): as an HTTP header
-(`build_responses_headers`, :2224-2242) and on WebSocket as a key of
-`response.create`'s `client_metadata` (:1903-1910). The proxy keeps one slot
-per `ConversationIdentity`, in memory, pruned after 30 min idle. A request
-whose last user message holds a `tool_result` continues the turn; any other
-starts one and clears the slot before it is sent (`starts_new_turn`; "has
-text" is no boundary, since Claude Code puts reminders next to tool results).
-A request with no conversation identity, no client tool with `input_schema`
-(titles and other side requests) or the progress-label marker takes no part.
-The first value wins, from the HTTP response header, the WebSocket handshake
-response or `headers["x-codex-turn-state"]` in any event JSON
-(`codex.response.metadata` carries it). The CLI reads the HTTP header and
-events of type `response.metadata` (`codex-rs/codex-api/src/sse/responses.rs`
-64-70 and 219-226), and its core passes no turn state to the handshake
-(`codex-rs/core/src/client.rs:1234`). Only
-the request the slot was planned for (`req_id`) fills or sends it, so a late
-reply of an earlier request cannot. The echo is added to the outgoing JSON
-after `build_websocket_request`, never to `ResponsesRequest::client_metadata`,
-whose presence marks the Lite lane, and never to the handshake.
+Turn state (`providers/codex/turn_state.rs`) uses the Codex CLI's transport
+locations. The CLI keeps the first `x-codex-turn-state` value of a turn in a
+per-turn `OnceLock` and sends it on every later request of that turn, never
+across turns (`codex-rs/core/src/client.rs:270-298` at rust-v0.157.1): as an
+HTTP header (`build_responses_headers`, :2224-2242) and on WebSocket as a key
+of `response.create`'s `client_metadata` (:1903-1910). The proxy keeps one slot
+per `ConversationIdentity`, in memory, and fills it with the first value of the
+turn from one of two sources:
+
+- the HTTP response header;
+- `headers["x-codex-turn-state"]` of a stream event whose `type` is exactly
+  `response.metadata` or `codex.response.metadata`. Any other event, `error`
+  included, is ignored even when it carries `headers`. The CLI reads only
+  `response.metadata` (`codex-rs/codex-api/src/sse/responses.rs` 64-70 for
+  the header, 219-227 for the event) and uses `codex.response.metadata` only
+  for `x-models-etag`
+  (`codex-rs/codex-api/src/endpoint/responses_websocket.rs:745-763`). Codex
+  WebSocket streams carry the value in `codex.response.metadata`, so reading
+  it there goes beyond the CLI.
+
+The WebSocket handshake response is not read, as the CLI's core passes no turn
+state to the handshake (`codex-rs/core/src/client.rs:1234` and :1301), and the
+handshake carries none. A request continues the turn only when its last user
+message holds at least one `tool_result` and every other block in it is a
+`tool_result` or a text block whose trimmed text starts with
+`<system-reminder>` (Claude Code puts reminders next to tool results). Any
+other text or content block there, such as a prompt typed after an interrupt
+and merged next to the tool result, starts a new turn, which clears the slot
+before the request is sent (`starts_new_turn`). Misjudging toward a new turn
+only drops the echo. A request with no conversation identity, no client tool
+with `input_schema` (titles and other side requests) or the progress-label
+marker takes no part. A slot expires after 30 min with no tracked activity:
+planning a request on it, storing a value in it or sending its value, each of
+which refreshes `touched_at`. That is a bound, not proof that the turn ended:
+a turn that waits longer, or one request that runs longer after its last
+tracked activity, loses the echo for the rest of the turn. Only the request
+the slot was planned for (`req_id`) fills or sends it, so a late reply of an
+earlier request cannot. The echo is added to the outgoing JSON after
+`build_websocket_request`, never to `ResponsesRequest::client_metadata`, whose
+presence marks the Lite lane, and never to the handshake.
 `codex_upstream_request_started` logs `newTurn` and `turnStateSent`, never the
 value. What the backend does with the echo is not established.
 

@@ -4867,8 +4867,8 @@ async fn spawn_turn_state_http_upstream(received: HeaderLog) -> String {
 }
 
 /// A WebSocket Codex upstream that records every handshake and every
-/// `response.create`. The first handshake answers with
-/// `x-codex-turn-state: hs-1`, and the Nth response opens with a
+/// `response.create`. The Nth handshake answers with
+/// `x-codex-turn-state: hs-N`, and the Nth response opens with a
 /// `codex.response.metadata` event whose headers carry `ws-ts-N`.
 async fn spawn_turn_state_websocket_upstream(
     handshakes: HeaderLog,
@@ -4894,11 +4894,10 @@ async fn spawn_turn_state_websocket_upstream(
                           -> Result<HandshakeResponse, ErrorResponse> {
                         let mut guard = handshakes.lock().unwrap();
                         guard.push(header_list(request.headers()));
-                        if guard.len() == 1 {
-                            response
-                                .headers_mut()
-                                .insert("x-codex-turn-state", "hs-1".parse().unwrap());
-                        }
+                        response.headers_mut().insert(
+                            "x-codex-turn-state",
+                            format!("hs-{}", guard.len()).parse().unwrap(),
+                        );
                         Ok(response)
                     };
                 let Ok(ws) = tokio_tungstenite::accept_hdr_async(stream, record_handshake).await
@@ -5009,25 +5008,32 @@ async fn smoke_codex_websocket_echoes_turn_state_in_client_metadata() {
         drain(call_turn_state_messages(session, body).await).await;
     }
 
-    let turn_state = |request: &Value| {
-        request
-            .get("client_metadata")
-            .and_then(|metadata| metadata.get("x-codex-turn-state"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    };
     let requests = received.lock().unwrap();
     assert_eq!(requests.len(), 4, "expected four response.create messages");
-    // The handshake's value came first in the first turn; the second turn
-    // keeps the value of its first response's metadata event.
-    assert_eq!(turn_state(&requests[0]), None);
-    assert_eq!(turn_state(&requests[1]).as_deref(), Some("hs-1"));
-    assert_eq!(turn_state(&requests[2]), None);
-    assert_eq!(turn_state(&requests[3]).as_deref(), Some("ws-ts-3"));
+    // Each turn keeps the value of its first response's metadata event; the
+    // handshake response's value is never read. A request that starts a turn
+    // on the full lane sends no `client_metadata` at all, and a continuing one
+    // sends only the turn-state key, without the Lite lane's key.
+    assert_eq!(requests[0].get("client_metadata"), None);
+    assert_eq!(
+        requests[1].get("client_metadata"),
+        Some(&json!({"x-codex-turn-state": "ws-ts-1"}))
+    );
+    assert_eq!(requests[2].get("client_metadata"), None);
+    assert_eq!(
+        requests[3].get("client_metadata"),
+        Some(&json!({"x-codex-turn-state": "ws-ts-3"}))
+    );
 
     let handshakes = handshakes.lock().unwrap();
     assert!(!handshakes.is_empty());
     for (index, headers) in handshakes.iter().enumerate() {
+        // The echo leaves the lane alone: the handshake stays on the full lane.
+        assert_eq!(
+            header_of(headers, "x-openai-internal-codex-responses-lite"),
+            None,
+            "handshake {index}"
+        );
         assert_eq!(
             header_of(headers, "session-id"),
             Some(session),

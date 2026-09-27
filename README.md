@@ -426,8 +426,15 @@ flowchart LR
   subagent, as the request's `prompt_cache_key` and in the `session-id` and
   `thread-id` headers. Without it every subagent would share the main thread's
   cache key and routing bucket. Within a turn the proxy also sends back the
-  first `x-codex-turn-state` value the backend returned in it, as the Codex CLI
-  does.
+  first `x-codex-turn-state` value the backend returned in it, in the places
+  the Codex CLI uses: a request header over HTTP and `client_metadata` of
+  `response.create` over WebSocket. The value is read from the HTTP response
+  header or from a `response.metadata` or `codex.response.metadata` stream
+  event, never from the WebSocket handshake. A turn goes on while Claude Code
+  answers tool calls, that is while the last user message holds tool results
+  and nothing but reminder text beside them; any other request starts a new
+  turn without a value. A value is kept in memory, never across a restart,
+  and is dropped after 30 minutes with no activity on its conversation.
 - **Reasoning survives a switch.** A `thinking` block produced by one backend
   cannot be replayed to the other natively, so the proxy rewrites it as tagged
   text before sending the history on. Context is not lost when you move a
