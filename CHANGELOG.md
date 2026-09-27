@@ -21,9 +21,10 @@
   - `server_is_overloaded` is a 529, with `Retry-After` only when the error
     carries one.
 
-  A `Retry-After` on these answers is in whole seconds, rounded up and at
-  least 1: a delay of `0.25` or `0` is sent as `1`, and a date is passed on
-  as it came. With opt-in server compaction
+  As with every error, a backend message that names the backend or its
+  transport is replaced with a generic one. A `Retry-After` given in seconds
+  is rounded up to whole seconds, at least 1: a delay of `0.25` or `0` is sent
+  as `1`, and a date is passed on as it came. With opt-in server compaction
   (`CCP_CODEX_SERVER_COMPACTION`), a compaction refused for spent credits or
   `usage_not_included` is answered with that error and the normal request is
   not sent, as a spent usage window already was.
@@ -52,9 +53,10 @@
     falls back on, and a hosted web search on `gpt-6-luna` is sent as
     `gpt-6-sol`, as one on `gpt-5.6-luna` already goes to `gpt-5.6-sol`;
   - the monitor's setup hint names `gpt-6-sol` and `gpt-6-luna`;
-  - the model listing call sends `client_version` 0.157.1 when neither
-    `CCP_CODEX_CLIENT_VERSION` nor the Codex CLI's `models_cache.json` names
-    one. Set `CCP_CODEX_CLIENT_VERSION` to send a different version.
+  - the model listing call sends `client_version` 0.157.1 when none of
+    `CCP_CODEX_CLIENT_VERSION`, `codex.clientVersion` in `config.json` and the
+    Codex CLI's `models_cache.json` names one. Set either of the first two to
+    send a different version.
 
 ## v0.13.0 (2026-09-27)
 

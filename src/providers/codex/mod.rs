@@ -1598,8 +1598,8 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
 /// Credits or a spend limit that ran out are answered with
 /// `x-should-retry: false` and no `Retry-After`, like a spent window, but
 /// without the unified rate limit headers: no subscription window refused the
-/// request, so none can be named. A `Retry-After` sent with any other class is
-/// in whole seconds (`normalize_retry_after`).
+/// request, so none can be named. A `Retry-After` in seconds sent with any
+/// other class is rounded up to whole seconds (`normalize_retry_after`).
 fn classified_error_response(
     class: events::CodexErrorClass,
     native: &str,

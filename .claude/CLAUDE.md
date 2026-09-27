@@ -636,9 +636,9 @@ code decides over the status and the message heuristics:
 - `server_is_overloaded`: 529 `overloaded_error`, with `Retry-After` only when
   the payload carries one.
 
-Every classified `Retry-After` is whole seconds (`normalize_retry_after`): a
-number is rounded up to at least 1, anything else (an HTTP date) passes as it
-came. `CodexError.class` carries the class to `map_codex_error_to_response`
+A classified `Retry-After` is normalised (`normalize_retry_after`): a number
+is rounded up to whole seconds, at least 1; anything else (an HTTP date)
+passes as it came. `CodexError.class` carries the class to `map_codex_error_to_response`
 (`classified_error_response`); a mid-stream error keeps its status and takes
 the class's error type. An unknown code keeps the old handling, and
 `usage_limit_reached` keeps precedence over all of these. An opt-in server
@@ -649,8 +649,9 @@ the direct upgrade and the HTTP CONNECT tunnel (on the tunnel only the bytes
 that arrived with the response head), never for a 407. Under `auto` transport
 a handshake failure, classified or not, falls back to HTTP unless the
 WebSocket proxy refused it (`should_fallback_to_http` in `client.rs`), and
-that HTTP answer is classified on its own. The codes and their shapes follow the Codex CLI's
-parser and tests; no traffic capture of them exists yet.
+that HTTP answer is classified on its own. The codes and their shapes follow
+the Codex CLI's own error handling; no test here runs them against the
+backend.
 
 Field-name trap: the wire format says `reset_at` / `reset_after_seconds`, while
 Codex CLI session logs reserialise the same data as `resets_at` /
@@ -775,8 +776,9 @@ Verified live 2026-09-11: the call answers 200 with the proxy's own
 `originator`, with or without `ChatGPT-Account-Id`, and while the weekly
 window is at 100% (`/backend-api/wham/usage` reported `limit_reached`); it
 answers 400 without `client_version`. The version comes from
-`CCP_CODEX_CLIENT_VERSION`, else the Codex CLI's `models_cache.json` next to
-`auth.json`, else `CODEX_CLIENT_VERSION` in `auth/constants.rs`.
+`CCP_CODEX_CLIENT_VERSION`, else `codex.clientVersion` in `config.json`, else
+the Codex CLI's `models_cache.json` next to `auth.json`, else
+`CODEX_CLIENT_VERSION` in `auth/constants.rs`.
 
 The compiled-in `CODEX_MODELS` / `ALLOWED_MODELS` lists still exist for
 routing until the first successful listing and for the OpenAI-compatible
