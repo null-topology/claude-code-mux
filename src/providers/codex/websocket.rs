@@ -220,6 +220,7 @@ impl WebSocketProxyConfig {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         })?;
         if !http_url.starts_with("https://") {
@@ -763,6 +764,7 @@ pub(super) async fn codex_websocket_request(
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let body_json = serde_json::to_string(body_value).unwrap_or_default();
@@ -851,6 +853,7 @@ pub(super) async fn codex_websocket_request(
                 detail: None,
                 retry_after: None,
                 usage_limit: None,
+                class: None,
                 origin: CodexErrorOrigin::WebSocket,
             }
         })?;
@@ -890,6 +893,7 @@ pub(super) async fn codex_websocket_request(
             detail: Some("previous_response_not_found".to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocket,
         });
     }
@@ -991,6 +995,7 @@ pub(super) async fn prepare_codex_websocket(
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let requires_origin = continuation
@@ -1043,6 +1048,7 @@ fn pooled_validation_error(detail: String) -> CodexError {
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1093,6 +1099,7 @@ pub(super) fn start_codex_websocket_events(
                     detail: None,
                     retry_after: None,
                     usage_limit: None,
+                    class: None,
                     origin: CodexErrorOrigin::WebSocket,
                 }))
                 .await;
@@ -1143,6 +1150,7 @@ pub(super) async fn codex_websocket_event_stream(
         detail: Some(error.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let ready = prepare_codex_websocket(
@@ -1172,6 +1180,7 @@ fn continuation_socket_missing_error() -> CodexError {
         detail: Some(WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1183,6 +1192,7 @@ fn missing_terminal_error() -> CodexError {
         detail: Some(WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocket,
     }
 }
@@ -1194,6 +1204,7 @@ fn response_start_timeout_error(timeout_ms: u64) -> CodexError {
         detail: Some(WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocket,
     }
 }
@@ -1312,6 +1323,7 @@ fn websocket_protocol_error(message: &str) -> CodexError {
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1445,6 +1457,7 @@ fn reqwest_handshake_error(error: reqwest::Error) -> CodexError {
         detail: proxy_tunnel_rejected.then(|| WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1542,6 +1555,7 @@ fn tunnel_error(status: u16, retry_after: Option<String>) -> CodexError {
         },
         retry_after,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1553,6 +1567,7 @@ fn invalid_tunnel_response(message: &str) -> CodexError {
         detail: Some(WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1619,6 +1634,7 @@ async fn establish_connect_tunnel(
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
 
@@ -1678,6 +1694,7 @@ async fn tls_connect(
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         })?;
     Ok(Box::new(stream))
@@ -1705,6 +1722,7 @@ async fn connect_to_http_proxy(
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         })?;
     let stream: BoxedWebSocketIo = Box::new(stream);
@@ -1750,6 +1768,7 @@ fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> 
             detail: Some(GENERIC_HANDSHAKE_ERROR_DETAIL.to_string()),
             retry_after,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         };
     }
@@ -1759,6 +1778,7 @@ fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> 
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1833,6 +1853,7 @@ async fn connect_via_http_upgrade(
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let websocket_key = generate_key();
@@ -1860,11 +1881,15 @@ async fn connect_via_http_upgrade(
             .get(http::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let detail = if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16() {
-            GENERIC_HANDSHAKE_ERROR_DETAIL.to_string()
+        let (detail, class) = if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
+        {
+            (GENERIC_HANDSHAKE_ERROR_DETAIL.to_string(), None)
         } else {
             let body = bounded_handshake_error_body(response).await;
-            handshake_error_detail(Some(&body))
+            (
+                handshake_error_detail(Some(&body)),
+                super::events::error_class_from_body(&body),
+            )
         };
         return Err(CodexError {
             status,
@@ -1872,6 +1897,7 @@ async fn connect_via_http_upgrade(
             detail: Some(detail),
             retry_after,
             usage_limit: None,
+            class,
             origin: CodexErrorOrigin::WebSocketHandshake,
         });
     }
@@ -2081,6 +2107,7 @@ where
                         detail: None,
                         retry_after: None,
                         usage_limit: None,
+                        class: None,
                         origin: CodexErrorOrigin::WebSocket,
                     });
                 }
@@ -2106,6 +2133,7 @@ where
                         detail: None,
                         retry_after: None,
                         usage_limit: None,
+                        class: None,
                         origin: CodexErrorOrigin::WebSocket,
                     }
                 } else {
@@ -2120,6 +2148,7 @@ where
                     detail: Some(WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
                     retry_after: None,
                     usage_limit: None,
+                    class: None,
                     origin: CodexErrorOrigin::WebSocket,
                 });
             }
@@ -2179,6 +2208,7 @@ where
                     detail: None,
                     retry_after: None,
                     usage_limit: None,
+                    class: None,
                     origin: CodexErrorOrigin::WebSocket,
                 });
             }
@@ -2208,6 +2238,7 @@ where
                     detail: None,
                     retry_after: None,
                     usage_limit: None,
+                    class: None,
                     origin: CodexErrorOrigin::WebSocket,
                 });
             }
@@ -2258,6 +2289,7 @@ where
                             detail: None,
                             retry_after: None,
                             usage_limit: None,
+                            class: None,
                             origin: CodexErrorOrigin::WebSocket,
                         }
                     } else {
@@ -2284,6 +2316,7 @@ where
                             detail: None,
                             retry_after: None,
                             usage_limit: None,
+                            class: None,
                             origin: CodexErrorOrigin::WebSocket,
                         }
                     } else {
@@ -2298,6 +2331,7 @@ where
                         detail: None,
                         retry_after: None,
                         usage_limit: None,
+                        class: None,
                         origin: CodexErrorOrigin::WebSocket,
                     }));
                     break;
@@ -2345,6 +2379,7 @@ where
                             detail: Some("previous_response_not_found".to_string()),
                             retry_after: None,
                             usage_limit: None,
+                            class: None,
                             origin: CodexErrorOrigin::WebSocket,
                         }));
                     } else {
@@ -2366,6 +2401,7 @@ where
                     detail: None,
                     retry_after: None,
                     usage_limit: None,
+                    class: None,
                     origin: CodexErrorOrigin::WebSocket,
                 }));
                 break;
@@ -2385,6 +2421,7 @@ where
                     detail: None,
                     retry_after: None,
                     usage_limit: None,
+                    class: None,
                     origin: CodexErrorOrigin::WebSocket,
                 }));
                 break;
@@ -2501,6 +2538,7 @@ mod tests {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         }
     }
@@ -2788,6 +2826,7 @@ mod tests {
                             detail: Some("second-detail".to_string()),
                             retry_after: Some("7".to_string()),
                             usage_limit: None,
+                            class: None,
                             origin: CodexErrorOrigin::WebSocketHandshake,
                         }))
                     }

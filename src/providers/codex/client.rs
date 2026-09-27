@@ -12,7 +12,7 @@ use crate::traffic::TrafficCapture;
 use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIGINATOR};
 use super::auth::manager::CodexAuthManager;
 use super::auth::token_store::{DefaultCodexAuthStore, StoredAuth, file_store};
-pub use super::events::{CodexLimitWindow, CodexUsageLimit};
+pub use super::events::{CodexErrorClass, CodexLimitWindow, CodexUsageLimit};
 use super::search::{SearchRequest, SearchResponse};
 use super::translate::request::ResponsesRequest;
 
@@ -27,6 +27,9 @@ pub struct CodexError {
     pub detail: Option<String>,
     pub retry_after: Option<String>,
     pub usage_limit: Option<Box<CodexUsageLimit>>,
+    /// What the backend's error code says about the failure, when it names a
+    /// code the proxy knows. It decides the client's answer over the status.
+    pub class: Option<CodexErrorClass>,
     pub origin: CodexErrorOrigin,
 }
 
@@ -48,6 +51,7 @@ impl CodexError {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         }
     }
@@ -357,6 +361,7 @@ fn header_value(name: &str, value: &str) -> Result<http::HeaderValue, CodexError
         detail: Some(e.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::Http,
     })
 }
@@ -542,6 +547,7 @@ fn http_sse_error(message: &str) -> CodexError {
         detail: Some("http_response_sse".to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::Http,
     }
 }
@@ -877,6 +883,7 @@ impl CodexHttpClient {
                 detail: Some(error.to_string()),
                 retry_after: None,
                 usage_limit: None,
+                class: None,
                 origin: CodexErrorOrigin::Auth,
             })?;
         let mut refresh_attempted = false;
@@ -913,6 +920,7 @@ impl CodexHttpClient {
                 detail: Some(error.to_string()),
                 retry_after: None,
                 usage_limit: None,
+                class: None,
                 origin: CodexErrorOrigin::Http,
             })?;
         let mut form = reqwest::multipart::Form::new().part("file", part);
@@ -937,6 +945,7 @@ impl CodexHttpClient {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         })?
         .map_err(|error| CodexError {
@@ -945,6 +954,7 @@ impl CodexHttpClient {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         })
     }
@@ -962,6 +972,7 @@ impl CodexHttpClient {
             detail: Some(error.to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         })?;
         let url = format!(
@@ -979,6 +990,7 @@ impl CodexHttpClient {
                 detail: Some(error.to_string()),
                 retry_after: None,
                 usage_limit: None,
+                class: None,
                 origin: CodexErrorOrigin::Auth,
             })?;
         let mut refresh_attempted = false;
@@ -1026,6 +1038,7 @@ impl CodexHttpClient {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         })?
         .map_err(|error| CodexError {
@@ -1034,6 +1047,7 @@ impl CodexHttpClient {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         })
     }
@@ -1051,6 +1065,7 @@ impl CodexHttpClient {
             detail: Some(err.to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         })?;
         let mut auth = self
@@ -1063,6 +1078,7 @@ impl CodexHttpClient {
                 detail: Some(err.to_string()),
                 retry_after: None,
                 usage_limit: None,
+                class: None,
                 origin: CodexErrorOrigin::Auth,
             })?;
         let mut refresh_attempted = false;
@@ -1124,6 +1140,7 @@ impl CodexHttpClient {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         })?
         .map_err(|err| CodexError {
@@ -1132,6 +1149,7 @@ impl CodexHttpClient {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         })
     }
@@ -1175,6 +1193,7 @@ impl CodexHttpClient {
             detail: Some(e.to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Auth,
         })?;
         let body_json = serde_json::to_string(body).map_err(|e| CodexError {
@@ -1183,6 +1202,7 @@ impl CodexHttpClient {
             detail: Some(e.to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         })?;
         let mut auth_refresh_attempted = false;
@@ -1207,6 +1227,7 @@ impl CodexHttpClient {
                 detail: Some(e.to_string()),
                 retry_after: None,
                 usage_limit: None,
+                class: None,
                 origin: CodexErrorOrigin::Http,
             });
         }
@@ -1223,6 +1244,7 @@ impl CodexHttpClient {
             detail: Some(e.to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Auth,
         })?;
         let body_json = serde_json::to_string(body).map_err(|e| CodexError {
@@ -1231,6 +1253,7 @@ impl CodexHttpClient {
             detail: Some(e.to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         })?;
         let mut auth_refresh_attempted = false;
@@ -1353,6 +1376,7 @@ impl CodexHttpClient {
                 detail: Some(super::websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
                 retry_after: None,
                 usage_limit: None,
+                class: None,
                 origin: CodexErrorOrigin::WebSocket,
             }),
         }
@@ -1450,6 +1474,7 @@ impl CodexHttpClient {
                                 detail: Some("http_response_body".to_string()),
                                 retry_after: None,
                                 usage_limit: None,
+                                class: None,
                                 origin: CodexErrorOrigin::Http,
                             };
                             log_http_stream_end(
@@ -1477,6 +1502,7 @@ impl CodexHttpClient {
                                 detail: Some("http_response_body".to_string()),
                                 retry_after: None,
                                 usage_limit: None,
+                                class: None,
                                 origin: CodexErrorOrigin::Http,
                             };
                             log_http_stream_end(
@@ -1622,6 +1648,7 @@ impl CodexHttpClient {
             detail: Some(e.to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Auth,
         })?;
 
@@ -1646,6 +1673,7 @@ impl CodexHttpClient {
                         detail: Some(e.to_string()),
                         retry_after: None,
                         usage_limit: None,
+                        class: None,
                         origin: CodexErrorOrigin::Http,
                     })?;
                     self.attempt_post_http(
@@ -1740,6 +1768,7 @@ impl CodexHttpClient {
                                     detail: Some(e.to_string()),
                                     retry_after: None,
                                     usage_limit: None,
+                                    class: None,
                                     origin: CodexErrorOrigin::Http,
                                 })?;
                             self.attempt_post_http(
@@ -1774,6 +1803,7 @@ impl CodexHttpClient {
                             detail: Some(e.to_string()),
                             retry_after: None,
                             usage_limit: None,
+                            class: None,
                             origin: CodexErrorOrigin::Http,
                         });
                     }
@@ -1793,7 +1823,7 @@ impl CodexHttpClient {
 
             if let Ok(response) = &result
                 && (200..300).contains(&response.status)
-                && let Some(failure) = super::events::first_retryable_failure(&response.body)
+                && let Some(failure) = super::events::first_reportable_failure(&response.body)
             {
                 return Err(CodexError {
                     status: failure.status,
@@ -1801,6 +1831,7 @@ impl CodexHttpClient {
                     detail: Some(failure.message),
                     retry_after: failure.retry_after,
                     usage_limit: None,
+                    class: failure.class,
                     origin: CodexErrorOrigin::Http,
                 });
             }
@@ -1814,8 +1845,17 @@ impl CodexHttpClient {
                         detail: Some(detail),
                         retry_after: None,
                         usage_limit: None,
+                        class: None,
                         origin: CodexErrorOrigin::Http,
                     });
+                }
+                // An error code in the body says more than the status: read
+                // its class and its message rather than the raw body.
+                Ok(response)
+                    if !(200..300).contains(&response.status)
+                        && super::events::error_class_from_body(&response.body).is_some() =>
+                {
+                    return Err(codex_status_error(response.into_response()));
                 }
                 Ok(response) if response.status == 403 => {
                     let detail = String::from_utf8_lossy(&response.body).to_string();
@@ -1825,6 +1865,7 @@ impl CodexHttpClient {
                         detail: Some(detail),
                         retry_after: None,
                         usage_limit: None,
+                        class: None,
                         origin: CodexErrorOrigin::Http,
                     });
                 }
@@ -1841,6 +1882,7 @@ impl CodexHttpClient {
                         detail: Some(detail),
                         retry_after,
                         usage_limit: None,
+                        class: None,
                         origin: CodexErrorOrigin::Http,
                     });
                 }
@@ -1884,6 +1926,7 @@ impl CodexHttpClient {
             detail: Some(e.to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Auth,
         })?;
 
@@ -2197,6 +2240,7 @@ impl CodexHttpClient {
                 detail: None,
                 retry_after: None,
                 usage_limit: None,
+                class: None,
                 origin: CodexErrorOrigin::Http,
             })?
             .map_err(|e| {
@@ -2207,6 +2251,7 @@ impl CodexHttpClient {
                         detail: None,
                         retry_after: None,
                         usage_limit: None,
+                        class: None,
                         origin: CodexErrorOrigin::Http,
                     }
                 } else {
@@ -2216,6 +2261,7 @@ impl CodexHttpClient {
                         detail: None,
                         retry_after: None,
                         usage_limit: None,
+                        class: None,
                         origin: CodexErrorOrigin::Http,
                     }
                 }
@@ -2254,6 +2300,7 @@ impl CodexHttpClient {
                 detail: Some("http_response_body".to_string()),
                 retry_after: None,
                 usage_limit: None,
+                class: None,
                 origin: CodexErrorOrigin::Http,
             })?
             .map_err(|e| CodexError {
@@ -2262,6 +2309,7 @@ impl CodexHttpClient {
                 detail: Some("http_response_body".to_string()),
                 retry_after: None,
                 usage_limit: None,
+                class: None,
                 origin: CodexErrorOrigin::Http,
             })?;
 
@@ -2327,6 +2375,7 @@ impl CodexHttpClient {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         })?
         .map_err(|e| CodexError {
@@ -2335,6 +2384,7 @@ impl CodexHttpClient {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         })?;
 
@@ -2366,6 +2416,7 @@ impl CodexHttpClient {
                 detail: Some("http_response_body".to_string()),
                 retry_after: None,
                 usage_limit: None,
+                class: None,
                 origin: CodexErrorOrigin::Http,
             })?
             .map_err(|e| CodexError {
@@ -2374,6 +2425,7 @@ impl CodexHttpClient {
                 detail: Some("http_response_body".to_string()),
                 retry_after: None,
                 usage_limit: None,
+                class: None,
                 origin: CodexErrorOrigin::Http,
             })?;
             let Some(chunk) = chunk else {
@@ -2482,6 +2534,7 @@ fn codex_event_failure_error(failure: super::events::CodexEventFailure) -> Codex
         detail: Some(failure.message),
         retry_after: failure.retry_after,
         usage_limit: None,
+        class: failure.class,
         origin: CodexErrorOrigin::Http,
     }
 }
@@ -2493,6 +2546,7 @@ fn codex_usage_limit_error(limit: CodexUsageLimit, origin: CodexErrorOrigin) -> 
         detail: Some(limit.message.clone()),
         retry_after: None,
         usage_limit: Some(Box::new(limit)),
+        class: None,
         origin,
     }
 }
@@ -2715,6 +2769,7 @@ fn auth_refresh_error(err: anyhow::Error) -> CodexError {
         detail: Some(err.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::Auth,
     }
 }
@@ -2739,6 +2794,7 @@ fn codex_status_error(response: CodexResponse) -> CodexError {
         detail: Some(message),
         retry_after,
         usage_limit,
+        class: super::events::error_class_from_body(&response.body),
         origin: match response.transport {
             ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
             ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
@@ -4869,6 +4925,7 @@ mod tests {
             detail: Some("body".to_string()),
             retry_after: Some("5".to_string()),
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::Http,
         };
         let display = format!("{err}");
@@ -4884,6 +4941,7 @@ mod tests {
             detail: Some("websocket_pre_request".to_string()),
             retry_after: Some("3".to_string()),
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 
@@ -4900,6 +4958,7 @@ mod tests {
             ),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         };
 
@@ -4915,6 +4974,7 @@ mod tests {
             detail: Some("websocket_pre_request".to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 
@@ -4929,6 +4989,7 @@ mod tests {
             detail: Some("websocket_pre_request".to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 
@@ -4944,6 +5005,7 @@ mod tests {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 
@@ -4958,6 +5020,7 @@ mod tests {
             detail: Some(super::super::websocket::WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 
@@ -4973,6 +5036,7 @@ mod tests {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 
@@ -5293,6 +5357,7 @@ mod tests {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocket,
         });
         let forbidden = Err(CodexError {
@@ -5301,6 +5366,7 @@ mod tests {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocket,
         });
         let rejected_handshake = Err(CodexError {
@@ -5309,6 +5375,7 @@ mod tests {
             detail: Some("policy denied".to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         });
         let rejected_handshake_err = match &rejected_handshake {
@@ -5378,6 +5445,7 @@ mod tests {
             ),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocket,
         };
         let missing = CodexError {
@@ -5386,6 +5454,7 @@ mod tests {
             detail: Some("previous_response_not_found".to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocket,
         };
         let idle = CodexError {
@@ -5394,6 +5463,7 @@ mod tests {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocket,
         };
 

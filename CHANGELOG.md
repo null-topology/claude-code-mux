@@ -1,3 +1,30 @@
+## Unreleased
+
+- Codex errors that carry a known error code now reach Claude Code with a
+  status that says whether trying again can help, so Claude Code no longer
+  retries a request the backend will refuse again. Until now most of them
+  arrived as a 502 server error or a plain 429. Now:
+  - a spent credit balance or spend limit (`insufficient_quota`,
+    `credit_balance_exhausted`, `organization_spend_limit_exceeded`,
+    `project_spend_limit_exceeded`, `organization_usage_limit_exceeded`) is a
+    429 with `x-should-retry: false` and the backend's message. Unlike a spent
+    usage window it names no reset time, because the backend gives none;
+  - `usage_not_included`, a plan without Codex access, is a 403;
+  - a prompt the backend refuses (`invalid_prompt`, `cyber_policy`,
+    `bio_policy`, `misalignment_policy_violation`) is a 400 with the backend's
+    message;
+  - `context_length_exceeded` is the same 413 that a context window message
+    already produced;
+  - `slow_down` and `rate_limit_exceeded` are a 429 that may be retried, with
+    `Retry-After` taken from the error or from the "try again in" delay its
+    message names;
+  - `server_is_overloaded` is a 529.
+
+  An error that arrives after the answer has started streaming keeps the
+  status already sent and now carries the matching error type. A code the
+  proxy does not know is handled as before, and so is a spent usage window
+  (`usage_limit_reached`). There is no setting to get the old answers back.
+
 ## v0.13.0 (2026-09-27)
 
 - The monitor's Stats tab no longer counts token count requests. The local

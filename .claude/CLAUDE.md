@@ -595,7 +595,7 @@ Every transport answers a spent window once, without retrying, with
 `-reset` and `-representative-claim`: the live WebSocket and live HTTP
 streams, a non-2xx startup status whose body or `X-Codex-*` response headers
 carry the limit, the buffered paths (`usage_limit_from_response` runs ahead of
-`first_retryable_failure`, so a buffered WebSocket relay shares the branch),
+`first_reportable_failure`, so a buffered WebSocket relay shares the branch),
 and an opt-in server compaction request, which aborts instead of spending the
 normal request as well. The live HTTP stream hands its response headers to
 `usage_limit_from_event_with_headers`, so a limit event that carries only a
@@ -613,6 +613,35 @@ readings become `-5h-utilization` / `-5h-reset` / `-7d-*`, and a window past
 its threshold (`CCP_CODEX_QUOTA_WARN_AT`, defaults 0.9 session / 0.75 weekly)
 adds `-surpassed-threshold`; readings whose reset time has passed are dropped.
 
+Other failures are classified by their error code first (`error_class` in
+`events.rs`, `CodexErrorClass`), in event payloads (`error`,
+`/response/error`) and in JSON error bodies of any status, on the live
+WebSocket and HTTP starts, the WebSocket handshake and the buffered paths. The
+code decides over the status and the message heuristics:
+
+- quota (`insufficient_quota`, `credit_balance_exhausted`,
+  `organization_spend_limit_exceeded`, `project_spend_limit_exceeded`,
+  `organization_usage_limit_exceeded`, as code or type): 429
+  `rate_limit_error` with `x-should-retry: false`, no `Retry-After` and no
+  unified headers (`with_rate_limit_headers` leaves alone any response that
+  carries `x-should-retry`);
+- `usage_not_included` (code or type): 403 `permission_error`;
+- `invalid_prompt`, `cyber_policy`, `bio_policy`,
+  `misalignment_policy_violation`: 400 `invalid_request_error`, with a short
+  fallback text when the message is empty;
+- `context_length_exceeded`: the 413 `request_too_large` path;
+- `slow_down`, `rate_limit_exceeded`: 429 with `Retry-After` from the payload,
+  else from the message's `try again in N s|ms|seconds`, whole seconds rounded
+  up, at least 1;
+- `server_is_overloaded`: 529 `overloaded_error`.
+
+`CodexError.class` carries the class to `map_codex_error_to_response`
+(`classified_error_response`); a mid-stream error keeps its status and takes
+the class's error type. An unknown code keeps the old handling, and
+`usage_limit_reached` keeps precedence over all of these. The codes and their
+shapes follow the Codex CLI's parser and tests; no traffic capture of them
+exists yet.
+
 Field-name trap: the wire format says `reset_at` / `reset_after_seconds`, while
 Codex CLI session logs reserialise the same data as `resets_at` /
 `resets_in_seconds`. Both spellings are read. If quota headers ever stop
@@ -621,7 +650,8 @@ appearing, compare against a fresh traffic capture before anything else.
 The proxy does not retry a failed Codex request: one attempt, then the error
 goes to the client, which owns the retry policy. The only resends left repair
 the proxy's own state (a forgotten `previous_response_id`, a 401 token refresh).
-A 429 on the WebSocket handshake reaches the client as a plain 429.
+A 429 on the WebSocket handshake reaches the client as a plain 429 unless its
+body names one of the codes above.
 
 ## Naming and distribution
 

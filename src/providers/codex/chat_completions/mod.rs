@@ -455,6 +455,7 @@ mod tests {
             detail: Some("Try later".into()),
             retry_after: Some("7".into()),
             usage_limit: None,
+            class: None,
             origin: super::super::client::CodexErrorOrigin::Http,
         });
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -466,6 +467,7 @@ mod tests {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: super::super::client::CodexErrorOrigin::Auth,
         });
         assert_eq!(auth.status, StatusCode::UNAUTHORIZED);
