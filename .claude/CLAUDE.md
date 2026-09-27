@@ -629,18 +629,28 @@ code decides over the status and the message heuristics:
 - `invalid_prompt`, `cyber_policy`, `bio_policy`,
   `misalignment_policy_violation`: 400 `invalid_request_error`, with a short
   fallback text when the message is empty;
-- `context_length_exceeded`: the 413 `request_too_large` path;
+- `context_length_exceeded`: the 413 `request_too_large` answer of the
+  context window message path (`context_overflow_response`), native text kept;
 - `slow_down`, `rate_limit_exceeded`: 429 with `Retry-After` from the payload,
-  else from the message's `try again in N s|ms|seconds`, whole seconds rounded
-  up, at least 1;
-- `server_is_overloaded`: 529 `overloaded_error`.
+  else from the message's `try again in N s|ms|seconds`;
+- `server_is_overloaded`: 529 `overloaded_error`, with `Retry-After` only when
+  the payload carries one.
 
-`CodexError.class` carries the class to `map_codex_error_to_response`
+Every classified `Retry-After` is whole seconds (`normalize_retry_after`): a
+number is rounded up to at least 1, anything else (an HTTP date) passes as it
+came. `CodexError.class` carries the class to `map_codex_error_to_response`
 (`classified_error_response`); a mid-stream error keeps its status and takes
 the class's error type. An unknown code keeps the old handling, and
-`usage_limit_reached` keeps precedence over all of these. The codes and their
-shapes follow the Codex CLI's parser and tests; no traffic capture of them
-exists yet.
+`usage_limit_reached` keeps precedence over all of these. An opt-in server
+compaction refused as quota or `usage_not_included` answers the client with
+that class and does not send the normal request; any other compaction failure
+falls back to it. The WebSocket handshake reads the rejection body on both
+the direct upgrade and the HTTP CONNECT tunnel (on the tunnel only the bytes
+that arrived with the response head), never for a 407. Under `auto` transport
+a handshake failure, classified or not, falls back to HTTP unless the
+WebSocket proxy refused it (`should_fallback_to_http` in `client.rs`), and
+that HTTP answer is classified on its own. The codes and their shapes follow the Codex CLI's
+parser and tests; no traffic capture of them exists yet.
 
 Field-name trap: the wire format says `reset_at` / `reset_after_seconds`, while
 Codex CLI session logs reserialise the same data as `resets_at` /

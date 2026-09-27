@@ -130,7 +130,22 @@ pub(crate) fn retry_after_from_message(message: &str) -> Option<String> {
     let seconds = lower
         .match_indices("try again in")
         .find_map(|(start, phrase)| delay_seconds(lower[start + phrase.len()..].trim_start()))?;
-    Some((seconds.ceil() as u64).max(1).to_string())
+    Some(whole_seconds(seconds))
+}
+
+/// A `Retry-After` value a client can wait on: a number of seconds becomes
+/// whole seconds, rounded up and never below one, because a fraction or a zero
+/// reads as "retry at once". Any other value, such as an HTTP date, is kept as
+/// it came.
+pub(crate) fn normalize_retry_after(value: &str) -> String {
+    match value.trim().parse::<f64>() {
+        Ok(seconds) if seconds.is_finite() => whole_seconds(seconds),
+        _ => value.to_string(),
+    }
+}
+
+fn whole_seconds(seconds: f64) -> String {
+    (seconds.ceil() as u64).max(1).to_string()
 }
 
 /// The delay a text opens with, as a number and a unit, in seconds.

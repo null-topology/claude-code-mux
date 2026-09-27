@@ -187,10 +187,12 @@ fn uses_responses_lite_with_full_lane(
     )
 }
 
-/// Luna models exist only behind the Responses Lite lane; the full Responses
-/// API resolves them to a `-free` variant and returns 404 (Model not found
-/// gpt-5.6-luna-free-...). Hosted web_search requests must run on the full
-/// lane, so luna is upgraded to its nearest full-lane sibling.
+/// Hosted web_search requests run on the full lane, and a luna model named for
+/// one is sent as its sol sibling. The substitution dates from a report that
+/// the full lane does not serve luna; that report did not reproduce (see
+/// `uses_responses_lite_with_full_lane`), and whether luna can run a hosted
+/// search on the full lane has not been checked for either generation, so the
+/// substitution stays until it is.
 pub fn full_lane_web_search_model(model: &str) -> &str {
     match model {
         "gpt-5.6-luna" => "gpt-5.6-sol",

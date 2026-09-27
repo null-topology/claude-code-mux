@@ -1843,6 +1843,151 @@ async fn smoke_codex_http_server_compaction_fast_fails_usage_limit() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_codex_http_server_compaction_refused_for_credits_or_plan_sends_no_normal_request() {
+    let _guard = env_lock();
+    let cases = [
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "insufficient_quota",
+            "You exceeded your current quota.",
+            "rate_limit_error",
+            Some("false"),
+        ),
+        (
+            StatusCode::FORBIDDEN,
+            "usage_not_included",
+            "Your plan does not include this usage.",
+            "permission_error",
+            None,
+        ),
+    ];
+    for (status, code, message, error_type, should_retry) in cases {
+        clear_all_compactions_for_tests();
+        let config = TempDir::new().unwrap();
+        let _codex_auth = write_codex_auth(config.path());
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = format!("http://{addr}");
+        let mock = axum::Router::new().fallback({
+            let requests = requests.clone();
+            move |body: String| {
+                let requests = requests.clone();
+                async move {
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_str(&body).unwrap_or_default());
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"error": {"code": code, "message": message}}).to_string(),
+                        ))
+                        .unwrap()
+                }
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, mock).await.ok();
+        });
+
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+        let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+        let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
+        let response = call_messages_body(json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64,
+            "system": "You are Claude Code.",
+            "messages": [
+                {"role":"user","content":"old conversation"},
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"tool-1","name":"Read","input":{}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"tool-1","content":"result"},
+                    {"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far."}
+                ]}
+            ]
+        }))
+        .await;
+
+        let requests = requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "{code}");
+        assert_eq!(
+            requests[0]["input"].as_array().unwrap().last().unwrap()["type"],
+            "compaction_trigger",
+            "{code}"
+        );
+        assert_eq!(response.status(), status, "{code}");
+        assert_eq!(
+            response
+                .headers()
+                .get("x-should-retry")
+                .and_then(|value| value.to_str().ok()),
+            should_retry,
+            "{code}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], error_type, "{code}");
+        assert_eq!(body["error"]["message"], message, "{code}");
+    }
+    clear_all_compactions_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_non_stream_refused_prompt_is_a_client_error() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            format!(
+                "data: {}\n\n",
+                json!({"type": "response.failed", "response": {
+                    "id": "resp_failed",
+                    "status": "failed",
+                    "error": {"code": "invalid_prompt", "message": "Invalid prompt: toy refusal."}
+                }})
+            )
+            .into_bytes()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hello"}]
+    }))
+    .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["message"], "Invalid prompt: toy refusal.");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_server_compaction_replays_native_history() {
     let _guard = env_lock();
     clear_all_compactions_for_tests();

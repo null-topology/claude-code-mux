@@ -1754,6 +1754,10 @@ fn websocket_destination(url: &str) -> Result<(String, String), CodexError> {
     Ok((host.to_string(), authority))
 }
 
+/// A rejected upgrade on the tunneled path. The rejection carries whatever
+/// body bytes arrived with its head, which may be all of a short body, part of
+/// it or nothing; the detail and class come from them the way the direct path
+/// reads its body, and a 407 is not read at all.
 fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> CodexError {
     if let tokio_tungstenite::tungstenite::Error::Http(response) = error {
         let status = response.status().as_u16();
@@ -1762,13 +1766,25 @@ fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> 
             .get(http::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        let body = response
+            .body()
+            .as_deref()
+            .filter(|_| response.status() != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+            .map(|body| &body[..body.len().min(MAX_HANDSHAKE_ERROR_DETAIL_BYTES)]);
+        let (detail, class) = match body {
+            Some(body) => (
+                handshake_error_detail(Some(body)),
+                super::events::error_class_from_body(body),
+            ),
+            None => (GENERIC_HANDSHAKE_ERROR_DETAIL.to_string(), None),
+        };
         return CodexError {
             status,
             message: format!("WebSocket upgrade rejected with status {status}"),
-            detail: Some(GENERIC_HANDSHAKE_ERROR_DETAIL.to_string()),
+            detail: Some(detail),
             retry_after,
             usage_limit: None,
-            class: None,
+            class,
             origin: CodexErrorOrigin::WebSocketHandshake,
         };
     }
@@ -3838,6 +3854,63 @@ mod tests {
         assert_eq!(err.status, 401);
         assert_eq!(err.detail.as_deref(), Some(GENERIC_HANDSHAKE_ERROR_DETAIL));
         assert_eq!(err.origin, CodexErrorOrigin::WebSocketHandshake);
+    }
+
+    #[tokio::test]
+    async fn tunneled_handshake_rejection_is_classified_from_its_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let body = r#"{"error":{"code":"usage_not_included","message":"Your plan does not include this usage."}}"#;
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = server_io.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buf[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            server_io.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let request = tunneled_websocket_request(
+            "ws://codex.test/backend-api/codex/responses",
+            &HeaderMap::new(),
+            &generate_key(),
+        )
+        .unwrap();
+        let err = match tokio_tungstenite::client_async(request, client_io).await {
+            Ok(_) => panic!("expected the tunneled upgrade to be rejected"),
+            Err(error) => tungstenite_handshake_error(error),
+        };
+
+        assert_eq!(err.status, 403);
+        assert_eq!(
+            err.class,
+            Some(super::super::events::CodexErrorClass::UsageNotIncluded)
+        );
+        assert_eq!(
+            err.detail.as_deref(),
+            Some("Your plan does not include this usage.")
+        );
+        assert_eq!(err.origin, CodexErrorOrigin::WebSocketHandshake);
+
+        // A proxy's own 407 is never read, whatever its body says.
+        let rejected = http::Response::builder()
+            .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+            .body(Some(body.as_bytes().to_vec()))
+            .unwrap();
+        let err =
+            tungstenite_handshake_error(tokio_tungstenite::tungstenite::Error::Http(rejected));
+        assert_eq!(err.status, 407);
+        assert_eq!(err.class, None);
+        assert_eq!(err.detail.as_deref(), Some(GENERIC_HANDSHAKE_ERROR_DETAIL));
     }
 
     #[tokio::test]

@@ -18,7 +18,15 @@
   - `slow_down` and `rate_limit_exceeded` are a 429 that may be retried, with
     `Retry-After` taken from the error or from the "try again in" delay its
     message names;
-  - `server_is_overloaded` is a 529.
+  - `server_is_overloaded` is a 529, with `Retry-After` only when the error
+    carries one.
+
+  A `Retry-After` on these answers is in whole seconds, rounded up and at
+  least 1: a delay of `0.25` or `0` is sent as `1`, and a date is passed on
+  as it came. With opt-in server compaction
+  (`CCP_CODEX_SERVER_COMPACTION`), a compaction refused for spent credits or
+  `usage_not_included` is answered with that error and the normal request is
+  not sent, as a spent usage window already was.
 
   An error that arrives after the answer has started streaming keeps the
   status already sent and now carries the matching error type. A code the

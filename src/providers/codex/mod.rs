@@ -274,7 +274,18 @@ impl CodexProvider {
                         );
                     }
                 }
-                Err(CompactionError::Upstream(error)) if error.usage_limit.is_some() => {
+                // Spent allowance, credits or plan access refuse the normal
+                // request the same way, so it is not sent after them.
+                Err(CompactionError::Upstream(error))
+                    if error.usage_limit.is_some()
+                        || matches!(
+                            error.class,
+                            Some(
+                                events::CodexErrorClass::QuotaExceeded
+                                    | events::CodexErrorClass::UsageNotIncluded
+                            )
+                        ) =>
+                {
                     abort_compaction_attempt(Some(session_id), Some(attempt));
                     log_compaction_event(
                         "server_compaction_failed",
@@ -1587,7 +1598,8 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
 /// Credits or a spend limit that ran out are answered with
 /// `x-should-retry: false` and no `Retry-After`, like a spent window, but
 /// without the unified rate limit headers: no subscription window refused the
-/// request, so none can be named.
+/// request, so none can be named. A `Retry-After` sent with any other class is
+/// in whole seconds (`normalize_retry_after`).
 fn classified_error_response(
     class: events::CodexErrorClass,
     native: &str,
@@ -1599,6 +1611,9 @@ fn classified_error_response(
     } else {
         native
     };
+    if class == events::CodexErrorClass::ContextOverflow {
+        return context_overflow_response(native);
+    }
     let response = client_error(
         StatusCode::from_u16(class.status()).unwrap_or(StatusCode::BAD_GATEWAY),
         error_type,
@@ -1616,9 +1631,9 @@ fn classified_error_response(
                 .into_response();
         }
         events::CodexErrorClass::Throttled => retry_after
-            .map(str::to_string)
+            .map(events::normalize_retry_after)
             .or_else(|| events::retry_after_from_message(native)),
-        events::CodexErrorClass::Overloaded => retry_after.map(str::to_string),
+        events::CodexErrorClass::Overloaded => retry_after.map(events::normalize_retry_after),
         events::CodexErrorClass::UsageNotIncluded
         | events::CodexErrorClass::Rejected
         | events::CodexErrorClass::ContextOverflow => None,
@@ -1631,10 +1646,17 @@ fn classified_error_response(
 
 fn map_codex_failure_to_response(message: &str) -> Response {
     if is_context_window_overflow(message) {
-        json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", message)
+        context_overflow_response(message)
     } else {
         client_error(StatusCode::BAD_GATEWAY, "api_error", message)
     }
+}
+
+/// A prompt that does not fit the context window, whether its code or its
+/// message says so. The native text is kept as it came, never replaced by
+/// `client_error`.
+fn context_overflow_response(message: &str) -> Response {
+    json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", message)
 }
 
 /// An error for `/v1/messages`. The client expects Anthropic's API, so a text
@@ -2003,6 +2025,53 @@ mod tests {
         ));
         let body = error_body(response).await;
         assert_eq!(body["error"]["message"], "Invalid request");
+    }
+
+    #[test]
+    fn a_classified_retry_after_is_whole_seconds() {
+        let http_date = "Wed, 21 Oct 2026 07:28:00 GMT";
+        let cases = [
+            (events::CodexErrorClass::Throttled, "0.25", "1"),
+            (events::CodexErrorClass::Throttled, "0", "1"),
+            (events::CodexErrorClass::Throttled, "7", "7"),
+            (events::CodexErrorClass::Throttled, http_date, http_date),
+            (events::CodexErrorClass::Overloaded, "1.5", "2"),
+            (events::CodexErrorClass::Overloaded, "0", "1"),
+            (events::CodexErrorClass::Overloaded, http_date, http_date),
+        ];
+        for (class, sent, expected) in cases {
+            let response = map_codex_error_to_response(&classified_codex_error(
+                class,
+                429,
+                "toy backend message",
+                Some(sent),
+            ));
+            assert_eq!(
+                response.headers()[http::header::RETRY_AFTER],
+                expected,
+                "{class:?} {sent}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_context_overflow_code_answers_like_the_context_window_message() {
+        // The text names the backend, which `client_error` would replace.
+        let native = "Codex error: your input exceeds the context window of this model.";
+        let by_code = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::ContextOverflow,
+            400,
+            native,
+            None,
+        ));
+        let by_message = map_codex_failure_to_response(native);
+
+        assert_eq!(by_code.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(by_code.status(), by_message.status());
+        let by_code = error_body(by_code).await;
+        assert_eq!(by_code["error"]["type"], "request_too_large");
+        assert_eq!(by_code["error"]["message"], native);
+        assert_eq!(by_code, error_body(by_message).await);
     }
 
     #[test]
