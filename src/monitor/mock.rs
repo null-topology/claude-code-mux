@@ -7,7 +7,7 @@ use std::{
 use super::{
     AbsorbedRequest, ActiveRequest, CacheMiss, CacheMissCause, CompletedRequest, EndpointKind,
     LOCAL_PROVIDER, Ledger, MonitorState, RequestCache, RequestStatus, apply_window_rate,
-    session_summaries,
+    hide_idle_sessions, session_summaries,
 };
 
 const TICK_MILLIS: u64 = 250;
@@ -538,6 +538,28 @@ fn mock_state_for_tick(
     no_status.error = Some("request future ended before completion".to_string());
     recent.push_back(no_status);
 
+    // Idle for two hours: kept in memory and in Stats, hidden from the
+    // Sessions pane, which counts it in its title instead.
+    let mut idle = completed_request(
+        now,
+        "req-idle-session",
+        Some("overnight-migration"),
+        Some(1),
+        EndpointKind::Messages,
+        Duration::from_secs(2 * 60 * 60),
+        Duration::from_secs(4),
+        RequestStatus::Completed,
+        Some(200),
+    );
+    idle.project = Some("automation-sandbox".to_string());
+    idle.provider = Some("codex".to_string());
+    idle.model = Some("gpt-5.4-mini".to_string());
+    idle.requested_model = Some("gpt-5.4-mini".to_string());
+    idle.effective_model = Some("gpt-5.4-mini".to_string());
+    idle.input_tokens = Some(2_600);
+    idle.output_tokens = Some(140);
+    recent.push_back(idle);
+
     add_simulated_requests(now, instant_now, tick, &mut active, &mut recent);
     // The demo builds finished requests instead of replaying their events, so
     // the ledger absorbs them and answers for the session rows exactly as it
@@ -553,10 +575,13 @@ fn mock_state_for_tick(
         ledger.seed_output_history(session_id.clone(), samples);
     }
     let mut sessions = session_summaries(&ledger);
+    let idle_sessions = hide_idle_sessions(&mut sessions, now);
     apply_window_rate(&mut sessions, &active, &recent);
     MonitorState {
         started_at,
         sessions,
+        idle_sessions,
+        models: ledger.measured_usage(),
         active,
         recent: recent.into_iter().collect(),
     }

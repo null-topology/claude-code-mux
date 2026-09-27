@@ -10,16 +10,20 @@
 //! ends, so the backend's own counts can arrive arbitrarily late.
 //!
 //! A record holds numbers and small metadata only: no prompt, no request or
-//! response body, no output text. It lives until the process restarts, so the
-//! map grows with the number of requests served. That is the deliberate price
-//! of keeping those late corrections right.
+//! response body, no output text. It lives as long as its session: a session
+//! idle for a day is dropped with its records and rows
+//! ([`Ledger::drop_sessions_idle_since`]), so the map grows with the requests
+//! of the sessions still in use rather than with every request ever served. A
+//! day is far past any late correction, which only a request in flight or one
+//! that just finished receives.
 //!
 //! Every change to a record happens between taking its contribution out of the
 //! rows it feeds and putting it back ([`Ledger::update`]), so a row is always
 //! the sum of the records attached to it, corrections and moves between rows
 //! included. A change worth nothing numerically still matters: a count moving
 //! from missing to a reported zero changes the evidence behind a total without
-//! changing the total.
+//! changing the total. Dropping a record detaches it like any change; only the
+//! per-model figures Stats shows are kept, moved to a table of their own.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -383,6 +387,15 @@ impl RequestRecord {
             && self.provider.as_deref() != Some(LOCAL_PROVIDER)
     }
 
+    /// Whether the request belongs in Stats. A `count_tokens` estimate asked a
+    /// backend, or the proxy, what a prompt would cost and ran no model, so it
+    /// would only inflate the request count and the timings of the model row
+    /// it names. A local answer does run here and has a row of its own, which
+    /// Stats leaves out by provider.
+    fn ran_on_model(&self) -> bool {
+        self.endpoint != EndpointKind::CountTokens
+    }
+
     pub(crate) fn quality(&self) -> QualityFields {
         usage_quality(self.input_tokens, self.output_tokens, &self.cache)
     }
@@ -528,6 +541,30 @@ impl ModelRecord {
             self.requested.remove(requested);
         }
     }
+
+    fn usage(&self, key: &ModelKey) -> ModelUsage {
+        ModelUsage {
+            provider: key.provider.clone(),
+            model: key.model.clone(),
+            first_seen_rank: as_usize(self.rank),
+            active_count: as_usize(self.counts.active_count),
+            request_count: as_usize(self.counts.request_count),
+            failure_count: as_usize(self.counts.failure_count),
+            input_tokens: self.counts.usage.input_tokens,
+            output_tokens: self.counts.usage.output_tokens,
+            cache_read_tokens: self.counts.usage.cache_read_tokens,
+            cache_write_tokens: self.counts.usage.cache_write_tokens,
+            cache_write_5m_tokens: self.counts.usage.cache_write_5m_tokens,
+            cache_write_1h_tokens: self.counts.usage.cache_write_1h_tokens,
+            evidence: self.counts.evidence,
+            misses: self.misses,
+            requested_models: self
+                .requested
+                .iter()
+                .map(|(model, count)| (model.clone(), as_usize(*count)))
+                .collect(),
+        }
+    }
 }
 
 impl SessionRecord {
@@ -571,27 +608,7 @@ impl SessionRecord {
         pairs.sort_by_key(|(_, record)| record.rank);
         pairs
             .into_iter()
-            .map(|(key, record)| ModelUsage {
-                provider: key.provider.clone(),
-                model: key.model.clone(),
-                first_seen_rank: as_usize(record.rank),
-                active_count: as_usize(record.counts.active_count),
-                request_count: as_usize(record.counts.request_count),
-                failure_count: as_usize(record.counts.failure_count),
-                input_tokens: record.counts.usage.input_tokens,
-                output_tokens: record.counts.usage.output_tokens,
-                cache_read_tokens: record.counts.usage.cache_read_tokens,
-                cache_write_tokens: record.counts.usage.cache_write_tokens,
-                cache_write_5m_tokens: record.counts.usage.cache_write_5m_tokens,
-                cache_write_1h_tokens: record.counts.usage.cache_write_1h_tokens,
-                evidence: record.counts.evidence,
-                misses: record.misses,
-                requested_models: record
-                    .requested
-                    .iter()
-                    .map(|(model, count)| (model.clone(), as_usize(*count)))
-                    .collect(),
-            })
+            .map(|(key, record)| record.usage(key))
             .collect()
     }
 
@@ -842,6 +859,13 @@ pub(crate) struct RequestNumbers {
 pub(crate) struct Ledger {
     requests: HashMap<String, RequestRecord>,
     sessions: HashMap<Option<String>, SessionRecord>,
+    /// What each backend and model ran, over the records held: the rows Stats
+    /// adds up. A `count_tokens` estimate ran nothing and stays out, though its
+    /// session and its model row count it as a request.
+    measured: HashMap<ModelKey, ModelRecord>,
+    /// What the records of dropped sessions had put into `measured`, kept so
+    /// that Stats still covers every request since the process started.
+    retired: HashMap<ModelKey, ModelRecord>,
     next_session_rank: u64,
     next_request_rank: u64,
 }
@@ -1319,11 +1343,19 @@ impl Ledger {
         let Self {
             requests,
             sessions,
+            measured,
             next_session_rank,
             ..
         } = self;
         if let Some(record) = requests.get(request_id) {
-            apply_contribution(sessions, next_session_rank, request_id, record, -1);
+            apply_contribution(
+                sessions,
+                measured,
+                next_session_rank,
+                request_id,
+                record,
+                -1,
+            );
         }
     }
 
@@ -1331,12 +1363,85 @@ impl Ledger {
         let Self {
             requests,
             sessions,
+            measured,
             next_session_rank,
             ..
         } = self;
         if let Some(record) = requests.get(request_id) {
-            apply_contribution(sessions, next_session_rank, request_id, record, 1);
+            apply_contribution(sessions, measured, next_session_rank, request_id, record, 1);
         }
+    }
+
+    /// Drop every session with nothing in flight whose latest request is older
+    /// than `cutoff`: its row, its conversations and the records of its
+    /// requests, and say which sessions went. A request naming one of them
+    /// afterwards starts a new session with a new rank.
+    ///
+    /// Each record is detached from `measured` as it goes and its figures are
+    /// added to `retired` instead, so what Stats sums is the same before and
+    /// after. A report arriving later for a dropped request finds no record and
+    /// changes nothing.
+    pub(crate) fn drop_sessions_idle_since(
+        &mut self,
+        cutoff: SystemTime,
+    ) -> HashSet<Option<String>> {
+        let dropped: HashSet<Option<String>> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.counts.active_count == 0 && session.last_seen < cutoff)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        if dropped.is_empty() {
+            return dropped;
+        }
+        let Self {
+            requests,
+            sessions,
+            measured,
+            retired,
+            ..
+        } = self;
+        requests.retain(|_, record| {
+            if !dropped.contains(&record.session_id) {
+                return true;
+            }
+            if record.ran_on_model() {
+                let contribution = record.contribution();
+                let key = record.model_key();
+                if let Some(row) = measured.get_mut(&key) {
+                    row.apply(&contribution, &record.requested_model, -1);
+                    if row.counts.is_empty() {
+                        measured.remove(&key);
+                    }
+                }
+                retired
+                    .entry(key)
+                    .or_default()
+                    .apply(&contribution, &record.requested_model, 1);
+            }
+            false
+        });
+        sessions.retain(|session_id, _| !dropped.contains(session_id));
+        dropped
+    }
+
+    /// What each backend and model ran since the process started, for Stats:
+    /// the records held and the ones already dropped, in no particular order.
+    /// A pair can appear twice, once for each; the rows are summed by pair.
+    pub(crate) fn measured_usage(&self) -> Vec<ModelUsage> {
+        self.measured
+            .iter()
+            .chain(&self.retired)
+            .filter(|(_, record)| !record.counts.is_empty())
+            .map(|(key, record)| record.usage(key))
+            .collect()
+    }
+
+    /// How many records and sessions the ledger holds, for tests that check a
+    /// dropped session took its requests with it.
+    #[cfg(test)]
+    pub(crate) fn held_for_tests(&self) -> (usize, usize) {
+        (self.requests.len(), self.sessions.len())
     }
 
     /// Move a request's start in time, for tests that need a request older than
@@ -1361,6 +1466,7 @@ impl Ledger {
 /// back out of them.
 fn apply_contribution(
     sessions: &mut HashMap<Option<String>, SessionRecord>,
+    measured: &mut HashMap<ModelKey, ModelRecord>,
     next_session_rank: &mut u64,
     request_id: &str,
     record: &RequestRecord,
@@ -1393,6 +1499,14 @@ fn apply_contribution(
     session
         .model_mut(record.model_key())
         .apply(&contribution, &record.requested_model, sign);
+    // Stats has no order to keep, so its rows are made and read by pair alone.
+    if record.ran_on_model() {
+        measured.entry(record.model_key()).or_default().apply(
+            &contribution,
+            &record.requested_model,
+            sign,
+        );
+    }
     match record.conversation.as_deref() {
         Some(conversation) => {
             let row = session.conversation_mut(conversation, record.started_at);

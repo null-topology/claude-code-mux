@@ -314,8 +314,16 @@ one compact numeric record plus small metadata per request id, so a report
 arriving after a request was evicted still lands on its record and corrects
 every session, conversation and model total it fed. The live Codex path needs
 that: it hands the response to the client before the stream ends, so the
-backend's own counts can arrive arbitrarily late. The price is a map that grows
-with the number of requests served until the process restarts. Records hold
+backend's own counts can arrive arbitrarily late. A record lives as long as
+its session: `MonitorStore::drop_idle_sessions` removes a session with no
+request in flight and no activity for `SESSION_DROPPED_AFTER` (24 h), with its
+conversations, its records and its cache lanes, through
+`Ledger::drop_sessions_idle_since`. It runs on every `snapshot()` and at every
+`RequestStarted` before the ledger sees the request, so a request for a session
+id idle that long starts a new session (fresh counters, a new rank, no old
+cache baseline) whether or not a snapshot ran in between. A later report for a
+dropped request finds no record and changes nothing. So the map grows with the
+requests of the sessions still in use, not with the whole run. Records hold
 numbers and small metadata only — no prompt, no request or response body, no
 output text. Every mutation goes through `Ledger::update`, which detaches a
 record's contribution from the rows it feeds, applies the change, and attaches
@@ -366,13 +374,30 @@ The `demo` command shows all of it from `src/monitor/mock.rs`.
 flight first, then by `last_seen` descending, then by `first_seen_rank`
 descending as the tie-break, whichever model or conversation made the latest
 request; the conversations under a session keep `order_conversations`' tree
-order. The bottom pane is tabbed (`BottomTab`: `Events`, `Stats`); Tab cycles
+order. `MonitorStore::snapshot` then leaves out a session with no request in
+flight and no activity for `SESSION_HIDDEN_AFTER` (1 h, `hide_idle_sessions`)
+and counts it in `MonitorState::idle_sessions`, which the Sessions pane title
+shows as `idle hidden: N`; its data stays in the ledger and its next request
+brings it back whole. The header's session count is the visible sessions. The
+store's clock is `MonitorStore::now`, which tests move with `clock_offset`.
+`apply_window_rate` skips a recent request older than its session's
+`first_seen`, which belonged to an earlier session dropped under the same id.
+The bottom pane is tabbed (`BottomTab`: `Events`, `Stats`); Tab cycles
 `FocusPane` Sessions → Recent → Bottom, and while Bottom has focus Left/Right
 switch the tab (`MonitorApp::navigate`) and Up/Down/j/k scroll it, with no
 row identity to keep. The title brackets the shown tab (`[Events] Stats`).
 The Stats tab renders `MonitorState::model_stats`: one `ModelStats` per
-(provider, effective model), the session `models` rollups summed across every
-session, with `local` rows left out. Its cache miss tally is `CacheMissTally`
+(provider, effective model), summed over `MonitorState::models`, with `local`
+rows left out. Those come from `Ledger::measured_usage`: the ledger's own
+per-model rows (`measured`, fed in `apply_contribution` beside the session
+rollups) plus `retired`, where `drop_sessions_idle_since` moves a dropped
+record's contribution, so Stats covers every request since the proxy started
+whether its session is shown, hidden or dropped. A `count_tokens` request runs
+no model and is left out of Stats entirely (`RequestRecord::ran_on_model`, and
+the median window skips the endpoint): the local Codex estimate names no
+effective model and used to make a `codex/-` row, and Anthropic's relayed one
+inflated its model's `Reqs`. It stays in the session rollups, so a session's
+`models` still add up to its figures. Its cache miss tally is `CacheMissTally`
 on `ModelUsage`, fed by `Contribution.miss` from the `CacheMiss` a request's
 evaluation stored on its record, so a per-model miss is counted exactly once
 and detached with the record like every other number; the judging itself is

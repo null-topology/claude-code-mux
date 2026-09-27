@@ -457,6 +457,13 @@ conversation made it; a session with a request in flight sits above the idle
 ones. The conversations under a session keep their tree order, and the
 selected row stays selected when the order changes.
 
+A session with nothing in flight and no request for an hour leaves the
+Sessions pane, whose title counts it (`Sessions (idle hidden: N)`); its figures
+stay, and its next request brings it back with its whole history. After a day
+without a request it is dropped from memory, and a request under the same
+session id then starts a new session from zero. The Stats tab keeps the figures
+of hidden and dropped sessions alike. Neither period is configurable.
+
 | key | what it does |
 | --- | --- |
 | `q` | ask to quit; `y` confirms, `n`, `q` or `Esc` cancels |
@@ -505,7 +512,9 @@ rows are summed over every session since the proxy started and sorted by
 prompt tokens, biggest first. The two `(rec)` columns are medians over the
 completed requests of that row still in the recent list, not over the whole
 run, and an even number of requests gives the mean of the two middle values;
-the other columns are lifetime sums.
+the other columns are lifetime sums. Token count requests (`count_tokens`) run
+no model and are not counted in Stats; they still show in the Sessions pane,
+the recent list and the events.
 
 Marks that carry meaning:
 

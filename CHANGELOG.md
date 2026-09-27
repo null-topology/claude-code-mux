@@ -1,3 +1,22 @@
+## Unreleased
+
+- The monitor's Stats tab no longer counts token count requests. The local
+  Codex estimate used to add a `codex/-` row of requests with every token
+  column `n/a`, and Anthropic's relayed `count_tokens` inflated `Reqs` (and
+  could feed `Fail` and the latency median) of the Claude model it named.
+  These requests still show in the Sessions pane, the recent list and the
+  events as before.
+- The monitor now forgets idle sessions. A session with nothing in flight and
+  no request for an hour is hidden from the Sessions pane, whose title says
+  how many are hidden (`Sessions (idle hidden: N)`), and its next request
+  brings it back with its history. After a day without a request it is dropped
+  from memory, so a long-running proxy no longer keeps every request it ever
+  served; a later request under the same session id starts a new session from
+  zero. The header's session count covers the visible sessions only. The Stats
+  tab still covers every request since the proxy started, dropped sessions
+  included. There is no setting for either period and no switch back to
+  keeping every session.
+
 ## v0.12.0 (2026-09-23)
 
 - Client headers can now reach the Codex backend. `CCP_CODEX_FORWARD_HEADERS`

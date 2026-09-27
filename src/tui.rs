@@ -810,6 +810,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
             frame,
             root[1],
             &state.sessions,
+            state.idle_sessions,
             app.selected.view(),
             app.focus == FocusPane::Sessions,
         ),
@@ -2047,23 +2048,28 @@ impl SessionRow<'_> {
     }
 }
 
+/// The Sessions pane's name, which counts the sessions it leaves out as idle so
+/// that they are not missing without a word.
+fn sessions_pane_name(idle_sessions: usize) -> String {
+    match idle_sessions {
+        0 => "Sessions".to_string(),
+        count => format!("Sessions (idle hidden: {count})"),
+    }
+}
+
 fn render_sessions(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     sessions: &[SessionSummary],
+    idle_sessions: usize,
     selection: SelectionView,
     focused: bool,
 ) {
+    let title = selection.title(&sessions_pane_name(idle_sessions));
     if sessions.is_empty() {
         // A pane with nothing left to mark still says what became of the row
         // that was.
-        render_empty_table_state(
-            frame,
-            area,
-            &selection.title("Sessions"),
-            focused,
-            "No sessions",
-        );
+        render_empty_table_state(frame, area, &title, focused, "No sessions");
         return;
     }
 
@@ -2131,7 +2137,7 @@ fn render_sessions(
         .collect::<Vec<_>>();
     let table = Table::new(rows, widths.clone())
         .header(column_header(&columns))
-        .block(panel(&selection.title("Sessions"), focused));
+        .block(panel(&title, focused));
     let mut table_state = TableState::default().with_selected(selection.row);
     frame.render_stateful_widget(table, area, &mut table_state);
 }
@@ -3970,6 +3976,7 @@ mod tests {
                     frame,
                     frame.area(),
                     &state.sessions,
+                    0,
                     SelectionView::at(0),
                     true,
                 )
@@ -4003,10 +4010,36 @@ mod tests {
         assert!(spark_chars(&wide) > 0, "{wide}");
     }
 
+    /// The demo holds one session idle for hours: the pane leaves it out and
+    /// its title says so, whether rows remain or not.
+    #[test]
+    fn the_sessions_pane_counts_the_idle_sessions_it_hides() {
+        let state = mock_state();
+        assert_eq!(state.idle_sessions, 1);
+        let pane = buffer_text(&draw(120, 24, |frame| {
+            render_sessions(
+                frame,
+                frame.area(),
+                &state.sessions,
+                state.idle_sessions,
+                SelectionView::at(0),
+                true,
+            )
+        }));
+        assert!(pane.contains("Sessions (idle hidden: 1)"), "{pane}");
+        assert!(!pane.contains("overnight-migration"), "{pane}");
+
+        let empty = buffer_text(&draw(60, 9, |frame| {
+            render_sessions(frame, frame.area(), &[], 3, SelectionView::at(0), true)
+        }));
+        assert!(empty.contains("Sessions (idle hidden: 3)"), "{empty}");
+        assert!(empty.contains("No sessions"), "{empty}");
+    }
+
     #[test]
     fn empty_tables_hide_columns_and_center_placeholders() {
         let sessions = draw(40, 9, |frame| {
-            render_sessions(frame, frame.area(), &[], SelectionView::at(0), true)
+            render_sessions(frame, frame.area(), &[], 0, SelectionView::at(0), true)
         });
         let sessions_text = buffer_text(&sessions);
         assert_centered(&sessions, "No sessions", 4);
@@ -4083,6 +4116,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(session_index),
                 true,
             )
@@ -4233,6 +4267,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &active_state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
@@ -4348,6 +4383,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(4),
                 true,
             )
@@ -4398,6 +4434,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
@@ -4534,6 +4571,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(0),
                 false,
             )
@@ -4707,6 +4745,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &mixed_state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
@@ -4735,6 +4774,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &single_state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
@@ -4758,6 +4798,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &local_state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
@@ -4795,6 +4836,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
@@ -4954,6 +4996,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &sessions,
+                0,
                 SelectionView::at(last_session_row),
                 true,
             )
@@ -5069,6 +5112,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
@@ -5087,6 +5131,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
