@@ -1,4 +1,4 @@
-## Unreleased
+## v0.13.0 (2026-09-27)
 
 - The monitor's Stats tab no longer counts token count requests. The local
   Codex estimate used to add a `codex/-` row of requests with every token
