@@ -1767,7 +1767,7 @@ async fn smoke_auto_review_uses_codex_default_and_configured_override() {
 
     let sent = captured.lock().unwrap();
     assert_eq!(sent.len(), 3);
-    assert_eq!(sent[0]["model"], "gpt-5.6-luna");
+    assert_eq!(sent[0]["model"], "gpt-6-luna");
     assert_eq!(sent[1]["model"], "gpt-5.6-terra");
     assert_eq!(sent[2]["model"], "gpt-5.6-sol");
 }
@@ -4336,16 +4336,16 @@ async fn smoke_auto_review_keeps_the_requested_model_beside_the_one_that_ran() {
         .unwrap()
         .clone()
         .expect("upstream was called");
-    assert_eq!(sent["model"], "gpt-5.6-luna");
+    assert_eq!(sent["model"], "gpt-6-luna");
 
     let state = monitor.snapshot();
     let request = &state.recent[0];
     assert_eq!(request.requested_model.as_deref(), Some("gpt-5.6-sol"));
-    assert_eq!(request.effective_model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(request.effective_model.as_deref(), Some("gpt-6-luna"));
     let row = state.sessions[0]
         .models
         .iter()
-        .find(|row| row.model.as_deref() == Some("gpt-5.6-luna"))
+        .find(|row| row.model.as_deref() == Some("gpt-6-luna"))
         .expect("a row for the model that ran");
     assert_eq!(
         row.requested_models
@@ -4571,7 +4571,7 @@ async fn smoke_codex_progress_label_forbids_tool_calls_and_keeps_tools() {
         "forbidding tool calls must not change the tools the label carries"
     );
 
-    assert_eq!(junior["model"], "gpt-5.6-luna");
+    assert_eq!(junior["model"], "gpt-6-luna");
     assert_eq!(junior["tool_choice"], "none");
     assert_eq!(
         junior["tools"], not_a_label["tools"],

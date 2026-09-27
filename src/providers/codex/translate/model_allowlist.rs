@@ -15,21 +15,24 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
-    ("haiku", "gpt-5.6-luna"),
-    ("claude-haiku-4-5", "gpt-5.6-luna"),
-    ("claude-haiku-4-5-20251001", "gpt-5.6-luna"),
+    ("haiku", "gpt-6-luna"),
+    ("claude-haiku-4-5", "gpt-6-luna"),
+    ("claude-haiku-4-5-20251001", "gpt-6-luna"),
     ("sonnet", "gpt-5.6-terra"),
     ("claude-sonnet-4-6", "gpt-5.6-terra"),
     ("claude-sonnet-5", "gpt-5.6-terra"),
-    ("opus", "gpt-5.6-sol"),
-    ("claude-opus-4-7", "gpt-5.6-sol"),
-    ("claude-opus-4-8", "gpt-5.6-sol"),
-    ("claude-opus-5", "gpt-5.6-sol"),
-    ("fable", "gpt-5.6-sol"),
-    ("claude-fable-5", "gpt-5.6-sol"),
+    ("opus", "gpt-6-sol"),
+    ("claude-opus-4-7", "gpt-6-sol"),
+    ("claude-opus-4-8", "gpt-6-sol"),
+    ("claude-opus-5", "gpt-6-sol"),
+    ("claude-opus-5-5", "gpt-6-sol"),
+    ("fable", "gpt-6-sol"),
+    ("claude-fable-5", "gpt-6-sol"),
 ];
 
 #[derive(Debug, Clone)]
@@ -175,19 +178,24 @@ fn uses_responses_lite_with_full_lane(
     }
     matches!(
         model,
-        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra"
+        "gpt-5.6-luna"
+            | "gpt-5.6-sol"
+            | "gpt-5.6-terra"
+            | "gpt-6-astra"
+            | "gpt-6-luna"
+            | "gpt-6-sol"
     )
 }
 
-/// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
-/// Responses API resolves it to a `-free` variant and returns 404 (Model not
-/// found gpt-5.6-luna-free-...). Hosted web_search requests must run on the
-/// full lane, so luna is upgraded to its nearest full-lane sibling.
+/// Luna models exist only behind the Responses Lite lane; the full Responses
+/// API resolves them to a `-free` variant and returns 404 (Model not found
+/// gpt-5.6-luna-free-...). Hosted web_search requests must run on the full
+/// lane, so luna is upgraded to its nearest full-lane sibling.
 pub fn full_lane_web_search_model(model: &str) -> &str {
-    if model == "gpt-5.6-luna" {
-        "gpt-5.6-sol"
-    } else {
-        model
+    match model {
+        "gpt-5.6-luna" => "gpt-5.6-sol",
+        "gpt-6-luna" => "gpt-6-sol",
+        _ => model,
     }
 }
 
@@ -209,7 +217,7 @@ mod tests {
     #[test]
     fn haiku_resolves_to_luna() {
         let r = resolve_model_request("haiku");
-        assert_eq!(r.model, "gpt-5.6-luna");
+        assert_eq!(r.model, "gpt-6-luna");
     }
 
     #[test]
@@ -218,6 +226,8 @@ mod tests {
         assert_eq!(full_lane_web_search_model("gpt-5.6-sol"), "gpt-5.6-sol");
         assert_eq!(full_lane_web_search_model("gpt-5.6-terra"), "gpt-5.6-terra");
         assert_eq!(full_lane_web_search_model("gpt-5.4"), "gpt-5.4");
+        assert_eq!(full_lane_web_search_model("gpt-6-luna"), "gpt-6-sol");
+        assert_eq!(full_lane_web_search_model("gpt-6-sol"), "gpt-6-sol");
     }
 
     #[test]
@@ -235,14 +245,14 @@ mod tests {
     #[test]
     fn opus_resolves_to_sol() {
         let r = resolve_model_request("opus");
-        assert_eq!(r.model, "gpt-5.6-sol");
+        assert_eq!(r.model, "gpt-6-sol");
     }
 
     #[test]
     fn opus_aliases_resolve_to_sol() {
-        for model in ["claude-opus-4-8", "claude-opus-5"] {
+        for model in ["claude-opus-4-8", "claude-opus-5", "claude-opus-5-5"] {
             let r = resolve_model_request(model);
-            assert_eq!(r.model, "gpt-5.6-sol");
+            assert_eq!(r.model, "gpt-6-sol");
         }
     }
 
@@ -250,7 +260,7 @@ mod tests {
     fn fable_5_resolves_to_sol() {
         for model in ["fable", "claude-fable-5"] {
             let r = resolve_model_request(model);
-            assert_eq!(r.model, "gpt-5.6-sol");
+            assert_eq!(r.model, "gpt-6-sol");
         }
     }
 
@@ -268,6 +278,8 @@ mod tests {
         assert!(assert_allowed_model("gpt-5.6-terra").is_ok());
         assert!(assert_allowed_model("gpt-5.6-luna").is_ok());
         assert!(assert_allowed_model("gpt-6-astra").is_ok());
+        assert!(assert_allowed_model("gpt-6-luna").is_ok());
+        assert!(assert_allowed_model("gpt-6-sol").is_ok());
     }
 
     #[test]
@@ -297,6 +309,8 @@ mod tests {
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
         ] {
             assert!(uses_responses_lite_with_full_lane(model, None, false));
         }
@@ -312,6 +326,8 @@ mod tests {
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
         ] {
             assert!(!uses_responses_lite_with_full_lane(model, None, true));
             assert!(!uses_responses_lite_with_full_lane(model, Some(true), true));

@@ -150,7 +150,7 @@ Request path:
    the model (strip `[1m]`), look up the session by `x-claude-code-session-id`,
    pick a provider via the registry, apply the auto-review override (Claude
    Code's non-streaming, tool-free security classifier is rerouted to
-   `CCP_AUTO_REVIEW_MODEL`, default `gpt-5.6-luna` on codex), then call the
+   `CCP_AUTO_REVIEW_MODEL`, default `gpt-6-luna` on codex), then call the
    provider and record log, monitor and traffic capture. Every response it
    returns, early rejections and the local agent-summary answer (with
    `CCP_AGENT_SUMMARY=local`) included,
@@ -550,7 +550,7 @@ client's own, so the request Anthropic receives is unchanged and only the
 proxy's own record names the junior model. The junior model
 must still hold the subagent's context, which is why Anthropic's is
 `claude-sonnet-5` and not Haiku (200k would drop the label on a long subagent)
-and Codex's is `gpt-5.6-luna`; a provider without an entry in
+and Codex's is `gpt-6-luna`; a provider without an entry in
 `summary_model_for` keeps the request's model. Detection is the prompt text,
 `SUMMARY_PROMPT_MARKER`: these requests otherwise look like a normal subagent
 turn, with its tools and history. Detection skips trailing `role: "system"`
@@ -752,8 +752,10 @@ bodies. `/v1/models` still reports such an empty answer as it came.
 
 Hosted web search sits outside the policy: a request carrying the hosted
 `web_search_20250305` tool is forced onto the full lane, and there a non-forced
-`gpt-5.6-luna` is rewritten to `gpt-5.6-sol` (`apply_model_lane_for_request`,
-`full_lane_web_search_model`). The forced standalone `/alpha/search` path
+`gpt-5.6-luna` is rewritten to `gpt-5.6-sol` and `gpt-6-luna` to `gpt-6-sol`
+(`apply_model_lane_for_request`, `full_lane_web_search_model`). The compiled-in
+lane table lists `gpt-6-luna` and `gpt-6-sol` beside the gpt-5.6 family and
+`gpt-6-astra`. The forced standalone `/alpha/search` path
 (`is_standalone_search_request`) builds a request of its own and keeps the
 model that was asked for. The rewrite rests on no reproducible capture of a
 Luna refusal on the full lane, and no live capability check has been run
@@ -802,8 +804,8 @@ the FABLE variable below on 2.1.269:
   2.1.269 binary and the CLI ships new builds quickly, so check the version in
   use before relying on it.
 
-Those four variables give a whole-picker recipe — haiku to `gpt-5.6-luna`,
-sonnet to `gpt-5.6-terra`, opus to `gpt-5.6-sol`, fable to `gpt-6-astra`. It is
+Those four variables give a whole-picker recipe — haiku to `gpt-6-luna`,
+sonnet to `gpt-5.6-terra`, opus to `gpt-6-sol`, fable to `gpt-6-astra`. It is
 client configuration, not a proxy feature: the proxy has no subscription
 detection, no provider selector, no launcher and no failover when a backend's
 auth fails. Starting Codex-only, with no Claude credentials present, is not

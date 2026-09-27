@@ -25,6 +25,29 @@
   proxy does not know is handled as before, and so is a spent usage window
   (`usage_limit_reached`). There is no setting to get the old answers back.
 
+- The Codex defaults move to the gpt-6 models, following the same change in
+  raine/claude-code-proxy#165:
+  - Claude Code's security classifier, when it goes to Codex, now runs on
+    `gpt-6-luna` instead of `gpt-5.6-luna`. `CCP_AUTO_REVIEW_MODEL=gpt-5.6-luna`
+    brings the old model back, but a set value applies to the classifier on
+    every route, not only on Codex; there is no Codex-only way back;
+  - in the `upstream` progress-label mode the Codex junior model is now
+    `gpt-6-luna`. `CCP_AGENT_SUMMARY_MODEL=gpt-5.6-luna` brings the old model
+    back, and it too applies to labels on every route;
+  - with `CCP_ALIAS_PROVIDER=codex`, `haiku` and the Claude Haiku ids resolve
+    to `gpt-6-luna`, and `opus`, `fable`, the Claude Opus and Fable ids and the
+    new `claude-opus-5-5` to `gpt-6-sol`; Sonnet stays on `gpt-5.6-terra`.
+    There is no setting for the old mapping; name the Codex model directly
+    instead;
+  - `gpt-6-luna` and `gpt-6-sol` are known before the first model listing
+    arrives, sit in the built-in Lite table that the `inventory` lane policy
+    falls back on, and a hosted web search on `gpt-6-luna` is sent as
+    `gpt-6-sol`, as one on `gpt-5.6-luna` already goes to `gpt-5.6-sol`;
+  - the monitor's setup hint names `gpt-6-sol` and `gpt-6-luna`;
+  - the model listing call sends `client_version` 0.157.1 when neither
+    `CCP_CODEX_CLIENT_VERSION` nor the Codex CLI's `models_cache.json` names
+    one. Set `CCP_CODEX_CLIENT_VERSION` to send a different version.
+
 ## v0.13.0 (2026-09-27)
 
 - The monitor's Stats tab no longer counts token count requests. The local

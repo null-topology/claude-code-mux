@@ -42,7 +42,7 @@ pub const SUMMARY_PROMPT_MARKER: &str = "Describe your most recent action in 3-5
 /// subagent without a status line; on Codex, Luna holds a million tokens.
 /// A provider with no entry here keeps the request's own model.
 pub const ANTHROPIC_SUMMARY_MODEL: &str = "claude-sonnet-5";
-pub const CODEX_SUMMARY_MODEL: &str = "gpt-5.6-luna";
+pub const CODEX_SUMMARY_MODEL: &str = "gpt-6-luna";
 
 pub fn summary_model_for(provider: &str) -> Option<&'static str> {
     match provider {
@@ -382,7 +382,7 @@ mod tests {
     fn each_provider_gets_a_junior_model_that_still_holds_the_context() {
         // Sonnet, not Haiku: a subagent past 200k tokens must keep its label.
         assert_eq!(summary_model_for("anthropic"), Some("claude-sonnet-5"));
-        assert_eq!(summary_model_for("codex"), Some("gpt-5.6-luna"));
+        assert_eq!(summary_model_for("codex"), Some("gpt-6-luna"));
         // Unknown provider: keep the request's own model rather than guess.
         assert_eq!(summary_model_for("kimi"), None);
     }

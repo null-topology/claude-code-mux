@@ -205,7 +205,7 @@ impl Provider for IdentityCaptureProvider {
     }
 
     fn supported_models(&self) -> Vec<String> {
-        vec!["gpt-5.5".to_string(), "gpt-5.6-luna".to_string()]
+        vec!["gpt-5.5".to_string(), "gpt-6-luna".to_string()]
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {
@@ -2143,7 +2143,7 @@ async fn agent_progress_label_upstream_route_keeps_the_junior_model() {
     assert_eq!(response.status(), StatusCode::OK);
     let bodies = bodies.lock().unwrap();
     assert_eq!(bodies.len(), 1);
-    assert_eq!(bodies[0].model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(bodies[0].model.as_deref(), Some("gpt-6-luna"));
     assert_eq!(
         bodies[0].extra.get("output_config"),
         Some(&json!({"effort": "low"}))

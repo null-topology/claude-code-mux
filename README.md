@@ -882,9 +882,9 @@ This is the complete list of variables the proxy reads.
 | `CCP_CONFIG_DIR` | per platform | Move the config directory. It does **not** move the state directory. |
 | `CLAUDE_CONFIG_DIR` | `$HOME/.claude` | Claude Code's own configuration directory, read the way Claude Code reads it. The monitor looks for session transcripts under its `projects` directory to name sessions. Separate from `CCP_CONFIG_DIR`. |
 | `CCP_ALIAS_PROVIDER` | `anthropic` | Backend for the Claude aliases: `anthropic`, `codex` or `kimi`. Leave it alone unless you want `opus` to stop meaning Claude. |
-| `CCP_AUTO_REVIEW_MODEL` | unset | Model for Claude Code's background security classifier. Unset, the classifier goes to `gpt-5.6-luna` only when it would have reached Codex anyway; set, it applies on any route. |
+| `CCP_AUTO_REVIEW_MODEL` | unset | Model for Claude Code's background security classifier. Unset, the classifier goes to `gpt-6-luna` only when it would have reached Codex anyway; set, it applies on any route. |
 | `CCP_AGENT_SUMMARY` | `native` | Claude Code periodically asks for a short progress label for each running background subagent and resends that subagent's whole context with it. The proxy recognizes the prompt, also when trailing system messages follow it, and only when the `x-claude-code-request-class` header is absent or says `auxiliary`; any other class rules the request out. The header alone is not enough, because Claude Code sends `auxiliary` on every side request. `native` routes and relays the request like any other for its model, so the client sees its real usage; like any request it can fail (429, 5xx, a spent Codex window). On the Codex route, in `native` and `upstream` mode both, the label goes out with `tool_choice` set to `none` and its tools kept: the client only asks in prose not to use tools, and Codex models often answered a label with a tool call, which the client discards. Measured on the ChatGPT backend, every listed Codex model accepts and enforces it, and the cached prefix is unaffected. The Anthropic route is untouched, because a `tool_choice` change invalidates Anthropic's messages cache and the passthrough relays the client's bytes as they are. `local` answers it from the transcript, built from the last tool call; the monitor shows provider `local` and the usage reports zero input. `upstream` (`model` and `remote` do the same) pins the provider's junior model at `effort: low`, or `CCP_AGENT_SUMMARY_MODEL` when set; on the Anthropic route the relayed bytes stay the client's own, so the request Anthropic receives is unchanged and only the proxy's own record names the junior model. Values are trimmed and case-sensitive: exactly `native`, `local`, `upstream`, `model` or `remote`. An empty or unrecognized value is skipped, so the setting falls back to `agentSummary` in `config.json`, then to `native`. `proxy.log` records `agent_summary_forwarded` or `agent_summary_answered_locally` for the first two modes, and `agent_summary_routed` only when `upstream` picked a model; on a backend with no junior model and no `CCP_AGENT_SUMMARY_MODEL` the request keeps its own model and none of the three is logged. |
-| `CCP_AGENT_SUMMARY_MODEL` | the provider's junior model | Which model answers a label in `upstream` mode. Without it: `claude-sonnet-5` on Anthropic, `gpt-5.6-luna` on Codex, and the request's own model on a backend with no entry. Ignored in `native` and `local`. |
+| `CCP_AGENT_SUMMARY_MODEL` | the provider's junior model | Which model answers a label in `upstream` mode. Without it: `claude-sonnet-5` on Anthropic, `gpt-6-luna` on Codex, and the request's own model on a backend with no entry. Ignored in `native` and `local`. |
 | `CCP_USER_AGENT` | per backend | Fallback `User-Agent` for the Codex and Kimi backends when neither has its own override. |
 
 **Anthropic route**
@@ -961,7 +961,7 @@ the default. Eleven variables have no key in the file and are environment-only:
   "bindAddress": "127.0.0.1",
   "port": 18765,
   "aliasProvider": "anthropic",
-  "autoReviewModel": "gpt-5.6-luna",
+  "autoReviewModel": "gpt-6-luna",
   "agentSummary": "native",
   "log": { "verbose": false, "stderr": false },
   "codex": {
@@ -1030,7 +1030,8 @@ capped at 30 seconds.
 ## Responses lanes and parallel tool calls
 
 Codex marks the gpt-5.6 family and `gpt-6-astra` for the Responses **Lite**
-lane in its model listing. That lane requires `parallel_tool_calls: false` — a
+lane in its model listing, and the proxy's built-in table puts `gpt-6-luna` and
+`gpt-6-sol` there as well. That lane requires `parallel_tool_calls: false` — a
 Lite request that sets it to `true` is rejected with 400 `unsupported_value` —
 so a model on it answers with at most one tool call per turn. Claude Code
 normally batches several, three files read at once for instance, and behind Lite
@@ -1045,7 +1046,7 @@ behaviors:
 | value | lane for an ordinary request |
 | --- | --- |
 | `full` (default) | The full lane, whatever the inventory says. |
-| `inventory` | Whatever `use_responses_lite` said in the last successful model listing; for a model that listing did not name, or named without the flag, the built-in table, which marks `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra` and `gpt-6-astra` as Lite. |
+| `inventory` | Whatever `use_responses_lite` said in the last successful model listing; for a model that listing did not name, or named without the flag, the built-in table, which marks `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6-luna` and `gpt-6-sol` as Lite. |
 
 `inventory` is not "force Lite" — it hands the decision back to the backend's
 own flag — and it costs no extra call: the flag comes from the listing
@@ -1056,11 +1057,13 @@ setting are listed under [Configuration file](#configuration-file).
 A request carrying the hosted `web_search_20250305` tool goes on the full lane
 whatever the policy says, because the Lite lane only accepts function and
 custom tools. On `gpt-5.6-luna` such a request is currently sent as
-`gpt-5.6-sol` instead. The 404 that this substitution was written for did not
-reproduce when ordinary full-lane requests were rechecked, and the substitution
-itself has not been retested. A request whose `tool_choice` pins the hosted
-`web_search` tool takes a separate path that builds its own search request and
-keeps the requested model, `gpt-5.6-luna` included.
+`gpt-5.6-sol` instead, and on `gpt-6-luna` as `gpt-6-sol`. The 404 that this
+substitution was written for did not reproduce when ordinary full-lane requests
+were rechecked, and the substitution itself has not been retested; the gpt-6
+pair follows the same rule without a check of its own. A request whose
+`tool_choice` pins the hosted `web_search` tool takes a separate path that
+builds its own search request and keeps the requested model, a Luna model
+included.
 
 ## Other backends
 
