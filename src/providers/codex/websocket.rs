@@ -750,7 +750,7 @@ pub(super) async fn codex_websocket_request(
     url: &str,
     headers: &HeaderMap,
     body_value: &serde_json::Value,
-    _ctx: &RequestContext,
+    ctx: &RequestContext,
     traffic: Option<&TrafficCapture>,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
@@ -802,12 +802,15 @@ pub(super) async fn codex_websocket_request(
         entry
     } else {
         Arc::new(PoolEntry::new(
-            connect_with_timeout(
-                websocket_client,
-                proxy_config,
-                &ws_url,
-                headers,
-                connect_timeout_ms,
+            super::turn_state::connect_for_request(
+                &ctx.req_id,
+                connect_with_timeout(
+                    websocket_client,
+                    proxy_config,
+                    &ws_url,
+                    headers,
+                    connect_timeout_ms,
+                ),
             )
             .await?,
         ))
@@ -827,12 +830,15 @@ pub(super) async fn codex_websocket_request(
             return Err(continuation_socket_missing_error());
         }
         entry = Arc::new(PoolEntry::new(
-            connect_with_timeout(
-                websocket_client,
-                proxy_config,
-                &ws_url,
-                headers,
-                connect_timeout_ms,
+            super::turn_state::connect_for_request(
+                &ctx.req_id,
+                connect_with_timeout(
+                    websocket_client,
+                    proxy_config,
+                    &ws_url,
+                    headers,
+                    connect_timeout_ms,
+                ),
             )
             .await?,
         ));
@@ -1138,7 +1144,7 @@ pub(super) async fn codex_websocket_event_stream(
     url: &str,
     headers: &HeaderMap,
     body_value: &serde_json::Value,
-    _ctx: &RequestContext,
+    ctx: &RequestContext,
     traffic: Option<Arc<TrafficCapture>>,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
@@ -1153,15 +1159,18 @@ pub(super) async fn codex_websocket_event_stream(
         class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
-    let ready = prepare_codex_websocket(
-        websocket_client,
-        proxy_config,
-        url,
-        headers,
-        traffic,
-        reservation,
-        connect_timeout_ms,
-        idle_timeout_ms,
+    let ready = super::turn_state::connect_for_request(
+        &ctx.req_id,
+        prepare_codex_websocket(
+            websocket_client,
+            proxy_config,
+            url,
+            headers,
+            traffic,
+            reservation,
+            connect_timeout_ms,
+            idle_timeout_ms,
+        ),
     )
     .await?;
     Ok(start_codex_websocket_events(
@@ -1855,6 +1864,7 @@ async fn connect_via_http_proxy_tunnel(
         &subprotocols,
     )
     .map_err(ConnectAttemptError::Origin)?;
+    super::turn_state::observe_handshake(response.headers());
     Ok(websocket)
 }
 
@@ -1924,6 +1934,7 @@ async fn connect_via_http_upgrade(
         &websocket_key,
         &subprotocols,
     )?;
+    super::turn_state::observe_handshake(response.headers());
     let upgraded = response
         .upgrade()
         .await

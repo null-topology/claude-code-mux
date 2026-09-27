@@ -13,6 +13,7 @@ pub mod request_summary;
 pub mod search;
 pub mod transcription;
 pub mod translate;
+pub(crate) mod turn_state;
 pub mod websocket;
 
 use async_trait::async_trait;
@@ -321,6 +322,8 @@ impl CodexProvider {
             previous_response_id_enabled,
         );
         let turn_id = continuation.turn_id();
+        let turn_state =
+            turn_state::plan_request(&ctx.req_id, conversation_identity.as_ref(), &body);
         let configured_transport = config::codex_transport();
         let transport = configured_transport.as_str();
         let upstream_started_at = Instant::now();
@@ -353,6 +356,14 @@ impl CodexProvider {
                     serde_json::json!(continuation.candidate().input_delta.as_ref().map(Vec::len)),
                 ),
                 ("turnId".to_string(), serde_json::json!(turn_id)),
+                (
+                    "newTurn".to_string(),
+                    serde_json::json!(turn_state.new_turn),
+                ),
+                (
+                    "turnStateSent".to_string(),
+                    serde_json::json!(turn_state.sent),
+                ),
             ])),
         );
 
@@ -400,7 +411,10 @@ impl CodexProvider {
             .post_codex_for_owner(&translated, &ctx, Some(&continuation))
             .await
         {
-            Ok(r) => r,
+            Ok(r) => {
+                turn_state::observe_buffered_response(&ctx.req_id, &r.headers, &r.body);
+                r
+            }
             Err(e) => {
                 log.warn(
                     "codex_upstream_request_failed",
@@ -892,6 +906,7 @@ async fn live_stream_response_once(
             generation_started = true;
         }
         rate_limits::observe_event(&payload);
+        turn_state::observe_event(&ctx.req_id, &payload);
         append_upstream_sse_payload(&mut upstream_sse_body, &payload);
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, None)
         {
@@ -1173,6 +1188,7 @@ fn remaining_live_stream_response(
             match item {
                 Ok(payload) => {
                     rate_limits::observe_event(&payload);
+                    turn_state::observe_event(&ctx.req_id, &payload);
                     append_upstream_sse_payload(&mut upstream_sse_body, &payload);
                     let (chunk, terminal) = match translate_live_stream_payload(
                         &mut translator,

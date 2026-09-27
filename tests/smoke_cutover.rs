@@ -4723,3 +4723,329 @@ async fn smoke_codex_progress_label_forbids_tool_calls_and_keeps_tools() {
         "the junior model gets the same tools with tool calls forbidden"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Turn-state echo
+// ---------------------------------------------------------------------------
+
+/// Post `body` as a request of `session`, a session no other test uses, so the
+/// turn state a test leaves behind never reaches another one.
+async fn call_turn_state_messages(session: &str, body: Value) -> Response {
+    let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    let response = app(Arc::new(Registry::with_default_alias()))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", session)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+}
+
+async fn drain(response: Response) {
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+}
+
+/// Two turns of one conversation, each with a tool round trip: the history of
+/// the 1st to 4th request. The 1st and 3rd start a turn, the 2nd and 4th
+/// answer a tool call and continue it.
+fn turn_state_conversation(stream: [bool; 4]) -> [Value; 4] {
+    let first = vec![json!({"role": "user", "content": "first question"})];
+    let mut second = first.clone();
+    second.extend([
+        json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "read_chunk", "input": {"n": 1}}
+        ]}),
+        json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "chunk one"},
+            {"type": "text", "text": "<system-reminder>keep going</system-reminder>"}
+        ]}),
+    ]);
+    let mut third = second.clone();
+    third.extend([
+        json!({"role": "assistant", "content": "answer one"}),
+        json!({"role": "user", "content": "second question"}),
+    ]);
+    let mut fourth = third.clone();
+    fourth.extend([
+        json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_2", "name": "read_chunk", "input": {"n": 2}}
+        ]}),
+        json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_2", "content": "chunk two"}
+        ]}),
+    ]);
+    let request = |stream: bool, messages: Vec<Value>| {
+        json!({
+            "model": "gpt-5.5",
+            "max_tokens": 64,
+            "stream": stream,
+            "tools": [{
+                "name": "read_chunk",
+                "description": "Read a chunk of a file",
+                "input_schema": {"type": "object", "properties": {"n": {"type": "integer"}}}
+            }],
+            "messages": messages
+        })
+    };
+    [
+        request(stream[0], first),
+        request(stream[1], second),
+        request(stream[2], third),
+        request(stream[3], fourth),
+    ]
+}
+
+fn turn_state_response_events(index: usize) -> [Value; 4] {
+    [
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":format!("msg_up_{index}")}}),
+        json!({"type":"response.output_text.delta","output_index":0,"delta":"ok"}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}),
+        json!({"type":"response.completed","response":{"id":format!("resp_{index}"),"usage":{"input_tokens":5,"output_tokens":2}}}),
+    ]
+}
+
+fn header_list(headers: &http::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_ascii_lowercase(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn header_of<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
+/// The headers of each request an upstream mock received, in order.
+type HeaderLog = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+
+/// An HTTP Codex upstream that records each request's headers and answers the
+/// Nth request with `x-codex-turn-state: ts-N`.
+async fn spawn_turn_state_http_upstream(received: HeaderLog) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new().fallback(move |headers: http::HeaderMap| {
+        let received = received.clone();
+        async move {
+            let index = {
+                let mut guard = received.lock().unwrap();
+                guard.push(header_list(&headers));
+                guard.len()
+            };
+            let body: String = turn_state_response_events(index)
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect();
+            http::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .header("x-codex-turn-state", format!("ts-{index}"))
+                .body(Body::from(body))
+                .unwrap()
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    format!("http://{addr}")
+}
+
+/// A WebSocket Codex upstream that records every handshake and every
+/// `response.create`. The first handshake answers with
+/// `x-codex-turn-state: hs-1`, and the Nth response opens with a
+/// `codex.response.metadata` event whose headers carry `ws-ts-N`.
+async fn spawn_turn_state_websocket_upstream(
+    handshakes: HeaderLog,
+    received: Arc<Mutex<Vec<Value>>>,
+) -> String {
+    use tokio_tungstenite::tungstenite::handshake::server::{
+        ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let handshakes = handshakes.clone();
+            let received = received.clone();
+            tokio::spawn(async move {
+                // tungstenite's own callback type fixes the error response size.
+                #[allow(clippy::result_large_err)]
+                let record_handshake =
+                    move |request: &HandshakeRequest,
+                          mut response: HandshakeResponse|
+                          -> Result<HandshakeResponse, ErrorResponse> {
+                        let mut guard = handshakes.lock().unwrap();
+                        guard.push(header_list(request.headers()));
+                        if guard.len() == 1 {
+                            response
+                                .headers_mut()
+                                .insert("x-codex-turn-state", "hs-1".parse().unwrap());
+                        }
+                        Ok(response)
+                    };
+                let Ok(ws) = tokio_tungstenite::accept_hdr_async(stream, record_handshake).await
+                else {
+                    return;
+                };
+                let (mut sender, mut receiver) = ws.split();
+                loop {
+                    let Some(text) = (loop {
+                        match receiver.next().await {
+                            Some(Ok(Message::Text(text))) => break Some(text),
+                            Some(Ok(Message::Ping(data))) => {
+                                let _ = sender.send(Message::Pong(data)).await;
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(_)) | None => break None,
+                        }
+                    }) else {
+                        return;
+                    };
+                    let index = {
+                        let mut guard = received.lock().unwrap();
+                        guard.push(serde_json::from_str::<Value>(&text).unwrap_or_default());
+                        guard.len()
+                    };
+                    let metadata = json!({
+                        "type": "codex.response.metadata",
+                        "headers": {"x-codex-turn-state": format!("ws-ts-{index}")}
+                    });
+                    let events = std::iter::once(metadata).chain(turn_state_response_events(index));
+                    for event in events {
+                        let _ = sender.send(Message::Text(event.to_string())).await;
+                    }
+                }
+            });
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_http_echoes_turn_state_within_a_turn_only() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_turn_state_http_upstream(received.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    // Buffered and live requests alternate, so both read the response header.
+    let session = "turn-state-http";
+    for body in turn_state_conversation([false, true, true, false]) {
+        drain(call_turn_state_messages(session, body).await).await;
+    }
+
+    let guard = received.lock().unwrap();
+    assert_eq!(guard.len(), 4, "expected four upstream requests");
+    for (index, headers) in guard.iter().enumerate() {
+        assert_eq!(
+            header_of(headers, "session-id"),
+            Some(session),
+            "request {index}"
+        );
+        assert_eq!(
+            header_of(headers, "thread-id"),
+            Some(session),
+            "request {index}"
+        );
+        assert_eq!(header_of(headers, "session_id"), None, "request {index}");
+    }
+    // The first value of a turn goes back on its later requests, and a new
+    // turn starts without one.
+    assert_eq!(header_of(&guard[0], "x-codex-turn-state"), None);
+    assert_eq!(header_of(&guard[1], "x-codex-turn-state"), Some("ts-1"));
+    assert_eq!(header_of(&guard[2], "x-codex-turn-state"), None);
+    assert_eq!(header_of(&guard[3], "x-codex-turn-state"), Some("ts-3"));
+
+    clear_all_continuations_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_echoes_turn_state_in_client_metadata() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let handshakes = Arc::new(Mutex::new(Vec::new()));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_turn_state_websocket_upstream(handshakes.clone(), received.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let session = "turn-state-websocket";
+    for body in turn_state_conversation([true, true, true, false]) {
+        drain(call_turn_state_messages(session, body).await).await;
+    }
+
+    let turn_state = |request: &Value| {
+        request
+            .get("client_metadata")
+            .and_then(|metadata| metadata.get("x-codex-turn-state"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let requests = received.lock().unwrap();
+    assert_eq!(requests.len(), 4, "expected four response.create messages");
+    // The handshake's value came first in the first turn; the second turn
+    // keeps the value of its first response's metadata event.
+    assert_eq!(turn_state(&requests[0]), None);
+    assert_eq!(turn_state(&requests[1]).as_deref(), Some("hs-1"));
+    assert_eq!(turn_state(&requests[2]), None);
+    assert_eq!(turn_state(&requests[3]).as_deref(), Some("ws-ts-3"));
+
+    let handshakes = handshakes.lock().unwrap();
+    assert!(!handshakes.is_empty());
+    for (index, headers) in handshakes.iter().enumerate() {
+        assert_eq!(
+            header_of(headers, "session-id"),
+            Some(session),
+            "handshake {index}"
+        );
+        assert_eq!(
+            header_of(headers, "thread-id"),
+            Some(session),
+            "handshake {index}"
+        );
+        assert_eq!(header_of(headers, "session_id"), None, "handshake {index}");
+        assert_eq!(
+            header_of(headers, "x-codex-turn-state"),
+            None,
+            "handshake {index}"
+        );
+    }
+
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}

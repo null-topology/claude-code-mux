@@ -470,7 +470,7 @@ Deferred and non-blocking: `RequestRecord::model_key` and the requested-model
 histogram allocate `String`s on every ledger update.
 
 What the Codex backend keys its prompt cache on is the request's
-`prompt_cache_key` plus the `session_id` header, and the proxy sends
+`prompt_cache_key` plus the session header, and the proxy sends
 `ConversationIdentity::cache_scope()` in both: the session id for a main
 thread, a uuid v5 of session plus agent id for a subagent. Claude Code gives a
 subagent its parent's session id, so without this every subagent shared the
@@ -478,9 +478,37 @@ main thread's key and its routing bucket, and OpenAI documents overflow routing
 above about 15 requests per minute on one key. `build_codex_headers` takes the
 scope from the translated body's `prompt_cache_key`, so every transport and
 retry path sends the same value; a request routed without a conversation
-identity (the auto-review classifier) falls back to the session id.
+identity (the auto-review classifier) falls back to the session id. The session
+header goes out as `session-id` plus `thread-id` with the same value, the
+spelling of the Codex CLI (`codex-rs/codex-api/src/requests/headers.rs:8-11` at
+rust-v0.157.1); 0.13.0 and earlier sent one `session_id` header instead.
 
-On the ChatGPT Codex backend the `session_id` header drives cache affinity:
+Turn state (`providers/codex/turn_state.rs`) follows the Codex CLI, which keeps
+the first `x-codex-turn-state` value of a turn in a per-turn `OnceLock` and
+sends it on every later request of that turn, never across turns
+(`codex-rs/core/src/client.rs:270-298` at rust-v0.157.1): as an HTTP header
+(`build_responses_headers`, :2224-2242) and on WebSocket as a key of
+`response.create`'s `client_metadata` (:1903-1910). The proxy keeps one slot
+per `ConversationIdentity`, in memory, pruned after 30 min idle. A request
+whose last user message holds a `tool_result` continues the turn; any other
+starts one and clears the slot before it is sent (`starts_new_turn`; "has
+text" is no boundary, since Claude Code puts reminders next to tool results).
+A request with no conversation identity, no client tool with `input_schema`
+(titles and other side requests) or the progress-label marker takes no part.
+The first value wins, from the HTTP response header, the WebSocket handshake
+response or `headers["x-codex-turn-state"]` in any event JSON
+(`codex.response.metadata` carries it). The CLI reads the HTTP header and
+events of type `response.metadata` (`codex-rs/codex-api/src/sse/responses.rs`
+64-70 and 219-226), and its core passes no turn state to the handshake
+(`codex-rs/core/src/client.rs:1234`). Only
+the request the slot was planned for (`req_id`) fills or sends it, so a late
+reply of an earlier request cannot. The echo is added to the outgoing JSON
+after `build_websocket_request`, never to `ResponsesRequest::client_metadata`,
+whose presence marks the Lite lane, and never to the handshake.
+`codex_upstream_request_started` logs `newTurn` and `turnStateSent`, never the
+value. What the backend does with the echo is not established.
+
+On the ChatGPT Codex backend the session header (then `session_id`) drives cache affinity:
 byte-identical requests repeated 5 seconds apart hit the cache 4 times out of 4
 with it and 1 time out of 4 without it (measured 2026-09-11). Even with it,
 some re-sends miss at random. With gpt-5.6-sol, re-sends missed after 2, 6,

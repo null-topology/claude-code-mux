@@ -58,6 +58,23 @@
     Codex CLI's `models_cache.json` names one. Set either of the first two to
     send a different version.
 
+- Codex requests now name their conversation the way the Codex CLI does. The
+  `session_id` header is replaced by `session-id` and `thread-id`, both with
+  the value `session_id` had (the session id for a main thread, the derived
+  id for a subagent), on HTTP and on the WebSocket handshake alike. Within a
+  turn the proxy also sends back the first `x-codex-turn-state` value the
+  backend returned in that turn: as a request header over HTTP and inside
+  `client_metadata` of `response.create` over WebSocket. A request whose last
+  user message holds a tool result continues the turn; any other request
+  starts a new one and sends no value. A request without a Claude Code
+  session header, a title request and a subagent progress label take no
+  part, and the value lives in memory only, so a restart forgets it.
+  `prompt_cache_key`, `x-client-request-id`, `x-codex-window-id` and the
+  request body are unchanged. `codex_upstream_request_started` in
+  `proxy.log` gains `newTurn` and `turnStateSent`; the value itself is never
+  logged. There is no setting for this: to send the old `session_id` header
+  and no turn state, stay on 0.13.0.
+
 ## v0.13.0 (2026-09-27)
 
 - The monitor's Stats tab no longer counts token count requests. The local

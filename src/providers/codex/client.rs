@@ -163,7 +163,10 @@ pub fn build_codex_headers(
         .filter(|scope| is_routing_id(scope))
         .or(ctx.session_id.as_deref())
     {
-        headers.insert("session_id", header_value("session_id", session_id)?);
+        // Spelled as the Codex CLI spells them; both carry the conversation's
+        // routing id.
+        headers.insert("session-id", header_value("session-id", session_id)?);
+        headers.insert("thread-id", header_value("thread-id", session_id)?);
         headers.insert(
             "x-client-request-id",
             header_value("x-client-request-id", session_id)?,
@@ -1322,6 +1325,7 @@ impl CodexHttpClient {
 
             let status = resp.status().as_u16();
             let headers = response_headers(&resp);
+            super::turn_state::observe_response_headers(&ctx.req_id, &headers);
             if let Some(traffic) = ctx.traffic.as_deref() {
                 write_upstream_response_headers_capture(
                     traffic,
@@ -1694,12 +1698,13 @@ impl CodexHttpClient {
                         body.prompt_cache_key.as_deref(),
                     )?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
-                    let ws_body = build_websocket_request(
+                    let mut ws_body = build_websocket_request(
                         body,
                         active_continuation
                             .as_ref()
                             .map(super::continuation::ContinuationReservation::candidate),
                     );
+                    super::turn_state::apply_to_websocket_request(&ctx.req_id, &mut ws_body);
 
                     super::websocket::codex_websocket_request(
                         &self.websocket_client,
@@ -1723,12 +1728,13 @@ impl CodexHttpClient {
                         body.prompt_cache_key.as_deref(),
                     )?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
-                    let ws_body = build_websocket_request(
+                    let mut ws_body = build_websocket_request(
                         body,
                         active_continuation
                             .as_ref()
                             .map(super::continuation::ContinuationReservation::candidate),
                     );
+                    super::turn_state::apply_to_websocket_request(&ctx.req_id, &mut ws_body);
 
                     // Try WebSocket first
                     let ws_result = super::websocket::codex_websocket_request(
@@ -1995,12 +2001,13 @@ impl CodexHttpClient {
                     return;
                 }
             };
-            let ws_body = build_websocket_request(
+            let mut ws_body = build_websocket_request(
                 &body,
                 continuation
                     .as_ref()
                     .map(super::continuation::ContinuationReservation::candidate),
             );
+            super::turn_state::apply_to_websocket_request(&ctx.req_id, &mut ws_body);
             let start = super::websocket::codex_websocket_event_stream(
                 &self.websocket_client,
                 &self.websocket_proxy_config,
@@ -2212,7 +2219,13 @@ impl CodexHttpClient {
         cache_scope: Option<&str>,
     ) -> Result<(reqwest::Response, Instant), CodexError> {
         let url = &self.base_url;
-        let headers = build_codex_headers(auth, ctx, use_responses_lite, cache_scope)?;
+        let mut headers = build_codex_headers(auth, ctx, use_responses_lite, cache_scope)?;
+        if let Some(turn_state) = super::turn_state::outgoing(&ctx.req_id) {
+            headers.insert(
+                super::turn_state::TURN_STATE_HEADER,
+                header_value(super::turn_state::TURN_STATE_HEADER, &turn_state)?,
+            );
+        }
 
         if let Some(traffic) = ctx.traffic.as_deref() {
             write_codex_http_request_capture(traffic, url, &headers, body_json);
@@ -4820,7 +4833,9 @@ mod tests {
             .expect("request should reach the mock upstream");
         let request = server.await.unwrap();
 
-        assert!(request.contains("session_id: agent-scope"), "{request}");
+        assert!(request.contains("session-id: agent-scope"), "{request}");
+        assert!(request.contains("thread-id: agent-scope"), "{request}");
+        assert!(!request.contains("session_id:"), "{request}");
         assert!(
             request.contains("x-client-request-id: agent-scope"),
             "{request}"
@@ -5135,18 +5150,21 @@ mod tests {
             headers.get("openai-beta").unwrap(),
             "responses=experimental"
         );
-        assert_eq!(headers.get("session_id").unwrap(), "s");
+        assert_eq!(headers.get("session-id").unwrap(), "s");
+        assert_eq!(headers.get("thread-id").unwrap(), "s");
+        assert!(headers.get("session_id").is_none());
         // A conversation scope (a subagent's) wins over the session id, so its
         // prompt cache gets its own routing bucket upstream.
         let scoped = build_codex_headers(&auth, &ctx, false, Some("agent-scope")).unwrap();
-        assert_eq!(scoped.get("session_id").unwrap(), "agent-scope");
+        assert_eq!(scoped.get("session-id").unwrap(), "agent-scope");
+        assert_eq!(scoped.get("thread-id").unwrap(), "agent-scope");
         assert_eq!(scoped.get("x-client-request-id").unwrap(), "agent-scope");
         assert_eq!(scoped.get("x-codex-window-id").unwrap(), "agent-scope:0");
         // A key from an OpenAI-compatible client is not header material; it
         // stays in the body and the headers keep the session.
         for unusable in ["", "conv\n1", "ключ"] {
             let relayed = build_codex_headers(&auth, &ctx, false, Some(unusable)).unwrap();
-            assert_eq!(relayed.get("session_id").unwrap(), "s", "key={unusable:?}");
+            assert_eq!(relayed.get("session-id").unwrap(), "s", "key={unusable:?}");
             assert_eq!(relayed.get("x-codex-window-id").unwrap(), "s:0");
         }
         assert_eq!(
@@ -5201,7 +5219,8 @@ mod tests {
             passthrough: None,
         };
         let headers = build_codex_headers(&auth, &ctx, false, None).unwrap();
-        assert!(headers.get("session_id").is_none());
+        assert!(headers.get("session-id").is_none());
+        assert!(headers.get("thread-id").is_none());
         assert!(headers.get("x-client-request-id").is_none());
     }
 
@@ -5224,7 +5243,7 @@ mod tests {
         };
         let err = build_codex_headers(&auth, &ctx, false, None).unwrap_err();
         assert_eq!(err.status, 500);
-        assert!(err.message.contains("session_id"));
+        assert!(err.message.contains("session-id"));
     }
 
     #[test]
