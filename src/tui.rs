@@ -8,6 +8,7 @@ use layout::{
 };
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io::{self, Stdout},
     sync::mpsc,
@@ -34,9 +35,8 @@ use crate::{
     monitor::{
         ActiveRequest, CacheMissTally, CacheWriteQuality, CompletedRequest, ConversationSummary,
         LOCAL_PROVIDER, MockMonitor, ModelStats, ModelUsage, MonitorHandle, MonitorState,
-        QualityCoverage, QualityFields, RequestCache, SESSION_TOKEN_BUCKET_SECS,
-        SIDE_CONVERSATION_SUFFIX, SessionCacheStats, SessionSummary, UnattributedUsage,
-        UsageEvidence, UsageQuality,
+        QualityCoverage, QualityFields, RequestCache, SESSION_TOKEN_BUCKET_SECS, SessionCacheStats,
+        SessionSummary, UnattributedUsage, UsageEvidence, UsageQuality, split_side_conversation,
     },
     paths,
     registry::Registry,
@@ -810,6 +810,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
             frame,
             root[1],
             &state.sessions,
+            state.idle_sessions,
             app.selected.view(),
             app.focus == FocusPane::Sessions,
         ),
@@ -1060,11 +1061,12 @@ fn display_session_id(session_id: Option<&str>) -> &str {
 
 /// A conversation is labelled by the agent id Claude Code assigned it, which
 /// is as long as a session id is before [`display_session_id`] shortens it. Cut
-/// it the same way so a nested row still fits its column, and keep the `/side`
-/// suffix, which is what distinguishes a conversation from its own side calls.
+/// it the same way so a nested row still fits its column, and keep the side
+/// suffix (`/title`, `/search`, `/side` and the rest), which is what
+/// distinguishes a conversation from its own side calls and names their kind.
 fn display_conversation_label(conversation: &str) -> String {
-    let (base, suffix) = match conversation.strip_suffix(SIDE_CONVERSATION_SUFFIX) {
-        Some(base) => (base, SIDE_CONVERSATION_SUFFIX),
+    let (base, suffix) = match split_side_conversation(conversation) {
+        Some((base, kind)) => (base, kind.suffix()),
         None => (conversation, ""),
     };
     let shortened = match base.split_once('-') {
@@ -1533,7 +1535,7 @@ const SESSION_ID_WIDTH: u16 = ID_WIDTH + 2;
 enum SessionColumn {
     Marker,
     Id,
-    Project,
+    Name,
     Active,
     Requests,
     Failures,
@@ -1558,7 +1560,7 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
         (LayoutTier::Wide, true) => vec![
             ColumnSpec::fixed(C::Marker, "", Alignment::Left, 1),
             ColumnSpec::fixed(C::Id, "ID", Alignment::Left, SESSION_TREE_ID_WIDTH),
-            ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_WIDE_WIDTH),
+            ColumnSpec::fixed(C::Name, "Session", Alignment::Left, PROJECT_WIDE_WIDTH),
             ColumnSpec::fixed(C::Active, "A", Alignment::Right, COUNT_WIDTH),
             ColumnSpec::fixed(C::Requests, "R", Alignment::Right, COUNT_WIDTH),
             ColumnSpec::fixed(C::Failures, "F", Alignment::Right, COUNT_WIDTH),
@@ -1577,7 +1579,7 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
         (LayoutTier::Wide, false) => vec![
             ColumnSpec::fixed(C::Marker, "", Alignment::Left, 1),
             ColumnSpec::fixed(C::Id, "ID", Alignment::Left, SESSION_TREE_ID_WIDTH),
-            ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_WIDE_WIDTH),
+            ColumnSpec::fixed(C::Name, "Session", Alignment::Left, PROJECT_WIDE_WIDTH),
             ColumnSpec::fixed(C::Counts, "A/R/F", Alignment::Right, 7),
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
             ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_NARROW_WIDTH),
@@ -1596,9 +1598,9 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
             ColumnSpec::fixed(C::Id, "ID", Alignment::Left, SESSION_ID_WIDTH),
             // The tier is sized so the sparkline header still fits at its
             // narrowest, so the two columns the aggregate mark needs come out
-            // of the project rather than out of the flexible column. Ten is
-            // what the narrow tier already gives a project name.
-            ColumnSpec::fixed(C::Project, "Project", Alignment::Left, 10),
+            // of the session name rather than out of the flexible column. Ten
+            // is what the narrow tier already gives a session name.
+            ColumnSpec::fixed(C::Name, "Session", Alignment::Left, 10),
             ColumnSpec::fixed(C::Counts, "A/R/F", Alignment::Right, 7),
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
             ColumnSpec::fixed(C::Model, "Model", Alignment::Left, MODEL_NARROW_WIDTH),
@@ -1612,7 +1614,7 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
         (LayoutTier::Medium, _) => vec![
             ColumnSpec::fixed(C::Marker, "", Alignment::Left, 1),
             ColumnSpec::fixed(C::Id, "ID", Alignment::Left, SESSION_ID_WIDTH),
-            ColumnSpec::fixed(C::Project, "Project", Alignment::Left, PROJECT_MEDIUM_WIDTH),
+            ColumnSpec::fixed(C::Name, "Session", Alignment::Left, PROJECT_MEDIUM_WIDTH),
             ColumnSpec::fixed(C::Counts, "A/R/F", Alignment::Right, 7),
             ColumnSpec::fixed(C::Provider, "Provider", Alignment::Left, PROVIDER_WIDTH),
             ColumnSpec::flex(C::Model, "Model", Alignment::Left, 1),
@@ -1623,7 +1625,7 @@ fn session_columns(tier: LayoutTier, show_full_sparkline: bool) -> Vec<ColumnSpe
         (LayoutTier::Narrow, _) => vec![
             ColumnSpec::fixed(C::Marker, "", Alignment::Left, 1),
             ColumnSpec::fixed(C::Id, "ID", Alignment::Left, SESSION_ID_WIDTH),
-            ColumnSpec::fixed(C::Project, "Project", Alignment::Left, 10),
+            ColumnSpec::fixed(C::Name, "Session", Alignment::Left, 10),
             ColumnSpec::fixed(C::Counts, "A/R/F", Alignment::Right, 7),
             ColumnSpec::flex(C::Target, "Target", Alignment::Left, 1),
             ColumnSpec::fixed(C::Rate, "Rate", Alignment::Right, RATE_WIDTH),
@@ -1892,10 +1894,8 @@ impl SessionRow<'_> {
                 // agent for. Spell it out where the cell has room, so the row
                 // reads as the session's own thread rather than as a lane whose
                 // id went missing.
-                let base = conversation
-                    .conversation
-                    .strip_suffix(SIDE_CONVERSATION_SUFFIX)
-                    .unwrap_or(&conversation.conversation);
+                let base = split_side_conversation(&conversation.conversation)
+                    .map_or(conversation.conversation.as_str(), |(base, _)| base);
                 let label = (base == MAIN_CONVERSATION)
                     .then(|| {
                         format!(
@@ -1914,11 +1914,15 @@ impl SessionRow<'_> {
         }
     }
 
-    /// Columns that describe the session as a whole stay on its own row.
-    fn project(&self) -> &str {
+    /// Columns that describe the session as a whole stay on its own row. The
+    /// name falls back to the project, with its worktree when it runs in one,
+    /// and last to the session id.
+    fn name(&self) -> Cow<'_, str> {
         match self {
-            Self::Session(session) => session.project.as_deref().unwrap_or("-"),
-            Self::Conversation { .. } => "",
+            Self::Session(session) => session.display_name().unwrap_or_else(|| {
+                Cow::Borrowed(display_session_id(session.session_id.as_deref()))
+            }),
+            Self::Conversation { .. } => Cow::Borrowed(""),
         }
     }
 
@@ -2047,23 +2051,28 @@ impl SessionRow<'_> {
     }
 }
 
+/// The Sessions pane's name, which counts the sessions it leaves out as idle so
+/// that they are not missing without a word.
+fn sessions_pane_name(idle_sessions: usize) -> String {
+    match idle_sessions {
+        0 => "Sessions".to_string(),
+        count => format!("Sessions (idle hidden: {count})"),
+    }
+}
+
 fn render_sessions(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     sessions: &[SessionSummary],
+    idle_sessions: usize,
     selection: SelectionView,
     focused: bool,
 ) {
+    let title = selection.title(&sessions_pane_name(idle_sessions));
     if sessions.is_empty() {
         // A pane with nothing left to mark still says what became of the row
         // that was.
-        render_empty_table_state(
-            frame,
-            area,
-            &selection.title("Sessions"),
-            focused,
-            "No sessions",
-        );
+        render_empty_table_state(frame, area, &title, focused, "No sessions");
         return;
     }
 
@@ -2092,7 +2101,7 @@ fn render_sessions(
                             Cell::from(Span::styled(marker, Style::default().fg(TEAL)))
                         }
                         SessionColumn::Id => text_cell(row.id_label(width)),
-                        SessionColumn::Project => text_cell(ellipsize(row.project(), width)),
+                        SessionColumn::Name => text_cell(ellipsize(&row.name(), width)),
                         SessionColumn::Active => number_cell(active_count.to_string()),
                         SessionColumn::Requests => number_cell(request_count.to_string()),
                         SessionColumn::Failures => number_cell(failure_count.to_string()),
@@ -2131,7 +2140,7 @@ fn render_sessions(
         .collect::<Vec<_>>();
     let table = Table::new(rows, widths.clone())
         .header(column_header(&columns))
-        .block(panel(&selection.title("Sessions"), focused));
+        .block(panel(&title, focused));
     let mut table_state = TableState::default().with_selected(selection.row);
     frame.render_stateful_widget(table, area, &mut table_state);
 }
@@ -2977,7 +2986,29 @@ fn render_session_detail(
     let lines = if let Some(session) = state.sessions.get(selected) {
         let mut lines = vec![
             detail_line("session", session.label(), WHITE),
-            detail_line("project", session.project.as_deref().unwrap_or("-"), TEAL),
+            // The source is spelled out beside the name: which of the
+            // three it came from is not shown by color.
+            detail_line(
+                "name",
+                session.name.as_ref().map_or_else(
+                    || "-".to_string(),
+                    |name| format!("{} ({})", name.text, name.source.label()),
+                ),
+                WHITE,
+            ),
+            // The worktree shares the project's line so the rollups below
+            // stay above the fold of a short pane.
+            detail_line(
+                "project",
+                match session.worktree.as_deref() {
+                    Some(worktree) => format!(
+                        "{} · worktree {worktree}",
+                        session.project.as_deref().unwrap_or("-")
+                    ),
+                    None => session.project.as_deref().unwrap_or("-").to_string(),
+                },
+                TEAL,
+            ),
             detail_line("active requests", session.active_count.to_string(), YELLOW),
             detail_line(
                 "total requests",
@@ -3821,7 +3852,7 @@ mod tests {
         assert!(
             sessions
                 .iter()
-                .any(|column| column.key == SessionColumn::Project)
+                .any(|column| column.key == SessionColumn::Name)
         );
         assert!(
             sessions
@@ -3884,6 +3915,11 @@ mod tests {
             display_conversation_label("a0c17aa4e68872d70/side"),
             "a0c17aa4/side"
         );
+        assert_eq!(
+            display_conversation_label("a0c17aa4e68872d70/title"),
+            "a0c17aa4/title"
+        );
+        assert_eq!(display_conversation_label("main/fetch"), "main/fetch");
         assert_eq!(
             display_conversation_label("57c7c914-ada4-4f40-9672-985f950fbb66"),
             "57c7c914"
@@ -3970,6 +4006,7 @@ mod tests {
                     frame,
                     frame.area(),
                     &state.sessions,
+                    0,
                     SelectionView::at(0),
                     true,
                 )
@@ -4003,10 +4040,36 @@ mod tests {
         assert!(spark_chars(&wide) > 0, "{wide}");
     }
 
+    /// The demo holds one session idle for hours: the pane leaves it out and
+    /// its title says so, whether rows remain or not.
+    #[test]
+    fn the_sessions_pane_counts_the_idle_sessions_it_hides() {
+        let state = mock_state();
+        assert_eq!(state.idle_sessions, 1);
+        let pane = buffer_text(&draw(120, 24, |frame| {
+            render_sessions(
+                frame,
+                frame.area(),
+                &state.sessions,
+                state.idle_sessions,
+                SelectionView::at(0),
+                true,
+            )
+        }));
+        assert!(pane.contains("Sessions (idle hidden: 1)"), "{pane}");
+        assert!(!pane.contains("overnight-migration"), "{pane}");
+
+        let empty = buffer_text(&draw(60, 9, |frame| {
+            render_sessions(frame, frame.area(), &[], 3, SelectionView::at(0), true)
+        }));
+        assert!(empty.contains("Sessions (idle hidden: 3)"), "{empty}");
+        assert!(empty.contains("No sessions"), "{empty}");
+    }
+
     #[test]
     fn empty_tables_hide_columns_and_center_placeholders() {
         let sessions = draw(40, 9, |frame| {
-            render_sessions(frame, frame.area(), &[], SelectionView::at(0), true)
+            render_sessions(frame, frame.area(), &[], 0, SelectionView::at(0), true)
         });
         let sessions_text = buffer_text(&sessions);
         assert_centered(&sessions, "No sessions", 4);
@@ -4083,6 +4146,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(session_index),
                 true,
             )
@@ -4211,6 +4275,60 @@ mod tests {
     }
 
     #[test]
+    fn the_session_column_shows_the_name_and_the_detail_says_where_it_came_from() {
+        let monitor = MonitorHandle::new(10);
+        for (request_id, session_id) in [("r1", "s-named"), ("r2", "s-bare")] {
+            monitor.request_started(
+                request_id,
+                Some(session_id.to_string()),
+                None,
+                EndpointKind::Messages,
+            );
+        }
+        monitor.project_resolved("r1", "repo", Some("wt".to_string()));
+        monitor.transcript_names_read(
+            "s-named",
+            crate::monitor::TranscriptNames {
+                renamed: Some("Fix login".to_string()),
+                auto_title: Some("Login flake".to_string()),
+            },
+        );
+        let state = monitor.snapshot();
+        let named = state
+            .sessions
+            .iter()
+            .position(|session| session.session_id.as_deref() == Some("s-named"))
+            .unwrap();
+
+        let sessions_text = buffer_text(&draw(170, 8, |frame| {
+            render_sessions(
+                frame,
+                frame.area(),
+                &state.sessions,
+                0,
+                SelectionView::at(0),
+                true,
+            )
+        }));
+        assert!(sessions_text.contains("Fix login"), "{sessions_text}");
+        assert!(!sessions_text.contains("Login flake"), "{sessions_text}");
+        // A session nothing named, with no project either, shows its id.
+        assert!(
+            sessions_text
+                .lines()
+                .any(|line| line.matches("s-bare").count() == 2),
+            "{sessions_text}"
+        );
+
+        let detail = buffer_text(&draw(140, 24, |frame| {
+            render_session_detail(frame, frame.area(), &state, named)
+        }));
+        assert!(detail.contains("s-named"), "{detail}");
+        assert!(detail.contains("Fix login (rename)"), "{detail}");
+        assert!(detail.contains("repo · worktree wt"), "{detail}");
+    }
+
+    #[test]
     fn populated_tables_render_rows_without_placeholders() {
         let monitor = MonitorHandle::new(10);
         monitor.request_started(
@@ -4219,7 +4337,7 @@ mod tests {
             Some(1),
             EndpointKind::Messages,
         );
-        monitor.project_resolved("request-1", "example-project");
+        monitor.project_resolved("request-1", "example-project", None);
         monitor.provider_selected(
             "request-1",
             "codex",
@@ -4233,13 +4351,19 @@ mod tests {
                 frame,
                 frame.area(),
                 &active_state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
         });
         let sessions_text = buffer_text(&sessions);
         assert!(sessions_text.contains("Provider"));
-        assert!(sessions_text.contains("Project"));
+        assert!(
+            sessions_text
+                .lines()
+                .any(|line| line.contains("ID") && line.contains("Session ")),
+            "{sessions_text}"
+        );
         assert!(sessions_text.contains("example-project"));
         assert!(sessions_text.contains("sess-1"));
         assert!(!sessions_text.contains("No sessions"));
@@ -4314,7 +4438,7 @@ mod tests {
                 None,
                 EndpointKind::Messages,
             );
-            monitor.project_resolved(request_id, "example-project");
+            monitor.project_resolved(request_id, "example-project", None);
             monitor.conversation_resolved(request_id, conversation, parent.map(str::to_string));
             monitor.provider_selected(request_id, provider, model, None);
             monitor.request_completed(request_id, 200, Some(1_000), Some(50));
@@ -4348,6 +4472,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(4),
                 true,
             )
@@ -4398,6 +4523,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
@@ -4420,7 +4546,7 @@ mod tests {
             None,
             EndpointKind::Messages,
         );
-        monitor.project_resolved(request_id, project);
+        monitor.project_resolved(request_id, project, None);
         monitor.provider_selected(request_id, "codex", "gpt-5.6-sol", None);
         monitor.request_completed(request_id, 200, Some(1_000), Some(50));
     }
@@ -4534,6 +4660,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(0),
                 false,
             )
@@ -4707,6 +4834,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &mixed_state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
@@ -4735,6 +4863,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &single_state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
@@ -4758,6 +4887,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &local_state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
@@ -4795,6 +4925,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
@@ -4954,6 +5085,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &sessions,
+                0,
                 SelectionView::at(last_session_row),
                 true,
             )
@@ -5069,6 +5201,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )
@@ -5087,6 +5220,7 @@ mod tests {
                 frame,
                 frame.area(),
                 &state.sessions,
+                0,
                 SelectionView::at(0),
                 true,
             )

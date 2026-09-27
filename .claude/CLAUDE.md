@@ -281,11 +281,20 @@ start-to-start gap exceeds the lifetime of the previous request's entries
 (Anthropic `cache_creation.ephemeral_1h/5m`, else 5m; Codex 30m), `within ttl`
 otherwise. The store skips judging:
 
-- side lanes: `server::monitor_conversation_label` appends `/side` when a
-  request has no tool with `input_schema` (titles, the auto-mode classifier,
-  the isolated web search call carrying only the hosted `web_search_*` tool).
-  Without this, web search calls on the main model reset the main lane's
-  baseline and set the context size to a few thousand tokens;
+- side lanes: when a request has no tool with `input_schema`,
+  `server::monitor_conversation_label` appends the suffix of its kind
+  (`side_request_kind`, `SideKind` in `src/monitor/side.rs`), first match
+  wins: `/classifier` (the auto-mode classifier, by
+  `is_claude_auto_review_request` or its system prefix), `/title` (an
+  `output_config` JSON schema whose only property is `title`), `/search` (a
+  hosted `web_search_*` tool), `/recap` (the walked-away recap system
+  prefix), `/fetch` (no tools and a last user text ending with the WebFetch
+  lyrics sentence, the weakest marker), else `/side`. Every consumer reads
+  the kind through `split_side_conversation` / `is_side_conversation`, never
+  a literal suffix, and every kind is a side lane alike: not judged, parented
+  to its base conversation, ranked after it in the tree. Without this, web
+  search calls on the main model reset the main lane's baseline and set the
+  context size to a few thousand tokens;
 - a request that started before the lane baseline's response began
   (`readable_from`), since Anthropic entries are readable only from then;
 - a request that started before the baseline itself (it finished late; it
@@ -314,20 +323,75 @@ one compact numeric record plus small metadata per request id, so a report
 arriving after a request was evicted still lands on its record and corrects
 every session, conversation and model total it fed. The live Codex path needs
 that: it hands the response to the client before the stream ends, so the
-backend's own counts can arrive arbitrarily late. The price is a map that grows
-with the number of requests served until the process restarts. Records hold
-numbers and small metadata only — no prompt, no request or response body, no
-output text. Every mutation goes through `Ledger::update`, which detaches a
+backend's own counts can arrive arbitrarily late. A record lives as long as
+its session: `MonitorStore::drop_idle_sessions` removes a session with no
+request in flight and no activity for `SESSION_DROPPED_AFTER` (24 h), with its
+conversations, its records and its cache lanes, through
+`Ledger::drop_sessions_idle_since`. It runs on every `snapshot()` and at every
+`RequestStarted` before the ledger sees the request, so a request for a session
+id idle that long starts a new session (fresh counters, a new rank, no old
+cache baseline) whether or not a snapshot ran in between. A later usage report
+for a dropped request finds no record and changes nothing. A terminal event for
+an unknown id still starts a record, because `Ledger::finish` calls `start`
+first; that is the terminal-first path, kept on purpose. So the map grows with
+the requests of the sessions still in use, not with the whole run. Records hold
+numbers and small metadata only — no prompt, no request or response body. The
+one piece of output text they keep is a session title taken from a title reply
+(`RequestRecord::session_title`, `SessionRecord::wire_title`), beside the names
+read from transcripts. Every mutation goes through `Ledger::update`, which detaches a
 record's contribution from the rows it feeds, applies the change, and attaches
 it again, so a row is always the sum of the records attached to it; one signed
 `UsageDelta` path carries the numbers, and a change worth nothing numerically
 still counts, because a missing count arriving as a reported zero moves the
 evidence behind a total. Metadata is ordered by `(started_at, rank)` and a row
 shows the metadata of the request with the greatest order, so a late report for
-an older request cannot take a row's model or status back; a session's project
-and a conversation's parent have independent watermarks (`project_order`,
-`parent_order`) because a request states them separately from being routed. In
-`note_metadata` a `None` never erases a value already known.
+an older request cannot take a row's model or status back; a session's project,
+its wire title and a conversation's parent have independent watermarks
+(`project_order`, `wire_title_order`, `parent_order`) because a request states
+them separately from being routed. In `note_metadata` a `None` never erases a
+value already known, with one exception: the worktree is part of the project
+statement and rides on `project_order`, so a newer project statement replaces
+both and one without a worktree clears it.
+
+A session's name (`SessionRecord::name`) is, first available: the last
+`custom-title` line of its Claude Code transcript (`/rename`), the last
+`ai-title` line, then a title seen on the wire; `SessionSummary::display_name`
+falls back to the project, as `project · worktree` when the session runs in a
+worktree, and the TUI to the session id (`project.rs` only ever names a
+worktree together with a project). Every name is normalised to one line (each
+run of whitespace and control characters becomes one space), an empty one is
+rejected, and it is cut to 120 characters (`clean_session_name`).
+The transcript is `$CLAUDE_CONFIG_DIR` (else `~/.claude`)
+`/projects/*/<session id>.jsonl`, the one with the newest mtime when several
+project directories hold it, read by `TranscriptReader`
+(`src/monitor/naming.rs`) in a task `serve_listener` spawns when a monitor
+exists: every 5 s, on tokio's blocking pool, for the sessions the ledger holds
+(`session_generations`), from the offset after the last complete line, keeping
+no line over 16 KiB and parsing only lines that mention a title. The reader
+forgets a session a poll no longer sees; a session dropped and started again
+under the same id between two polls stays, and the new session's rank (its
+generation) tells the reader to hand the names it holds over again. A poll that
+panics loses the reader's state: the loop logs one warning with no name, title
+or path and goes on with a fresh reader. A missing file is looked for again
+after a minute; a file that shrank is read again from the start. Names reach
+the ledger as `TranscriptNamesRead`, which only fills a session that exists and
+never erases. The wire title comes from Claude Code's session-title request (the
+`/title` kind): `UsageObserver` in the Anthropic passthrough keeps up to 4 KiB
+of the reply text, only for a request `sanitize_anthropic_request` flagged
+with `is_session_title_side_request` (in `side.rs`, the predicate the `/title`
+label uses too: no client tools and a title-only `output_config` schema),
+and publishes `SessionTitleObserved` once the reply completed with valid
+`{"title": ...}` JSON. It reads the relayed bytes only; the relay stays
+byte-exact. The Codex route observes no title. Names live in memory only and
+the proxy logs none; a traffic capture holds the title reply only as part of
+the response it records anyway.
+
+`src/project.rs` returns a `ProjectName { project, worktree }`. On disk, a
+`.git` file whose `gitdir` sits under `<main>/.git/worktrees/` names the main
+repository as the project and the checkout's directory as the worktree (a
+submodule's `.git` file gets no worktree). A path that is not on this machine
+and contains `.claude/worktrees/<name>` names the directory before `.claude`
+as the project and `<name>` as the worktree.
 
 Requested and effective model are tracked separately. `ModelRequested` captures
 the id the client's body named, before the agent-summary and auto-review
@@ -354,9 +418,11 @@ opening, `n/a` missing, plain exact, a reported zero included), names the
 executed model on request rows and marks a routed-only one with `?`, labels a
 locally answered request `local answer` in every cell (an agent summary is
 answered locally only with `CCP_AGENT_SUMMARY=local`), shows the session root
-as `Σ <id>` with `mixed N` when the rollups name more than one model, lists the
-`models` rollups, the `unattributed` row and an `evidence` line in the session
-detail, prints the 5m/1h buckets as parts reported separately, marks a
+as `Σ <id>` with `mixed N` when the rollups name more than one model, shows
+the session's display name in the `Session` column, lists the name with its
+source spelled out (`rename`, `auto`, `wire`), the project with its worktree,
+the `models` rollups, the `unattributed` row and an `evidence` line in the
+session detail, prints the 5m/1h buckets as parts reported separately, marks a
 conversation whose `raw_parent` was never resolved with `^`, and keys the
 selection by row identity so a re-render keeps it (`(selection reset)` in the
 pane title when the row is gone). Meaning is never carried by color alone.
@@ -366,13 +432,30 @@ The `demo` command shows all of it from `src/monitor/mock.rs`.
 flight first, then by `last_seen` descending, then by `first_seen_rank`
 descending as the tie-break, whichever model or conversation made the latest
 request; the conversations under a session keep `order_conversations`' tree
-order. The bottom pane is tabbed (`BottomTab`: `Events`, `Stats`); Tab cycles
+order. `MonitorStore::snapshot` then leaves out a session with no request in
+flight and no activity for `SESSION_HIDDEN_AFTER` (1 h, `hide_idle_sessions`)
+and counts it in `MonitorState::idle_sessions`, which the Sessions pane title
+shows as `idle hidden: N`; its data stays in the ledger and its next request
+brings it back whole. The header's session count is the visible sessions. The
+store's clock is `MonitorStore::now`, which tests move with `clock_offset`.
+`apply_window_rate` skips a recent request older than its session's
+`first_seen`, which belonged to an earlier session dropped under the same id.
+The bottom pane is tabbed (`BottomTab`: `Events`, `Stats`); Tab cycles
 `FocusPane` Sessions → Recent → Bottom, and while Bottom has focus Left/Right
 switch the tab (`MonitorApp::navigate`) and Up/Down/j/k scroll it, with no
 row identity to keep. The title brackets the shown tab (`[Events] Stats`).
 The Stats tab renders `MonitorState::model_stats`: one `ModelStats` per
-(provider, effective model), the session `models` rollups summed across every
-session, with `local` rows left out. Its cache miss tally is `CacheMissTally`
+(provider, effective model), summed over `MonitorState::models`, with `local`
+rows left out. Those come from `Ledger::measured_usage`: the ledger's own
+per-model rows (`measured`, fed in `apply_contribution` beside the session
+rollups) plus `retired`, where `drop_sessions_idle_since` moves a dropped
+record's contribution, so Stats covers every request since the proxy started
+whether its session is shown, hidden or dropped. A `count_tokens` request runs
+no model and is left out of Stats entirely (`RequestRecord::ran_on_model`, and
+the median window skips the endpoint): the local Codex estimate names no
+effective model and used to make a `codex/-` row, and Anthropic's relayed one
+inflated its model's `Reqs`. It stays in the session rollups, so a session's
+`models` still add up to its figures. Its cache miss tally is `CacheMissTally`
 on `ModelUsage`, fed by `Contribution.miss` from the `CacheMiss` a request's
 evaluation stored on its record, so a per-model miss is counted exactly once
 and detached with the record like every other number; the judging itself is
@@ -772,6 +855,12 @@ JSON captures (`write_json`, `write_json_event`) pass through
 and proxy-owned `ccp:codex:v1:` reasoning signatures with `[redacted len=N]`
 and keeps any other signature. The raw SSE and raw byte captures
 (`write_text`, `write_bytes`) are not redacted at all.
+
+With the monitor on, the proxy reads Claude Code's local session transcripts
+under `$CLAUDE_CONFIG_DIR/projects` every 5 s, incrementally, to name
+sessions. It keeps only titles and read offsets, never modifies the files,
+sends nothing from them upstream and writes no name to `proxy.log`. A traffic
+capture may still contain a title as part of a recorded title reply.
 
 ## Style
 

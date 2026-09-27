@@ -1,3 +1,44 @@
+## Unreleased
+
+- The monitor's Stats tab no longer counts token count requests. The local
+  Codex estimate used to add a `codex/-` row of requests with every token
+  column `n/a`, and Anthropic's relayed `count_tokens` inflated `Reqs` (and
+  could feed `Fail` and the latency median) of the Claude model it named.
+  These requests still show in the Sessions pane, the recent list and the
+  events as before.
+- The monitor now forgets idle sessions. A session with nothing in flight and
+  no request for an hour is hidden from the Sessions pane, whose title says
+  how many are hidden (`Sessions (idle hidden: N)`), and its next request
+  brings it back with its history. After a day without a request it is dropped
+  from memory, so a long-running proxy no longer keeps every request it ever
+  served; a later request under the same session id starts a new session from
+  zero, which gets its transcript name back. The header's session count covers
+  the visible sessions only. The Stats
+  tab still covers every request since the proxy started, dropped sessions
+  included. There is no setting for either period and no switch back to
+  keeping every session.
+- Sessions in the monitor have names. The Sessions pane's `Project` column is
+  now `Session` and shows the name given with `/rename`, else the title Claude
+  Code generated for the session, both read from its transcript under
+  `$CLAUDE_CONFIG_DIR/projects` (default `~/.claude/projects`), else the title
+  seen in Claude Code's title request on the Anthropic route, else the project
+  (as `project · worktree` when the session runs in a git worktree), else the
+  session id. Transcripts are read in the background every few seconds, from
+  where the previous read stopped, and never modified; names stay in memory
+  and are not written to `proxy.log` (a traffic capture holds the title reply
+  as it holds any response). The session detail
+  says where the name came from and shows the worktree beside the project. A
+  checkout under `.claude/worktrees/<name>` on another machine used to show
+  the worktree name as its project; it now shows the repository, and a local
+  git worktree shows its worktree name as well.
+- Side calls are labelled by kind. Conversations that used to end in `/side`
+  now end in `/classifier` (the auto-mode classifier), `/title` (the session
+  title), `/search` (the isolated web search), `/recap` (the recap of a
+  subagent left running) or `/fetch` (a WebFetch summary), and in `/side` for
+  any other request without client tools. They are placed and counted exactly
+  as before: under the conversation that made them and never judged for cache
+  misses.
+
 ## v0.12.0 (2026-09-23)
 
 - Client headers can now reach the Codex backend. `CCP_CODEX_FORWARD_HEADERS`

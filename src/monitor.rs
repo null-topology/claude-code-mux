@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -7,6 +8,8 @@ use std::{
 
 mod accounting;
 mod mock;
+mod naming;
+mod side;
 mod usage;
 
 use accounting::{AbsorbedRequest, Ledger, SessionRecord};
@@ -14,6 +17,12 @@ pub use accounting::{
     CacheMissTally, LOCAL_PROVIDER, ModelUsage, QualityCoverage, UnattributedUsage, UsageEvidence,
 };
 pub use mock::{MockMonitor, mock_state};
+pub(crate) use naming::session_title_from_reply;
+pub use naming::{SessionName, SessionNameSource, TranscriptNames, spawn_transcript_reader};
+pub use side::{
+    SideKind, has_client_tools, is_session_title_side_request, is_side_conversation,
+    split_side_conversation,
+};
 pub use usage::{
     CacheMiss, CacheMissCause, CacheWriteQuality, QualityFields, UsageFields, UsageQuality,
     UsageReport, caches_implicitly, default_cache_ttl, detect_cache_miss,
@@ -23,6 +32,14 @@ use usage::{ClosedFields, UsageDelta, apply_closing, apply_opening, quality_of};
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
 pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
+/// How long a session with nothing in flight stays in the Sessions pane after
+/// its latest request. Past it the row is hidden, not forgotten: a request
+/// brings it back with everything it had.
+const SESSION_HIDDEN_AFTER: Duration = Duration::from_secs(60 * 60);
+/// How long an idle session is kept at all. Past it its rows, the records of
+/// its requests and its cache lanes are dropped, and a request naming it
+/// starts a new session. Stats keeps what its requests ran.
+const SESSION_DROPPED_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointKind {
@@ -80,9 +97,23 @@ pub enum MonitorEvent {
         session_seq: Option<u64>,
         endpoint: EndpointKind,
     },
+    /// The project the request's working directory belongs to, and the
+    /// worktree of it when the directory is one.
     ProjectResolved {
         request_id: String,
         project: String,
+        worktree: Option<String>,
+    },
+    /// The session title the reply to Claude Code's request for one carried.
+    SessionTitleObserved {
+        request_id: String,
+        title: String,
+    },
+    /// The names the session's transcript on this machine holds, from the
+    /// reader that follows it. A name it did not state is `None`.
+    TranscriptNamesRead {
+        session_id: String,
+        names: TranscriptNames,
     },
     SessionSequenceResolved {
         request_id: String,
@@ -398,26 +429,36 @@ impl Throughput {
 #[derive(Debug, Clone)]
 pub struct MonitorState {
     pub started_at: SystemTime,
+    /// The sessions in view: every one with a request in flight or a request
+    /// within [`SESSION_HIDDEN_AFTER`].
     pub sessions: Vec<SessionSummary>,
+    /// How many sessions the store still holds but `sessions` leaves out as
+    /// idle.
+    pub idle_sessions: usize,
+    /// What each backend and model ran since the proxy started, for Stats:
+    /// every request but a `count_tokens` estimate, hidden and dropped sessions
+    /// included. A pair may have more than one entry; Stats sums them.
+    pub models: Vec<ModelUsage>,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<CompletedRequest>,
 }
 
 impl MonitorState {
     /// What every backend and model that ran cost since the proxy started, one
-    /// row per pair, added up over every session, largest prompt total first.
+    /// row per pair, largest prompt total first.
     ///
-    /// The counts are the session rollups summed, so they outlive the recent
-    /// list the way the sessions do. The two timing figures are the exception:
-    /// a median is read off the requests still in view, so they cover the
-    /// recent window only and say so in the row.
+    /// The counts are [`MonitorState::models`] summed, so they outlive the
+    /// recent list, and the sessions too: a session hidden or dropped as idle
+    /// still counts. A `count_tokens` estimate ran no model and is in no row.
+    /// The two timing figures are the exception: a median is read off the
+    /// requests still in view, so they cover the recent window only and say so
+    /// in the row.
     pub fn model_stats(&self) -> Vec<ModelStats> {
         let mut rows: Vec<ModelStats> = Vec::new();
         // Answers the proxy gave itself ran on no model, so they have no row.
         for usage in self
-            .sessions
+            .models
             .iter()
-            .flat_map(|session| &session.models)
             .filter(|usage| usage.provider.as_deref() != Some(LOCAL_PROVIDER))
         {
             let row = match rows
@@ -459,11 +500,15 @@ impl MonitorState {
             }
         }
         for row in &mut rows {
+            // The entries arrive in no particular order; the caller ids are
+            // listed by name so a row reads the same from one frame to the next.
+            row.requested_models.sort();
             let window: Vec<&CompletedRequest> = self
                 .recent
                 .iter()
                 .filter(|request| {
                     request.status == RequestStatus::Completed
+                        && request.endpoint != EndpointKind::CountTokens
                         && request.provider == row.provider
                         && request.effective_model == row.model
                 })
@@ -564,7 +609,12 @@ impl ModelStats {
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub session_id: Option<String>,
+    /// What the session is called, from the first source that has a name:
+    /// `/rename`, the transcript's title, the title seen on the wire.
+    pub name: Option<SessionName>,
     pub project: Option<String>,
+    /// The worktree the session's working directory sits in, when it is one.
+    pub worktree: Option<String>,
     /// Where the session sits among the ones seen before it: a stable key for
     /// ordering rows, unaffected by anything that happens later.
     pub first_seen_rank: usize,
@@ -660,7 +710,7 @@ impl ConversationSummary {
     /// Whether the conversation is one of Claude Code's side calls, which do
     /// not extend a transcript.
     pub fn is_side(&self) -> bool {
-        self.conversation.ends_with(SIDE_CONVERSATION_SUFFIX)
+        is_side_conversation(&self.conversation)
     }
 }
 
@@ -737,6 +787,20 @@ impl SessionSummary {
             .clone()
             .unwrap_or_else(|| "no-session".to_string())
     }
+
+    /// What the Sessions pane calls the session: its name, else its project,
+    /// as `project · worktree` when it runs in a worktree. `None` leaves it to
+    /// the session id.
+    pub fn display_name(&self) -> Option<Cow<'_, str>> {
+        if let Some(name) = &self.name {
+            return Some(Cow::Borrowed(name.text.as_str()));
+        }
+        let project = self.project.as_deref()?;
+        Some(match self.worktree.as_deref() {
+            Some(worktree) => Cow::Owned(format!("{project} · {worktree}")),
+            None => Cow::Borrowed(project),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -749,6 +813,10 @@ struct MonitorStore {
     ledger: Ledger,
     lanes: HashMap<LaneKey, LaneState>,
     recent_limit: usize,
+    /// How far a test moved the store's clock on, to reach an idle session's
+    /// limits without waiting for them.
+    #[cfg(test)]
+    clock_offset: Duration,
 }
 
 /// The four accumulated cost categories of one row, and the lifetime split of
@@ -782,11 +850,6 @@ fn note_miss(stats: &mut SessionCacheStats, started_at: SystemTime, miss: CacheM
     stats.missed_tokens = stats.missed_tokens.saturating_add(miss.missed_tokens);
     stats.last_miss = Some((started_at, miss));
 }
-
-/// Appended to a conversation label for requests without client tools. They
-/// are side calls that do not extend the transcript, so consecutive ones share
-/// little beyond the system prompt and are not judged for cache misses.
-pub const SIDE_CONVERSATION_SUFFIX: &str = "/side";
 
 /// One conversation's stream of requests to one model: the unit a prompt cache
 /// builds up in. Subagents and side requests get their own lanes.
@@ -919,6 +982,8 @@ impl MonitorHandle {
                 ledger: Ledger::default(),
                 lanes: HashMap::new(),
                 recent_limit,
+                #[cfg(test)]
+                clock_offset: Duration::ZERO,
             })),
         }
     }
@@ -929,12 +994,21 @@ impl MonitorHandle {
         }
     }
 
+    /// What the monitor shows now. Sessions idle past their limit are dropped
+    /// first, so a monitor that only watches, with no request arriving to do
+    /// it, still lets them go.
     pub fn snapshot(&self) -> MonitorState {
         match self.store.lock() {
-            Ok(store) => store.snapshot(),
+            Ok(mut store) => {
+                let now = store.now();
+                store.drop_idle_sessions(now);
+                store.snapshot(now)
+            }
             Err(_) => MonitorState {
                 started_at: SystemTime::now(),
                 sessions: Vec::new(),
+                idle_sessions: 0,
+                models: Vec::new(),
                 active: Vec::new(),
                 recent: Vec::new(),
             },
@@ -956,11 +1030,40 @@ impl MonitorHandle {
         });
     }
 
-    pub fn project_resolved(&self, request_id: impl Into<String>, project: impl Into<String>) {
+    pub fn project_resolved(
+        &self,
+        request_id: impl Into<String>,
+        project: impl Into<String>,
+        worktree: Option<String>,
+    ) {
         self.publish(MonitorEvent::ProjectResolved {
             request_id: request_id.into(),
             project: project.into(),
+            worktree,
         });
+    }
+
+    pub fn session_title_observed(&self, request_id: impl Into<String>, title: impl Into<String>) {
+        self.publish(MonitorEvent::SessionTitleObserved {
+            request_id: request_id.into(),
+            title: title.into(),
+        });
+    }
+
+    pub fn transcript_names_read(&self, session_id: impl Into<String>, names: TranscriptNames) {
+        self.publish(MonitorEvent::TranscriptNamesRead {
+            session_id: session_id.into(),
+            names,
+        });
+    }
+
+    /// The ids of the sessions the monitor holds, each with a generation that
+    /// changes when a session was dropped and started again under its id.
+    pub fn session_generations(&self) -> Vec<(String, u64)> {
+        self.store
+            .lock()
+            .map(|store| store.ledger.session_generations())
+            .unwrap_or_default()
     }
 
     pub fn session_sequence_resolved(&self, request_id: impl Into<String>, session_seq: u64) {
@@ -1141,7 +1244,11 @@ impl MonitorStore {
                 session_seq,
                 endpoint,
             } => {
-                let started_at = SystemTime::now();
+                let started_at = self.now();
+                // A session idle past its limit goes before the request is
+                // counted, so a request naming it starts a new one rather than
+                // adding to what is about to be dropped.
+                self.drop_idle_sessions(started_at);
                 self.ledger
                     .start(&request_id, session_id.clone(), endpoint, started_at);
                 self.active.insert(
@@ -1179,11 +1286,20 @@ impl MonitorStore {
             MonitorEvent::ProjectResolved {
                 request_id,
                 project,
+                worktree,
             } => {
-                self.ledger.note_project(&request_id, project.clone());
+                self.ledger
+                    .note_project(&request_id, project.clone(), worktree);
                 if let Some(active) = self.active.get_mut(&request_id) {
                     active.project = Some(project);
                 }
+            }
+            MonitorEvent::SessionTitleObserved { request_id, title } => {
+                self.ledger.note_session_title(&request_id, title);
+            }
+            MonitorEvent::TranscriptNamesRead { session_id, names } => {
+                self.ledger
+                    .note_transcript_names(&session_id, names.renamed, names.auto_title);
             }
             MonitorEvent::SessionSequenceResolved {
                 request_id,
@@ -1235,8 +1351,8 @@ impl MonitorStore {
                 self.project(&request_id);
             }
             MonitorEvent::GenerationStarted { request_id } => {
-                self.ledger
-                    .note_generation_started(&request_id, SystemTime::now());
+                let now = self.now();
+                self.ledger.note_generation_started(&request_id, now);
                 self.project(&request_id);
             }
             MonitorEvent::TrafficCapturePath { request_id, path } => {
@@ -1264,9 +1380,10 @@ impl MonitorStore {
             } => {
                 // The ledger owns the counts and the generation interval; the
                 // visible row mirrors them and keeps the stream's own volume.
+                let now = self.now();
                 if self
                     .ledger
-                    .note_stream_progress(&request_id, &usage, SystemTime::now())
+                    .note_stream_progress(&request_id, &usage, now)
                     .is_some()
                 {
                     if let Some(active) = self.active.get_mut(&request_id) {
@@ -1285,11 +1402,8 @@ impl MonitorStore {
                 self.evaluate_cache(&request_id);
             }
             MonitorEvent::UsageUpdated { request_id, usage } => {
-                if self
-                    .ledger
-                    .note_usage(&request_id, &usage, SystemTime::now())
-                    .is_some()
-                {
+                let now = self.now();
+                if self.ledger.note_usage(&request_id, &usage, now).is_some() {
                     self.project(&request_id);
                 }
                 self.evaluate_cache(&request_id);
@@ -1367,10 +1481,8 @@ impl MonitorStore {
         error: Option<String>,
     ) {
         let report = UsageReport::opening(input_tokens, output_tokens);
-        if !self
-            .ledger
-            .finish(request_id, status, &report, SystemTime::now())
-        {
+        let now = self.now();
+        if !self.ledger.finish(request_id, status, &report, now) {
             // A second terminal event for the same request counts nothing
             // twice, and the outcome the first one recorded stands. The counts
             // it carried are still worth taking.
@@ -1394,7 +1506,7 @@ impl MonitorStore {
                 effective_model: None,
                 effort: None,
                 endpoint: EndpointKind::Messages,
-                started_at: SystemTime::now(),
+                started_at: now,
                 started_instant: Instant::now(),
                 generation_started_at: None,
                 generation_initial_output_tokens: 0,
@@ -1424,7 +1536,7 @@ impl MonitorStore {
             effort: active.effort,
             endpoint: active.endpoint,
             started_at: active.started_at,
-            finished_at: SystemTime::now(),
+            finished_at: now,
             generation_started_at: active.generation_started_at,
             generation_initial_output_tokens: active.generation_initial_output_tokens,
             generation_finished_at: active.generation_finished_at,
@@ -1583,7 +1695,7 @@ impl MonitorStore {
         let side = key
             .conversation
             .as_deref()
-            .is_some_and(|name| name.ends_with(SIDE_CONVERSATION_SUFFIX));
+            .is_some_and(is_side_conversation);
         let judged = judge && !superseded && !side;
         let miss = previous.filter(|_| judged).and_then(|lane| {
             // It was sent before the previous response began, so the entries
@@ -1606,12 +1718,13 @@ impl MonitorStore {
             detect_cache_miss(lane.prompt_tokens, prompt, cache_read, gap, ttl)
         });
         if !superseded {
+            let readable_from = response_started_at.unwrap_or_else(|| self.now());
             self.lanes.insert(
                 key.clone(),
                 LaneState {
                     prompt_tokens: prompt,
                     started_at,
-                    readable_from: response_started_at.unwrap_or_else(SystemTime::now),
+                    readable_from,
                     ttl: cache.ttl.or(previous.and_then(|lane| lane.ttl)),
                     reported_cache: reported_cache
                         || previous.is_some_and(|lane| lane.reported_cache),
@@ -1656,14 +1769,41 @@ impl MonitorStore {
         self.project(request_id);
     }
 
-    fn snapshot(&self) -> MonitorState {
+    #[cfg(not(test))]
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+
+    #[cfg(test)]
+    fn now(&self) -> SystemTime {
+        SystemTime::now() + self.clock_offset
+    }
+
+    /// Forget the sessions idle past [`SESSION_DROPPED_AFTER`], with the cache
+    /// lanes they judged their requests on, so a session starting again under
+    /// the same id has no baseline to be measured against.
+    fn drop_idle_sessions(&mut self, now: SystemTime) {
+        let Some(cutoff) = now.checked_sub(SESSION_DROPPED_AFTER) else {
+            return;
+        };
+        let dropped = self.ledger.drop_sessions_idle_since(cutoff);
+        if !dropped.is_empty() {
+            self.lanes
+                .retain(|key, _| !dropped.contains(&key.session_id));
+        }
+    }
+
+    fn snapshot(&self, now: SystemTime) -> MonitorState {
         let mut active: Vec<_> = self.active.values().cloned().collect();
         active.sort_by_key(|request| request.started_at);
         let mut sessions = session_summaries(&self.ledger);
+        let idle_sessions = hide_idle_sessions(&mut sessions, now);
         apply_window_rate(&mut sessions, &active, &self.recent);
         MonitorState {
             started_at: self.started_at,
             sessions,
+            idle_sessions,
+            models: self.ledger.measured_usage(),
             active,
             recent: self.recent.iter().cloned().collect(),
         }
@@ -1691,10 +1831,8 @@ fn resolve_parent(conversations: &[ConversationSummary], index: usize) -> Option
             .position(|conversation| conversation.conversation == label)
     };
     let conversation = &conversations[index];
-    conversation
-        .conversation
-        .strip_suffix(SIDE_CONVERSATION_SUFFIX)
-        .and_then(position)
+    split_side_conversation(&conversation.conversation)
+        .and_then(|(base, _)| position(base))
         .or_else(|| conversation.raw_parent.as_deref().and_then(position))
         .filter(|parent| *parent != index)
 }
@@ -1803,6 +1941,18 @@ fn session_summaries(ledger: &Ledger) -> Vec<SessionSummary> {
     out
 }
 
+/// Leave out of the pane the sessions with nothing in flight and no request
+/// within [`SESSION_HIDDEN_AFTER`], and say how many that was. They stay in
+/// the store, and a request makes one recent again.
+fn hide_idle_sessions(sessions: &mut Vec<SessionSummary>, now: SystemTime) -> usize {
+    let Some(cutoff) = now.checked_sub(SESSION_HIDDEN_AFTER) else {
+        return 0;
+    };
+    let held = sessions.len();
+    sessions.retain(|session| session.active_count > 0 || session.last_seen >= cutoff);
+    held - sessions.len()
+}
+
 fn session_summary(session_id: Option<String>, record: &SessionRecord) -> SessionSummary {
     // The rows are stored by name; their first-seen rank is what keeps the
     // order stable, as the display order builds on it.
@@ -1814,7 +1964,9 @@ fn session_summary(session_id: Option<String>, record: &SessionRecord) -> Sessio
         .collect();
     SessionSummary {
         session_id,
+        name: record.name(),
         project: record.project.clone(),
+        worktree: record.worktree.clone(),
         first_seen_rank: count(record.rank),
         active_count: count(record.counts.active_count),
         request_count: count(record.counts.request_count),
@@ -1886,6 +2038,9 @@ fn conversation_summary(
 /// session whose requests have all left them shows no rate rather than an old
 /// one. The rows themselves, their counts and their token totals come from the
 /// ledger and owe nothing to this window.
+///
+/// A request older than its session's first one belonged to an earlier session
+/// under the same id, dropped as idle since, and is not this one's.
 fn apply_window_rate(
     sessions: &mut [SessionSummary],
     active: &[ActiveRequest],
@@ -1901,6 +2056,7 @@ fn apply_window_rate(
         .map(|request| {
             (
                 &request.session_id,
+                request.started_at,
                 request.output_tokens,
                 request.generation_initial_output_tokens,
                 request.generation_duration,
@@ -1909,13 +2065,18 @@ fn apply_window_rate(
         .chain(active.iter().map(|request| {
             (
                 &request.session_id,
+                request.started_at,
                 request.output_tokens,
                 request.generation_initial_output_tokens,
                 request.generation_duration,
             )
         }));
-    for (session_id, output_tokens, initial_output_tokens, duration) in samples {
-        let Some(index) = rows.get(session_id).copied() else {
+    for (session_id, started_at, output_tokens, initial_output_tokens, duration) in samples {
+        let Some(index) = rows
+            .get(session_id)
+            .copied()
+            .filter(|index| started_at >= sessions[*index].first_seen)
+        else {
             continue;
         };
         // Output without a measured interval, and an interval without output,
@@ -2275,6 +2436,22 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         sessions
     }
 
+    /// A whole monitor state for requests built directly, Stats included.
+    fn state_for_requests(recent: VecDeque<CompletedRequest>) -> MonitorState {
+        let mut ledger = Ledger::default();
+        for request in recent.iter().rev() {
+            ledger.absorb(AbsorbedRequest::from_completed(request));
+        }
+        MonitorState {
+            started_at: SystemTime::UNIX_EPOCH,
+            sessions: session_summaries_for_requests(&recent),
+            idle_sessions: 0,
+            models: ledger.measured_usage(),
+            active: Vec::new(),
+            recent: recent.into_iter().collect(),
+        }
+    }
+
     #[test]
     fn completed_request_rate_uses_stream_interval_instead_of_request_latency() {
         let request = completed_request(
@@ -2395,7 +2572,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             Some(1),
             EndpointKind::Messages,
         );
-        monitor.project_resolved("r1", "example");
+        monitor.project_resolved("r1", "example", None);
         monitor.provider_selected("r1", "codex", "gpt-5.5", None);
         monitor.request_completed("r1", 200, Some(10), Some(20));
         monitor.request_started(
@@ -2785,12 +2962,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         ]
         .into_iter()
         .collect();
-        let state = MonitorState {
-            started_at: SystemTime::UNIX_EPOCH,
-            sessions: session_summaries_for_requests(&recent),
-            active: Vec::new(),
-            recent: recent.into_iter().collect(),
-        };
+        let state = state_for_requests(recent);
         let rows = state.model_stats();
         let sol = stats_row(&rows, "codex", "gpt-5.6-sol");
         assert_eq!(sol.request_count, 4);
@@ -2823,12 +2995,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         ]
         .into_iter()
         .collect();
-        let state = MonitorState {
-            started_at: SystemTime::UNIX_EPOCH,
-            sessions: session_summaries_for_requests(&recent),
-            active: Vec::new(),
-            recent: recent.into_iter().collect(),
-        };
+        let state = state_for_requests(recent);
         let rows = state.model_stats();
         let sol = stats_row(&rows, "codex", "gpt-5.6-sol");
         assert_eq!(sol.recent_requests, 2);
@@ -3538,6 +3705,62 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     }
 
     #[test]
+    fn side_calls_of_a_named_kind_are_not_judged_either() {
+        let monitor = MonitorHandle::new(20);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(40_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+
+        for (id, conversation) in [
+            ("q1", "main/recap"),
+            ("q2", "main/recap"),
+            ("w1", "main/search"),
+            ("w2", "main/search"),
+        ] {
+            start_codex_request(&monitor, id, conversation);
+            monitor.usage_reported(id, closing_usage(3_000, 0, 0, 20));
+            monitor.request_completed(id, 200, None, None);
+        }
+
+        let state = monitor.snapshot();
+        for id in ["q2", "w2"] {
+            assert!(recent_by_id(&state, id).cache.evaluated());
+            assert!(recent_by_id(&state, id).cache.miss.is_none());
+        }
+        assert_eq!(state.sessions[0].cache.miss_count, 0);
+        assert_eq!(state.sessions[0].cache.context_tokens, 40_000);
+    }
+
+    #[test]
+    fn side_calls_of_a_named_kind_hang_under_the_conversation_that_made_them() {
+        let monitor = MonitorHandle::new(20);
+        for (request_id, conversation) in [
+            ("f1", "main/fetch"),
+            ("a1", "agent-1"),
+            ("r1", "main"),
+            ("t1", "agent-1/title"),
+            ("c1", "main/classifier"),
+        ] {
+            start_codex_request(&monitor, request_id, conversation);
+            monitor.usage_reported(request_id, closing_usage(1_000, 0, 0, 10));
+            monitor.request_completed(request_id, 200, None, None);
+        }
+
+        let state = monitor.snapshot();
+
+        assert_eq!(
+            conversation_shape(&state.sessions[0]),
+            vec![
+                ("main", None, 0),
+                ("main/fetch", Some("main"), 1),
+                ("main/classifier", Some("main"), 1),
+                ("agent-1", None, 0),
+                ("agent-1/title", Some("agent-1"), 1),
+            ]
+        );
+    }
+
+    #[test]
     fn a_request_sent_before_the_previous_response_began_is_not_a_miss() {
         let monitor = MonitorHandle::new(20);
         start_anthropic_request(&monitor, "r1", "claude-opus-5");
@@ -3654,7 +3877,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     fn session_and_conversation_rows_outlive_the_recent_window() {
         let monitor = MonitorHandle::new(1);
         start_codex_request(&monitor, "r1", "main");
-        monitor.project_resolved("r1", "example");
+        monitor.project_resolved("r1", "example", None);
         monitor.usage_reported("r1", closing_usage(30_000, 0, 0, 50));
         monitor.request_completed("r1", 200, None, None);
         // A subagent of the main thread, whose stream died after the status line.
@@ -4211,7 +4434,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         monitor.provider_selected("r2", "codex", "gpt-5.6-luna", None);
         monitor.request_completed("r2", 200, Some(500), Some(10));
 
-        monitor.project_resolved("r1", "example-project");
+        monitor.project_resolved("r1", "example-project", None);
         monitor.conversation_resolved("r1", "main", None);
         monitor.provider_selected("r1", "codex", "gpt-5.6-sol", None);
 
@@ -4234,8 +4457,8 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         monitor.request_started("r2", Some("s1".to_string()), None, EndpointKind::Messages);
         // The newer request names where it is working, and only then does the
         // older one name the directory it was started in.
-        monitor.project_resolved("r2", "current-project");
-        monitor.project_resolved("r1", "previous-project");
+        monitor.project_resolved("r2", "current-project", None);
+        monitor.project_resolved("r1", "previous-project", None);
 
         let state = monitor.snapshot();
         assert_eq!(
@@ -4256,13 +4479,105 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             store.ledger.backdate_for_tests("r1", same_instant);
             store.ledger.backdate_for_tests("r2", same_instant);
         }
-        monitor.project_resolved("r2", "current-project");
-        monitor.project_resolved("r1", "previous-project");
+        monitor.project_resolved("r2", "current-project", None);
+        monitor.project_resolved("r1", "previous-project", None);
 
         let state = monitor.snapshot();
         assert_eq!(
             state.sessions[0].project.as_deref(),
             Some("current-project")
+        );
+    }
+
+    #[test]
+    fn a_session_is_named_by_rename_then_transcript_title_then_wire_title() {
+        let monitor = MonitorHandle::new(10);
+        let shown = |monitor: &MonitorHandle| {
+            let state = monitor.snapshot();
+            let session = &state.sessions[0];
+            (
+                session.display_name().map(Cow::into_owned),
+                session.name.as_ref().map(|name| name.source),
+            )
+        };
+        let names = |renamed: Option<&str>, auto_title: Option<&str>| TranscriptNames {
+            renamed: renamed.map(str::to_string),
+            auto_title: auto_title.map(str::to_string),
+        };
+        monitor.request_started("r1", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.project_resolved("r1", "repo", Some("wt".to_string()));
+        // Nothing named it yet, so the project and its worktree stand in.
+        assert_eq!(shown(&monitor), (Some("repo · wt".to_string()), None));
+        assert_eq!(
+            monitor.snapshot().sessions[0].worktree.as_deref(),
+            Some("wt")
+        );
+
+        monitor.request_started("r2", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.conversation_resolved("r2", "main/title", None);
+        monitor.session_title_observed("r2", "Wire title");
+        assert_eq!(
+            shown(&monitor),
+            (
+                Some("Wire title".to_string()),
+                Some(SessionNameSource::Wire)
+            )
+        );
+
+        monitor.transcript_names_read("s1", names(None, Some("Auto title")));
+        assert_eq!(
+            shown(&monitor),
+            (
+                Some("Auto title".to_string()),
+                Some(SessionNameSource::Auto)
+            )
+        );
+
+        // A newer title from the wire never replaces a name the transcript gave.
+        monitor.request_started("r3", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.session_title_observed("r3", "Newer wire title");
+        assert_eq!(
+            shown(&monitor),
+            (
+                Some("Auto title".to_string()),
+                Some(SessionNameSource::Auto)
+            )
+        );
+
+        monitor.transcript_names_read("s1", names(Some("Renamed"), Some("Auto title")));
+        assert_eq!(
+            shown(&monitor),
+            (Some("Renamed".to_string()), Some(SessionNameSource::Rename))
+        );
+
+        // A later rename replaces the earlier one, and a read that names
+        // nothing erases nothing.
+        monitor.transcript_names_read("s1", names(Some("Renamed again"), None));
+        monitor.transcript_names_read("s1", names(None, None));
+        assert_eq!(
+            shown(&monitor),
+            (
+                Some("Renamed again".to_string()),
+                Some(SessionNameSource::Rename)
+            )
+        );
+    }
+
+    #[test]
+    fn the_newest_title_request_names_the_session_however_late_an_older_reply_arrives() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.request_started("r2", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.session_title_observed("r2", "Current title");
+        monitor.session_title_observed("r1", "Previous title");
+
+        let state = monitor.snapshot();
+        assert_eq!(
+            state.sessions[0]
+                .name
+                .as_ref()
+                .map(|name| name.text.as_str()),
+            Some("Current title")
         );
     }
 
@@ -5239,5 +5554,486 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert_eq!(session.evidence.cache_write.missing, 1);
         assert_eq!(session.cache_write_5m_tokens, 400);
         assert_eq!(session.cache_write_1h_tokens, 500);
+    }
+
+    /// Moves the monitor's clock forward, as if that much time had passed.
+    fn advance_clock(monitor: &MonitorHandle, by: Duration) {
+        if let Ok(mut store) = monitor.store.lock() {
+            store.clock_offset += by;
+        }
+    }
+
+    fn held_requests_and_sessions(monitor: &MonitorHandle) -> (usize, usize) {
+        monitor
+            .store
+            .lock()
+            .map(|store| store.ledger.held_for_tests())
+            .unwrap_or_default()
+    }
+
+    fn lane_sessions(monitor: &MonitorHandle) -> Vec<Option<String>> {
+        monitor
+            .store
+            .lock()
+            .map(|store| {
+                store
+                    .lanes
+                    .keys()
+                    .map(|key| key.session_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A token count estimate runs no model: the local Codex one names none and
+    /// would make a row of its own, and neither belongs among the requests a
+    /// model served. It stays a request of its session.
+    #[test]
+    fn a_local_count_tokens_estimate_makes_no_stats_row() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "count",
+            Some("s1".to_string()),
+            None,
+            EndpointKind::CountTokens,
+        );
+        monitor.provider_selected("count", "codex", "gpt-5.6-sol", None);
+        monitor.usage_updated("count", Some(40_000), None);
+        monitor.request_completed("count", 200, None, None);
+        finish_with_usage(
+            &monitor,
+            "r1",
+            "s1",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(100, 0, 0, 10),
+        );
+
+        let state = monitor.snapshot();
+        let rows = state.model_stats();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(stats_row(&rows, "codex", "gpt-5.6-sol").request_count, 1);
+        // The session still counts it, and its model rollups still add up.
+        let session = &state.sessions[0];
+        assert_eq!(session.request_count, 2);
+        let rollup: usize = session.models.iter().map(|row| row.request_count).sum();
+        assert_eq!(rollup, 2);
+    }
+
+    /// The Anthropic token count is relayed and names a model, which is no
+    /// reason to count it with that model's requests, failures or medians.
+    #[test]
+    fn a_relayed_count_tokens_request_stays_out_of_its_models_stats() {
+        let anthropic = |mut request: CompletedRequest| {
+            request.provider = Some("anthropic".to_string());
+            request.model = Some("claude-opus-5".to_string());
+            request.requested_model = Some("claude-opus-5".to_string());
+            request.effective_model = Some("claude-opus-5".to_string());
+            request
+        };
+        let count_tokens = |mut request: CompletedRequest, status| {
+            request.endpoint = EndpointKind::CountTokens;
+            request.status = status;
+            request
+        };
+        let recent: VecDeque<CompletedRequest> = [
+            anthropic(completed_request(
+                "r1",
+                "s1",
+                100,
+                Duration::from_secs(2),
+                Some(Duration::from_secs(1)),
+            )),
+            anthropic(completed_request(
+                "r2",
+                "s1",
+                300,
+                Duration::from_secs(4),
+                Some(Duration::from_secs(1)),
+            )),
+            count_tokens(
+                anthropic(completed_request(
+                    "count-1",
+                    "s1",
+                    10_000,
+                    Duration::from_secs(60),
+                    Some(Duration::from_secs(1)),
+                )),
+                RequestStatus::Completed,
+            ),
+            count_tokens(
+                anthropic(completed_request(
+                    "count-2",
+                    "s1",
+                    0,
+                    Duration::from_secs(1),
+                    None,
+                )),
+                RequestStatus::Failed,
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let state = state_for_requests(recent);
+
+        let rows = state.model_stats();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let opus = stats_row(&rows, "anthropic", "claude-opus-5");
+        assert_eq!(opus.request_count, 2);
+        assert_eq!(opus.failure_count, 0);
+        assert_eq!(opus.recent_requests, 2);
+        assert_eq!(opus.median_latency, Some(Duration::from_secs(3)));
+        assert_eq!(opus.median_output_rate, Some(200.0));
+        assert_eq!(state.sessions[0].request_count, 4);
+        assert_eq!(state.sessions[0].failure_count, 1);
+    }
+
+    /// The rate of a session counts only its own requests, not those an
+    /// earlier session under the same id left in the recent list.
+    #[test]
+    fn a_session_rate_leaves_out_requests_older_than_the_session() {
+        let earlier = completed_request(
+            "r1",
+            "s1",
+            900,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+        );
+        let mut current = completed_request(
+            "r2",
+            "s1",
+            100,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+        );
+        current.started_at += Duration::from_secs(100);
+        current.finished_at += Duration::from_secs(100);
+        let mut ledger = Ledger::default();
+        ledger.absorb(AbsorbedRequest::from_completed(&current));
+        let recent: VecDeque<CompletedRequest> = [current, earlier].into_iter().collect();
+
+        let mut sessions = session_summaries(&ledger);
+        apply_window_rate(&mut sessions, &[], &recent);
+        assert_eq!(sessions[0].rate(), Throughput::TokensPerSecond(100.0));
+    }
+
+    /// An hour without a request hides a session from the pane; its figures
+    /// stay, Stats still counts them, and its next request brings it back whole.
+    #[test]
+    fn a_session_idle_for_an_hour_is_hidden_until_its_next_request() {
+        let monitor = MonitorHandle::new(10);
+        finish_with_usage(
+            &monitor,
+            "old",
+            "s-idle",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(1_000, 0, 0, 10),
+        );
+        let rank = monitor.snapshot().sessions[0].first_seen_rank;
+        advance_clock(&monitor, Duration::from_secs(30 * 60));
+        finish_with_usage(
+            &monitor,
+            "fresh",
+            "s-live",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(1_000, 0, 0, 10),
+        );
+        advance_clock(&monitor, Duration::from_secs(31 * 60));
+
+        let state = monitor.snapshot();
+        assert_eq!(session_labels(&state), ["s-live"]);
+        assert_eq!(state.idle_sessions, 1);
+        let rows = state.model_stats();
+        assert_eq!(stats_row(&rows, "codex", "gpt-5.6-sol").request_count, 2);
+
+        finish_with_usage(
+            &monitor,
+            "back",
+            "s-idle",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(1_000, 0, 0, 10),
+        );
+        let state = monitor.snapshot();
+        assert_eq!(session_labels(&state), ["s-idle", "s-live"]);
+        assert_eq!(state.idle_sessions, 0);
+        let session = &state.sessions[0];
+        assert_eq!(session.first_seen_rank, rank);
+        assert_eq!(session.request_count, 2);
+        assert_eq!(session.input_tokens, 2_000);
+    }
+
+    /// A day without a request drops a session with its requests and cache
+    /// lanes, and Stats keeps every figure it showed.
+    #[test]
+    fn a_session_idle_for_a_day_is_dropped_and_stats_keep_its_figures() {
+        let monitor = MonitorHandle::new(10);
+        finish_with_usage(
+            &monitor,
+            "old",
+            "s-gone",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(1_000, 9_000, 0, 10),
+        );
+        finish_with_usage(
+            &monitor,
+            "keep",
+            "s-keep",
+            "anthropic",
+            "claude-opus-5",
+            closing_usage(50, 4_000, 300, 20),
+        );
+        advance_clock(&monitor, Duration::from_secs(12 * 60 * 60));
+        finish_with_usage(
+            &monitor,
+            "keep-2",
+            "s-keep",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(2_000, 8_000, 0, 30),
+        );
+        let before = monitor.snapshot().model_stats();
+        assert_eq!(held_requests_and_sessions(&monitor), (3, 2));
+        assert!(lane_sessions(&monitor).contains(&Some("s-gone".to_string())));
+
+        advance_clock(&monitor, Duration::from_secs(13 * 60 * 60));
+        let state = monitor.snapshot();
+        assert_eq!(held_requests_and_sessions(&monitor), (2, 1));
+        assert!(!lane_sessions(&monitor).contains(&Some("s-gone".to_string())));
+        assert_eq!(state.model_stats(), before);
+        // The one left is idle too, hidden but held.
+        assert!(state.sessions.is_empty());
+        assert_eq!(state.idle_sessions, 1);
+    }
+
+    /// A session's name goes with it, and a transcript read that arrives
+    /// after the drop does not bring the session back.
+    #[test]
+    fn a_session_name_is_dropped_with_its_session() {
+        let monitor = MonitorHandle::new(10);
+        finish_with_usage(
+            &monitor,
+            "old",
+            "s-gone",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(1_000, 0, 0, 10),
+        );
+        let renamed = || TranscriptNames {
+            renamed: Some("Renamed".to_string()),
+            auto_title: None,
+        };
+        monitor.transcript_names_read("s-gone", renamed());
+        let generations = monitor.session_generations();
+        assert_eq!(generations.len(), 1);
+        assert_eq!(generations[0].0, "s-gone");
+
+        advance_clock(&monitor, Duration::from_secs(25 * 60 * 60));
+        let _ = monitor.snapshot();
+        assert!(monitor.session_generations().is_empty());
+
+        monitor.transcript_names_read("s-gone", renamed());
+        assert!(monitor.session_generations().is_empty());
+        assert_eq!(held_requests_and_sessions(&monitor), (0, 0));
+    }
+
+    /// A session dropped as idle and started again under its id before the
+    /// transcript is read again gets the names read before once more, though
+    /// the transcript gained nothing since.
+    #[test]
+    fn a_session_started_again_under_its_id_gets_its_transcript_names_back() {
+        let session = "00000000-0000-4000-8000-000000000002";
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("projects").join("-home-u-repo");
+        std::fs::create_dir_all(&directory).unwrap();
+        let line = serde_json::json!({
+            "type": "custom-title",
+            "customTitle": "Renamed",
+            "sessionId": session
+        });
+        std::fs::write(
+            directory.join(format!("{session}.jsonl")),
+            format!("{line}\n"),
+        )
+        .unwrap();
+        let mut reader = super::naming::TranscriptReader::new(root.path().join("projects"));
+        let monitor = MonitorHandle::new(10);
+        let read = |reader: &mut super::naming::TranscriptReader| {
+            for (id, names) in reader.poll(&monitor.session_generations(), Instant::now()) {
+                monitor.transcript_names_read(id, names);
+            }
+        };
+        let name = || {
+            monitor
+                .snapshot()
+                .sessions
+                .first()
+                .and_then(|session| session.name.clone())
+                .map(|name| name.text)
+        };
+
+        finish_with_usage(
+            &monitor,
+            "old",
+            session,
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(1_000, 0, 0, 10),
+        );
+        read(&mut reader);
+        assert_eq!(name().as_deref(), Some("Renamed"));
+
+        // Dropped and started again by the same request, with no read between.
+        advance_clock(&monitor, Duration::from_secs(25 * 60 * 60));
+        finish_with_usage(
+            &monitor,
+            "new",
+            session,
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(1_000, 0, 0, 10),
+        );
+        assert_eq!(name(), None);
+
+        read(&mut reader);
+        assert_eq!(name().as_deref(), Some("Renamed"));
+        // Handed over once; the next read has nothing to say.
+        assert!(
+            reader
+                .poll(&monitor.session_generations(), Instant::now())
+                .is_empty()
+        );
+    }
+
+    /// The worktree is part of the project statement: a newer statement
+    /// without one clears it, and the older one arriving late brings neither
+    /// back.
+    #[test]
+    fn a_newer_project_statement_replaces_the_worktree_with_the_project() {
+        let monitor = MonitorHandle::new(10);
+        let place = || {
+            let state = monitor.snapshot();
+            let session = &state.sessions[0];
+            (
+                session.project.clone(),
+                session.worktree.clone(),
+                session.display_name().map(Cow::into_owned),
+            )
+        };
+        let owned = |project: &str, worktree: Option<&str>, shown: &str| {
+            (
+                Some(project.to_string()),
+                worktree.map(str::to_string),
+                Some(shown.to_string()),
+            )
+        };
+        monitor.request_started("r1", Some("s1".to_string()), None, EndpointKind::Messages);
+        monitor.request_started("r2", Some("s1".to_string()), None, EndpointKind::Messages);
+
+        monitor.project_resolved("r1", "repo-a", Some("wt".to_string()));
+        assert_eq!(place(), owned("repo-a", Some("wt"), "repo-a · wt"));
+
+        monitor.project_resolved("r2", "repo-b", None);
+        assert_eq!(place(), owned("repo-b", None, "repo-b"));
+
+        monitor.project_resolved("r1", "repo-a", Some("wt".to_string()));
+        assert_eq!(place(), owned("repo-b", None, "repo-b"));
+    }
+
+    /// A request for a session dropped as idle starts a new one, even when no
+    /// sweep has run since: fresh counters, a new rank, no old cache baseline.
+    #[test]
+    fn a_request_for_a_dropped_session_starts_a_new_one() {
+        let monitor = MonitorHandle::new(10);
+        finish_with_usage(
+            &monitor,
+            "old",
+            "s1",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(10_000, 90_000, 0, 10),
+        );
+        let rank = monitor.snapshot().sessions[0].first_seen_rank;
+        advance_clock(&monitor, Duration::from_secs(25 * 60 * 60));
+        finish_with_usage(
+            &monitor,
+            "new",
+            "s1",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(100_000, 0, 0, 5),
+        );
+
+        let state = monitor.snapshot();
+        assert_eq!(session_labels(&state), ["s1"]);
+        let session = &state.sessions[0];
+        assert!(session.first_seen_rank > rank);
+        assert_eq!(session.request_count, 1);
+        assert_eq!(session.input_tokens, 100_000);
+        assert_eq!(session.conversations.len(), 1);
+        assert_eq!(session.conversations[0].request_count, 1);
+        // An old baseline would have judged the uncached prompt an expired miss.
+        assert_eq!(session.cache.miss_count, 0);
+        assert!(recent_by_id(&state, "new").cache.miss.is_none());
+        let rows = state.model_stats();
+        assert_eq!(stats_row(&rows, "codex", "gpt-5.6-sol").request_count, 2);
+    }
+
+    /// A request in flight keeps its session in view and in memory however old
+    /// its start is.
+    #[test]
+    fn a_session_with_a_request_in_flight_is_never_hidden_or_dropped() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "long", "main");
+        finish_with_usage(
+            &monitor,
+            "done",
+            "s2",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(100, 0, 0, 10),
+        );
+        advance_clock(&monitor, Duration::from_secs(25 * 60 * 60));
+
+        let state = monitor.snapshot();
+        assert_eq!(session_labels(&state), ["s1"]);
+        assert_eq!(state.idle_sessions, 0);
+        assert_eq!(held_requests_and_sessions(&monitor), (1, 1));
+
+        monitor.usage_reported("long", closing_usage(100, 0, 0, 10));
+        monitor.request_completed("long", 200, None, None);
+        let state = monitor.snapshot();
+        assert_eq!(session_labels(&state), ["s1"]);
+        assert_eq!(state.sessions[0].request_count, 1);
+        assert_eq!(state.sessions[0].input_tokens, 100);
+    }
+
+    /// A report that arrives after its request was dropped finds no record
+    /// and moves nothing.
+    #[test]
+    fn a_late_report_for_a_dropped_request_changes_nothing() {
+        let monitor = MonitorHandle::new(10);
+        finish_with_usage(
+            &monitor,
+            "old",
+            "s1",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(1_000, 0, 0, 10),
+        );
+        advance_clock(&monitor, Duration::from_secs(25 * 60 * 60));
+        let before = monitor.snapshot();
+        assert_eq!(held_requests_and_sessions(&monitor), (0, 0));
+
+        monitor.usage_reported("old", closing_usage(5_000, 1_000, 0, 50));
+        monitor.usage_updated("old", Some(7_000), Some(70));
+        let after = monitor.snapshot();
+        assert_eq!(held_requests_and_sessions(&monitor), (0, 0));
+        assert_eq!(after.model_stats(), before.model_stats());
+        assert!(after.sessions.is_empty());
+        assert_eq!(after.idle_sessions, 0);
     }
 }

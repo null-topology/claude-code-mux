@@ -20,7 +20,10 @@ use serde_json::Value;
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::MessagesRequest;
 use crate::logging::create_logger;
-use crate::monitor::{MonitorHandle, UsageReport, usage_report_from_anthropic_body};
+use crate::monitor::{
+    MonitorHandle, UsageReport, is_session_title_side_request, session_title_from_reply,
+    usage_report_from_anthropic_body,
+};
 use crate::provider::{CliHandlers, ModelListing, Provider, RequestContext, ResponseOutcome};
 use crate::providers::translate_shared::wrap_reasoning;
 use crate::registry::ANTHROPIC_STYLE_ALIASES;
@@ -46,6 +49,8 @@ use crate::registry::ANTHROPIC_STYLE_ALIASES;
 /// its typed copy of the request at another model. Reading it here costs nothing:
 /// the parse already happens, and the value is taken before the early return for a
 /// body with no `messages`, so a request that needs no rewrite still reports it.
+/// Whether the body is the session title request is read from the same parse, by
+/// the predicate that labels the request `/title`.
 fn sanitize_anthropic_request(raw: &[u8], req_id: &str) -> OutgoingRequest {
     let Ok(mut doc) = serde_json::from_slice::<Value>(raw) else {
         return OutgoingRequest::default();
@@ -56,10 +61,12 @@ fn sanitize_anthropic_request(raw: &[u8], req_id: &str) -> OutgoingRequest {
 
     detect_hosted_web_search_regression(obj, req_id);
     let model = obj.get("model").and_then(Value::as_str).map(str::to_string);
+    let session_title = is_session_title_side_request(obj);
 
     let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) else {
         return OutgoingRequest {
             model,
+            session_title,
             rewritten: None,
         };
     };
@@ -78,15 +85,18 @@ fn sanitize_anthropic_request(raw: &[u8], req_id: &str) -> OutgoingRequest {
 
     OutgoingRequest {
         model,
+        session_title,
         rewritten: changed.then(|| serde_json::to_vec(&doc).unwrap_or_else(|_| raw.to_vec())),
     }
 }
 
-/// What the relay is about to send: the model the outgoing document names, and
-/// the rewritten bytes when the body needed one.
+/// What the relay is about to send: the model the outgoing document names,
+/// whether it asks for the session title, and the rewritten bytes when the body
+/// needed one.
 #[derive(Debug, Default)]
 struct OutgoingRequest {
     model: Option<String>,
+    session_title: bool,
     rewritten: Option<Vec<u8>>,
 }
 
@@ -254,6 +264,7 @@ impl AnthropicProvider {
         if let (Some(monitor), Some(model)) = (monitor.as_ref(), prepared.model.as_deref()) {
             monitor.model_resolved(&req_id, model);
         }
+        let session_title = prepared.session_title;
         let outgoing = match prepared.rewritten {
             Some(bytes) => reqwest::Body::from(bytes),
             None => reqwest::Body::from(passthrough.raw_body),
@@ -296,7 +307,8 @@ impl AnthropicProvider {
                             ObservedBody::Json => ResponseOutcome::default(),
                         };
                         let mut observer =
-                            UsageObserver::new(monitor, req_id, kind, outcome.clone());
+                            UsageObserver::new(monitor, req_id, kind, outcome.clone())
+                                .with_session_title(session_title);
                         let mut inner = Box::pin(upstream.bytes_stream());
                         let body = Body::from_stream(futures_util::stream::poll_fn(move |cx| {
                             match Stream::poll_next(inner.as_mut(), cx) {
@@ -341,6 +353,10 @@ impl Default for AnthropicProvider {
 /// Largest JSON body or single SSE line the usage observer keeps in memory.
 const MAX_OBSERVED_BYTES: usize = 4 * 1024 * 1024;
 
+/// Longest session title reply the observer keeps. The reply is a short JSON
+/// object; a longer one is not a title and is dropped.
+const MAX_TITLE_REPLY_BYTES: usize = 4 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObservedBody {
     EventStream,
@@ -366,6 +382,10 @@ impl ObservedBody {
 /// line as they pass, a JSON body is kept up to a limit and parsed once the
 /// stream ends. Anthropic's `message_start` carries the exact prompt counts, so
 /// a cache miss is visible as soon as the stream starts.
+///
+/// For a request that asked for the session title, the observer also keeps the
+/// reply text, at most `MAX_TITLE_REPLY_BYTES` of it, and hands the title to
+/// the monitor once the reply is complete. Nothing else reads it.
 struct UsageObserver {
     monitor: MonitorHandle,
     req_id: String,
@@ -374,6 +394,7 @@ struct UsageObserver {
     pending: Vec<u8>,
     overflow: bool,
     finished: bool,
+    title: Option<String>,
 }
 
 impl UsageObserver {
@@ -391,7 +412,13 @@ impl UsageObserver {
             pending: Vec::new(),
             overflow: false,
             finished: false,
+            title: None,
         }
+    }
+
+    fn with_session_title(mut self, wanted: bool) -> Self {
+        self.title = wanted.then(String::new);
+        self
     }
 
     fn observe(&mut self, chunk: &[u8]) {
@@ -406,6 +433,7 @@ impl UsageObserver {
                         && let Ok(event) = serde_json::from_slice::<Value>(data.trim_ascii())
                     {
                         self.note_protocol_event(&event);
+                        self.note_title_event(&event);
                         report.add_event(&event, true);
                     }
                 }
@@ -447,6 +475,42 @@ impl UsageObserver {
         }
     }
 
+    /// Collect the text of a title reply. It counts only once `message_stop`
+    /// arrives; an `error` event or a reply over the limit drops it.
+    fn note_title_event(&mut self, event: &Value) {
+        let Some(text) = self.title.as_mut() else {
+            return;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("content_block_delta")
+                if event.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta") =>
+            {
+                let delta = event
+                    .pointer("/delta/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if text.len().saturating_add(delta.len()) > MAX_TITLE_REPLY_BYTES {
+                    self.title = None;
+                } else {
+                    text.push_str(delta);
+                }
+            }
+            Some("message_stop") => {
+                if let Some(reply) = self.title.take() {
+                    self.publish_title(&reply);
+                }
+            }
+            Some("error") => self.title = None,
+            _ => {}
+        }
+    }
+
+    fn publish_title(&self, reply: &str) {
+        if let Some(title) = session_title_from_reply(reply) {
+            self.monitor.session_title_observed(&self.req_id, title);
+        }
+    }
+
     fn finish(&mut self) {
         if std::mem::replace(&mut self.finished, true) {
             return;
@@ -458,6 +522,19 @@ impl UsageObserver {
             let report = usage_report_from_anthropic_body(&body);
             if !report.is_empty() {
                 self.monitor.usage_reported(&self.req_id, report);
+            }
+            if self.title.take().is_some() {
+                let reply: String = body
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|block| block.get("text").and_then(Value::as_str))
+                    .collect();
+                if reply.len() <= MAX_TITLE_REPLY_BYTES {
+                    self.publish_title(&reply);
+                }
             }
         }
     }
@@ -716,6 +793,33 @@ mod tests {
         assert_eq!(sanitize_anthropic_request(b"not json", "req10").model, None);
         let modelless = serde_json::to_vec(&serde_json::json!({"messages": []})).unwrap();
         assert_eq!(sanitize_anthropic_request(&modelless, "req11").model, None);
+    }
+
+    /// The reply is captured as the session title only for the side request
+    /// that asks for it; a turn with client tools that happens to ask for a
+    /// title-only schema is not that request.
+    #[test]
+    fn only_the_title_side_request_is_flagged_for_title_capture() {
+        let title_config = serde_json::json!({"format": {"type": "json_schema", "schema": {
+            "type": "object",
+            "properties": {"title": {"type": "string"}}
+        }}});
+        let side = serde_json::json!({
+            "model": "claude-haiku-5",
+            "output_config": title_config,
+            "messages": [{"role": "user", "content": "name this"}]
+        });
+        let raw = serde_json::to_vec(&side).unwrap();
+        assert!(sanitize_anthropic_request(&raw, "req12").session_title);
+
+        let main_turn = serde_json::json!({
+            "model": "claude-opus-5",
+            "output_config": title_config,
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "go on"}]
+        });
+        let raw = serde_json::to_vec(&main_turn).unwrap();
+        assert!(!sanitize_anthropic_request(&raw, "req13").session_title);
     }
 
     fn observed_monitor(request_id: &str, endpoint: crate::monitor::EndpointKind) -> MonitorHandle {
@@ -1025,5 +1129,187 @@ mod tests {
         );
         assert_eq!(ObservedBody::from_content_type(Some("text/html")), None);
         assert_eq!(ObservedBody::from_content_type(None), None);
+    }
+
+    /// A streamed session title reply whose JSON text arrives over three deltas.
+    const TITLE_STREAM: &str = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-4-5","content":[],"stop_reason":null,"usage":{"input_tokens":120,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"{\"title\": \"Fix the fl"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"aky login"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" test\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":12}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
+    fn session_name(monitor: &MonitorHandle) -> Option<crate::monitor::SessionName> {
+        monitor
+            .snapshot()
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id.as_deref() == Some("s1"))
+            .and_then(|session| session.name)
+    }
+
+    fn observe_stream(monitor: &MonitorHandle, stream: &str, title: bool, chunk: usize) -> Vec<u8> {
+        let mut observer = UsageObserver::new(
+            monitor.clone(),
+            "r1".to_string(),
+            ObservedBody::EventStream,
+            ResponseOutcome::requiring_terminal(),
+        )
+        .with_session_title(title);
+        let mut relayed = Vec::new();
+        for piece in stream.as_bytes().chunks(chunk) {
+            observer.observe(piece);
+            relayed.extend_from_slice(piece);
+        }
+        observer.finish();
+        relayed
+    }
+
+    #[test]
+    fn a_streamed_title_reply_names_the_session() {
+        let monitor = observed_monitor("r1", crate::monitor::EndpointKind::Messages);
+
+        let relayed = observe_stream(&monitor, TITLE_STREAM, true, 7);
+
+        assert_eq!(relayed, TITLE_STREAM.as_bytes());
+        let name = session_name(&monitor).expect("the title names the session");
+        assert_eq!(name.text, "Fix the flaky login test");
+        assert_eq!(name.source, crate::monitor::SessionNameSource::Wire);
+    }
+
+    #[test]
+    fn a_non_streamed_title_reply_names_the_session() {
+        let monitor = observed_monitor("r1", crate::monitor::EndpointKind::Messages);
+        let body = serde_json::json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-haiku-4-5",
+            "content": [{"type": "text", "text": "{\"title\":\"Rename the monitor column\"}"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 120, "output_tokens": 9}
+        })
+        .to_string();
+        let mut observer = UsageObserver::new(
+            monitor.clone(),
+            "r1".to_string(),
+            ObservedBody::Json,
+            ResponseOutcome::default(),
+        )
+        .with_session_title(true);
+        for piece in body.as_bytes().chunks(11) {
+            observer.observe(piece);
+        }
+        observer.finish();
+
+        let name = session_name(&monitor).expect("the title names the session");
+        assert_eq!(name.text, "Rename the monitor column");
+        assert_eq!(name.source, crate::monitor::SessionNameSource::Wire);
+    }
+
+    #[test]
+    fn only_a_complete_title_reply_to_a_title_request_names_the_session() {
+        // The same reply to a request that did not ask for a title.
+        let monitor = observed_monitor("r1", crate::monitor::EndpointKind::Messages);
+        observe_stream(&monitor, TITLE_STREAM, false, 7);
+        assert_eq!(session_name(&monitor), None);
+
+        // A title request whose reply is prose, not the title object.
+        let monitor = observed_monitor("r1", crate::monitor::EndpointKind::Messages);
+        let prose = TITLE_STREAM
+            .replace(r#"{\"title\": \"Fix the fl"#, "Fix the fl")
+            .replace(r#" test\"}"#, " test");
+        observe_stream(&monitor, &prose, true, 7);
+        assert_eq!(session_name(&monitor), None);
+
+        // A title reply cut off before `message_stop`.
+        let monitor = observed_monitor("r1", crate::monitor::EndpointKind::Messages);
+        let cut = &TITLE_STREAM[..TITLE_STREAM.find("event: message_stop").unwrap()];
+        observe_stream(&monitor, cut, true, 7);
+        assert_eq!(session_name(&monitor), None);
+    }
+
+    #[tokio::test]
+    async fn a_title_request_is_relayed_byte_for_byte() {
+        use std::sync::{Arc, Mutex};
+
+        let received: Arc<Mutex<Option<axum::body::Bytes>>> = Arc::default();
+        let seen = received.clone();
+        let upstream = axum::Router::new().fallback(move |body: axum::body::Bytes| {
+            let seen = seen.clone();
+            async move {
+                *seen.lock().unwrap() = Some(body);
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    TITLE_STREAM,
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let provider = AnthropicProvider {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}"),
+        };
+        // Key order, spacing and an escape that a reserialization would change.
+        let raw: &'static [u8] = br#"{"stream":true, "model":"claude-haiku-4-5","max_tokens":512,
+ "system":[{"type":"text","text":"Name this coding session. "}],
+ "messages":[{"role":"user","content":"fix the flaky login test"}],"tools":[],
+ "output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}}}"#;
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "r1",
+            Some("s1".to_string()),
+            None,
+            crate::monitor::EndpointKind::Messages,
+        );
+        monitor.provider_selected("r1", "anthropic", "claude-haiku-4-5", None);
+        let ctx = RequestContext {
+            req_id: "r1".to_string(),
+            session_id: Some("s1".to_string()),
+            session_seq: None,
+            provider: "anthropic".to_string(),
+            traffic: None,
+            monitor: Some(monitor.clone()),
+            passthrough: Some(crate::provider::Passthrough {
+                raw_body: axum::body::Bytes::from_static(raw),
+                headers: axum::http::HeaderMap::new(),
+                path_and_query: "/v1/messages?beta=true".to_string(),
+            }),
+        };
+
+        let response = provider.relay(ctx).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let relayed = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(received.lock().unwrap().as_deref(), Some(raw));
+        assert_eq!(relayed.as_ref(), TITLE_STREAM.as_bytes());
+        assert_eq!(
+            session_name(&monitor).map(|name| name.text).as_deref(),
+            Some("Fix the flaky login test")
+        );
     }
 }
