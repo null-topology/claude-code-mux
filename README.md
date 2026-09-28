@@ -423,9 +423,18 @@ flowchart LR
 - **Each conversation gets its own prompt-cache scope on Codex.** Claude Code
   gives a subagent its parent's session id, so the proxy sends the session id
   for a main thread and a derived id (a uuid v5 of session plus agent id) for a
-  subagent, as both the request's `prompt_cache_key` and the `session_id`
-  header. Without it every subagent would share the main thread's cache key and
-  routing bucket.
+  subagent, as the request's `prompt_cache_key` and in the `session-id` and
+  `thread-id` headers. Without it every subagent would share the main thread's
+  cache key and routing bucket. Within a turn the proxy also sends back the
+  first `x-codex-turn-state` value the backend returned in it, in the places
+  the Codex CLI uses: a request header over HTTP and `client_metadata` of
+  `response.create` over WebSocket. The value is read from the HTTP response
+  header or from a `response.metadata` or `codex.response.metadata` stream
+  event, never from the WebSocket handshake. A turn goes on while Claude Code
+  answers tool calls, that is while the last user message holds tool results
+  and nothing but reminder text beside them; any other request starts a new
+  turn without a value. A value is kept in memory, never across a restart,
+  and is dropped after 30 minutes with no activity on its conversation.
 - **Reasoning survives a switch.** A `thinking` block produced by one backend
   cannot be replayed to the other natively, so the proxy rewrites it as tagged
   text before sending the history on. Context is not lost when you move a
@@ -1221,7 +1230,7 @@ backend was contacted.
 | Codex retries | a live stream and an empty completion retried up to 10 times each, the buffered transport up to 3 | same | one attempt; the client owns the retry policy |
 | Deferred tool loading | `tool_reference` blocks dropped in the grok translator | same | mapped onto Codex's native tool search |
 | Subagent progress label | not handled | not handled | forwarded natively by default; answered locally or sent to a junior model on request |
-| Prompt-cache scope per subagent | the bare session id, so a subagent shares the main thread's scope and routing bucket | same | a derived id per conversation, sent as both the request's `prompt_cache_key` and the `session_id` header |
+| Prompt-cache scope per subagent | the bare session id, so a subagent shares the main thread's scope and routing bucket | same | a derived id per conversation, sent as the request's `prompt_cache_key` and in the `session-id` and `thread-id` headers |
 | Responses lane policy | compiled-in table only | same | `CCP_CODEX_LANE_POLICY` / `CCP_CODEX_FULL_LANE`, with the backend listing able to decide |
 | Monitor accounting | request list and totals | same | cache read/write split, evidence marks, per-lane cache-miss detection, conversation tree |
 | Anthropic request body limit | 64 MiB, 413 `request_too_large` | 16 MiB, 400 | 64 MiB, 413 `request_too_large` |

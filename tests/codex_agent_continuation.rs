@@ -180,10 +180,23 @@ impl CapturedRequest {
     fn assert_routing_session(&self, expected_session: Option<&str>) {
         assert_eq!(
             self.headers
-                .get("session_id")
+                .get("session-id")
                 .and_then(|value| value.to_str().ok()),
             expected_session,
-            "socket {} session_id header",
+            "socket {} session-id header",
+            self.socket_ordinal
+        );
+        assert_eq!(
+            self.headers
+                .get("thread-id")
+                .and_then(|value| value.to_str().ok()),
+            expected_session,
+            "socket {} thread-id header",
+            self.socket_ordinal
+        );
+        assert!(
+            self.headers.get("session_id").is_none(),
+            "socket {} still sends session_id",
             self.socket_ordinal
         );
         assert_eq!(
