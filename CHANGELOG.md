@@ -1,4 +1,4 @@
-## Unreleased
+## v0.14.0 (2026-09-28)
 
 - Codex errors that carry a known error code now reach Claude Code with a
   status that says whether trying again can help, so Claude Code no longer
