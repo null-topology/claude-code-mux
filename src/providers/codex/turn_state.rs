@@ -41,10 +41,11 @@ const METADATA_EVENT_TYPES: [&str; 2] = ["response.metadata", "codex.response.me
 
 /// A slot expires after this long with no tracked activity: a request planned
 /// on it, a value stored in it or a value sent from it. Idle time does not
-/// prove that the turn ended; it only bounds how long a slot is kept. A turn
-/// that waits longer than this, or a single request that runs longer than this
-/// after its last tracked activity, loses its value, and its later requests go
-/// out without one. The bound is the one continuation state uses.
+/// prove that the turn ended; it only bounds how long a slot is kept. Expired
+/// slots are dropped when the next request is planned. The first request of a
+/// turn planned after its slot expired goes out without a value, and a value
+/// its response carries is sent from then on. The bound is the one
+/// continuation state uses.
 const IDLE_MS: u64 = 30 * 60 * 1000;
 
 const REMINDER_PREFIX: &str = "<system-reminder>";

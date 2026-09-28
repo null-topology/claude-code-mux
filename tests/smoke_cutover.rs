@@ -4955,7 +4955,8 @@ async fn smoke_codex_http_echoes_turn_state_within_a_turn_only() {
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
 
-    // Buffered and live requests alternate, so both read the response header.
+    // The requests mix buffered and live responses, so both paths read the
+    // response header.
     let session = "turn-state-http";
     for body in turn_state_conversation([false, true, true, false]) {
         drain(call_turn_state_messages(session, body).await).await;

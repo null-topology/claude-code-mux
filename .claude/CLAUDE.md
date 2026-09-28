@@ -518,8 +518,9 @@ with `input_schema` (titles and other side requests) or the progress-label
 marker takes no part. A slot expires after 30 min with no tracked activity:
 planning a request on it, storing a value in it or sending its value, each of
 which refreshes `touched_at`. That is a bound, not proof that the turn ended:
-a turn that waits longer, or one request that runs longer after its last
-tracked activity, loses the echo for the rest of the turn. Only the request
+expired slots are dropped when the next request is planned, the first request
+of a turn planned after its slot expired goes out without the echo, and a
+value its response carries is echoed from then on. Only the request
 the slot was planned for (`req_id`) fills or sends it, so a late reply of an
 earlier request cannot. The echo is added to the outgoing JSON after
 `build_websocket_request`, never to `ResponsesRequest::client_metadata`, whose
