@@ -15,11 +15,163 @@ pub(crate) struct CodexEventFailure {
     pub status: u16,
     pub message: String,
     pub retry_after: Option<String>,
+    pub class: Option<CodexErrorClass>,
 }
 
 impl CodexEventFailure {
     pub fn retryable(&self) -> bool {
         !matches!(self.kind, CodexFailureKind::Permanent)
+    }
+}
+
+/// What a failure's error code says about it, read the way the Codex CLI reads
+/// it. A code settles the failure before any status or message heuristic, and
+/// an unknown code leaves the failure to those heuristics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexErrorClass {
+    /// Credits or a spend limit ran out. Waiting does not bring them back.
+    QuotaExceeded,
+    /// The account's plan does not include this usage.
+    UsageNotIncluded,
+    /// The backend refused the request itself, for its content or its policy.
+    Rejected,
+    /// The prompt does not fit the model's context window.
+    ContextOverflow,
+    /// Asked to slow down; the same request can succeed a little later.
+    Throttled,
+    /// The backend is overloaded; the same request can succeed later.
+    Overloaded,
+}
+
+impl CodexErrorClass {
+    /// The status the client is answered with.
+    pub fn status(self) -> u16 {
+        match self {
+            Self::QuotaExceeded | Self::Throttled => 429,
+            Self::UsageNotIncluded => 403,
+            Self::Rejected => 400,
+            Self::ContextOverflow => 413,
+            Self::Overloaded => 529,
+        }
+    }
+
+    /// The Anthropic error type the client is answered with.
+    pub fn error_type(self) -> &'static str {
+        match self {
+            Self::QuotaExceeded | Self::Throttled => "rate_limit_error",
+            Self::UsageNotIncluded => "permission_error",
+            Self::Rejected => "invalid_request_error",
+            Self::ContextOverflow => "request_too_large",
+            Self::Overloaded => "overloaded_error",
+        }
+    }
+
+    fn kind(self) -> CodexFailureKind {
+        match self {
+            Self::Throttled => CodexFailureKind::RateLimit,
+            Self::Overloaded => CodexFailureKind::Overloaded,
+            Self::QuotaExceeded
+            | Self::UsageNotIncluded
+            | Self::Rejected
+            | Self::ContextOverflow => CodexFailureKind::Permanent,
+        }
+    }
+}
+
+const QUOTA_ERROR_CODES: [&str; 5] = [
+    "insufficient_quota",
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "organization_usage_limit_exceeded",
+];
+
+/// The class an error object's `code` (or, for quota and plan errors, its
+/// `type`) names. A spent subscription window keeps its own handling, so an
+/// error typed `usage_limit_reached` has no class whatever its code says.
+pub(crate) fn error_class(error: &Value) -> Option<CodexErrorClass> {
+    let code = error.get("code").and_then(Value::as_str);
+    let error_type = error.get("type").and_then(Value::as_str);
+    if error_type == Some("usage_limit_reached") {
+        return None;
+    }
+    let names = |value: &str| code == Some(value) || error_type == Some(value);
+    if code == Some("context_length_exceeded") {
+        Some(CodexErrorClass::ContextOverflow)
+    } else if QUOTA_ERROR_CODES.into_iter().any(names) {
+        Some(CodexErrorClass::QuotaExceeded)
+    } else if names("usage_not_included") {
+        Some(CodexErrorClass::UsageNotIncluded)
+    } else if matches!(
+        code,
+        Some("invalid_prompt" | "cyber_policy" | "bio_policy" | "misalignment_policy_violation")
+    ) {
+        Some(CodexErrorClass::Rejected)
+    } else if code == Some("server_is_overloaded") {
+        Some(CodexErrorClass::Overloaded)
+    } else if matches!(code, Some("rate_limit_exceeded" | "slow_down")) {
+        Some(CodexErrorClass::Throttled)
+    } else {
+        None
+    }
+}
+
+/// The class a JSON error body `{"error": {...}}` names.
+pub(crate) fn error_class_from_body(body: &[u8]) -> Option<CodexErrorClass> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    error_class(value.get("error")?)
+}
+
+/// The delay a throttling message asks for, as in "Please try again in
+/// 11.054s": whole seconds, rounded up and never below one. Units are `s`,
+/// `ms` and `second(s)`; a message that names none of them gives no delay.
+pub(crate) fn retry_after_from_message(message: &str) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    let seconds = lower
+        .match_indices("try again in")
+        .find_map(|(start, phrase)| delay_seconds(lower[start + phrase.len()..].trim_start()))?;
+    Some(whole_seconds(seconds))
+}
+
+/// A `Retry-After` value a client can wait on: a number of seconds becomes
+/// whole seconds, rounded up and never below one, because a fraction or a zero
+/// reads as "retry at once". Any other value, such as an HTTP date, is kept as
+/// it came.
+pub(crate) fn normalize_retry_after(value: &str) -> String {
+    match value.trim().parse::<f64>() {
+        Ok(seconds) if seconds.is_finite() => whole_seconds(seconds),
+        _ => value.to_string(),
+    }
+}
+
+fn whole_seconds(seconds: f64) -> String {
+    (seconds.ceil() as u64).max(1).to_string()
+}
+
+/// The delay a text opens with, as a number and a unit, in seconds.
+fn delay_seconds(text: &str) -> Option<f64> {
+    let digits = |text: &str| {
+        text.find(|ch: char| !ch.is_ascii_digit())
+            .unwrap_or(text.len())
+    };
+    let mut end = digits(text);
+    if end == 0 {
+        return None;
+    }
+    if let Some(fraction) = text[end..].strip_prefix('.')
+        && digits(fraction) > 0
+    {
+        end += 1 + digits(fraction);
+    }
+    let (number, unit) = text.split_at(end);
+    let value = number.parse::<f64>().ok()?;
+    let unit = unit.trim_start();
+    if unit.starts_with("ms") {
+        Some(value / 1000.0)
+    } else if unit.starts_with('s') {
+        Some(value)
+    } else {
+        None
     }
 }
 
@@ -57,6 +209,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
             status: 429,
             message: "rate limit reached".to_string(),
             retry_after: scalar_string(payload.pointer("/rate_limits/primary/reset_after_seconds")),
+            class: None,
         });
     }
     if !matches!(event_type, "response.failed" | "response.error" | "error") {
@@ -83,8 +236,11 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         .and_then(|value| value.get("type"))
         .and_then(Value::as_str);
     let lower = message.to_ascii_lowercase();
+    let class = error.and_then(error_class);
 
-    let kind = if explicit_status == Some(429) || lower.contains("rate limit") {
+    let kind = if let Some(class) = class {
+        class.kind()
+    } else if explicit_status == Some(429) || lower.contains("rate limit") {
         CodexFailureKind::RateLimit
     } else if explicit_status == Some(529)
         || code == Some("overloaded_error")
@@ -107,11 +263,13 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
     } else {
         CodexFailureKind::Permanent
     };
-    let status = explicit_status.unwrap_or(match kind {
-        CodexFailureKind::RateLimit => 429,
-        CodexFailureKind::Overloaded => 529,
-        CodexFailureKind::Transient => 503,
-        CodexFailureKind::Permanent => 500,
+    let status = class.map(CodexErrorClass::status).unwrap_or_else(|| {
+        explicit_status.unwrap_or(match kind {
+            CodexFailureKind::RateLimit => 429,
+            CodexFailureKind::Overloaded => 529,
+            CodexFailureKind::Transient => 503,
+            CodexFailureKind::Permanent => 500,
+        })
     });
     let retry_after = error
         .and_then(|value| value.get("retry_after"))
@@ -131,6 +289,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         status,
         message,
         retry_after,
+        class,
     })
 }
 
@@ -377,7 +536,10 @@ fn numeric_value(value: Option<&Value>) -> Option<u64> {
     }
 }
 
-pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> {
+/// The first failure in a buffered body that ends the request as an error:
+/// one worth retrying, or one whose error code names what went wrong. Other
+/// failures are left to the body's own translation.
+pub(crate) fn first_reportable_failure(body: &[u8]) -> Option<CodexEventFailure> {
     for event in crate::anthropic::sse::parse_sse_events(body) {
         if event.data == "[DONE]" {
             continue;
@@ -386,7 +548,7 @@ pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> 
             continue;
         };
         if let Some(failure) = classify_event_failure(&payload)
-            && failure.retryable()
+            && (failure.retryable() || failure.class.is_some())
         {
             return Some(failure);
         }
@@ -807,5 +969,225 @@ mod tests {
         }))
         .unwrap();
         assert!(!failure.retryable());
+    }
+
+    #[test]
+    fn classifies_known_error_codes_in_both_event_shapes() {
+        let cases = [
+            (
+                "insufficient_quota",
+                CodexErrorClass::QuotaExceeded,
+                429,
+                false,
+            ),
+            (
+                "credit_balance_exhausted",
+                CodexErrorClass::QuotaExceeded,
+                429,
+                false,
+            ),
+            (
+                "organization_spend_limit_exceeded",
+                CodexErrorClass::QuotaExceeded,
+                429,
+                false,
+            ),
+            (
+                "project_spend_limit_exceeded",
+                CodexErrorClass::QuotaExceeded,
+                429,
+                false,
+            ),
+            (
+                "organization_usage_limit_exceeded",
+                CodexErrorClass::QuotaExceeded,
+                429,
+                false,
+            ),
+            (
+                "usage_not_included",
+                CodexErrorClass::UsageNotIncluded,
+                403,
+                false,
+            ),
+            ("invalid_prompt", CodexErrorClass::Rejected, 400, false),
+            ("cyber_policy", CodexErrorClass::Rejected, 400, false),
+            ("bio_policy", CodexErrorClass::Rejected, 400, false),
+            (
+                "misalignment_policy_violation",
+                CodexErrorClass::Rejected,
+                400,
+                false,
+            ),
+            (
+                "context_length_exceeded",
+                CodexErrorClass::ContextOverflow,
+                413,
+                false,
+            ),
+            ("slow_down", CodexErrorClass::Throttled, 429, true),
+            ("rate_limit_exceeded", CodexErrorClass::Throttled, 429, true),
+            (
+                "server_is_overloaded",
+                CodexErrorClass::Overloaded,
+                529,
+                true,
+            ),
+        ];
+        for (code, class, status, retryable) in cases {
+            let error = serde_json::json!({"code": code, "message": "toy message"});
+            let payloads = [
+                serde_json::json!({"type": "response.failed", "response": {"error": error}}),
+                serde_json::json!({"type": "error", "error": error}),
+            ];
+            for payload in payloads {
+                let failure = classify_event_failure(&payload).unwrap();
+                assert_eq!(failure.class, Some(class), "{code}: {payload}");
+                assert_eq!(failure.status, status, "{code}: {payload}");
+                assert_eq!(failure.retryable(), retryable, "{code}: {payload}");
+                assert_eq!(failure.message, "toy message");
+            }
+        }
+    }
+
+    #[test]
+    fn quota_and_plan_errors_are_also_read_from_the_error_type() {
+        for (error_type, class) in [
+            ("insufficient_quota", CodexErrorClass::QuotaExceeded),
+            ("usage_not_included", CodexErrorClass::UsageNotIncluded),
+        ] {
+            let failure = classify_event_failure(&serde_json::json!({
+                "type": "error",
+                "error": {"type": error_type, "message": "toy message"}
+            }))
+            .unwrap();
+            assert_eq!(failure.class, Some(class), "{error_type}");
+        }
+        // Only quota and plan errors are read from the type.
+        let failure = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "error": {"type": "invalid_prompt", "message": "toy message"}
+        }))
+        .unwrap();
+        assert_eq!(failure.class, None);
+    }
+
+    #[test]
+    fn a_known_code_decides_over_status_and_message() {
+        let throttled = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "status": 503,
+            "error": {"code": "slow_down", "message": "Please slow down."}
+        }))
+        .unwrap();
+        assert_eq!(throttled.class, Some(CodexErrorClass::Throttled));
+        assert_eq!(throttled.kind, CodexFailureKind::RateLimit);
+        assert_eq!(throttled.explicit_status, Some(503));
+        assert_eq!(throttled.status, 429);
+
+        let rejected = classify_event_failure(&serde_json::json!({
+            "type": "response.failed",
+            "response": {"error": {
+                "code": "invalid_prompt",
+                "message": "rate limit words in a refused prompt"
+            }}
+        }))
+        .unwrap();
+        assert_eq!(rejected.class, Some(CodexErrorClass::Rejected));
+        assert_eq!(rejected.kind, CodexFailureKind::Permanent);
+        assert_eq!(rejected.status, 400);
+    }
+
+    #[test]
+    fn unknown_codes_and_spent_windows_keep_their_old_handling() {
+        let unknown = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "status": 503,
+            "error": {"code": "some_future_code", "message": "toy message"}
+        }))
+        .unwrap();
+        assert_eq!(unknown.class, None);
+        assert_eq!(unknown.kind, CodexFailureKind::Transient);
+        assert_eq!(unknown.status, 503);
+
+        let spent_window = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "usage_limit_reached",
+                "code": "insufficient_quota",
+                "message": "The usage limit has been reached"
+            }
+        }))
+        .unwrap();
+        assert_eq!(spent_window.class, None);
+    }
+
+    #[test]
+    fn reads_the_class_of_a_json_error_body() {
+        assert_eq!(
+            error_class_from_body(br#"{"error":{"code":"credit_balance_exhausted"}}"#),
+            Some(CodexErrorClass::QuotaExceeded)
+        );
+        assert_eq!(
+            error_class_from_body(br#"{"error":{"type":"usage_not_included"}}"#),
+            Some(CodexErrorClass::UsageNotIncluded)
+        );
+        assert_eq!(
+            error_class_from_body(br#"{"error":{"code":"server_is_overloaded"}}"#),
+            Some(CodexErrorClass::Overloaded)
+        );
+        assert_eq!(
+            error_class_from_body(br#"{"error":{"code":"some_future_code"}}"#),
+            None
+        );
+        assert_eq!(error_class_from_body(br#"{"detail":"toy"}"#), None);
+        assert_eq!(error_class_from_body(b"not json"), None);
+    }
+
+    #[test]
+    fn buffered_scan_reports_classified_failures_that_are_not_retryable() {
+        let body = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_toy\"}}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":",
+            "{\"code\":\"invalid_prompt\",\"message\":\"toy refusal\"}}}\n\n",
+        );
+        let failure = first_reportable_failure(body.as_bytes()).unwrap();
+        assert_eq!(failure.class, Some(CodexErrorClass::Rejected));
+        assert_eq!(failure.message, "toy refusal");
+
+        let unknown = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":",
+            "{\"code\":\"some_future_code\",\"message\":\"toy\"}}}\n\n",
+        );
+        assert!(first_reportable_failure(unknown.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn parses_the_delay_a_throttle_message_names() {
+        let cases = [
+            (
+                "Rate limit reached for toy-model. Please try again in 11.054s. Visit the docs.",
+                Some("12"),
+            ),
+            ("Rate limit reached. Please try again in 1s.", Some("1")),
+            ("Please try again in 28ms.", Some("1")),
+            ("Please try again in 2500ms.", Some("3")),
+            ("Slow down. Try again in 2 seconds.", Some("2")),
+            ("Please try again in 1 second.", Some("1")),
+            ("TRY AGAIN IN 1.898S", Some("2")),
+            ("Please try again later.", None),
+            ("Please try again in 5 minutes.", None),
+            ("Rate limit exceeded.", None),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                retry_after_from_message(message).as_deref(),
+                expected,
+                "{message}"
+            );
+        }
     }
 }

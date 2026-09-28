@@ -98,7 +98,7 @@ impl CodexProvider {
     ) -> Response {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
-        let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
+        let model = body.model.as_deref().unwrap_or("gpt-6-sol");
 
         let mut resolved =
             resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
@@ -274,7 +274,18 @@ impl CodexProvider {
                         );
                     }
                 }
-                Err(CompactionError::Upstream(error)) if error.usage_limit.is_some() => {
+                // Spent allowance, credits or plan access refuse the normal
+                // request the same way, so it is not sent after them.
+                Err(CompactionError::Upstream(error))
+                    if error.usage_limit.is_some()
+                        || matches!(
+                            error.class,
+                            Some(
+                                events::CodexErrorClass::QuotaExceeded
+                                    | events::CodexErrorClass::UsageNotIncluded
+                            )
+                        ) =>
+                {
                     abort_compaction_attempt(Some(session_id), Some(attempt));
                     log_compaction_event(
                         "server_compaction_failed",
@@ -577,7 +588,7 @@ impl Provider for CodexProvider {
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        let model = body.model.as_deref().unwrap_or("gpt-5.6-sol");
+        let model = body.model.as_deref().unwrap_or("gpt-6-sol");
         let mut resolved =
             resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
         if let Err(e) = assert_allowed_model(&resolved.model) {
@@ -897,29 +908,34 @@ async fn live_stream_response_once(
                     );
                     return LiveStreamStart::Response(usage_limit_response(&limit));
                 }
+                let class =
+                    events::classify_event_failure(&payload).and_then(|failure| failure.class);
                 if retryable_live_start_payload(&payload, &message) {
                     let lower_message = message.to_ascii_lowercase();
-                    let status = websocket::event_error_status(&payload).unwrap_or_else(|| {
-                        let error = payload.get("error").or_else(|| {
-                            payload.get("response").and_then(|value| value.get("error"))
-                        });
-                        let overloaded = error.is_some_and(|error| {
-                            error.get("code").and_then(|value| value.as_str())
-                                == Some("overloaded_error")
-                                || error.get("type").and_then(|value| value.as_str())
+                    let status = class
+                        .map(events::CodexErrorClass::status)
+                        .or_else(|| websocket::event_error_status(&payload))
+                        .unwrap_or_else(|| {
+                            let error = payload.get("error").or_else(|| {
+                                payload.get("response").and_then(|value| value.get("error"))
+                            });
+                            let overloaded = error.is_some_and(|error| {
+                                error.get("code").and_then(|value| value.as_str())
                                     == Some("overloaded_error")
+                                    || error.get("type").and_then(|value| value.as_str())
+                                        == Some("overloaded_error")
+                            });
+                            if payload.get("type").and_then(|value| value.as_str())
+                                == Some("codex.rate_limits")
+                                || lower_message.contains("rate limit")
+                            {
+                                429
+                            } else if overloaded || lower_message.contains("overloaded") {
+                                529
+                            } else {
+                                503
+                            }
                         });
-                        if payload.get("type").and_then(|value| value.as_str())
-                            == Some("codex.rate_limits")
-                            || lower_message.contains("rate limit")
-                        {
-                            429
-                        } else if overloaded || lower_message.contains("overloaded") {
-                            529
-                        } else {
-                            503
-                        }
-                    });
                     return provider_retry(
                         &upstream_events,
                         client::CodexError {
@@ -928,6 +944,7 @@ async fn live_stream_response_once(
                             detail: Some(message),
                             retry_after: retry_after_from_live_payload(&payload),
                             usage_limit: None,
+                            class,
                             origin: client::CodexErrorOrigin::WebSocket,
                         },
                     );
@@ -937,6 +954,11 @@ async fn live_stream_response_once(
                     &request_continuation,
                     compaction.attempt,
                 );
+                if let Some(class) = class {
+                    return LiveStreamStart::Response(classified_error_response(
+                        class, &message, None,
+                    ));
+                }
                 return LiveStreamStart::Response(map_codex_failure_to_response(&message));
             }
         };
@@ -999,6 +1021,7 @@ async fn live_stream_response_once(
             detail: Some(websocket::WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: client::CodexErrorOrigin::WebSocket,
         },
     )
@@ -1163,9 +1186,12 @@ fn remaining_live_stream_response(
                                 &request_continuation,
                                 compaction.attempt,
                             );
+                            let error_type = events::classify_event_failure(&payload)
+                                .and_then(|failure| failure.class)
+                                .map_or("api_error", events::CodexErrorClass::error_type);
                             let chunk = translator.error_chunk(
-                                client_error_text(&message, "api_error"),
-                                "api_error",
+                                client_error_text(&message, error_type),
+                                error_type,
                                 ctx.traffic.as_deref(),
                             );
                             // The status left with the first chunk, so the
@@ -1365,6 +1391,9 @@ fn retry_after_from_live_payload(payload: &serde_json::Value) -> Option<String> 
 }
 
 fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
+    if let Some(class) = err.class {
+        return class.error_type();
+    }
     match err.status {
         429 => "rate_limit_error",
         529 => "overloaded_error",
@@ -1422,11 +1451,13 @@ fn update_continuation_from_upstream(
 ///
 /// A response that already states a rate limit status is left alone: a refusal
 /// carries the exact state of the window that refused it, which is better than
-/// a snapshot taken a turn earlier.
+/// a snapshot taken a turn earlier. So is one that tells the client not to
+/// retry: a spent credit balance is not a window, and a snapshot saying the
+/// window is allowed would contradict the refusal.
 fn with_rate_limit_headers(mut response: Response) -> Response {
-    if response
-        .headers()
-        .contains_key("anthropic-ratelimit-unified-status")
+    let headers = response.headers();
+    if headers.contains_key("anthropic-ratelimit-unified-status")
+        || headers.contains_key("x-should-retry")
     {
         return response;
     }
@@ -1491,6 +1522,13 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
     if let Some(limit) = err.usage_limit.as_ref() {
         return usage_limit_response(limit);
     }
+    if let Some(class) = err.class {
+        return classified_error_response(
+            class,
+            codex_error_message(err),
+            err.retry_after.as_deref(),
+        );
+    }
     let message = codex_error_message(err);
     if is_context_window_overflow(message) {
         return map_codex_failure_to_response(message);
@@ -1552,12 +1590,73 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
     }
 }
 
+/// Answer a failure whose error code the proxy knows. The code decides over
+/// the status it arrived with: a request the backend refused, or credits that
+/// ran out, fail the same way on every retry, while a throttle or an overload
+/// clears with time.
+///
+/// Credits or a spend limit that ran out are answered with
+/// `x-should-retry: false` and no `Retry-After`, like a spent window, but
+/// without the unified rate limit headers: no subscription window refused the
+/// request, so none can be named. A `Retry-After` in seconds sent with any
+/// other class is rounded up to whole seconds (`normalize_retry_after`).
+fn classified_error_response(
+    class: events::CodexErrorClass,
+    native: &str,
+    retry_after: Option<&str>,
+) -> Response {
+    let error_type = class.error_type();
+    let native = if native.trim().is_empty() {
+        generic_error_text(error_type)
+    } else {
+        native
+    };
+    if class == events::CodexErrorClass::ContextOverflow {
+        return context_overflow_response(native);
+    }
+    let response = client_error(
+        StatusCode::from_u16(class.status()).unwrap_or(StatusCode::BAD_GATEWAY),
+        error_type,
+        native,
+    );
+    let retry_after = match class {
+        events::CodexErrorClass::QuotaExceeded => {
+            return (
+                [(
+                    HeaderName::from_static("x-should-retry"),
+                    HeaderValue::from_static("false"),
+                )],
+                response,
+            )
+                .into_response();
+        }
+        events::CodexErrorClass::Throttled => retry_after
+            .map(events::normalize_retry_after)
+            .or_else(|| events::retry_after_from_message(native)),
+        events::CodexErrorClass::Overloaded => retry_after.map(events::normalize_retry_after),
+        events::CodexErrorClass::UsageNotIncluded
+        | events::CodexErrorClass::Rejected
+        | events::CodexErrorClass::ContextOverflow => None,
+    };
+    match retry_after {
+        Some(retry_after) => ([(http::header::RETRY_AFTER, retry_after)], response).into_response(),
+        None => response,
+    }
+}
+
 fn map_codex_failure_to_response(message: &str) -> Response {
     if is_context_window_overflow(message) {
-        json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", message)
+        context_overflow_response(message)
     } else {
         client_error(StatusCode::BAD_GATEWAY, "api_error", message)
     }
+}
+
+/// A prompt that does not fit the context window, whether its code or its
+/// message says so. The native text is kept as it came, never replaced by
+/// `client_error`.
+fn context_overflow_response(message: &str) -> Response {
+    json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", message)
 }
 
 /// An error for `/v1/messages`. The client expects Anthropic's API, so a text
@@ -1583,9 +1682,16 @@ fn client_error_text<'a>(native: &'a str, error_type: &str) -> &'a str {
     {
         return native;
     }
+    generic_error_text(error_type)
+}
+
+fn generic_error_text(error_type: &str) -> &'static str {
     match error_type {
         "overloaded_error" => "Overloaded",
         "rate_limit_error" => "Rate limited",
+        "invalid_request_error" => "Invalid request",
+        "permission_error" => "Permission denied",
+        "request_too_large" => "Request too large",
         _ => "Internal server error",
     }
 }
@@ -1722,6 +1828,261 @@ mod tests {
         );
     }
 
+    fn classified_codex_error(
+        class: events::CodexErrorClass,
+        status: u16,
+        message: &str,
+        retry_after: Option<&str>,
+    ) -> client::CodexError {
+        client::CodexError {
+            status,
+            message: message.to_string(),
+            detail: Some(message.to_string()),
+            retry_after: retry_after.map(str::to_string),
+            usage_limit: None,
+            class: Some(class),
+            origin: client::CodexErrorOrigin::BufferedHttp,
+        }
+    }
+
+    async fn error_body(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_known_error_code_decides_the_status_and_type() {
+        let cases = [
+            (
+                events::CodexErrorClass::QuotaExceeded,
+                503,
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+            ),
+            (
+                events::CodexErrorClass::UsageNotIncluded,
+                429,
+                StatusCode::FORBIDDEN,
+                "permission_error",
+            ),
+            (
+                events::CodexErrorClass::Rejected,
+                500,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+            (
+                events::CodexErrorClass::ContextOverflow,
+                400,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+            ),
+            (
+                events::CodexErrorClass::Throttled,
+                503,
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+            ),
+            (
+                events::CodexErrorClass::Overloaded,
+                503,
+                StatusCode::from_u16(529).unwrap(),
+                "overloaded_error",
+            ),
+        ];
+        for (class, backend_status, status, error_type) in cases {
+            let response = map_codex_error_to_response(&classified_codex_error(
+                class,
+                backend_status,
+                "toy backend message",
+                None,
+            ));
+            assert_eq!(response.status(), status, "{class:?}");
+            let body = error_body(response).await;
+            assert_eq!(body["error"]["type"], error_type, "{class:?}");
+            assert_eq!(body["error"]["message"], "toy backend message", "{class:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn spent_credits_stop_the_retry_loop_without_naming_a_window() {
+        // An earlier turn left a quota snapshot behind.
+        rate_limits::observe_event(&serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {
+                "primary": {"used_percent": 5.0, "window_minutes": 300, "resets_at": 1u64}
+            }
+        }));
+        let response =
+            with_rate_limit_headers(map_codex_error_to_response(&classified_codex_error(
+                events::CodexErrorClass::QuotaExceeded,
+                429,
+                "You exceeded your current quota, please check your plan and billing details.",
+                Some("30"),
+            )));
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let headers = response.headers();
+        assert_eq!(headers["x-should-retry"], "false");
+        assert!(!headers.contains_key(http::header::RETRY_AFTER));
+        for name in [
+            "anthropic-ratelimit-unified-status",
+            "anthropic-ratelimit-unified-reset",
+            "anthropic-ratelimit-unified-representative-claim",
+        ] {
+            assert!(!headers.contains_key(name), "{name}");
+        }
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(
+            body["error"]["message"],
+            "You exceeded your current quota, please check your plan and billing details."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_throttle_names_its_delay_and_other_classes_do_not() {
+        let from_field = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::Throttled,
+            429,
+            "Rate limit exceeded.",
+            Some("7"),
+        ));
+        assert_eq!(from_field.headers()[http::header::RETRY_AFTER], "7");
+        assert!(!from_field.headers().contains_key("x-should-retry"));
+
+        let from_message = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::Throttled,
+            503,
+            "Rate limit reached. Please try again in 1.898s.",
+            None,
+        ));
+        assert_eq!(from_message.headers()[http::header::RETRY_AFTER], "2");
+
+        let without_delay = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::Throttled,
+            429,
+            "Please slow down.",
+            None,
+        ));
+        assert!(
+            !without_delay
+                .headers()
+                .contains_key(http::header::RETRY_AFTER)
+        );
+
+        let overloaded = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::Overloaded,
+            503,
+            "Please try again in 5s.",
+            Some("1"),
+        ));
+        assert_eq!(overloaded.headers()[http::header::RETRY_AFTER], "1");
+
+        for class in [
+            events::CodexErrorClass::UsageNotIncluded,
+            events::CodexErrorClass::Rejected,
+            events::CodexErrorClass::ContextOverflow,
+        ] {
+            let response = map_codex_error_to_response(&classified_codex_error(
+                class,
+                400,
+                "Please try again in 5s.",
+                Some("5"),
+            ));
+            assert!(
+                !response.headers().contains_key(http::header::RETRY_AFTER),
+                "{class:?}"
+            );
+            assert!(
+                !response.headers().contains_key("x-should-retry"),
+                "{class:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_prompt_without_text_gets_a_short_message() {
+        let response = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::Rejected,
+            400,
+            "",
+            None,
+        ));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["message"], "Invalid request");
+
+        // The live translator's placeholder names the backend, so it is
+        // replaced in the same way.
+        let response = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::Rejected,
+            400,
+            "Upstream error",
+            None,
+        ));
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["message"], "Invalid request");
+    }
+
+    #[test]
+    fn a_classified_retry_after_is_whole_seconds() {
+        let http_date = "Wed, 21 Oct 2026 07:28:00 GMT";
+        let cases = [
+            (events::CodexErrorClass::Throttled, "0.25", "1"),
+            (events::CodexErrorClass::Throttled, "0", "1"),
+            (events::CodexErrorClass::Throttled, "7", "7"),
+            (events::CodexErrorClass::Throttled, http_date, http_date),
+            (events::CodexErrorClass::Overloaded, "1.5", "2"),
+            (events::CodexErrorClass::Overloaded, "0", "1"),
+            (events::CodexErrorClass::Overloaded, http_date, http_date),
+        ];
+        for (class, sent, expected) in cases {
+            let response = map_codex_error_to_response(&classified_codex_error(
+                class,
+                429,
+                "toy backend message",
+                Some(sent),
+            ));
+            assert_eq!(
+                response.headers()[http::header::RETRY_AFTER],
+                expected,
+                "{class:?} {sent}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_context_overflow_code_answers_like_the_context_window_message() {
+        // The text names the backend, which `client_error` would replace.
+        let native = "Codex error: your input exceeds the context window of this model.";
+        let by_code = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::ContextOverflow,
+            400,
+            native,
+            None,
+        ));
+        let by_message = map_codex_failure_to_response(native);
+
+        assert_eq!(by_code.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(by_code.status(), by_message.status());
+        let by_code = error_body(by_code).await;
+        assert_eq!(by_code["error"]["type"], "request_too_large");
+        assert_eq!(by_code["error"]["message"], native);
+        assert_eq!(by_code, error_body(by_message).await);
+    }
+
+    #[test]
+    fn a_classified_stream_error_takes_the_type_of_its_class() {
+        let err =
+            classified_codex_error(events::CodexErrorClass::UsageNotIncluded, 429, "toy", None);
+        assert_eq!(codex_stream_error_type(&err), "permission_error");
+        let err = classified_codex_error(events::CodexErrorClass::Rejected, 529, "toy", None);
+        assert_eq!(codex_stream_error_type(&err), "invalid_request_error");
+    }
+
     fn live_test_request(text: &str) -> translate::request::ResponsesRequest {
         translate::request::ResponsesRequest {
             model: "gpt-5.6-sol".to_string(),
@@ -1822,6 +2183,8 @@ mod tests {
             ("gpt-5.6-luna", "gpt-5.6-sol"),
             ("gpt-5.6-sol", "gpt-5.6-sol"),
             ("gpt-5.6-terra", "gpt-5.6-terra"),
+            ("gpt-6-luna", "gpt-6-sol"),
+            ("gpt-6-sol", "gpt-6-sol"),
             ("gpt-5.4", "gpt-5.4"),
         ] {
             let mut model = resolved.to_string();
@@ -2203,6 +2566,9 @@ mod tests {
         assert!(models.contains(&"gpt-5.6-sol-fast".to_string()));
         assert!(models.contains(&"gpt-5.6-terra".to_string()));
         assert!(models.contains(&"gpt-5.6-luna".to_string()));
+        assert!(models.contains(&"gpt-6-sol".to_string()));
+        assert!(models.contains(&"gpt-6-sol-fast".to_string()));
+        assert!(models.contains(&"gpt-6-luna".to_string()));
         assert!(models.contains(&"gpt-5.4".to_string()));
         assert!(models.contains(&"gpt-5.4-mini".to_string()));
     }
@@ -2234,6 +2600,7 @@ mod tests {
             detail: Some("invalid request".to_string()),
             retry_after: Some("7".to_string()),
             usage_limit: None,
+            class: None,
             origin: client::CodexErrorOrigin::WebSocketHandshake,
         };
         let response = map_codex_error_to_response(&err);
@@ -2252,6 +2619,7 @@ mod tests {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: client::CodexErrorOrigin::WebSocket,
         };
 
@@ -2289,6 +2657,7 @@ mod tests {
             detail: Some(detail.to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: client::CodexErrorOrigin::BufferedHttp,
         };
 
@@ -2312,6 +2681,7 @@ mod tests {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: client::CodexErrorOrigin::WebSocketHandshake,
         };
 
@@ -2326,6 +2696,7 @@ mod tests {
             detail: Some(websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: client::CodexErrorOrigin::WebSocketHandshake,
         };
 
@@ -2340,6 +2711,7 @@ mod tests {
             detail: Some(websocket::WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: client::CodexErrorOrigin::WebSocket,
         };
 
@@ -2473,6 +2845,64 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "rate_limit_error");
         assert_eq!(body["error"]["message"], "The usage limit has been reached");
+    }
+
+    #[tokio::test]
+    async fn spent_credits_fail_a_live_start_once_and_abort_request_state() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let response = run_live_failure_case(
+            "live-quota-cleanup",
+            serde_json::json!({
+                "type": "response.failed",
+                "response": {"error": {
+                    "code": "credit_balance_exhausted",
+                    "message": "Your credit balance is exhausted."
+                }}
+            }),
+            1,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["x-should-retry"], "false");
+        assert!(
+            !response
+                .headers()
+                .contains_key("anthropic-ratelimit-unified-status")
+        );
+        assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(
+            body["error"]["message"],
+            "Your credit balance is exhausted."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_throttled_live_start_is_answered_with_its_delay() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let response = run_live_failure_case(
+            "live-throttle-cleanup",
+            serde_json::json!({
+                "type": "error",
+                "status": 503,
+                "error": {
+                    "code": "slow_down",
+                    "message": "Please slow down. Try again in 3 seconds."
+                }
+            }),
+            1,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "3");
+        assert!(!response.headers().contains_key("x-should-retry"));
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "rate_limit_error");
     }
 
     #[tokio::test]

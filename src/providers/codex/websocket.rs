@@ -220,6 +220,7 @@ impl WebSocketProxyConfig {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         })?;
         if !http_url.starts_with("https://") {
@@ -763,6 +764,7 @@ pub(super) async fn codex_websocket_request(
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let body_json = serde_json::to_string(body_value).unwrap_or_default();
@@ -851,6 +853,7 @@ pub(super) async fn codex_websocket_request(
                 detail: None,
                 retry_after: None,
                 usage_limit: None,
+                class: None,
                 origin: CodexErrorOrigin::WebSocket,
             }
         })?;
@@ -890,6 +893,7 @@ pub(super) async fn codex_websocket_request(
             detail: Some("previous_response_not_found".to_string()),
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocket,
         });
     }
@@ -991,6 +995,7 @@ pub(super) async fn prepare_codex_websocket(
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let requires_origin = continuation
@@ -1043,6 +1048,7 @@ fn pooled_validation_error(detail: String) -> CodexError {
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1093,6 +1099,7 @@ pub(super) fn start_codex_websocket_events(
                     detail: None,
                     retry_after: None,
                     usage_limit: None,
+                    class: None,
                     origin: CodexErrorOrigin::WebSocket,
                 }))
                 .await;
@@ -1143,6 +1150,7 @@ pub(super) async fn codex_websocket_event_stream(
         detail: Some(error.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let ready = prepare_codex_websocket(
@@ -1172,6 +1180,7 @@ fn continuation_socket_missing_error() -> CodexError {
         detail: Some(WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1183,6 +1192,7 @@ fn missing_terminal_error() -> CodexError {
         detail: Some(WEBSOCKET_MISSING_TERMINAL_DETAIL.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocket,
     }
 }
@@ -1194,6 +1204,7 @@ fn response_start_timeout_error(timeout_ms: u64) -> CodexError {
         detail: Some(WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocket,
     }
 }
@@ -1312,6 +1323,7 @@ fn websocket_protocol_error(message: &str) -> CodexError {
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1445,6 +1457,7 @@ fn reqwest_handshake_error(error: reqwest::Error) -> CodexError {
         detail: proxy_tunnel_rejected.then(|| WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1542,6 +1555,7 @@ fn tunnel_error(status: u16, retry_after: Option<String>) -> CodexError {
         },
         retry_after,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1553,6 +1567,7 @@ fn invalid_tunnel_response(message: &str) -> CodexError {
         detail: Some(WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1619,6 +1634,7 @@ async fn establish_connect_tunnel(
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
 
@@ -1678,6 +1694,7 @@ async fn tls_connect(
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         })?;
     Ok(Box::new(stream))
@@ -1705,6 +1722,7 @@ async fn connect_to_http_proxy(
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         })?;
     let stream: BoxedWebSocketIo = Box::new(stream);
@@ -1736,6 +1754,10 @@ fn websocket_destination(url: &str) -> Result<(String, String), CodexError> {
     Ok((host.to_string(), authority))
 }
 
+/// A rejected upgrade on the tunneled path. The rejection carries whatever
+/// body bytes arrived with its head, which may be all of a short body, part of
+/// it or nothing; the detail and class come from them the way the direct path
+/// reads its body, and a 407 is not read at all.
 fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> CodexError {
     if let tokio_tungstenite::tungstenite::Error::Http(response) = error {
         let status = response.status().as_u16();
@@ -1744,12 +1766,25 @@ fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> 
             .get(http::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        let body = response
+            .body()
+            .as_deref()
+            .filter(|_| response.status() != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+            .map(|body| &body[..body.len().min(MAX_HANDSHAKE_ERROR_DETAIL_BYTES)]);
+        let (detail, class) = match body {
+            Some(body) => (
+                handshake_error_detail(Some(body)),
+                super::events::error_class_from_body(body),
+            ),
+            None => (GENERIC_HANDSHAKE_ERROR_DETAIL.to_string(), None),
+        };
         return CodexError {
             status,
             message: format!("WebSocket upgrade rejected with status {status}"),
-            detail: Some(GENERIC_HANDSHAKE_ERROR_DETAIL.to_string()),
+            detail: Some(detail),
             retry_after,
             usage_limit: None,
+            class,
             origin: CodexErrorOrigin::WebSocketHandshake,
         };
     }
@@ -1759,6 +1794,7 @@ fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> 
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     }
 }
@@ -1833,6 +1869,7 @@ async fn connect_via_http_upgrade(
         detail: None,
         retry_after: None,
         usage_limit: None,
+        class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
     })?;
     let websocket_key = generate_key();
@@ -1860,11 +1897,15 @@ async fn connect_via_http_upgrade(
             .get(http::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let detail = if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16() {
-            GENERIC_HANDSHAKE_ERROR_DETAIL.to_string()
+        let (detail, class) = if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
+        {
+            (GENERIC_HANDSHAKE_ERROR_DETAIL.to_string(), None)
         } else {
             let body = bounded_handshake_error_body(response).await;
-            handshake_error_detail(Some(&body))
+            (
+                handshake_error_detail(Some(&body)),
+                super::events::error_class_from_body(&body),
+            )
         };
         return Err(CodexError {
             status,
@@ -1872,6 +1913,7 @@ async fn connect_via_http_upgrade(
             detail: Some(detail),
             retry_after,
             usage_limit: None,
+            class,
             origin: CodexErrorOrigin::WebSocketHandshake,
         });
     }
@@ -2081,6 +2123,7 @@ where
                         detail: None,
                         retry_after: None,
                         usage_limit: None,
+                        class: None,
                         origin: CodexErrorOrigin::WebSocket,
                     });
                 }
@@ -2106,6 +2149,7 @@ where
                         detail: None,
                         retry_after: None,
                         usage_limit: None,
+                        class: None,
                         origin: CodexErrorOrigin::WebSocket,
                     }
                 } else {
@@ -2120,6 +2164,7 @@ where
                     detail: Some(WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
                     retry_after: None,
                     usage_limit: None,
+                    class: None,
                     origin: CodexErrorOrigin::WebSocket,
                 });
             }
@@ -2179,6 +2224,7 @@ where
                     detail: None,
                     retry_after: None,
                     usage_limit: None,
+                    class: None,
                     origin: CodexErrorOrigin::WebSocket,
                 });
             }
@@ -2208,6 +2254,7 @@ where
                     detail: None,
                     retry_after: None,
                     usage_limit: None,
+                    class: None,
                     origin: CodexErrorOrigin::WebSocket,
                 });
             }
@@ -2258,6 +2305,7 @@ where
                             detail: None,
                             retry_after: None,
                             usage_limit: None,
+                            class: None,
                             origin: CodexErrorOrigin::WebSocket,
                         }
                     } else {
@@ -2284,6 +2332,7 @@ where
                             detail: None,
                             retry_after: None,
                             usage_limit: None,
+                            class: None,
                             origin: CodexErrorOrigin::WebSocket,
                         }
                     } else {
@@ -2298,6 +2347,7 @@ where
                         detail: None,
                         retry_after: None,
                         usage_limit: None,
+                        class: None,
                         origin: CodexErrorOrigin::WebSocket,
                     }));
                     break;
@@ -2345,6 +2395,7 @@ where
                             detail: Some("previous_response_not_found".to_string()),
                             retry_after: None,
                             usage_limit: None,
+                            class: None,
                             origin: CodexErrorOrigin::WebSocket,
                         }));
                     } else {
@@ -2366,6 +2417,7 @@ where
                     detail: None,
                     retry_after: None,
                     usage_limit: None,
+                    class: None,
                     origin: CodexErrorOrigin::WebSocket,
                 }));
                 break;
@@ -2385,6 +2437,7 @@ where
                     detail: None,
                     retry_after: None,
                     usage_limit: None,
+                    class: None,
                     origin: CodexErrorOrigin::WebSocket,
                 }));
                 break;
@@ -2501,6 +2554,7 @@ mod tests {
             detail: None,
             retry_after: None,
             usage_limit: None,
+            class: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
         }
     }
@@ -2788,6 +2842,7 @@ mod tests {
                             detail: Some("second-detail".to_string()),
                             retry_after: Some("7".to_string()),
                             usage_limit: None,
+                            class: None,
                             origin: CodexErrorOrigin::WebSocketHandshake,
                         }))
                     }
@@ -3799,6 +3854,63 @@ mod tests {
         assert_eq!(err.status, 401);
         assert_eq!(err.detail.as_deref(), Some(GENERIC_HANDSHAKE_ERROR_DETAIL));
         assert_eq!(err.origin, CodexErrorOrigin::WebSocketHandshake);
+    }
+
+    #[tokio::test]
+    async fn tunneled_handshake_rejection_is_classified_from_its_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let body = r#"{"error":{"code":"usage_not_included","message":"Your plan does not include this usage."}}"#;
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = server_io.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buf[..read]);
+            }
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            server_io.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let request = tunneled_websocket_request(
+            "ws://codex.test/backend-api/codex/responses",
+            &HeaderMap::new(),
+            &generate_key(),
+        )
+        .unwrap();
+        let err = match tokio_tungstenite::client_async(request, client_io).await {
+            Ok(_) => panic!("expected the tunneled upgrade to be rejected"),
+            Err(error) => tungstenite_handshake_error(error),
+        };
+
+        assert_eq!(err.status, 403);
+        assert_eq!(
+            err.class,
+            Some(super::super::events::CodexErrorClass::UsageNotIncluded)
+        );
+        assert_eq!(
+            err.detail.as_deref(),
+            Some("Your plan does not include this usage.")
+        );
+        assert_eq!(err.origin, CodexErrorOrigin::WebSocketHandshake);
+
+        // A proxy's own 407 is never read, whatever its body says.
+        let rejected = http::Response::builder()
+            .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+            .body(Some(body.as_bytes().to_vec()))
+            .unwrap();
+        let err =
+            tungstenite_handshake_error(tokio_tungstenite::tungstenite::Error::Http(rejected));
+        assert_eq!(err.status, 407);
+        assert_eq!(err.class, None);
+        assert_eq!(err.detail.as_deref(), Some(GENERIC_HANDSHAKE_ERROR_DETAIL));
     }
 
     #[tokio::test]

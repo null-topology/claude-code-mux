@@ -534,6 +534,23 @@ async fn spawn_websocket_usage_limit_upstream(attempts: Arc<AtomicUsize>) -> Str
     format!("http://{addr}")
 }
 
+/// Answers every connection with one failure event and counts the attempts,
+/// so a test can see that the proxy did not try again.
+async fn spawn_websocket_failure_upstream(event: Value, attempts: Arc<AtomicUsize>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            if let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await {
+                let _ = websocket.next().await;
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let _ = websocket.send(Message::Text(event.to_string())).await;
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
 /// Reproduce the Codex subscription-credit response observed in production:
 /// the included window is exhausted, but usable credits remain and the model
 /// still completes the response after the rate-limit snapshot.
@@ -1398,6 +1415,26 @@ async fn assert_usage_limit_response(response: Response) {
     assert_eq!(body["error"]["message"], "The usage limit has been reached");
 }
 
+/// A spent credit balance or spend limit: no retry, and no window to report.
+async fn assert_quota_response(response: Response, message: &str) {
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["x-should-retry"], "false");
+    for name in [
+        "anthropic-ratelimit-unified-status",
+        "anthropic-ratelimit-unified-reset",
+        "anthropic-ratelimit-unified-representative-claim",
+    ] {
+        assert!(!response.headers().contains_key(name), "{name}");
+    }
+    assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["message"], message);
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_http_usage_limit_event_fast_fails_live_request() {
@@ -1730,7 +1767,7 @@ async fn smoke_auto_review_uses_codex_default_and_configured_override() {
 
     let sent = captured.lock().unwrap();
     assert_eq!(sent.len(), 3);
-    assert_eq!(sent[0]["model"], "gpt-5.6-luna");
+    assert_eq!(sent[0]["model"], "gpt-6-luna");
     assert_eq!(sent[1]["model"], "gpt-5.6-terra");
     assert_eq!(sent[2]["model"], "gpt-5.6-sol");
 }
@@ -1802,6 +1839,151 @@ async fn smoke_codex_http_server_compaction_fast_fails_usage_limit() {
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     assert_usage_limit_response(response).await;
     clear_all_compactions_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_server_compaction_refused_for_credits_or_plan_sends_no_normal_request() {
+    let _guard = env_lock();
+    let cases = [
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "insufficient_quota",
+            "You exceeded your current quota.",
+            "rate_limit_error",
+            Some("false"),
+        ),
+        (
+            StatusCode::FORBIDDEN,
+            "usage_not_included",
+            "Your plan does not include this usage.",
+            "permission_error",
+            None,
+        ),
+    ];
+    for (status, code, message, error_type, should_retry) in cases {
+        clear_all_compactions_for_tests();
+        let config = TempDir::new().unwrap();
+        let _codex_auth = write_codex_auth(config.path());
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = format!("http://{addr}");
+        let mock = axum::Router::new().fallback({
+            let requests = requests.clone();
+            move |body: String| {
+                let requests = requests.clone();
+                async move {
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_str(&body).unwrap_or_default());
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({"error": {"code": code, "message": message}}).to_string(),
+                        ))
+                        .unwrap()
+                }
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, mock).await.ok();
+        });
+
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+        let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+        let _compaction_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1");
+        let response = call_messages_body(json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 64,
+            "system": "You are Claude Code.",
+            "messages": [
+                {"role":"user","content":"old conversation"},
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"tool-1","name":"Read","input":{}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"tool-1","content":"result"},
+                    {"type":"text","text":"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\nYour task is to create a detailed summary of the conversation so far."}
+                ]}
+            ]
+        }))
+        .await;
+
+        let requests = requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "{code}");
+        assert_eq!(
+            requests[0]["input"].as_array().unwrap().last().unwrap()["type"],
+            "compaction_trigger",
+            "{code}"
+        );
+        assert_eq!(response.status(), status, "{code}");
+        assert_eq!(
+            response
+                .headers()
+                .get("x-should-retry")
+                .and_then(|value| value.to_str().ok()),
+            should_retry,
+            "{code}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], error_type, "{code}");
+        assert_eq!(body["error"]["message"], message, "{code}");
+    }
+    clear_all_compactions_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_non_stream_refused_prompt_is_a_client_error() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            format!(
+                "data: {}\n\n",
+                json!({"type": "response.failed", "response": {
+                    "id": "resp_failed",
+                    "status": "failed",
+                    "error": {"code": "invalid_prompt", "message": "Invalid prompt: toy refusal."}
+                }})
+            )
+            .into_bytes()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hello"}]
+    }))
+    .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["message"], "Invalid prompt: toy refusal.");
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -2335,6 +2517,60 @@ async fn smoke_codex_http_usage_limit_status_fast_fails_live_request() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_codex_http_spent_credits_status_is_not_retried() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream = format!("http://{addr}");
+    let mock = axum::Router::new().fallback({
+        let attempts = attempts.clone();
+        move || {
+            let attempts = attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                http::Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("content-type", "application/json")
+                    .header("retry-after", "30")
+                    .body(Body::from(
+                        json!({
+                            "error": {
+                                "code": "credit_balance_exhausted",
+                                "message": "Your credit balance is exhausted."
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, mock).await.ok();
+    });
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_quota_response(response, "Your credit balance is exhausted.").await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_reports_initial_status_without_retrying() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();
@@ -2826,6 +3062,101 @@ async fn smoke_codex_websocket_usage_limit_fast_fails_request() {
 
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     assert_usage_limit_response(response).await;
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_rejected_prompt_is_a_client_error() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_websocket_failure_upstream(
+        json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_failed",
+                "status": "failed",
+                "error": {
+                    "code": "invalid_prompt",
+                    "message": "Invalid prompt: toy refusal."
+                }
+            }
+        }),
+        attempts.clone(),
+    )
+    .await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!response.headers().contains_key("x-should-retry"));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["message"], "Invalid prompt: toy refusal.");
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_spent_credits_are_not_retried() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_websocket_failure_upstream(
+        json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_failed",
+                "status": "failed",
+                "error": {
+                    "code": "insufficient_quota",
+                    "message": "You exceeded your current quota, please check your plan and billing details."
+                }
+            }
+        }),
+        attempts.clone(),
+    )
+    .await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_quota_response(
+        response,
+        "You exceeded your current quota, please check your plan and billing details.",
+    )
+    .await;
     clear_codex_websocket_pool_for_tests();
 }
 
@@ -4150,16 +4481,16 @@ async fn smoke_auto_review_keeps_the_requested_model_beside_the_one_that_ran() {
         .unwrap()
         .clone()
         .expect("upstream was called");
-    assert_eq!(sent["model"], "gpt-5.6-luna");
+    assert_eq!(sent["model"], "gpt-6-luna");
 
     let state = monitor.snapshot();
     let request = &state.recent[0];
     assert_eq!(request.requested_model.as_deref(), Some("gpt-5.6-sol"));
-    assert_eq!(request.effective_model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(request.effective_model.as_deref(), Some("gpt-6-luna"));
     let row = state.sessions[0]
         .models
         .iter()
-        .find(|row| row.model.as_deref() == Some("gpt-5.6-luna"))
+        .find(|row| row.model.as_deref() == Some("gpt-6-luna"))
         .expect("a row for the model that ran");
     assert_eq!(
         row.requested_models
@@ -4385,7 +4716,7 @@ async fn smoke_codex_progress_label_forbids_tool_calls_and_keeps_tools() {
         "forbidding tool calls must not change the tools the label carries"
     );
 
-    assert_eq!(junior["model"], "gpt-5.6-luna");
+    assert_eq!(junior["model"], "gpt-6-luna");
     assert_eq!(junior["tool_choice"], "none");
     assert_eq!(
         junior["tools"], not_a_label["tools"],

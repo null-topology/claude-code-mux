@@ -6,7 +6,7 @@ pub const RESPONSES_LITE_ORIGINATOR: &str = "codex_cli_rs";
 /// `client_version` sent on the model listing call when neither
 /// `CCP_CODEX_CLIENT_VERSION` nor the Codex CLI's `models_cache.json` names
 /// one. The backend rejects the call without it.
-pub const CODEX_CLIENT_VERSION: &str = "0.153.4";
+pub const CODEX_CLIENT_VERSION: &str = "0.157.1";
 pub const REFRESH_MARGIN_MS: u64 = 5 * 60 * 1000;
 pub const OAUTH_PORT: u16 = 1455;
 pub const OAUTH_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";

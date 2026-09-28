@@ -150,7 +150,7 @@ Request path:
    the model (strip `[1m]`), look up the session by `x-claude-code-session-id`,
    pick a provider via the registry, apply the auto-review override (Claude
    Code's non-streaming, tool-free security classifier is rerouted to
-   `CCP_AUTO_REVIEW_MODEL`, default `gpt-5.6-luna` on codex), then call the
+   `CCP_AUTO_REVIEW_MODEL`, default `gpt-6-luna` on codex), then call the
    provider and record log, monitor and traffic capture. Every response it
    returns, early rejections and the local agent-summary answer (with
    `CCP_AGENT_SUMMARY=local`) included,
@@ -550,7 +550,7 @@ client's own, so the request Anthropic receives is unchanged and only the
 proxy's own record names the junior model. The junior model
 must still hold the subagent's context, which is why Anthropic's is
 `claude-sonnet-5` and not Haiku (200k would drop the label on a long subagent)
-and Codex's is `gpt-5.6-luna`; a provider without an entry in
+and Codex's is `gpt-6-luna`; a provider without an entry in
 `summary_model_for` keeps the request's model. Detection is the prompt text,
 `SUMMARY_PROMPT_MARKER`: these requests otherwise look like a normal subagent
 turn, with its tools and history. Detection skips trailing `role: "system"`
@@ -595,7 +595,7 @@ Every transport answers a spent window once, without retrying, with
 `-reset` and `-representative-claim`: the live WebSocket and live HTTP
 streams, a non-2xx startup status whose body or `X-Codex-*` response headers
 carry the limit, the buffered paths (`usage_limit_from_response` runs ahead of
-`first_retryable_failure`, so a buffered WebSocket relay shares the branch),
+`first_reportable_failure`, so a buffered WebSocket relay shares the branch),
 and an opt-in server compaction request, which aborts instead of spending the
 normal request as well. The live HTTP stream hands its response headers to
 `usage_limit_from_event_with_headers`, so a limit event that carries only a
@@ -613,6 +613,46 @@ readings become `-5h-utilization` / `-5h-reset` / `-7d-*`, and a window past
 its threshold (`CCP_CODEX_QUOTA_WARN_AT`, defaults 0.9 session / 0.75 weekly)
 adds `-surpassed-threshold`; readings whose reset time has passed are dropped.
 
+Other failures are classified by their error code first (`error_class` in
+`events.rs`, `CodexErrorClass`), in event payloads (`error`,
+`/response/error`) and in JSON error bodies of any status, on the live
+WebSocket and HTTP starts, the WebSocket handshake and the buffered paths. The
+code decides over the status and the message heuristics:
+
+- quota (`insufficient_quota`, `credit_balance_exhausted`,
+  `organization_spend_limit_exceeded`, `project_spend_limit_exceeded`,
+  `organization_usage_limit_exceeded`, as code or type): 429
+  `rate_limit_error` with `x-should-retry: false`, no `Retry-After` and no
+  unified headers (`with_rate_limit_headers` leaves alone any response that
+  carries `x-should-retry`);
+- `usage_not_included` (code or type): 403 `permission_error`;
+- `invalid_prompt`, `cyber_policy`, `bio_policy`,
+  `misalignment_policy_violation`: 400 `invalid_request_error`, with a short
+  fallback text when the message is empty;
+- `context_length_exceeded`: the 413 `request_too_large` answer of the
+  context window message path (`context_overflow_response`), native text kept;
+- `slow_down`, `rate_limit_exceeded`: 429 with `Retry-After` from the payload,
+  else from the message's `try again in N s|ms|seconds`;
+- `server_is_overloaded`: 529 `overloaded_error`, with `Retry-After` only when
+  the payload carries one.
+
+A classified `Retry-After` is normalised (`normalize_retry_after`): a number
+is rounded up to whole seconds, at least 1; anything else (an HTTP date)
+passes as it came. `CodexError.class` carries the class to `map_codex_error_to_response`
+(`classified_error_response`); a mid-stream error keeps its status and takes
+the class's error type. An unknown code keeps the old handling, and
+`usage_limit_reached` keeps precedence over all of these. An opt-in server
+compaction refused as quota or `usage_not_included` answers the client with
+that class and does not send the normal request; any other compaction failure
+falls back to it. The WebSocket handshake reads the rejection body on both
+the direct upgrade and the HTTP CONNECT tunnel (on the tunnel only the bytes
+that arrived with the response head), never for a 407. Under `auto` transport
+a handshake failure, classified or not, falls back to HTTP unless the
+WebSocket proxy refused it (`should_fallback_to_http` in `client.rs`), and
+that HTTP answer is classified on its own. The codes and their shapes follow
+the Codex CLI's own error handling; no test here runs them against the
+backend.
+
 Field-name trap: the wire format says `reset_at` / `reset_after_seconds`, while
 Codex CLI session logs reserialise the same data as `resets_at` /
 `resets_in_seconds`. Both spellings are read. If quota headers ever stop
@@ -621,7 +661,8 @@ appearing, compare against a fresh traffic capture before anything else.
 The proxy does not retry a failed Codex request: one attempt, then the error
 goes to the client, which owns the retry policy. The only resends left repair
 the proxy's own state (a forgotten `previous_response_id`, a 401 token refresh).
-A 429 on the WebSocket handshake reaches the client as a plain 429.
+A 429 on the WebSocket handshake reaches the client as a plain 429 unless its
+body names one of the codes above.
 
 ## Naming and distribution
 
@@ -722,8 +763,10 @@ bodies. `/v1/models` still reports such an empty answer as it came.
 
 Hosted web search sits outside the policy: a request carrying the hosted
 `web_search_20250305` tool is forced onto the full lane, and there a non-forced
-`gpt-5.6-luna` is rewritten to `gpt-5.6-sol` (`apply_model_lane_for_request`,
-`full_lane_web_search_model`). The forced standalone `/alpha/search` path
+`gpt-5.6-luna` is rewritten to `gpt-5.6-sol` and `gpt-6-luna` to `gpt-6-sol`
+(`apply_model_lane_for_request`, `full_lane_web_search_model`). The compiled-in
+lane table lists `gpt-6-luna` and `gpt-6-sol` beside the gpt-5.6 family and
+`gpt-6-astra`. The forced standalone `/alpha/search` path
 (`is_standalone_search_request`) builds a request of its own and keeps the
 model that was asked for. The rewrite rests on no reproducible capture of a
 Luna refusal on the full lane, and no live capability check has been run
@@ -733,8 +776,9 @@ Verified live 2026-09-11: the call answers 200 with the proxy's own
 `originator`, with or without `ChatGPT-Account-Id`, and while the weekly
 window is at 100% (`/backend-api/wham/usage` reported `limit_reached`); it
 answers 400 without `client_version`. The version comes from
-`CCP_CODEX_CLIENT_VERSION`, else the Codex CLI's `models_cache.json` next to
-`auth.json`, else `CODEX_CLIENT_VERSION` in `auth/constants.rs`.
+`CCP_CODEX_CLIENT_VERSION`, else `codex.clientVersion` in `config.json`, else
+the Codex CLI's `models_cache.json` next to `auth.json`, else
+`CODEX_CLIENT_VERSION` in `auth/constants.rs`.
 
 The compiled-in `CODEX_MODELS` / `ALLOWED_MODELS` lists still exist for
 routing until the first successful listing and for the OpenAI-compatible
@@ -772,8 +816,8 @@ the FABLE variable below on 2.1.269:
   2.1.269 binary and the CLI ships new builds quickly, so check the version in
   use before relying on it.
 
-Those four variables give a whole-picker recipe — haiku to `gpt-5.6-luna`,
-sonnet to `gpt-5.6-terra`, opus to `gpt-5.6-sol`, fable to `gpt-6-astra`. It is
+Those four variables give a whole-picker recipe — haiku to `gpt-6-luna`,
+sonnet to `gpt-5.6-terra`, opus to `gpt-6-sol`, fable to `gpt-6-astra`. It is
 client configuration, not a proxy feature: the proxy has no subscription
 detection, no provider selector, no launcher and no failover when a backend's
 auth fails. Starting Codex-only, with no Claude credentials present, is not

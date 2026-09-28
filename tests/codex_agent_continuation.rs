@@ -1416,7 +1416,7 @@ async fn auto_review_with_agent_headers_is_stateless() {
     // instead of being moved into `input` as a developer message.
     assert_full_input(&classifier, &[("user", &review)]);
     assert_eq!(classifier.body["instructions"], review_system);
-    assert_eq!(classifier.body["model"], "gpt-5.6-luna");
+    assert_eq!(classifier.body["model"], "gpt-6-luna");
     assert_eq!(first.socket_ordinal, 1);
     assert_eq!(classifier.socket_ordinal, 2);
     assert_delta_input(&second, &a_response, first.socket_ordinal, &a2);
