@@ -14,7 +14,8 @@ mod usage;
 
 use accounting::{AbsorbedRequest, Ledger, SessionRecord};
 pub use accounting::{
-    CacheMissTally, LOCAL_PROVIDER, ModelUsage, QualityCoverage, UnattributedUsage, UsageEvidence,
+    CacheMissTally, HitBasis, LOCAL_PROVIDER, ModelUsage, QualityCoverage, UnattributedUsage,
+    UsageEvidence,
 };
 pub use mock::{MockMonitor, mock_state};
 pub(crate) use naming::session_title_from_reply;
@@ -108,6 +109,11 @@ pub enum MonitorEvent {
     SessionTitleObserved {
         request_id: String,
         title: String,
+    },
+    /// The client's body held no assistant turn: the request opens its context
+    /// rather than continuing one, and its tokens stay out of the hit ratios.
+    RequestWithoutHistory {
+        request_id: String,
     },
     /// The names the session's transcript on this machine holds, from the
     /// reader that follows it. A name it did not state is `None`.
@@ -487,6 +493,7 @@ impl MonitorState {
                 .cache_write_tokens
                 .saturating_add(usage.cache_write_tokens);
             row.evidence.add(&usage.evidence);
+            row.hit_basis.add(&usage.hit_basis);
             row.misses.add(&usage.misses);
             for (requested, count) in &usage.requested_models {
                 match row
@@ -574,6 +581,8 @@ pub struct ModelStats {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub evidence: UsageEvidence,
+    /// The part of those prompt tokens the hit ratio is read off.
+    pub hit_basis: HitBasis,
     pub misses: CacheMissTally,
     /// The ids the clients asked for, with how many requests each fed in,
     /// summed over the session rollups.
@@ -596,13 +605,10 @@ impl ModelStats {
             .saturating_add(self.cache_write_tokens)
     }
 
-    /// Share of the row's prompt tokens served from cache.
+    /// Share of the row's prompt tokens served from cache, over the requests
+    /// that carried history.
     pub fn cache_hit_ratio(&self) -> Option<f64> {
-        totals_cache_hit_ratio(
-            self.input_tokens,
-            self.cache_read_tokens,
-            self.cache_write_tokens,
-        )
+        totals_cache_hit_ratio(&self.hit_basis)
     }
 }
 
@@ -638,6 +644,8 @@ pub struct SessionSummary {
     pub cache_write_1h_tokens: u64,
     /// How firmly each of those four counts is known, request by request.
     pub evidence: UsageEvidence,
+    /// The part of the prompt tokens the hit ratio is read off.
+    pub hit_basis: HitBasis,
     pub cache: SessionCacheStats,
     pub output_token_samples: Vec<(SystemTime, u64)>,
     rate_output_tokens: u64,
@@ -693,18 +701,17 @@ pub struct ConversationSummary {
     pub cache_write_1h_tokens: u64,
     /// How firmly each of those four counts is known, request by request.
     pub evidence: UsageEvidence,
+    /// The part of the prompt tokens the hit ratio is read off.
+    pub hit_basis: HitBasis,
     pub cache: SessionCacheStats,
     pub last_status: String,
 }
 
 impl ConversationSummary {
-    /// Share of this conversation's prompt tokens served from cache.
+    /// Share of this conversation's prompt tokens served from cache, over the
+    /// requests that carried history.
     pub fn cache_hit_ratio(&self) -> Option<f64> {
-        totals_cache_hit_ratio(
-            self.input_tokens,
-            self.cache_read_tokens,
-            self.cache_write_tokens,
-        )
+        totals_cache_hit_ratio(&self.hit_basis)
     }
 
     /// Whether the conversation is one of Claude Code's side calls, which do
@@ -750,27 +757,23 @@ pub enum CacheExpiry {
     ExpiredAgo(Duration),
 }
 
-/// Share of a set of accumulated prompt tokens that came from cache.
-fn totals_cache_hit_ratio(
-    input_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-) -> Option<f64> {
-    let prompt = input_tokens
-        .saturating_add(cache_read_tokens)
-        .saturating_add(cache_write_tokens);
-    (prompt > 0 && (cache_read_tokens > 0 || cache_write_tokens > 0))
-        .then(|| cache_read_tokens as f64 / prompt as f64)
+/// Share of a set of accumulated prompt tokens that came from cache. A basis
+/// with no cache read or write, the one of a row holding only requests without
+/// history included, has no ratio.
+fn totals_cache_hit_ratio(basis: &HitBasis) -> Option<f64> {
+    let prompt = basis
+        .input_tokens
+        .saturating_add(basis.cache_read_tokens)
+        .saturating_add(basis.cache_write_tokens);
+    (prompt > 0 && (basis.cache_read_tokens > 0 || basis.cache_write_tokens > 0))
+        .then(|| basis.cache_read_tokens as f64 / prompt as f64)
 }
 
 impl SessionSummary {
-    /// Share of all prompt tokens served from cache.
+    /// Share of the session's prompt tokens served from cache, over the
+    /// requests that carried history.
     pub fn cache_hit_ratio(&self) -> Option<f64> {
-        totals_cache_hit_ratio(
-            self.input_tokens,
-            self.cache_read_tokens,
-            self.cache_write_tokens,
-        )
+        totals_cache_hit_ratio(&self.hit_basis)
     }
 
     pub fn rate(&self) -> Throughput {
@@ -1050,6 +1053,12 @@ impl MonitorHandle {
         });
     }
 
+    pub fn request_without_history(&self, request_id: impl Into<String>) {
+        self.publish(MonitorEvent::RequestWithoutHistory {
+            request_id: request_id.into(),
+        });
+    }
+
     pub fn transcript_names_read(&self, session_id: impl Into<String>, names: TranscriptNames) {
         self.publish(MonitorEvent::TranscriptNamesRead {
             session_id: session_id.into(),
@@ -1296,6 +1305,9 @@ impl MonitorStore {
             }
             MonitorEvent::SessionTitleObserved { request_id, title } => {
                 self.ledger.note_session_title(&request_id, title);
+            }
+            MonitorEvent::RequestWithoutHistory { request_id } => {
+                self.ledger.note_without_history(&request_id);
             }
             MonitorEvent::TranscriptNamesRead { session_id, names } => {
                 self.ledger
@@ -1983,6 +1995,7 @@ fn session_summary(session_id: Option<String>, record: &SessionRecord) -> Sessio
         cache_write_5m_tokens: record.counts.usage.cache_write_5m_tokens,
         cache_write_1h_tokens: record.counts.usage.cache_write_1h_tokens,
         evidence: record.counts.evidence,
+        hit_basis: record.counts.hit_basis,
         cache: record.cache,
         output_token_samples: record
             .output_buckets
@@ -2025,6 +2038,7 @@ fn conversation_summary(
         cache_write_5m_tokens: record.counts.usage.cache_write_5m_tokens,
         cache_write_1h_tokens: record.counts.usage.cache_write_1h_tokens,
         evidence: record.counts.evidence,
+        hit_basis: record.counts.hit_basis,
         cache: record.cache,
         last_status: status_label(record.last_status),
     }
@@ -3871,6 +3885,210 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         // Judging the prompt cache also still works on an evicted request.
         assert_eq!(main.cache.context_tokens, 31_066);
         assert_eq!(session.cache.context_tokens, 31_066);
+    }
+
+    /// `finish_with_usage` for a request whose body held no assistant turn,
+    /// flagged where the server flags it: right after the request started.
+    fn finish_without_history(
+        monitor: &MonitorHandle,
+        request_id: &str,
+        session: &str,
+        provider: &str,
+        model: &str,
+        usage: UsageReport,
+    ) {
+        monitor.request_started(
+            request_id,
+            Some(session.to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.request_without_history(request_id);
+        monitor.conversation_resolved(request_id, "main", None);
+        monitor.provider_selected(request_id, provider, model, None);
+        monitor.model_resolved(request_id, model);
+        monitor.usage_reported(request_id, usage);
+        monitor.request_completed(request_id, 200, None, None);
+    }
+
+    /// A request without history is left out of every aggregate hit ratio
+    /// while its tokens stay in the totals. A request nobody flagged counts as
+    /// before.
+    #[test]
+    fn a_request_without_history_stays_out_of_every_aggregate_hit_ratio() {
+        let monitor = MonitorHandle::new(10);
+        finish_without_history(
+            &monitor,
+            "first",
+            "s1",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(1_000, 0, 0, 10),
+        );
+        finish_with_usage(
+            &monitor,
+            "second",
+            "s1",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(10, 990, 0, 10),
+        );
+        // The same two requests with no flag, on another session and model.
+        finish_with_usage(
+            &monitor,
+            "unflagged-1",
+            "s2",
+            "anthropic",
+            "claude-opus-5",
+            closing_usage(1_000, 0, 0, 10),
+        );
+        finish_with_usage(
+            &monitor,
+            "unflagged-2",
+            "s2",
+            "anthropic",
+            "claude-opus-5",
+            closing_usage(10, 990, 0, 10),
+        );
+
+        let state = monitor.snapshot();
+        let session = |id: &str| {
+            state
+                .sessions
+                .iter()
+                .find(|session| session.session_id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("session {id}"))
+        };
+        let flagged = session("s1");
+        assert_eq!(flagged.cache_hit_ratio(), Some(0.99));
+        assert_eq!(conversation(flagged, "main").cache_hit_ratio(), Some(0.99));
+        // Every total still holds both requests.
+        assert_eq!(flagged.request_count, 2);
+        assert_eq!(flagged.input_tokens, 1_010);
+        assert_eq!(flagged.cache_read_tokens, 990);
+        assert_eq!(flagged.output_tokens, 20);
+        assert_eq!(conversation(flagged, "main").input_tokens, 1_010);
+        let rows = state.model_stats();
+        let sol = stats_row(&rows, "codex", "gpt-5.6-sol");
+        assert_eq!(sol.cache_hit_ratio(), Some(0.99));
+        assert_eq!(sol.prompt_tokens(), 2_000);
+        assert_eq!(sol.input_tokens, 1_010);
+        assert_eq!(sol.cache_read_tokens, 990);
+        // The request's own cell still shows its own ratio.
+        assert_eq!(recent_by_id(&state, "first").cache_hit_ratio(), Some(0.0));
+
+        let unflagged = session("s2");
+        assert_eq!(unflagged.cache_hit_ratio(), Some(0.495));
+        assert_eq!(
+            stats_row(&rows, "anthropic", "claude-opus-5").cache_hit_ratio(),
+            Some(0.495)
+        );
+    }
+
+    /// A lane holding only requests without history has no ratio at all, not
+    /// a zero, whatever those requests read or wrote.
+    #[test]
+    fn a_lane_of_requests_without_history_has_no_hit_ratio() {
+        let monitor = MonitorHandle::new(10);
+        finish_without_history(
+            &monitor,
+            "first",
+            "s1",
+            "anthropic",
+            "claude-opus-5",
+            closing_usage(1_000, 0, 500, 10),
+        );
+        // A shared prefix can make a first request hit; it still says nothing.
+        finish_without_history(
+            &monitor,
+            "side",
+            "s1",
+            "anthropic",
+            "claude-opus-5",
+            closing_usage(100, 4_000, 0, 10),
+        );
+
+        let state = monitor.snapshot();
+        let session = &state.sessions[0];
+        assert_eq!(session.cache_write_tokens, 500);
+        assert_eq!(session.cache_read_tokens, 4_000);
+        assert_eq!(session.cache_hit_ratio(), None);
+        assert_eq!(conversation(session, "main").cache_hit_ratio(), None);
+        let rows = state.model_stats();
+        assert_eq!(
+            stats_row(&rows, "anthropic", "claude-opus-5").cache_hit_ratio(),
+            None
+        );
+    }
+
+    /// A report that lands on a flagged request after it left the recent list
+    /// moves every total and leaves the hit ratio's basis alone.
+    #[test]
+    fn a_late_report_for_an_evicted_request_without_history_stays_out_of_the_ratio() {
+        let monitor = MonitorHandle::new(1);
+        start_codex_request(&monitor, "a", "main");
+        monitor.request_without_history("a");
+        monitor.stream_progress("a", 100, 1, Some(31_066), Some(0));
+        monitor.request_completed("a", 200, None, None);
+        start_codex_request(&monitor, "b", "main");
+        monitor.model_resolved("b", "gpt-5.6-sol");
+        monitor.usage_reported("b", closing_usage(10, 990, 0, 10));
+        monitor.request_completed("b", 200, None, None);
+
+        let evicted = monitor.snapshot();
+        assert_eq!(evicted.recent.len(), 1);
+        assert_eq!(evicted.recent[0].request_id, "b");
+        assert_eq!(evicted.sessions[0].cache_hit_ratio(), Some(0.99));
+
+        monitor.stream_progress_usage("a", 50, 1, closing_usage(2_906, 28_160, 0, 117));
+
+        let state = monitor.snapshot();
+        let session = &state.sessions[0];
+        assert_eq!(session.input_tokens, 2_916);
+        assert_eq!(session.cache_read_tokens, 29_150);
+        assert_eq!(
+            session.hit_basis,
+            HitBasis {
+                input_tokens: 10,
+                cache_read_tokens: 990,
+                cache_write_tokens: 0,
+            }
+        );
+        assert_eq!(session.cache_hit_ratio(), Some(0.99));
+        assert_eq!(conversation(session, "main").cache_hit_ratio(), Some(0.99));
+    }
+
+    /// A dropped session's flagged request keeps out of the Stats ratio once
+    /// its figures move to the retired rows.
+    #[test]
+    fn a_dropped_session_keeps_its_requests_without_history_out_of_stats_ratio() {
+        let monitor = MonitorHandle::new(10);
+        finish_without_history(
+            &monitor,
+            "first",
+            "s-gone",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(1_000, 0, 0, 10),
+        );
+        finish_with_usage(
+            &monitor,
+            "second",
+            "s-gone",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(10, 990, 0, 10),
+        );
+        let before = monitor.snapshot().model_stats();
+
+        advance_clock(&monitor, Duration::from_secs(25 * 60 * 60));
+        let state = monitor.snapshot();
+        assert_eq!(held_requests_and_sessions(&monitor), (0, 0));
+        let rows = state.model_stats();
+        assert_eq!(rows, before);
+        let sol = stats_row(&rows, "codex", "gpt-5.6-sol");
+        assert_eq!(sol.cache_hit_ratio(), Some(0.99));
+        assert_eq!(sol.input_tokens, 1_010);
     }
 
     #[test]

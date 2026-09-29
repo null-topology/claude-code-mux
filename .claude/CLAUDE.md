@@ -460,11 +460,26 @@ on `ModelUsage`, fed by `Contribution.miss` from the `CacheMiss` a request's
 evaluation stored on its record, so a per-model miss is counted exactly once
 and detached with the record like every other number; the judging itself is
 unchanged. Prompt is `input + read + write` (no `reported_prompt_tokens` at
-this level), hit % is `totals_cache_hit_ratio`, a Codex row's cache write stays
-`Missing` (`n/a`) rather than zero, and `Lat(rec)` / `tok/s(rec)` are medians
-over the row's completed requests still in `recent` (the mean of the two
-middle values for an even count), so they cover the recent window only and
-the header says so. Rows sort by prompt tokens descending.
+this level), hit % is `totals_cache_hit_ratio` over the row's `hit_basis`,
+a Codex row's cache write stays `Missing` (`n/a`) rather than zero, and
+`Lat(rec)` / `tok/s(rec)` are medians over the row's completed requests
+still in `recent` (the mean of the two middle values for an even count), so
+they cover the recent window only and the header says so. Rows sort by
+prompt tokens descending.
+
+Every aggregate hit % (session, conversation, Stats row) is read off
+`HitBasis` (`hit_basis` on `RowCounts` and on the summaries), never off the
+token totals. It sums input, read and write over the requests that carried
+history: `dispatch_request` publishes `RequestWithoutHistory` when the parsed
+body holds no `assistant` message (a new session or subagent, a one-shot side
+call, the first turn after a compaction), whatever provider serves it, and
+`Ledger::note_without_history` sets `RequestRecord::without_history`. What
+such a request found in cache says nothing about how the conversation's cache
+holds. Its tokens stay in every other total, and a row holding only such
+requests has no ratio (`n/a`). A request not flagged as lacking history
+counts as before: a body that did not parse, the OpenAI-compatible surfaces,
+a terminal-first record. The per-request hit ratio and cache-miss judging are
+unchanged.
 
 Deferred and non-blocking: `RequestRecord::model_key` and the requested-model
 histogram allocate `String`s on every ledger update.

@@ -181,6 +181,39 @@ impl CacheMissTally {
     }
 }
 
+/// The prompt tokens a row's cache hit ratio is read off: those of its requests
+/// that carried history. A request whose body holds no assistant turn opens its
+/// context rather than continuing one, so what it found in cache says nothing
+/// about how well the conversation's cache holds, and the aggregate ratios
+/// leave it out. Its tokens stay in every other total; a request not flagged as
+/// lacking history counts here as before.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HitBasis {
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+}
+
+impl HitBasis {
+    fn apply(&mut self, usage: &SessionUsage, sign: i64) {
+        self.input_tokens = add_tokens(self.input_tokens, usage.input_tokens, sign);
+        self.cache_read_tokens = add_tokens(self.cache_read_tokens, usage.cache_read_tokens, sign);
+        self.cache_write_tokens =
+            add_tokens(self.cache_write_tokens, usage.cache_write_tokens, sign);
+    }
+
+    /// Fold another row's basis into this one.
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
+    }
+}
+
 /// What requests that named no conversation add up to, counted on their own
 /// rather than left as the difference between a session and its rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -222,6 +255,8 @@ pub struct ModelUsage {
     pub cache_write_5m_tokens: u64,
     pub cache_write_1h_tokens: u64,
     pub evidence: UsageEvidence,
+    /// The part of the prompt tokens above the hit ratio is read off.
+    pub hit_basis: HitBasis,
     /// How many of the row's requests were judged a cache miss, by cause.
     pub misses: CacheMissTally,
     /// The models the callers asked for to get here, and how many requests
@@ -239,6 +274,7 @@ pub(crate) struct RowCounts {
     pub active_count: u64,
     pub usage: SessionUsage,
     pub evidence: UsageEvidence,
+    pub hit_basis: HitBasis,
 }
 
 impl RowCounts {
@@ -255,6 +291,9 @@ impl RowCounts {
             return;
         }
         apply_usage_totals(&mut self.usage, &contribution.usage, sign);
+        if !contribution.without_history {
+            self.hit_basis.apply(&contribution.usage, sign);
+        }
         self.evidence.note(
             contribution.quality,
             contribution.cache_write_quality,
@@ -291,6 +330,8 @@ struct Contribution {
     failed: bool,
     active: bool,
     counts_tokens: bool,
+    /// Whether its tokens stay out of the hit ratio's basis.
+    without_history: bool,
     usage: SessionUsage,
     quality: QualityFields,
     cache_write_quality: CacheWriteQuality,
@@ -341,6 +382,9 @@ pub(crate) struct RequestRecord {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cache: RequestCache,
+    /// Whether the client's body held no assistant turn, so its tokens stay out
+    /// of every aggregate hit ratio (`HitBasis`). False until a producer says so.
+    pub without_history: bool,
     /// The output-history buckets this request put tokens in, oldest first, and
     /// how many of each bucket's tokens are its own. Enough to take a negative
     /// correction back out of the buckets it went into, and nothing more: no
@@ -382,6 +426,7 @@ impl RequestRecord {
             input_tokens: None,
             output_tokens: None,
             cache: RequestCache::default(),
+            without_history: false,
             output_buckets: Vec::new(),
             terminal: false,
         }
@@ -462,6 +507,7 @@ impl RequestRecord {
             failed: self.status == RequestStatus::Failed,
             active: !self.terminal,
             counts_tokens,
+            without_history: self.without_history,
             usage: SessionUsage {
                 input_tokens: self.input_tokens.unwrap_or(0),
                 output_tokens: self.output_tokens.unwrap_or(0),
@@ -579,6 +625,7 @@ impl ModelRecord {
             cache_write_5m_tokens: self.counts.usage.cache_write_5m_tokens,
             cache_write_1h_tokens: self.counts.usage.cache_write_1h_tokens,
             evidence: self.counts.evidence,
+            hit_basis: self.counts.hit_basis,
             misses: self.misses,
             requested_models: self
                 .requested
@@ -999,6 +1046,11 @@ impl Ledger {
     /// The session title the reply to a request carried.
     pub(crate) fn note_session_title(&mut self, request_id: &str, title: String) {
         self.update(request_id, |record| record.session_title = Some(title));
+    }
+
+    /// That the client's body for a request held no assistant turn.
+    pub(crate) fn note_without_history(&mut self, request_id: &str) {
+        self.update(request_id, |record| record.without_history = true);
     }
 
     /// The names a session's transcript holds. They belong to the session, so

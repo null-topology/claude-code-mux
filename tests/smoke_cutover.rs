@@ -9,7 +9,7 @@ use claude_code_mux::providers::codex::continuation::clear_all_continuations_for
 use claude_code_mux::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
 use claude_code_mux::{
     config::AliasProvider,
-    monitor::{MonitorHandle, QualityFields, RequestStatus, UsageQuality},
+    monitor::{HitBasis, MonitorHandle, QualityFields, RequestStatus, UsageQuality},
     registry::Registry,
     server::{app, app_with_monitor, app_with_options},
 };
@@ -4025,6 +4025,142 @@ async fn smoke_anthropic_stream_error_event_fails_the_request_with_exact_bytes()
             output: UsageQuality::Opening,
         }
     );
+}
+
+/// A completed Codex stream whose usage names `cached_tokens` of `input_tokens`.
+fn codex_sse_with_cached(input_tokens: u64, cached_tokens: u64) -> Vec<u8> {
+    [
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}),
+        json!({"type":"response.output_text.delta","output_index":0,"delta":"ok"}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}),
+        json!({"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":input_tokens,"input_tokens_details":{"cached_tokens":cached_tokens},"output_tokens":1}}}),
+    ]
+    .iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .collect::<String>()
+    .into_bytes()
+}
+
+/// A completed Anthropic stream with `input_tokens` uncached and `read` read
+/// from cache.
+fn anthropic_sse_with_read(input_tokens: u64, read: u64) -> Vec<u8> {
+    [
+        ("message_start", json!({"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":input_tokens,"cache_read_input_tokens":read,"cache_creation_input_tokens":0,"output_tokens":1}}})),
+        ("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})),
+        ("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}})),
+        ("content_block_stop", json!({"type":"content_block_stop","index":0})),
+        ("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}})),
+        ("message_stop", json!({"type":"message_stop"})),
+    ]
+    .iter()
+    .map(|(name, data)| format!("event: {name}\ndata: {data}\n\n"))
+    .collect::<String>()
+    .into_bytes()
+}
+
+/// Send a request with no history, then one that continues it, on `model`.
+async fn send_first_then_continued(monitor: &MonitorHandle, model: &str) {
+    for messages in [
+        json!([{"role":"user","content":"hello"}]),
+        json!([
+            {"role":"user","content":"hello"},
+            {"role":"assistant","content":"ok"},
+            {"role":"user","content":"again"}
+        ]),
+    ] {
+        let response = call_messages_body_with_monitor(
+            monitor.clone(),
+            json!({"model": model, "max_tokens": 64, "stream": true, "messages": messages}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = drain_stream(response).await;
+    }
+}
+
+/// The first request found nothing cached and the one that continued it read
+/// 990 of 1000 tokens from cache: every aggregate hit ratio uses the continued
+/// request alone, while the token totals keep both.
+fn assert_hit_ratio_skips_the_first_request(monitor: &MonitorHandle, model: &str) {
+    let state = monitor.snapshot();
+    let session = &state.sessions[0];
+    assert_eq!(session.request_count, 2);
+    assert_eq!(session.input_tokens, 1_010);
+    assert_eq!(session.cache_read_tokens, 990);
+    assert_eq!(
+        session.hit_basis,
+        HitBasis {
+            input_tokens: 10,
+            cache_read_tokens: 990,
+            cache_write_tokens: 0,
+        }
+    );
+    assert_eq!(session.cache_hit_ratio(), Some(0.99));
+    let row = state
+        .model_stats()
+        .into_iter()
+        .find(|row| row.model.as_deref() == Some(model))
+        .expect("a Stats row for the model that ran");
+    assert_eq!(row.input_tokens, 1_010);
+    assert_eq!(row.cache_hit_ratio(), Some(0.99));
+}
+
+/// The flag is read off the client's body before a provider is chosen, so a
+/// Codex request without history reaches the monitor flagged.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_request_without_history_stays_out_of_the_hit_ratio() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    clear_all_continuations_for_tests();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let calls = calls.clone();
+        move |_body: Value| {
+            let cached = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                0
+            } else {
+                990
+            };
+            codex_sse_with_cached(1_000, cached)
+        }
+    })
+    .await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    let monitor = MonitorHandle::new(10);
+    send_first_then_continued(&monitor, "gpt-5.6-sol").await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_hit_ratio_skips_the_first_request(&monitor, "gpt-5.6-sol");
+}
+
+/// The same on the Anthropic relay, whose bytes the flag leaves untouched.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_anthropic_request_without_history_stays_out_of_the_hit_ratio() {
+    let _guard = env_lock();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let calls = calls.clone();
+        move |_body: Value| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                anthropic_sse_with_read(1_000, 0)
+            } else {
+                anthropic_sse_with_read(10, 990)
+            }
+        }
+    })
+    .await;
+    let _base_url_env = EnvGuard::set("CCP_ANTHROPIC_BASE_URL", &upstream);
+
+    let monitor = MonitorHandle::new(10);
+    send_first_then_continued(&monitor, "claude-opus-5").await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_hit_ratio_skips_the_first_request(&monitor, "claude-opus-5");
 }
 
 /// An error event names the reason, and a broken body afterwards cannot rename
