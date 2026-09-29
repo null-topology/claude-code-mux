@@ -1,4 +1,4 @@
-## Unreleased
+## v0.14.1 (2026-09-30)
 
 - The monitor's aggregate cache hit % (the `Hit` column of sessions and
   conversations, the Stats tab and the session detail) now leaves out
