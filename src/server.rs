@@ -169,6 +169,16 @@ fn last_user_text(body: &crate::anthropic::schema::MessagesRequest) -> Option<&s
     }
 }
 
+/// Whether the request continues a conversation: its body holds at least one
+/// assistant turn. One that holds none opens its context (a new session or
+/// subagent, a one-shot side call, the first turn after a compaction), whatever
+/// provider serves it.
+fn carries_history(body: &crate::anthropic::schema::MessagesRequest) -> bool {
+    body.messages
+        .iter()
+        .any(|message| message.role == "assistant")
+}
+
 fn is_claude_auto_review_request(body: &crate::anthropic::schema::MessagesRequest) -> bool {
     if body.stream {
         return false;
@@ -1694,6 +1704,15 @@ async fn dispatch_request(
     if let (Some(monitor), Some(model)) = (state.monitor.as_ref(), body.model.as_deref()) {
         monitor.model_requested(&req_id, model);
     }
+    // What a request with no history found in cache says nothing about how
+    // well the conversation's cache holds, so the monitor leaves it out of the
+    // hit ratios. Read off the parsed body only; the relayed bytes are not
+    // touched.
+    if !carries_history(&body)
+        && let Some(monitor) = state.monitor.as_ref()
+    {
+        monitor.request_without_history(&req_id);
+    }
     if let Some(name) = project::name_from_request(
         body.extra.get("system"),
         body.messages.iter().rev().map(|message| &message.content),
@@ -2618,7 +2637,7 @@ mod request_id_header_tests {
 #[cfg(test)]
 mod auto_review_tests {
     use super::{
-        apply_auto_review_model, headers_to_record, is_claude_auto_review_request,
+        apply_auto_review_model, carries_history, headers_to_record, is_claude_auto_review_request,
         monitor_conversation_label, side_request_kind,
     };
     use crate::anthropic::schema::MessagesRequest;
@@ -2660,6 +2679,49 @@ mod auto_review_tests {
 
     fn body(value: serde_json::Value) -> MessagesRequest {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_body_without_an_assistant_turn_carries_no_history() {
+        // A first turn as a string or as blocks, an empty message list and a
+        // title request: none of them has an assistant message.
+        let first = body(json!({"model": "m", "messages": [
+            {"role": "user", "content": "hello"}
+        ]}));
+        let blocks = body(json!({"model": "m", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+        ]}));
+        let empty = body(json!({"model": "m", "messages": []}));
+        assert!(!carries_history(&first));
+        assert!(!carries_history(&blocks));
+        assert!(!carries_history(&empty));
+        assert!(!carries_history(&body(title_body())));
+    }
+
+    #[test]
+    fn a_body_with_an_assistant_turn_carries_history() {
+        let string_reply = body(json!({"model": "m", "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "go on"}
+        ]}));
+        let block_reply = body(json!({"model": "m", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "list files"}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+            ]}
+        ]}));
+        // A prefilled reply is a turn the conversation already holds too.
+        let prefill = body(json!({"model": "m", "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": [{"type": "text", "text": "{"}]}
+        ]}));
+        assert!(carries_history(&string_reply));
+        assert!(carries_history(&block_reply));
+        assert!(carries_history(&prefill));
     }
 
     fn title_body() -> serde_json::Value {

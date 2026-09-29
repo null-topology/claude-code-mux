@@ -1,3 +1,19 @@
+## Unreleased
+
+- The monitor's aggregate cache hit % (the `Hit` column of sessions and
+  conversations, the Stats tab and the session detail) now leaves out
+  requests that carry no history: a request whose body holds no assistant
+  turn, such as the first request of a session or a subagent, a one-shot side
+  request or the first turn after a compaction. Until now a cold first request
+  lowered the ratio for the rest of the session: with two prompts of the same
+  size, a cold first request followed by one that read 99% from cache showed
+  49.5%, and now shows 99%. A session resumed later
+  with a cold cache still carries its history, so that cold request still
+  counts against the ratio. The tokens of the requests left out stay in every
+  other total, the `Hit` cell of a single request still shows its own ratio,
+  and a row made only of such requests shows `n/a`. There is no setting to
+  get the old ratio back.
+
 ## v0.14.0 (2026-09-28)
 
 - Codex errors that carry a known error code now reach Claude Code with a
