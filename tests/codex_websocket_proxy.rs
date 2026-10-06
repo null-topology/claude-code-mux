@@ -1,10 +1,11 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use claude_code_mux::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_mux::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
 use claude_code_mux::{registry::Registry, server::app};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -117,6 +118,19 @@ async fn call_messages(session_id: &str) -> (StatusCode, String) {
 }
 
 async fn call_messages_with_stream(session_id: &str, stream: bool) -> (StatusCode, String) {
+    call_messages_with_history(
+        session_id,
+        stream,
+        json!([{"role": "user", "content": "hello"}]),
+    )
+    .await
+}
+
+async fn call_messages_with_history(
+    session_id: &str,
+    stream: bool,
+    messages: Value,
+) -> (StatusCode, String) {
     let response = app(Arc::new(Registry::with_default_alias()))
         .oneshot(
             Request::builder()
@@ -129,7 +143,7 @@ async fn call_messages_with_stream(session_id: &str, stream: bool) -> (StatusCod
                         "model": "gpt-5.6-sol",
                         "max_tokens": 64,
                         "stream": stream,
-                        "messages": [{"role": "user", "content": "hello"}]
+                        "messages": messages
                     })
                     .to_string(),
                 ))
@@ -339,6 +353,208 @@ async fn spawn_closing_websocket_origin() -> (String, Arc<Mutex<Vec<String>>>) {
         }
     });
     (format!("http://{addr}/responses"), seen)
+}
+
+type SeenRequests = Arc<Mutex<Vec<(&'static str, Value)>>>;
+
+/// A Codex origin that serves both transports and records each request as its
+/// transport and JSON body. The Nth `response.create` on any WebSocket is
+/// answered as `resp_ws_N` with the text `websocket reply N`; an HTTP POST
+/// gets `HTTP_FALLBACK_SSE`.
+async fn spawn_dual_transport_origin() -> (String, SeenRequests) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen: SeenRequests = Arc::new(Mutex::new(Vec::new()));
+    let task_seen = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let seen = task_seen.clone();
+            tokio::spawn(async move {
+                let mut first = [0_u8; 1];
+                if stream.peek(&mut first).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                if first[0] != b'G' {
+                    let request = read_http_head(&mut stream).await;
+                    let (head, partial) = request.split_once("\r\n\r\n").unwrap();
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    let mut body = partial.as_bytes().to_vec();
+                    let mut buffer = [0_u8; 8192];
+                    while body.len() < length {
+                        let read = stream.read(&mut buffer).await.unwrap();
+                        if read == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&buffer[..read]);
+                    }
+                    let body = serde_json::from_slice(&body).unwrap();
+                    seen.lock().unwrap().push(("http", body));
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{HTTP_FALLBACK_SSE}",
+                        HTTP_FALLBACK_SSE.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    return;
+                }
+                let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(message)) = websocket.next().await {
+                    let text = match message {
+                        Message::Text(text) => text,
+                        Message::Ping(data) => {
+                            let _ = websocket.send(Message::Pong(data)).await;
+                            continue;
+                        }
+                        Message::Close(_) => break,
+                        _ => continue,
+                    };
+                    let number = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(("websocket", serde_json::from_str(&text).unwrap()));
+                        seen.iter()
+                            .filter(|(transport, _)| *transport == "websocket")
+                            .count()
+                    };
+                    for event in [
+                        json!({
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": {"type": "message", "id": format!("msg_ws_{number}")}
+                        }),
+                        json!({
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "delta": format!("websocket reply {number}")
+                        }),
+                        json!({
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": {"type": "message"}
+                        }),
+                        json!({
+                            "type": "response.completed",
+                            "response": {
+                                "id": format!("resp_ws_{number}"),
+                                "usage": {"input_tokens": 5, "output_tokens": 2}
+                            }
+                        }),
+                    ] {
+                        if websocket
+                            .send(Message::Text(event.to_string()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{addr}/responses"), seen)
+}
+
+#[tokio::test]
+async fn codex_compaction_summary_goes_over_http_and_the_next_request_stays_on_websocket() {
+    let _env = ENV_LOCK.lock().await;
+    let config_dir = TempDir::new().unwrap();
+    write_codex_auth(config_dir.path());
+    let summary_prompt = concat!(
+        "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n",
+        "Your task is to create a detailed summary of the conversation so far."
+    );
+
+    for transport in [None, Some("websocket")] {
+        for stream in [false, true] {
+            let label = format!("transport {transport:?}, stream {stream}");
+            clear_codex_websocket_pool_for_tests();
+            clear_all_continuations_for_tests();
+            let (origin_url, seen) = spawn_dual_transport_origin().await;
+            let mut guards = clear_proxy_environment();
+            guards.extend(configure_codex(config_dir.path(), &origin_url));
+            guards.push(match transport {
+                Some(transport) => EnvGuard::set("CCP_CODEX_TRANSPORT", transport),
+                None => EnvGuard::unset("CCP_CODEX_TRANSPORT"),
+            });
+            guards.push(EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1"));
+
+            let turns = [
+                (
+                    json!([{"role": "user", "content": "one"}]),
+                    "websocket reply 1",
+                ),
+                (
+                    // Claude Code can send context after its summary prompt.
+                    json!([
+                        {"role": "user", "content": "one"},
+                        {"role": "assistant", "content": "websocket reply 1"},
+                        {"role": "user", "content": summary_prompt},
+                        {"role": "user", "content": "<system-reminder>Context.</system-reminder>"}
+                    ]),
+                    "transport fallback ok",
+                ),
+                (
+                    json!([
+                        {"role": "user", "content": "one"},
+                        {"role": "assistant", "content": "websocket reply 1"},
+                        {"role": "user", "content": "two"}
+                    ]),
+                    "websocket reply 2",
+                ),
+                (
+                    json!([
+                        {"role": "user", "content": "one"},
+                        {"role": "assistant", "content": "websocket reply 1"},
+                        {"role": "user", "content": "two"},
+                        {"role": "assistant", "content": "websocket reply 2"},
+                        {"role": "user", "content": "three"}
+                    ]),
+                    "websocket reply 3",
+                ),
+            ];
+            for (messages, reply) in turns {
+                let (status, body) =
+                    call_messages_with_history("compaction-transport", stream, messages).await;
+                assert_eq!(status, StatusCode::OK, "{label}: {body}");
+                assert!(body.contains(reply), "{label}: {body}");
+            }
+            drop(guards);
+
+            let seen = seen.lock().unwrap();
+            let transports: Vec<_> = seen.iter().map(|(transport, _)| *transport).collect();
+            assert_eq!(
+                transports,
+                ["websocket", "http", "websocket", "websocket"],
+                "{label}"
+            );
+            // The summary goes out whole, with no continuation.
+            assert!(seen[1].1["previous_response_id"].is_null(), "{label}");
+            // It leaves no continuation behind, so the next request sends the
+            // full context, and the one after continues from that request.
+            assert!(seen[2].1["previous_response_id"].is_null(), "{label}");
+            let full = seen[2].1["input"].to_string();
+            assert!(full.contains("websocket reply 1"), "{label}: {full}");
+            assert_eq!(seen[3].1["previous_response_id"], "resp_ws_2", "{label}");
+            let delta = seen[3].1["input"].to_string();
+            assert!(
+                delta.contains("three") && !delta.contains("websocket reply"),
+                "{label}: {delta}"
+            );
+        }
+    }
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
 }
 
 #[tokio::test]

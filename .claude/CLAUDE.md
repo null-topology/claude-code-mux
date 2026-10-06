@@ -199,7 +199,8 @@ Request path:
      `websocket.rs`, falling back to HTTP only when the handshake failed
      before anything was sent (`should_fallback_to_http` in `client.rs`). A
      request already sent over the WebSocket is never replayed over HTTP, and
-     `websocket` never falls back.
+     `websocket` never falls back. Claude Code's compaction summary goes over
+     HTTP whatever the setting (`transport_for_request` in `mod.rs`).
      `continuation.rs` keeps `previous_response_id` state keyed by
      `ConversationIdentity` (session plus agent headers) so subagents do not
      clobber each other; `compaction.rs` does server-side compaction;
@@ -947,6 +948,14 @@ currently serves, including `visibility` and `use_responses_lite` per model.
   requests no reasoning summary and no `reasoning.encrypted_content`
   (`reasoning_requested`). That last rule applies to every request, not only
   compaction.
+- A request is Claude Code's compaction summary when its system prompt holds
+  the summarizer marker or a user message among the newest eight holds both
+  prompt markers (`is_compact_messages_request`, `COMPACT_DETECTION_TAIL_MESSAGES`
+  in `translate/request.rs`); Claude Code can send context after the prompt,
+  and a prompt further back is history. The effort cap, the opt-in server
+  compaction and the HTTP routing all read this one detector. Over HTTP the
+  summary is sent whole and has no socket, so it leaves no
+  `previous_response_id` state and the next request sends its full context.
 
 ## Known limitation
 

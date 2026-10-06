@@ -12,6 +12,22 @@
   unchanged. `CCP_CODEX_TRANSPORT=websocket` (or `"transport": "websocket"`
   under `codex` in `config.json`) brings back the WebSocket-only behaviour,
   in which a refused handshake reaches Claude Code as an error.
+- Claude Code's compaction summary request now always goes to Codex over
+  HTTP, whatever `CCP_CODEX_TRANSPORT` says, adapted from
+  raine/claude-code-proxy#168. The summary request is large, and over a
+  WebSocket its connection can close before the answer is complete. Every
+  other request keeps the configured transport, so the requests after a
+  compaction go back to the WebSocket. The summary request is now also
+  recognised when Claude Code sends more context after the summary prompt:
+  the prompt counts when a user message among the last eight messages holds
+  it, not only the last one. Such a request now gets the compaction effort
+  cap (`CCP_COMPACT_EFFORT`) as well, and server compaction when
+  `CCP_CODEX_SERVER_COMPACTION` is on. Over HTTP the summary is sent whole and
+  leaves no `previous_response_id` state, so with
+  `CCP_CODEX_PREVIOUS_RESPONSE_ID` on the request after it sends its full
+  context. The `transport` field of the summary's Codex request events in
+  `proxy.log` says `http`. There is no setting to send the summary over the
+  WebSocket again.
 
 ## v0.14.1 (2026-09-30)
 

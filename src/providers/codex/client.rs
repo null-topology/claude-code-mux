@@ -1637,7 +1637,7 @@ impl CodexHttpClient {
         rx
     }
 
-    async fn post_codex_with_transport(
+    pub(crate) async fn post_codex_with_transport(
         &self,
         body: &ResponsesRequest,
         ctx: &RequestContext,
