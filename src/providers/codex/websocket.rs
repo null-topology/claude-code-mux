@@ -1269,6 +1269,9 @@ fn write_websocket_response_capture(
 // ---------------------------------------------------------------------------
 
 const MAX_HANDSHAKE_ERROR_DETAIL_BYTES: usize = 1024;
+/// How much of a rejection body is kept to read its class and a spent window
+/// from; the detail keeps at most `MAX_HANDSHAKE_ERROR_DETAIL_BYTES` of it.
+const MAX_HANDSHAKE_ERROR_BODY_BYTES: usize = 64 * 1024;
 const GENERIC_HANDSHAKE_ERROR_DETAIL: &str = "WebSocket upgrade was rejected";
 
 fn handshake_error_detail(body: Option<&[u8]>) -> String {
@@ -1444,12 +1447,12 @@ fn validate_websocket_upgrade(
 
 async fn bounded_handshake_error_body(mut response: reqwest::Response) -> Vec<u8> {
     let mut body = Vec::new();
-    while body.len() < MAX_HANDSHAKE_ERROR_DETAIL_BYTES {
+    while body.len() < MAX_HANDSHAKE_ERROR_BODY_BYTES {
         let chunk = match response.chunk().await {
             Ok(Some(chunk)) => chunk,
             Ok(None) | Err(_) => break,
         };
-        let remaining = MAX_HANDSHAKE_ERROR_DETAIL_BYTES - body.len();
+        let remaining = MAX_HANDSHAKE_ERROR_BODY_BYTES - body.len();
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
     body
@@ -1648,7 +1651,7 @@ fn parse_connect_response_head(response: &[u8]) -> Result<(u16, Option<String>),
             }
             std::str::from_utf8(&value[1..])
                 .ok()
-                .map(|value| value.trim().to_string())
+                .map(|value| super::events::normalize_retry_after(value.trim()))
         });
     Ok((status, retry_after))
 }
@@ -1801,7 +1804,7 @@ fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> 
             .body()
             .as_deref()
             .filter(|_| response.status() != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-            .map(|body| &body[..body.len().min(MAX_HANDSHAKE_ERROR_DETAIL_BYTES)]);
+            .map(|body| &body[..body.len().min(MAX_HANDSHAKE_ERROR_BODY_BYTES)]);
         return handshake_rejection_error(response.status().as_u16(), response.headers(), body);
     }
     CodexError {
@@ -3952,12 +3955,13 @@ mod tests {
         assert_eq!(err.origin, CodexErrorOrigin::WebSocketHandshake);
     }
 
-    fn raw_rejection(status_line: &str, retry_after: Option<&str>, body: &str) -> Vec<u8> {
-        let retry_after = retry_after
-            .map(|value| format!("Retry-After: {value}\r\n"))
-            .unwrap_or_default();
+    fn raw_rejection(status_line: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
+        let headers: String = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
         format!(
-            "HTTP/1.1 {status_line}\r\n{retry_after}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
         .into_bytes()
@@ -4080,7 +4084,8 @@ mod tests {
             ),
         ];
         for (status_line, retry_after, body, status, expected, headers) in cases {
-            let raw = raw_rejection(status_line, retry_after, body);
+            let sent = retry_after.map(|value| ("Retry-After", value));
+            let raw = raw_rejection(status_line, sent.as_slice(), body);
             let direct = direct_handshake_rejection(raw.clone()).await;
             let tunneled = tunneled_handshake_rejection(raw).await;
             for err in [direct, tunneled] {
@@ -4100,6 +4105,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_long_rejection_body_still_reports_a_spent_window() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let message = format!("The usage limit has been reached. {}", "x".repeat(2048));
+        let body = serde_json::json!({"error": {
+            "type": "usage_limit_reached",
+            "message": message,
+            "resets_in_seconds": 3600
+        }})
+        .to_string();
+        assert!(body.len() > 2 * MAX_HANDSHAKE_ERROR_DETAIL_BYTES);
+        let raw = raw_rejection("429 Too Many Requests", &[("Retry-After", "3600")], &body);
+        let direct = direct_handshake_rejection(raw.clone()).await;
+        let tunneled = tunneled_handshake_rejection(raw).await;
+        for err in [direct, tunneled] {
+            assert!(err.usage_limit.is_some(), "{:?}", err.origin);
+            assert!(err.detail.as_ref().unwrap().len() <= MAX_HANDSHAKE_ERROR_DETAIL_BYTES);
+            let response = super::super::map_codex_error_to_response(&err);
+            assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()["x-should-retry"], "false");
+            assert_eq!(
+                response.headers()["anthropic-ratelimit-unified-status"],
+                "rejected"
+            );
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_upgrade_takes_the_spent_window_from_codex_headers() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let raw = raw_rejection(
+            "429 Too Many Requests",
+            &[
+                ("Retry-After", "9568"),
+                ("X-Codex-Primary-Window-Minutes", "300"),
+                ("X-Codex-Primary-Reset-After-Seconds", "9569"),
+                ("X-Codex-Primary-Reset-At", "1788879438"),
+                ("X-Codex-Secondary-Window-Minutes", "10080"),
+                ("X-Codex-Secondary-Reset-After-Seconds", "596369"),
+                ("X-Codex-Secondary-Reset-At", "1789466238"),
+            ],
+            r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":9568}}"#,
+        );
+        let direct = direct_handshake_rejection(raw.clone()).await;
+        let tunneled = tunneled_handshake_rejection(raw).await;
+        for err in [direct, tunneled] {
+            let response = super::super::map_codex_error_to_response(&err);
+            assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                response.headers()["anthropic-ratelimit-unified-reset"],
+                "1788879438"
+            );
+            assert_eq!(
+                response.headers()["anthropic-ratelimit-unified-representative-claim"],
+                "five_hour"
+            );
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+        }
+    }
+
+    #[test]
+    fn a_refused_connect_tunnel_normalizes_its_retry_after() {
+        let head = b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0.5\r\n\r\n";
+        let (status, retry_after) = parse_connect_response_head(head).unwrap();
+        assert_eq!(status, 503);
+        assert_eq!(retry_after.as_deref(), Some("1"));
+        let date = "Wed, 21 Oct 2026 07:28:00 GMT";
+        let head = format!("HTTP/1.1 502 Bad Gateway\r\nretry-after: {date}\r\n\r\n");
+        let (_, retry_after) = parse_connect_response_head(head.as_bytes()).unwrap();
+        assert_eq!(retry_after.as_deref(), Some(date));
     }
 
     #[tokio::test]

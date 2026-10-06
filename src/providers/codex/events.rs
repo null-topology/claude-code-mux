@@ -291,7 +291,10 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
                 scalar_string(value.pointer("/headers/retry-after"))
                     .or_else(|| scalar_string(value.pointer("/headers/Retry-After")))
             })
-        });
+        })
+        // Normalised once here, so a failure without a class passes whole
+        // seconds as well; normalising a whole number again keeps it.
+        .map(|value| normalize_retry_after(&value));
 
     Some(CodexEventFailure {
         kind,
@@ -954,6 +957,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(envelope.retry_after.as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn a_failure_without_a_class_passes_whole_seconds() {
+        let overloaded = classify_event_failure(&serde_json::json!({
+            "type": "response.failed",
+            "response": {"error": {"type": "overloaded_error", "message": "busy", "retry_after": 0.1}}
+        }))
+        .unwrap();
+        assert_eq!(overloaded.class, None);
+        assert_eq!(overloaded.retry_after.as_deref(), Some("1"));
+
+        let date = "Wed, 21 Oct 2026 07:28:00 GMT";
+        let dated = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "error": {"message": "rate limit", "headers": {"retry-after": date}}
+        }))
+        .unwrap();
+        assert_eq!(dated.class, None);
+        assert_eq!(dated.retry_after.as_deref(), Some(date));
     }
 
     #[test]
