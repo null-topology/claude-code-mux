@@ -551,6 +551,44 @@ mod tests {
     }
 
     #[test]
+    fn stream_incomplete_mid_item_closes_the_block_and_keeps_the_stop_reason() {
+        for (reason, expected) in [
+            ("content_filter", "refusal"),
+            ("max_output_tokens", "max_tokens"),
+        ] {
+            let upstream = format!(
+                "{}{}{}",
+                sse_event(
+                    "response.output_item.added",
+                    serde_json::json!({"output_index":0,"item":{"type":"message","id":"msg_up"}})
+                ),
+                sse_event(
+                    "response.output_text.delta",
+                    serde_json::json!({"output_index":0,"delta":"partial"})
+                ),
+                sse_event(
+                    "response.incomplete",
+                    serde_json::json!({
+                        "response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":reason},"usage":{}}
+                    })
+                ),
+            );
+            let out = String::from_utf8(
+                translate_stream_bytes(upstream.as_bytes(), "msg_1", "gpt-5.5")
+                    .unwrap_or_else(|err| panic!("{reason}: {err:#}")),
+            )
+            .unwrap();
+            assert!(out.contains("partial"), "{reason}: {out}");
+            assert!(out.contains("content_block_stop"), "{reason}: {out}");
+            assert!(
+                out.contains(&format!(r#""stop_reason":"{expected}""#)),
+                "{reason}: {out}"
+            );
+            assert!(out.contains("message_stop"), "{reason}: {out}");
+        }
+    }
+
+    #[test]
     fn stream_translates_web_search_response() {
         let upstream = format!(
             "{}{}{}{}{}{}{}{}",

@@ -809,7 +809,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     }
 
     let open_blocks = describe_open_blocks(&blocks_by_output_index);
-    if !_saw_terminal || !open_blocks.is_empty() {
+    if !_saw_terminal || (!open_blocks.is_empty() && incomplete.is_none()) {
         let diagnostics = UpstreamStreamDiagnostics {
             event_count,
             last_event_type,
@@ -834,6 +834,17 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         &mut reasoning_by_output_index,
         &mut output_items_by_index,
     );
+
+    // An incomplete response can stop in the middle of an output item. Its
+    // open blocks are closed as they stand, as the live stream closes them.
+    let mut still_open: Vec<_> = blocks_by_output_index.into_iter().collect();
+    still_open.sort_by_key(|(output_index, _)| *output_index);
+    for (_, state) in still_open {
+        match state {
+            BlockState::Text { index, .. } => out.push(ReducerEvent::TextStop { index }),
+            BlockState::Tool { index, .. } => out.push(ReducerEvent::ToolStop { index }),
+        }
+    }
 
     let stop_reason: StopReason = if let Some(stop_reason) = incomplete {
         stop_reason
@@ -928,9 +939,10 @@ fn response_is_incomplete(payload: &serde_json::Value, event_type: &str) -> bool
             .is_some()
 }
 
-/// The stop reason of a response that ended incomplete. A content filter
-/// stopped the answer, which the Codex CLI treats apart from running out of
-/// output, so it is a refusal; any other reason, or none, is the output cap.
+/// Maps an incomplete response to an Anthropic stop reason. A content-filtered
+/// response maps to `refusal`; any other reason, or a missing reason, maps to
+/// `max_tokens`. The Codex CLI also treats a content filter apart from the
+/// output cap (`codex-rs/codex-api/src/sse/responses.rs` at rust-v0.160.1).
 pub(crate) fn incomplete_stop_reason(payload: &serde_json::Value) -> StopReason {
     match payload
         .get("response")
