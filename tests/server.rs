@@ -2578,6 +2578,19 @@ async fn an_upstream_request_id_is_kept_on_the_anthropic_route() {
     });
     tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
 
+    let response = post_json(
+        anthropic_app(address),
+        "/v1/messages",
+        messages_body("claude-opus-5"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(request_id(&response), "req_upstream");
+}
+
+/// An app whose only provider is the Anthropic passthrough, sending to
+/// `address`.
+fn anthropic_app(address: std::net::SocketAddr) -> axum::Router {
     // The provider reads its base URL once, when it is built.
     let previous = std::env::var_os("CCP_ANTHROPIC_BASE_URL");
     unsafe {
@@ -2591,12 +2604,138 @@ async fn an_upstream_request_id_is_kept_on_the_anthropic_route() {
             None => std::env::remove_var("CCP_ANTHROPIC_BASE_URL"),
         }
     }
-    let app = app(Arc::new(Registry::from_providers(
+    app(Arc::new(Registry::from_providers(
         AliasProvider::Anthropic,
+        [provider],
+    )))
+}
+
+/// The start of the message a refused thread continuation carries. Claude Code
+/// matches the token up to a character outside `[A-Za-z0-9_:.-]`, hence the
+/// trailing space.
+const THREAD_REJECTED: &str = "capability_rejected: beta_header:message-threads-2026-08-12 ";
+
+/// A message threads request whose new messages answer a tool call made
+/// earlier in the thread.
+fn thread_body(model: &str, thread_type: &str) -> Body {
+    Body::from(
+        json!({
+            "model": model,
+            "max_tokens": 16,
+            "thread": {"type": thread_type, "previous_message_id": "msg_01"},
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_01", "content": "done"}
+            ]}]
+        })
+        .to_string(),
+    )
+}
+
+/// A continuation holds only what came after the message it names. A
+/// translator would take it for the whole conversation, so the request is
+/// refused before it reaches the provider, in the shape that makes the client
+/// drop threading and resend the full history.
+#[tokio::test]
+async fn a_thread_continuation_is_refused_on_a_translated_route() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(IdentityCaptureProvider {
+        captured: captured.clone(),
+        bodies: Default::default(),
+    }) as Arc<dyn Provider>;
+    let monitor = MonitorHandle::new(10);
+    let app = app_with_monitor(
+        Arc::new(Registry::from_providers(AliasProvider::Codex, [provider])),
+        Some(monitor.clone()),
+    );
+
+    let response = post_json(app, "/v1/messages", thread_body("gpt-5.5", "continue")).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!request_id(&response).is_empty());
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with(THREAD_REJECTED), "{message}");
+    assert!(captured.lock().unwrap().is_empty());
+
+    let state = monitor.snapshot();
+    assert!(state.active.is_empty());
+    assert_eq!(state.recent[0].status, RequestStatus::Failed);
+    assert_eq!(state.recent[0].http_status, Some(400));
+    assert_eq!(state.recent[0].error.as_deref(), Some(message));
+}
+
+/// The guard keys on the route, not on Codex: every translator would lose the
+/// earlier messages alike. A request that reached these providers would get
+/// their 501.
+#[tokio::test]
+async fn a_thread_continuation_is_refused_on_every_translated_provider() {
+    for model in ["kimi-k2.6", "grok-4.5"] {
+        let response = post_json(
+            app(routed_registry()),
+            "/v1/messages",
+            thread_body(model, "continue"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{model}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with(THREAD_REJECTED), "{model}: {message}");
+    }
+}
+
+/// The first request of a thread carries the whole conversation, so a
+/// translator can serve it as it is.
+#[tokio::test]
+async fn a_thread_creation_is_forwarded_on_a_translated_route() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(IdentityCaptureProvider {
+        captured: captured.clone(),
+        bodies: Default::default(),
+    }) as Arc<dyn Provider>;
+    let app = app(Arc::new(Registry::from_providers(
+        AliasProvider::Codex,
         [provider],
     )));
 
-    let response = post_json(app, "/v1/messages", messages_body("claude-opus-5")).await;
+    let response = post_json(app, "/v1/messages", thread_body("gpt-5.5", "create")).await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(request_id(&response), "req_upstream");
+    assert_eq!(captured.lock().unwrap().len(), 1);
+}
+
+/// Anthropic holds the thread, so a continuation goes there as the client
+/// sent it, byte for byte.
+#[tokio::test]
+async fn a_thread_continuation_is_relayed_untouched_on_the_anthropic_route() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen: Arc<Mutex<Option<axum::body::Bytes>>> = Default::default();
+    let upstream = axum::Router::new().fallback({
+        let seen = seen.clone();
+        move |body: axum::body::Bytes| {
+            let seen = seen.clone();
+            async move {
+                *seen.lock().unwrap() = Some(body);
+                (
+                    [("content-type", "application/json")],
+                    r#"{"type":"message","content":[]}"#,
+                )
+            }
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+    // Spacing and key order no serializer would produce, so a rewrite shows.
+    let sent = r#"{ "thread" : {"type":"continue","previous_message_id":"msg_01"},
+  "model":"claude-opus-5", "max_tokens":16,
+  "messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"done"}]}] }"#;
+    let response = post_json(anthropic_app(address), "/v1/messages", Body::from(sent)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(seen.lock().unwrap().as_deref(), Some(sent.as_bytes()));
 }

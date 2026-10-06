@@ -151,7 +151,14 @@ Request path:
    pick a provider via the registry, apply the auto-review override (Claude
    Code's non-streaming, tool-free security classifier is rerouted to
    `CCP_AUTO_REVIEW_MODEL`, default `gpt-6-luna` on codex), then call the
-   provider and record log, monitor and traffic capture. Every response it
+   provider and record log, monitor and traffic capture. A `/v1/messages`
+   body with `thread.type == "continue"` (message threads beta) whose final
+   provider is not anthropic is refused before the provider runs with a 400
+   whose message starts `capability_rejected:
+   beta_header:message-threads-2026-08-12`, on which Claude Code drops
+   threading for the session and resends the full history; translators would
+   read the partial body as the whole conversation. `create`, `count_tokens`
+   and the Anthropic route pass untouched. Every response `dispatch_request`
    returns, early rejections and the local agent-summary answer (with
    `CCP_AGENT_SUMMARY=local`) included,
    carries a `request-id` header with the proxy's `req_id` unless the upstream
