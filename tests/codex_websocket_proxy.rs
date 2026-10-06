@@ -558,6 +558,66 @@ async fn codex_compaction_summary_goes_over_http_and_the_next_request_stays_on_w
 }
 
 #[tokio::test]
+async fn codex_server_compaction_call_goes_over_http_without_the_summary_prompt() {
+    let _env = ENV_LOCK.lock().await;
+    let config_dir = TempDir::new().unwrap();
+    write_codex_auth(config_dir.path());
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+    let (origin_url, seen) = spawn_dual_transport_origin().await;
+    let mut guards = clear_proxy_environment();
+    // `configure_codex` pins the transport to `websocket`.
+    guards.extend(configure_codex(config_dir.path(), &origin_url));
+    guards.push(EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1"));
+    let reminder = "<system-reminder>Context.</system-reminder>";
+
+    let (status, body) = call_messages_with_history(
+        "server-compaction-transport",
+        false,
+        json!([
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "earlier reply"},
+            {"role": "user", "content": concat!(
+                "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n",
+                "Your task is to create a detailed summary of the conversation so far."
+            )},
+            {"role": "user", "content": reminder}
+        ]),
+    )
+    .await;
+    drop(guards);
+    // The origin answers the compaction call with an ordinary message, so the
+    // compaction fails and the summary request is sent on its own as before.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("transport fallback ok"), "{body}");
+
+    let seen = seen.lock().unwrap();
+    let transports: Vec<_> = seen.iter().map(|(transport, _)| *transport).collect();
+    assert_eq!(transports, ["http", "http"]);
+    let compaction = &seen[0].1;
+    let compaction_input = compaction["input"].as_array().unwrap();
+    assert_eq!(
+        compaction_input.last().unwrap()["type"],
+        "compaction_trigger"
+    );
+    let compaction_text = compaction.to_string();
+    assert!(
+        !compaction_text.contains("Your task is to create a detailed summary"),
+        "{compaction_text}"
+    );
+    assert!(compaction_text.contains(reminder), "{compaction_text}");
+    assert!(
+        seen[1]
+            .1
+            .to_string()
+            .contains("Your task is to create a detailed summary")
+    );
+    drop(seen);
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+}
+
+#[tokio::test]
 async fn codex_default_transport_falls_back_to_http_only_before_sending() {
     let _env = ENV_LOCK.lock().await;
     let _retry_delay = ZeroRetryDelayGuard::new();

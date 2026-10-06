@@ -1175,16 +1175,6 @@ impl CodexHttpClient {
         .map(OwnerAwareCodexResponse::into_response)
     }
 
-    pub(crate) async fn post_codex_for_owner(
-        &self,
-        body: &ResponsesRequest,
-        ctx: &RequestContext,
-        continuation: Option<&super::continuation::ContinuationReservation>,
-    ) -> Result<OwnerAwareCodexResponse, CodexError> {
-        self.post_codex_with_transport(body, ctx, continuation, crate::config::codex_transport())
-            .await
-    }
-
     pub async fn post_search(
         &self,
         body: &SearchRequest,

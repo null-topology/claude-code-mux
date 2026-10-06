@@ -58,7 +58,8 @@ use self::translate::reducer::{
     finish_metadata_from_upstream, reported_usage_report_from_upstream,
 };
 use self::translate::request::{
-    TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
+    TranslateOptions, compact_prompt_message_index, has_hosted_web_search,
+    is_compact_messages_request, translate_request,
 };
 
 const LIVE_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -257,7 +258,16 @@ impl CodexProvider {
             }
             let mut compaction_ctx = ctx.clone();
             compaction_ctx.monitor = None;
-            match request_compaction(self.client.as_ref(), &translated, &compaction_ctx).await {
+            let messages_after_prompt = compact_prompt_message_index(&body)
+                .map_or(0, |index| body.messages.len() - index - 1);
+            match request_compaction(
+                self.client.as_ref(),
+                &translated,
+                &compaction_ctx,
+                messages_after_prompt,
+            )
+            .await
+            {
                 Ok(native_history) => {
                     if store_compaction(session_id, attempt, native_history) {
                         log_compaction_event(
