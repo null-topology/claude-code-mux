@@ -152,13 +152,17 @@ Request path:
    Code's non-streaming, tool-free security classifier is rerouted to
    `CCP_AUTO_REVIEW_MODEL`, default `gpt-6-luna` on codex), then call the
    provider and record log, monitor and traffic capture. A `/v1/messages`
-   body with `thread.type == "continue"` (message threads beta) whose final
-   provider is not anthropic is refused before the provider runs with a 400
-   whose message starts `capability_rejected:
-   beta_header:message-threads-2026-08-12`, on which Claude Code drops
-   threading for the session and resends the full history; translators would
-   read the partial body as the whole conversation. `create`, `count_tokens`
-   and the Anthropic route pass untouched. Every response `dispatch_request`
+   body with a `thread` object whose `type` is a string (message threads
+   beta, `create` or `continue`) and whose final provider is not anthropic is
+   refused before the provider runs with a 400 whose message starts
+   `capability_rejected: beta_header:message-threads-2026-08-12`, on which
+   Claude Code drops threading for the session and resends the full history:
+   a `continue` holds only the newest messages, and a `create` served off
+   Anthropic would anchor the thread on an id Anthropic never issued. The
+   refusal calls `provider_selected` for the monitor and records no session
+   state. A threaded request whose model routes to anthropic is never
+   rerouted (`apply_auto_review_model` and the `upstream` label route skip
+   it) and is relayed untouched. Every response `dispatch_request`
    returns, early rejections and the local agent-summary answer (with
    `CCP_AGENT_SUMMARY=local`) included,
    carries a `request-id` header with the proxy's `req_id` unless the upstream
