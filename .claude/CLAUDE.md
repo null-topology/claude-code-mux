@@ -194,8 +194,12 @@ Request path:
      the `Passthrough` bytes verbatim; the only rewrite is turning a
      signature-less `thinking` block into tagged text. Holds no credentials.
    - `codex/`: by far the largest. Maps Anthropic Messages onto the OpenAI
-     Responses API. Transport defaults to WebSocket (`CCP_CODEX_TRANSPORT` =
-     `http|websocket|auto`) with a per-conversation pool in `websocket.rs`.
+     Responses API. Transport (`CCP_CODEX_TRANSPORT` = `auto|websocket|http`)
+     defaults to `auto`: a WebSocket from a per-conversation pool in
+     `websocket.rs`, falling back to HTTP only when the handshake failed
+     before anything was sent (`should_fallback_to_http` in `client.rs`). A
+     request already sent over the WebSocket is never replayed over HTTP, and
+     `websocket` never falls back.
      `continuation.rs` keeps `previous_response_id` state keyed by
      `ConversationIdentity` (session plus agent headers) so subagents do not
      clobber each other; `compaction.rs` does server-side compaction;
@@ -710,7 +714,7 @@ that class and does not send the normal request; any other compaction failure
 falls back to it. The WebSocket handshake reads the rejection body on both
 the direct upgrade and the HTTP CONNECT tunnel (on the tunnel only the bytes
 that arrived with the response head), never for a 407. Under `auto` transport
-a handshake failure, classified or not, falls back to HTTP unless the
+(the default) a handshake failure, classified or not, falls back to HTTP unless the
 WebSocket proxy refused it (`should_fallback_to_http` in `client.rs`), and
 that HTTP answer is classified on its own. The codes and their shapes follow
 the Codex CLI's own error handling; no test here runs them against the
@@ -724,8 +728,10 @@ appearing, compare against a fresh traffic capture before anything else.
 The proxy does not retry a failed Codex request: one attempt, then the error
 goes to the client, which owns the retry policy. The only resends left repair
 the proxy's own state (a forgotten `previous_response_id`, a 401 token refresh).
-A 429 on the WebSocket handshake reaches the client as a plain 429 unless its
-body names one of the codes above.
+The `auto` fallback to HTTP is not a resend: it happens only when the
+handshake failed, before the request went out. With `websocket` transport a
+429 on the WebSocket handshake reaches the client as a plain 429 unless its
+body names one of the codes above; under `auto` it falls back to HTTP.
 
 ## Naming and distribution
 

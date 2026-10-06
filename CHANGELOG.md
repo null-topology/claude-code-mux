@@ -1,3 +1,18 @@
+## Unreleased
+
+- The Codex transport now defaults to `auto` instead of `websocket`, adapted
+  from raine/claude-code-proxy#173. Requests still go over a WebSocket first.
+  When the WebSocket cannot be set up before the request is sent, for example
+  because the handshake is refused or answered with a 429, the request goes
+  over HTTP instead of failing. A request already sent over the WebSocket is
+  never sent again over HTTP, so a connection that drops in the middle of an
+  answer still reports an error. An unrecognised transport value now falls
+  back to `auto` as well, and the `transport` field of the Codex request
+  events in `proxy.log` says `auto`. A transport you have already set is
+  unchanged. `CCP_CODEX_TRANSPORT=websocket` (or `"transport": "websocket"`
+  under `codex` in `config.json`) brings back the WebSocket-only behaviour,
+  in which a refused handshake reaches Claude Code as an error.
+
 ## v0.14.1 (2026-09-30)
 
 - The monitor's aggregate cache hit % (the `Hit` column of sessions and

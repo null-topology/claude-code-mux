@@ -15,6 +15,8 @@ use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
 use tower::util::ServiceExt;
 
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct EnvGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
@@ -267,8 +269,149 @@ async fn spawn_rejecting_proxy(
     )
 }
 
+const HTTP_FALLBACK_SSE: &str = concat!(
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_http\"}}\n\n",
+    "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"transport fallback ok\"}\n\n",
+    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n",
+);
+
+/// A Codex origin that refuses every WebSocket upgrade with 403 and answers a
+/// POST with a complete Responses stream. Records the method of each request.
+async fn spawn_rejecting_websocket_origin() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let app = axum::Router::new().fallback({
+        let seen = seen.clone();
+        move |request: Request<Body>| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(request.method().to_string());
+                if request.headers().contains_key(http::header::UPGRADE) {
+                    return http::Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(Body::empty())
+                        .unwrap();
+                }
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(HTTP_FALLBACK_SSE))
+                    .unwrap()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (format!("http://{addr}/responses"), seen)
+}
+
+/// A Codex origin that accepts the WebSocket, reads `response.create` and
+/// drops the connection before any event. Records `GET` for an upgrade,
+/// `response.create` once the request arrived, and `HTTP` for anything else.
+async fn spawn_closing_websocket_origin() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let task_seen = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let seen = task_seen.clone();
+            tokio::spawn(async move {
+                let mut first = [0_u8; 1];
+                if stream.peek(&mut first).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                if first[0] != b'G' {
+                    seen.lock().unwrap().push("HTTP".to_string());
+                    return;
+                }
+                seen.lock().unwrap().push("GET".to_string());
+                let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                if let Some(Ok(Message::Text(_))) = websocket.next().await {
+                    seen.lock().unwrap().push("response.create".to_string());
+                }
+            });
+        }
+    });
+    (format!("http://{addr}/responses"), seen)
+}
+
+#[tokio::test]
+async fn codex_default_transport_falls_back_to_http_only_before_sending() {
+    let _env = ENV_LOCK.lock().await;
+    let _retry_delay = ZeroRetryDelayGuard::new();
+    let config_dir = TempDir::new().unwrap();
+    write_codex_auth(config_dir.path());
+
+    for stream in [false, true] {
+        clear_codex_websocket_pool_for_tests();
+        let (origin_url, seen) = spawn_rejecting_websocket_origin().await;
+        let (status, body) = {
+            let mut guards = clear_proxy_environment();
+            guards.extend(configure_codex(config_dir.path(), &origin_url));
+            guards.push(EnvGuard::unset("CCP_CODEX_TRANSPORT"));
+            call_messages_with_stream("transport-default-fallback", stream).await
+        };
+        assert_eq!(status, StatusCode::OK, "stream {stream}: {body}");
+        assert!(
+            body.contains("transport fallback ok"),
+            "stream {stream}: {body}"
+        );
+        // The refused handshake is tried once more before HTTP takes over.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["GET", "GET", "POST"],
+            "stream {stream}"
+        );
+    }
+
+    clear_codex_websocket_pool_for_tests();
+    let (origin_url, seen) = spawn_rejecting_websocket_origin().await;
+    let (status, _) = {
+        let mut guards = clear_proxy_environment();
+        guards.extend(configure_codex(config_dir.path(), &origin_url));
+        call_messages("transport-explicit-websocket").await
+    };
+    assert!(!status.is_success());
+    assert_eq!(*seen.lock().unwrap(), ["GET", "GET"]);
+
+    for stream in [false, true] {
+        clear_codex_websocket_pool_for_tests();
+        let (origin_url, seen) = spawn_closing_websocket_origin().await;
+        let (status, body) = {
+            let mut guards = clear_proxy_environment();
+            guards.extend(configure_codex(config_dir.path(), &origin_url));
+            guards.push(EnvGuard::unset("CCP_CODEX_TRANSPORT"));
+            call_messages_with_stream("transport-default-in-flight", stream).await
+        };
+        assert!(
+            !body.contains("transport fallback ok"),
+            "stream {stream}: {body}"
+        );
+        if !stream {
+            assert!(!status.is_success());
+        }
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().any(|event| event == "response.create"),
+            "stream {stream}: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|event| event == "HTTP"),
+            "stream {stream}: {seen:?}"
+        );
+    }
+    clear_codex_websocket_pool_for_tests();
+}
+
 #[tokio::test]
 async fn codex_websocket_inherits_environment_proxy_configuration() {
+    let _env = ENV_LOCK.lock().await;
     let config_dir = TempDir::new().unwrap();
     write_codex_auth(config_dir.path());
 
