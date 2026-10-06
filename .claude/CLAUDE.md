@@ -656,7 +656,9 @@ window is spent, and emits a `codex.rate_limits` event during healthy streams.
 Every transport answers a spent window once, without retrying, with
 `x-should-retry: false` plus `anthropic-ratelimit-unified-status: rejected`,
 `-reset` and `-representative-claim`: the live WebSocket and live HTTP
-streams, a non-2xx startup status whose body or `X-Codex-*` response headers
+streams, a rejected WebSocket upgrade whose body reports the limit
+(`handshake_rejection_error` in `websocket.rs`, direct upgrade and CONNECT
+tunnel alike), a non-2xx startup status whose body or `X-Codex-*` response headers
 carry the limit, the buffered paths (`usage_limit_from_response` runs ahead of
 `first_reportable_failure`, so a buffered WebSocket relay shares the branch),
 and an opt-in server compaction request, which aborts instead of spending the
@@ -701,7 +703,15 @@ code decides over the status and the message heuristics:
 
 A classified `Retry-After` is normalised (`normalize_retry_after`): a number
 is rounded up to whole seconds, at least 1; anything else (an HTTP date)
-passes as it came. `CodexError.class` carries the class to `map_codex_error_to_response`
+passes as it came. In a stream event (`classify_event_failure`, where the
+error is the event's `error` or else `/response/error`) the first of these
+gives the value: `error.retry_after`, `error.retry_after_seconds`, the event's
+`retry_after_seconds`, the event's `headers` (`retry-after`, then
+`Retry-After`), then the error's own `headers` the same way, which is where
+`response.failed` carries them (`codex-rs/codex-api/src/sse/responses_error.rs`
+at rust-v0.162.0-alpha.17). Any of them wins over the message's delay. A rejected upgrade's `Retry-After`
+header is normalised when it is read, so an unclassified 429 or 5xx rejection
+passes it on in that form too. `CodexError.class` carries the class to `map_codex_error_to_response`
 (`classified_error_response`); a mid-stream error keeps its status and takes
 the class's error type. An unknown code keeps the old handling, and
 `usage_limit_reached` keeps precedence over all of these. An opt-in server

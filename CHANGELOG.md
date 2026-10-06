@@ -1,3 +1,25 @@
+## Unreleased
+
+- Codex `Retry-After` values reach Claude Code from two more places, and a
+  rejected WebSocket upgrade follows the same rules as every other error:
+  - a rejected upgrade's `Retry-After` header is passed on rounded up to whole
+    seconds, at least 1, as classified errors already were; an HTTP date
+    passes as it came. Until now a fractional or zero value went through
+    unchanged;
+  - a `response.failed` or `error` stream event that carries `Retry-After` in
+    its error's `headers` now passes it on. It wins over a "try again in"
+    delay the message names, while a `retry_after` field or the event's own
+    `headers` still win over it;
+  - a rejected upgrade whose body reports a spent usage window
+    (`usage_limit_reached`) is answered like a spent window on every other
+    transport: a 429 with `x-should-retry: false`,
+    `anthropic-ratelimit-unified-status: rejected`, the reset time when the
+    backend names one, and no `Retry-After`. Until now it was a plain 429 that
+    passed on any `Retry-After` the upgrade carried. Under `auto` transport
+    such a rejection still falls back to HTTP first.
+
+  There is no setting to get the previous behaviour back.
+
 ## v0.14.1 (2026-09-30)
 
 - The monitor's aggregate cache hit % (the `Hit` column of sessions and

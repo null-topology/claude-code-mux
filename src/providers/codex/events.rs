@@ -281,7 +281,17 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         })
         .or_else(|| scalar_string(payload.get("retry_after_seconds")))
         .or_else(|| scalar_string(payload.pointer("/headers/retry-after")))
-        .or_else(|| scalar_string(payload.pointer("/headers/Retry-After")));
+        .or_else(|| scalar_string(payload.pointer("/headers/Retry-After")))
+        // The headers of the failed response, which `response.failed` carries
+        // inside its error (codex-rs/codex-api/src/sse/responses_error.rs at
+        // rust-v0.162.0-alpha.17). Read after the fields above, so a value
+        // they give is kept.
+        .or_else(|| {
+            error.and_then(|value| {
+                scalar_string(value.pointer("/headers/retry-after"))
+                    .or_else(|| scalar_string(value.pointer("/headers/Retry-After")))
+            })
+        });
 
     Some(CodexEventFailure {
         kind,
@@ -897,6 +907,53 @@ mod tests {
         .unwrap();
         assert_eq!(overload.status, 529);
         assert!(overload.retryable());
+    }
+
+    #[test]
+    fn retry_after_is_read_from_the_headers_of_the_error() {
+        let failed = classify_event_failure(&serde_json::json!({
+            "type": "response.failed",
+            "response": {"error": {
+                "code": "rate_limit_exceeded",
+                "message": "Rate limit reached. Please try again in 20s.",
+                "headers": {"retry-after": "3"}
+            }}
+        }))
+        .unwrap();
+        assert_eq!(failed.class, Some(CodexErrorClass::Throttled));
+        assert_eq!(failed.retry_after.as_deref(), Some("3"));
+
+        let error = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "error": {
+                "code": "server_is_overloaded",
+                "message": "busy",
+                "headers": {"Retry-After": 4}
+            }
+        }))
+        .unwrap();
+        assert_eq!(error.retry_after.as_deref(), Some("4"));
+
+        // A field read before the error's headers keeps its value.
+        let both = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "error": {
+                "code": "rate_limit_exceeded",
+                "message": "busy",
+                "retry_after_seconds": 9,
+                "headers": {"retry-after": "3"}
+            },
+            "headers": {"retry-after": "5"}
+        }))
+        .unwrap();
+        assert_eq!(both.retry_after.as_deref(), Some("9"));
+        let envelope = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "error": {"code": "rate_limit_exceeded", "headers": {"retry-after": "3"}},
+            "headers": {"retry-after": "5"}
+        }))
+        .unwrap();
+        assert_eq!(envelope.retry_after.as_deref(), Some("5"));
     }
 
     #[test]
