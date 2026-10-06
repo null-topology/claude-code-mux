@@ -333,6 +333,18 @@ mod tests {
     }
 
     #[test]
+    fn accumulate_content_filter_is_a_refusal() {
+        let upstream = sse_event(
+            "response.incomplete",
+            json!({
+                "response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"content_filter"},"usage":{"input_tokens":5,"output_tokens":0}}
+            }),
+        );
+        let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap();
+        assert_eq!(response["stop_reason"], "refusal");
+    }
+
+    #[test]
     fn the_reported_usage_is_separate_from_the_response_body_usage() {
         let body = |usage: serde_json::Value| {
             format!(

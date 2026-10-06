@@ -535,6 +535,22 @@ mod tests {
     }
 
     #[test]
+    fn stream_content_filter_is_a_refusal() {
+        let upstream = sse_event(
+            "response.incomplete",
+            serde_json::json!({
+                "response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"content_filter"},"usage":{}}
+            }),
+        );
+        let out = String::from_utf8(
+            translate_stream_bytes(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap(),
+        )
+        .unwrap();
+        assert!(out.contains(r#""stop_reason":"refusal""#), "{out}");
+        assert!(out.contains("message_stop"), "{out}");
+    }
+
+    #[test]
     fn stream_translates_web_search_response() {
         let upstream = format!(
             "{}{}{}{}{}{}{}{}",
