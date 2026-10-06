@@ -23,9 +23,10 @@
   when Claude Code sends system reminders after the summary prompt: the
   prompt counts when it sits in a user message among the last eight messages
   and every message after it is a user message holding only
-  `<system-reminder>` text. A prompt followed by anything else, such as an
-  answer, a tool result or other text, is not a summary request, so an
-  ordinary turn that quotes the prompt is left alone. A recognised request
+  `<system-reminder>` text, or a system message holding only text. A prompt
+  followed by anything else, such as an answer, a tool result or other text,
+  is not a summary request, so an ordinary turn that quotes the prompt is
+  left alone. A recognised request
   gets the compaction effort cap (`CCP_COMPACT_EFFORT`) as well, and server
   compaction when `CCP_CODEX_SERVER_COMPACTION` is on; server compaction now
   removes the summary prompt from the message that holds it rather than from

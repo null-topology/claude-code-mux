@@ -73,8 +73,9 @@ struct CompactionRegistry {
 static REGISTRY: Mutex<Option<CompactionRegistry>> = Mutex::new(None);
 static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// `messages_after_prompt` counts the reminder-only user messages Claude Code
-/// sent after its compaction prompt (`compact_prompt_message_index`).
+/// `messages_after_prompt` counts the injected context messages (reminder-only
+/// user messages and text-only system messages) Claude Code sent after its
+/// compaction prompt (`compact_prompt_message_index`).
 pub async fn request_compaction(
     client: &CodexHttpClient,
     request: &ResponsesRequest,
@@ -291,9 +292,10 @@ fn split_input_envelope(
 }
 
 /// Drops Claude Code's compaction prompt from the conversation, so it never
-/// reaches the stored native history. Each reminder-only user message after
-/// the prompt translates to exactly one input item, so the prompt's message is
-/// the item `messages_after_prompt` places before the last one.
+/// reaches the stored native history. Each message after the prompt translates
+/// to exactly one input item (a user message, or a developer message for a
+/// system one), so the prompt's message is the item `messages_after_prompt`
+/// places before the last one.
 fn without_compaction_instruction(
     input: &[ResponsesInputItem],
     messages_after_prompt: usize,
@@ -634,6 +636,24 @@ mod tests {
             json!([
                 {"type":"message","role":"user","content":[{"type":"input_text","text":"old conversation"}]},
                 {"type":"message","role":"user","content":[{"type":"input_text","text":reminder}]}
+            ])
+        );
+
+        // A system message after the prompt arrives as one developer item.
+        let input: Vec<ResponsesInputItem> = serde_json::from_value(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"old conversation"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":PROMPT}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":reminder}]},
+            {"type":"message","role":"developer","content":[{"type":"input_text","text":"system note"}]}
+        ]))
+        .unwrap();
+        let stripped = serde_json::to_value(without_compaction_instruction(&input, 2)).unwrap();
+        assert_eq!(
+            stripped,
+            json!([
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"old conversation"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":reminder}]},
+                {"type":"message","role":"developer","content":[{"type":"input_text","text":"system note"}]}
             ])
         );
 

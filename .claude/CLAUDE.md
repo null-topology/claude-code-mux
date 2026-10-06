@@ -952,8 +952,11 @@ currently serves, including `visibility` and `use_responses_lite` per model.
   compaction.
 - A request is Claude Code's compaction summary when its system prompt holds
   the summarizer marker, or when a user message among the newest eight holds
-  both prompt markers and every message after it is a user message made only
-  of text that starts with `<system-reminder>` once trimmed
+  both prompt markers and every message after it is injected context
+  (`is_injected_context_message`): a user message made only of text that
+  starts with `<system-reminder>` once trimmed, or a `role: "system"` message
+  made only of text, which Claude Code sends mid-conversation to carry
+  reminders (`is_agent_summary_request` skips those too)
   (`is_compact_messages_request`, `compact_prompt_message_index`,
   `COMPACT_DETECTION_TAIL_MESSAGES` in `translate/request.rs`). The prompt as
   the last message is the plain case. A prompt followed by anything else (an
@@ -961,8 +964,9 @@ currently serves, including `visibility` and `use_responses_lite` per model.
   prompt further back is history; neither counts. The effort cap, the opt-in
   server compaction and the HTTP routing all read this one detector. Server
   compaction strips the prompt from the prompt's own message
-  (`without_compaction_instruction`, given the number of reminder messages
-  after it), so the instruction never enters the stored native history. The
+  (`without_compaction_instruction`, given the number of injected messages
+  after it; each becomes exactly one input item, a system one a `developer`
+  message), so the instruction never enters the stored native history. The
   HTTP summary request sends the full context and leaves no WebSocket
   continuation state, so the next request also sends its full context without
   `previous_response_id`.

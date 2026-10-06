@@ -290,9 +290,10 @@ const HTTP_FALLBACK_SSE: &str = concat!(
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n",
 );
 
-/// A Codex origin that refuses every WebSocket upgrade with 403 and answers a
-/// POST with a complete Responses stream. Records the method of each request.
-async fn spawn_rejecting_websocket_origin() -> (String, Arc<Mutex<Vec<String>>>) {
+/// A Codex origin that refuses every WebSocket upgrade with `status` and an
+/// empty body, and answers a POST with a complete Responses stream. Records
+/// the method of each request.
+async fn spawn_rejecting_websocket_origin(status: StatusCode) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -304,7 +305,7 @@ async fn spawn_rejecting_websocket_origin() -> (String, Arc<Mutex<Vec<String>>>)
                 seen.lock().unwrap().push(request.method().to_string());
                 if request.headers().contains_key(http::header::UPGRADE) {
                     return http::Response::builder()
-                        .status(StatusCode::FORBIDDEN)
+                        .status(status)
                         .body(Body::empty())
                         .unwrap();
                 }
@@ -570,6 +571,7 @@ async fn codex_server_compaction_call_goes_over_http_without_the_summary_prompt(
     guards.extend(configure_codex(config_dir.path(), &origin_url));
     guards.push(EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "1"));
     let reminder = "<system-reminder>Context.</system-reminder>";
+    let system_note = "Injected system note.";
 
     let (status, body) = call_messages_with_history(
         "server-compaction-transport",
@@ -581,7 +583,8 @@ async fn codex_server_compaction_call_goes_over_http_without_the_summary_prompt(
                 "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n",
                 "Your task is to create a detailed summary of the conversation so far."
             )},
-            {"role": "user", "content": reminder}
+            {"role": "user", "content": reminder},
+            {"role": "system", "content": system_note}
         ]),
     )
     .await;
@@ -596,16 +599,36 @@ async fn codex_server_compaction_call_goes_over_http_without_the_summary_prompt(
     assert_eq!(transports, ["http", "http"]);
     let compaction = &seen[0].1;
     let compaction_input = compaction["input"].as_array().unwrap();
+    // The prompt's own message is gone; the reminder and the system message
+    // after it stay, in order, before the trigger.
+    let tail: Vec<_> = compaction_input
+        .iter()
+        .rev()
+        .take(4)
+        .rev()
+        .map(|item| {
+            (
+                item["type"].as_str().unwrap_or_default(),
+                item["role"].as_str().unwrap_or_default(),
+                item["content"][0]["text"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
     assert_eq!(
-        compaction_input.last().unwrap()["type"],
-        "compaction_trigger"
+        tail,
+        [
+            ("message", "assistant", "earlier reply"),
+            ("message", "user", reminder),
+            ("message", "developer", system_note),
+            ("compaction_trigger", "", ""),
+        ],
+        "{compaction}"
     );
     let compaction_text = compaction.to_string();
     assert!(
         !compaction_text.contains("Your task is to create a detailed summary"),
         "{compaction_text}"
     );
-    assert!(compaction_text.contains(reminder), "{compaction_text}");
     assert!(
         seen[1]
             .1
@@ -618,6 +641,44 @@ async fn codex_server_compaction_call_goes_over_http_without_the_summary_prompt(
 }
 
 #[tokio::test]
+async fn codex_default_transport_falls_back_to_http_after_a_rate_limited_handshake() {
+    let _env = ENV_LOCK.lock().await;
+    let _retry_delay = ZeroRetryDelayGuard::new();
+    let config_dir = TempDir::new().unwrap();
+    write_codex_auth(config_dir.path());
+
+    for stream in [false, true] {
+        clear_codex_websocket_pool_for_tests();
+        let (origin_url, seen) =
+            spawn_rejecting_websocket_origin(StatusCode::TOO_MANY_REQUESTS).await;
+        let (status, body) = {
+            let mut guards = clear_proxy_environment();
+            guards.extend(configure_codex(config_dir.path(), &origin_url));
+            guards.push(EnvGuard::unset("CCP_CODEX_TRANSPORT"));
+            call_messages_with_stream("transport-default-rate-limited", stream).await
+        };
+        assert_eq!(status, StatusCode::OK, "stream {stream}: {body}");
+        assert!(
+            body.contains("transport fallback ok"),
+            "stream {stream}: {body}"
+        );
+        assert_eq!(*seen.lock().unwrap(), ["GET", "POST"], "stream {stream}");
+    }
+
+    // With `websocket` the handshake's 429 reaches the client as it came.
+    clear_codex_websocket_pool_for_tests();
+    let (origin_url, seen) = spawn_rejecting_websocket_origin(StatusCode::TOO_MANY_REQUESTS).await;
+    let (status, body) = {
+        let mut guards = clear_proxy_environment();
+        guards.extend(configure_codex(config_dir.path(), &origin_url));
+        call_messages("transport-explicit-websocket-rate-limited").await
+    };
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(*seen.lock().unwrap(), ["GET"]);
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[tokio::test]
 async fn codex_default_transport_falls_back_to_http_only_before_sending() {
     let _env = ENV_LOCK.lock().await;
     let _retry_delay = ZeroRetryDelayGuard::new();
@@ -626,7 +687,7 @@ async fn codex_default_transport_falls_back_to_http_only_before_sending() {
 
     for stream in [false, true] {
         clear_codex_websocket_pool_for_tests();
-        let (origin_url, seen) = spawn_rejecting_websocket_origin().await;
+        let (origin_url, seen) = spawn_rejecting_websocket_origin(StatusCode::FORBIDDEN).await;
         let (status, body) = {
             let mut guards = clear_proxy_environment();
             guards.extend(configure_codex(config_dir.path(), &origin_url));
@@ -647,7 +708,7 @@ async fn codex_default_transport_falls_back_to_http_only_before_sending() {
     }
 
     clear_codex_websocket_pool_for_tests();
-    let (origin_url, seen) = spawn_rejecting_websocket_origin().await;
+    let (origin_url, seen) = spawn_rejecting_websocket_origin(StatusCode::FORBIDDEN).await;
     let (status, _) = {
         let mut guards = clear_proxy_environment();
         guards.extend(configure_codex(config_dir.path(), &origin_url));

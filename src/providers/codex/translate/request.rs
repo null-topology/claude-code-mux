@@ -396,31 +396,42 @@ const COMPACT_DETECTION_TAIL_MESSAGES: usize = 8;
 
 const SYSTEM_REMINDER_PREFIX: &str = "<system-reminder>";
 
-/// A user message made only of `<system-reminder>` text.
-fn is_system_reminder_message(message: &Message) -> bool {
-    let is_reminder = |text: &str| text.trim().starts_with(SYSTEM_REMINDER_PREFIX);
-    message.role == "user"
-        && match &message.content {
-            Value::String(text) => is_reminder(text),
-            Value::Array(blocks) => {
-                !blocks.is_empty()
-                    && blocks.iter().all(|block| {
-                        block.get("type").and_then(Value::as_str) == Some("text")
-                            && block
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .is_some_and(is_reminder)
-                    })
-            }
-            _ => false,
+/// Whether `content` is a string or a non-empty list of text blocks whose texts
+/// all pass `accept`.
+fn is_text_only_content(content: &Value, accept: impl Fn(&str) -> bool) -> bool {
+    match content {
+        Value::String(text) => accept(text),
+        Value::Array(blocks) => {
+            !blocks.is_empty()
+                && blocks.iter().all(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("text")
+                        && accept(block.get("text").and_then(Value::as_str).unwrap_or(""))
+                })
         }
+        _ => false,
+    }
+}
+
+/// A message the client injects next to the conversation rather than a turn
+/// of it: a user message made only of `<system-reminder>` text, or a
+/// `role: "system"` message made only of text, which Claude Code sends
+/// mid-conversation to carry reminders. Each translates to exactly one input
+/// item.
+fn is_injected_context_message(message: &Message) -> bool {
+    match message.role.as_str() {
+        "user" => is_text_only_content(&message.content, |text| {
+            text.trim().starts_with(SYSTEM_REMINDER_PREFIX)
+        }),
+        "system" => is_text_only_content(&message.content, |_| true),
+        _ => false,
+    }
 }
 
 /// Index of the user message that holds Claude Code's compaction prompt. It
 /// must be among the newest `COMPACT_DETECTION_TAIL_MESSAGES`, and every
-/// message after it must be a user message made only of `<system-reminder>`
-/// text. A prompt followed by anything else (an assistant turn, a tool result,
-/// other text) was quoted or answered, so the request is not a summary.
+/// message after it must be injected context (`is_injected_context_message`).
+/// A prompt followed by anything else (an assistant turn, a tool result, other
+/// text) was quoted or answered, so the request is not a summary.
 pub(crate) fn compact_prompt_message_index(request: &MessagesRequest) -> Option<usize> {
     let is_prompt =
         |message: &Message| message.role == "user" && is_compact_message_content(&message.content);
@@ -430,7 +441,7 @@ pub(crate) fn compact_prompt_message_index(request: &MessagesRequest) -> Option<
         .enumerate()
         .rev()
         .take(COMPACT_DETECTION_TAIL_MESSAGES)
-        .find(|(_, message)| is_prompt(message) || !is_system_reminder_message(message))
+        .find(|(_, message)| is_prompt(message) || !is_injected_context_message(message))
         .and_then(|(index, message)| is_prompt(message).then_some(index))
 }
 
@@ -2070,6 +2081,39 @@ mod tests {
             let req = compact_request_with_messages_after_prompt(reminder_messages(trailing));
             assert_eq!(compact_prompt_message_index(&req), Some(1), "{trailing}");
             assert!(is_compact_messages_request(&req), "{trailing}");
+        }
+    }
+
+    #[test]
+    fn compact_request_detected_when_system_messages_follow_compact_message() {
+        let system_string = json!({"role": "system", "content": "Reminder for the model."});
+        let system_blocks = json!({"role": "system", "content": [
+            {"type": "text", "text": "First reminder."},
+            {"type": "text", "text": "Second reminder."}
+        ]});
+        let mut reminder_then_system = reminder_messages(1);
+        reminder_then_system.push(system_string.clone());
+        for trailing in [
+            vec![system_string.clone()],
+            vec![system_blocks],
+            reminder_then_system,
+        ] {
+            let label = Value::Array(trailing.clone());
+            let req = compact_request_with_messages_after_prompt(trailing);
+            assert_eq!(compact_prompt_message_index(&req), Some(1), "{label}");
+            assert!(is_compact_messages_request(&req), "{label}");
+        }
+
+        // A system message with anything but text is not injected context.
+        for follower in [
+            json!({"role": "system", "content": []}),
+            json!({"role": "system", "content": [
+                {"type": "text", "text": "Reminder."},
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}
+            ]}),
+        ] {
+            let req = compact_request_with_messages_after_prompt(vec![follower.clone()]);
+            assert_eq!(compact_prompt_message_index(&req), None, "{follower}");
         }
     }
 
