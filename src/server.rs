@@ -179,6 +179,19 @@ fn carries_history(body: &crate::anthropic::schema::MessagesRequest) -> bool {
         .any(|message| message.role == "assistant")
 }
 
+/// The beta under which Claude Code threads a conversation on Anthropic's side.
+const MESSAGE_THREADS_BETA: &str = "message-threads-2026-08-12";
+
+/// Whether the request belongs to a message thread, which lives on Anthropic's
+/// side: a `create` anchors one on the message the answer gets, a `continue`
+/// holds only the messages after `thread.previous_message_id`.
+fn carries_message_thread(body: &crate::anthropic::schema::MessagesRequest) -> bool {
+    body.extra
+        .get("thread")
+        .and_then(|thread| thread.get("type"))
+        .is_some_and(Value::is_string)
+}
+
 fn is_claude_auto_review_request(body: &crate::anthropic::schema::MessagesRequest) -> bool {
     if body.stream {
         return false;
@@ -212,7 +225,13 @@ fn apply_auto_review_model(
     configured_model: Option<&str>,
     original_provider: &str,
 ) -> Option<AutoReviewRoute> {
-    if count_tokens || !is_claude_auto_review_request(body) {
+    // A threaded request stays on Anthropic as the client sent it: another
+    // backend would refuse the thread, and the client would drop threading for
+    // the whole session.
+    if count_tokens
+        || !is_claude_auto_review_request(body)
+        || (original_provider == "anthropic" && carries_message_thread(body))
+    {
         return None;
     }
 
@@ -1783,7 +1802,13 @@ async fn dispatch_request(
                         })
                         .map(str::to_string)
                 });
-                if let Some(summary_model) = summary_model {
+                // A threaded label stays on Anthropic as the client sent it,
+                // for the same reason as on the auto-review route below.
+                let keeps_thread = carries_message_thread(&body)
+                    && provider
+                        .as_ref()
+                        .is_some_and(|provider| provider.name() == "anthropic");
+                if !keeps_thread && let Some(summary_model) = summary_model {
                     crate::agent_summary::apply_summary_route(&mut body, &summary_model);
                     log.info(
                         "agent_summary_routed",
@@ -1975,6 +2000,75 @@ async fn dispatch_request(
         }
     };
 
+    let effort = crate::providers::translate_shared::read_effort(&body)
+        .ok()
+        .flatten()
+        .map(str::to_string);
+
+    // A message thread lives on Anthropic's side. A `continue` carries only the
+    // messages after the one it names, which a translator would take for the
+    // whole conversation, and a `create` served elsewhere would anchor the
+    // thread on a message id Anthropic never issued. So any route but
+    // Anthropic's refuses a threaded request with the client's capability
+    // token, and the client drops threading for the session and resends the
+    // full history. This runs on the final provider; the reroutes above keep a
+    // threaded request on Anthropic, and a label answered locally has already
+    // returned. The monitor learns the route, and nothing else records the
+    // request: no session state, affinity or compaction change.
+    if !count_tokens && provider.name() != "anthropic" && carries_message_thread(&body) {
+        log.info(
+            "message_thread_rejected",
+            Some(serde_json::Map::from_iter([
+                ("reqId".to_string(), json!(&req_id)),
+                ("provider".to_string(), json!(provider.name())),
+                ("model".to_string(), json!(&normalized_model)),
+            ])),
+        );
+        if let Some(monitor) = state.monitor.as_ref() {
+            monitor.provider_selected(&req_id, provider.name(), &normalized_model, effort);
+        }
+        let response = json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "capability_rejected: beta_header:{MESSAGE_THREADS_BETA} is not supported on this route; send the full conversation"
+            ),
+        );
+        log_request_completed(
+            &log,
+            RequestLogContext {
+                req_id: &req_id,
+                provider: Some(provider.name()),
+                model: Some(&normalized_model),
+                count_tokens,
+                status: response.status(),
+                started_at,
+            },
+        );
+        let (response, details) = record_failed_response(
+            &log,
+            FailedResponseLogContext {
+                req_id: &req_id,
+                provider: Some(provider.name()),
+                model: Some(&normalized_model),
+                count_tokens,
+                started_at,
+            },
+            response,
+        )
+        .await;
+        monitor_failed(
+            state.monitor.as_ref(),
+            &req_id,
+            Some(response.status()),
+            details
+                .as_ref()
+                .map(|details| details.message.as_str())
+                .unwrap_or("Message thread rejected"),
+        );
+        return with_request_id(response, &req_id);
+    }
+
     // A label sent to Codex, whichever model answers it, must come back as
     // text: the client asks in prose only, and measured on the ChatGPT backend
     // Codex models often answered a label with a tool call the client
@@ -2009,10 +2103,6 @@ async fn dispatch_request(
         crate::providers::codex::clear_session_compaction(session_id);
     }
 
-    let effort = crate::providers::translate_shared::read_effort(&body)
-        .ok()
-        .flatten()
-        .map(str::to_string);
     let current = session::record_session_request_with_affinity_update(
         session_id.as_deref(),
         session_state.as_ref(),
