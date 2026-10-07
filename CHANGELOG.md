@@ -1,5 +1,39 @@
 ## Unreleased
 
+- A request that belongs to a Claude Code message thread (a body with a
+  `thread` field, `"type": "create"` or `"continue"`, under the
+  `message-threads-2026-08-12` beta) is now refused with a 400 when its model
+  goes to Codex, Kimi, Grok or Cursor, instead of being forwarded. A thread
+  lives on Anthropic's side: a continuation carries only the messages after
+  the one it names, so a translated route would answer from part of the
+  conversation (the upstream report describes Codex failing on a
+  continuation that answers a tool call, and a plain message losing its
+  context), and a thread created on another backend would be anchored on a
+  message id Anthropic never issued. The refusal's message starts with
+  `capability_rejected: beta_header:message-threads-2026-08-12`, on which
+  Claude Code turns threading off for the rest of the session and sends the
+  full conversation from then on. That costs one extra round trip in a
+  session that threads. The proxy also never reroutes a threaded request away
+  from Anthropic: the auto-review override (`CCP_AUTO_REVIEW_MODEL`) and the
+  `upstream` progress-label route leave it on the model the client named, so
+  a side request cannot turn threading off for the main conversation. The
+  Anthropic route keeps threading and relays these requests unchanged. Each
+  refusal is logged as `message_thread_rejected` with the provider and model.
+  There is no setting to forward threaded requests again. Reported in
+  raine/claude-code-proxy#148.
+- A Codex answer stopped by the backend's content filter now reaches Claude
+  Code with `stop_reason: "refusal"` instead of `"max_tokens"`. Until now
+  every response that ended incomplete was reported as running out of output,
+  so Claude Code took a filtered answer for one cut off by the output limit.
+  Now it applies its own handling for a content refusal. A response that ended
+  incomplete for any other reason, or without one, still reports
+  `max_tokens`. This covers streaming and non-streaming requests on every
+  Codex transport. On the non-streaming and buffered paths, a response that
+  ended incomplete in the middle of an output item now reaches the client
+  with the text it had so far and its stop reason, instead of a 502. The
+  proxy still makes one attempt and leaves any retry to the client. The
+  OpenAI-compatible routes are unchanged. There is no setting to get the old
+  stop reason back.
 - The proxy now reads Codex `Retry-After` from the `headers` of a stream
   error, rounds the value of a stream error, a rejected WebSocket upgrade and a
   refused WebSocket proxy tunnel up to whole seconds like every classified
