@@ -468,15 +468,20 @@ fn normalize_service_tier(tier: &str) -> Result<Option<ServiceTier>, anyhow::Err
 
 /// The tier for a request to `model` (the id that goes on the wire), given the
 /// tier its `-fast` suffix asked for. The configured tier wins, then the
-/// suffix, then the catalog default the Codex CLI would apply; otherwise none.
+/// suffix, then, when `use_catalog_default` holds, the catalog default the
+/// Codex CLI would put in the request's `service_tier`; otherwise none.
 pub fn resolve_service_tier(
     model: &str,
     suffix_tier: Option<ServiceTier>,
+    use_catalog_default: bool,
 ) -> Result<ServiceTierChoice, anyhow::Error> {
+    let catalog_default = use_catalog_default
+        .then(|| super::super::models::discovered_default_service_tier(model))
+        .flatten();
     choose_service_tier(
         config::codex_service_tier().as_deref(),
         suffix_tier,
-        super::super::models::discovered_default_service_tier(model).as_deref(),
+        catalog_default.as_deref(),
     )
 }
 

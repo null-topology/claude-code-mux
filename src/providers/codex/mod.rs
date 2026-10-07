@@ -208,17 +208,20 @@ impl CodexProvider {
             .or_else(|| ctx.session_id.clone());
 
         // Decided on the model that goes on the wire, after the lane upgrade.
-        let service_tier =
-            match resolve_service_tier(&resolved.model, resolved.service_tier.clone()) {
-                Ok(choice) => choice,
-                Err(e) => {
-                    return json_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request_error",
-                        e.to_string(),
-                    );
-                }
-            };
+        let service_tier = match resolve_service_tier(
+            &resolved.model,
+            resolved.service_tier.clone(),
+            !body.bypass_catalog_service_tier,
+        ) {
+            Ok(choice) => choice,
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    e.to_string(),
+                );
+            }
+        };
 
         let mut translated = match translate_request(
             &body,
@@ -639,17 +642,20 @@ impl Provider for CodexProvider {
         }
         let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
 
-        let service_tier =
-            match resolve_service_tier(&resolved.model, resolved.service_tier.clone()) {
-                Ok(choice) => choice,
-                Err(e) => {
-                    return json_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request_error",
-                        e.to_string(),
-                    );
-                }
-            };
+        let service_tier = match resolve_service_tier(
+            &resolved.model,
+            resolved.service_tier.clone(),
+            !body.bypass_catalog_service_tier,
+        ) {
+            Ok(choice) => choice,
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    e.to_string(),
+                );
+            }
+        };
 
         // The estimate below is computed here, against the translated request;
         // nothing is sent, so no model runs and none is named as having run.

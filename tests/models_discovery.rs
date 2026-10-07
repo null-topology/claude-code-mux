@@ -10,14 +10,17 @@ use claude_code_mux::providers::codex::continuation::clear_all_continuations_for
 use claude_code_mux::providers::codex::models::{
     clear_discovered_models_for_tests, is_discovered_model,
 };
+use claude_code_mux::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
 use claude_code_mux::registry::clear_listed_models_for_tests;
 use claude_code_mux::{registry::Registry, server::app};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::Message;
 use tower::util::ServiceExt;
 
 // ---------------------------------------------------------------------------
@@ -1160,4 +1163,283 @@ async fn serve_lists_models_at_start_so_the_first_request_needs_no_refresh() {
         "routed from the listing made at start"
     );
     assert_eq!(completions(&captured)[0].body["model"], "gpt-7-test");
+}
+
+/// A listing that names a default tier for gpt-6-sol only. gpt-6-luna offers
+/// the same tier with a null default, and gpt-5.5 names no default at all.
+fn tier_inventory() -> Value {
+    let offered = json!([{"id": "priority", "name": "Fast"}]);
+    json!({
+        "models": [
+            {
+                "slug": "gpt-6-sol",
+                "visibility": "list",
+                "supported_in_api": true,
+                "service_tiers": offered,
+                "default_service_tier": "priority"
+            },
+            {
+                "slug": "gpt-6-luna",
+                "visibility": "list",
+                "supported_in_api": true,
+                "service_tiers": offered,
+                "default_service_tier": null
+            },
+            {
+                "slug": "gpt-5.5",
+                "visibility": "list",
+                "supported_in_api": true,
+                "service_tiers": offered
+            }
+        ]
+    })
+}
+
+/// The environment of the service tier tests: [`routing_env`], plus no
+/// configured tier, model or auto-review model inherited from the shell.
+fn tier_env(config: &TempDir, upstream: &str) -> Vec<EnvGuard> {
+    let mut env = routing_env(config, upstream);
+    env.push(EnvGuard::unset("CCP_CODEX_SERVICE_TIER"));
+    env.push(EnvGuard::unset("CCP_CODEX_MODEL"));
+    env.push(EnvGuard::unset("CCP_AUTO_REVIEW_MODEL"));
+    env
+}
+
+fn message_body(model: &str) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": 64,
+        "messages": [{"role":"user","content":"hello"}]
+    })
+}
+
+/// `body` on `/v1/messages` through a registry built now, after the caller's
+/// environment, under its own session so no continuation carries over.
+async fn post_body(body: Value, session: &str) -> Response {
+    app(Arc::new(Registry::with_default_alias()))
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-claude-code-session-id", session)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// The newest completion the mock backend received.
+fn last_sent(captured: &Arc<Mutex<CapturedTraffic>>) -> Value {
+    completions(captured)
+        .pop()
+        .expect("the backend received a completion")
+        .body
+}
+
+/// `serviceTier` and `serviceTierSource` of the newest upstream request the
+/// proxy log recorded.
+fn last_logged_tier() -> (Value, Value) {
+    let event = logged("codex_upstream_request_started")
+        .pop()
+        .expect("the request was logged");
+    (
+        event["fields"]["serviceTier"].clone(),
+        event["fields"]["serviceTierSource"].clone(),
+    )
+}
+
+/// Mock Codex WebSocket backend for one `response.create`, which it records
+/// before answering with a completed message.
+async fn spawn_websocket_upstream(captured: Arc<Mutex<Option<Value>>>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
+        {
+            let (mut sender, mut receiver) = ws.split();
+            if let Some(Ok(Message::Text(text))) = receiver.next().await
+                && let Ok(json) = serde_json::from_str::<Value>(&text)
+            {
+                *captured.lock().unwrap() = Some(json);
+            }
+            for event in [
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#,
+                r#"{"type":"response.output_text.delta","output_index":0,"delta":"discovered ok"}"#,
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+                r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":2}}}"#,
+            ] {
+                let _ = sender.send(Message::Text(event.to_string())).await;
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// The listing's `default_service_tier` goes on the wire as `service_tier` for
+/// the model the request is sent to: nothing before a listing, the default
+/// once one names it, nothing for a null or missing default, and the default of
+/// the model that replaced the requested one, whether the hosted web search
+/// upgrade or `CCP_CODEX_MODEL` replaced it.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn catalog_default_service_tier_follows_the_model_on_the_wire() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let (upstream, captured) = spawn_codex_upstream(StatusCode::OK, tier_inventory()).await;
+    let _env = tier_env(&config, &upstream);
+
+    // gpt-6-sol is in the compiled-in list, so it routes before any listing,
+    // and with no listing there is no catalog default.
+    assert_routed(
+        post_body(message_body("gpt-6-sol"), "tier-1").await,
+        "before a listing",
+    )
+    .await;
+    assert_eq!(listings(&captured), 0);
+    assert!(last_sent(&captured).get("service_tier").is_none());
+    assert_eq!(last_logged_tier(), (Value::Null, Value::Null));
+
+    let (status, value) = get_models("/v1/models?provider=codex").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let rows = value["data"].as_array().unwrap();
+    let row = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap();
+    assert_eq!(row("gpt-6-sol")["default_service_tier"], "priority");
+    assert_eq!(row("gpt-6-sol")["service_tiers"][0]["id"], "priority");
+    assert!(row("gpt-6-luna").get("default_service_tier").is_none());
+
+    assert_routed(
+        post_body(message_body("gpt-6-sol"), "tier-2").await,
+        "listed default",
+    )
+    .await;
+    assert_eq!(last_sent(&captured)["service_tier"], "priority");
+    assert_eq!(last_logged_tier(), (json!("priority"), json!("catalog")));
+
+    for (model, case) in [("gpt-6-luna", "null default"), ("gpt-5.5", "no default")] {
+        assert_routed(post_body(message_body(model), case).await, case).await;
+        let sent = last_sent(&captured);
+        assert_eq!(sent["model"], model, "{case}");
+        assert!(sent.get("service_tier").is_none(), "{case}: {sent}");
+    }
+
+    // Hosted web search sends gpt-6-luna as gpt-6-sol, whose default applies.
+    let mut search = message_body("gpt-6-luna");
+    search["tools"] = json!([{"type": "web_search_20250305", "name": "web_search"}]);
+    assert_routed(post_body(search, "tier-search").await, "web search").await;
+    let sent = last_sent(&captured);
+    assert_eq!(sent["model"], "gpt-6-sol");
+    assert_eq!(sent["service_tier"], "priority");
+
+    // A configured model replaces gpt-5.5, and its default applies.
+    let _model_env = EnvGuard::set("CCP_CODEX_MODEL", "gpt-6-sol");
+    assert_routed(
+        post_body(message_body("gpt-5.5"), "tier-override").await,
+        "configured model",
+    )
+    .await;
+    let sent = last_sent(&captured);
+    assert_eq!(sent["model"], "gpt-6-sol");
+    assert_eq!(sent["service_tier"], "priority");
+    assert_eq!(listings(&captured), 1);
+
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+}
+
+/// Over WebSocket the catalog default rides in `response.create` the same way.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn catalog_default_service_tier_goes_out_over_websocket() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+    let config = TempDir::new().unwrap();
+    let (listing_upstream, _) = spawn_codex_upstream(StatusCode::OK, tier_inventory()).await;
+    let _env = tier_env(&config, &listing_upstream);
+    let (status, value) = get_models("/v1/models?provider=codex").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+
+    let captured = Arc::new(Mutex::new(None));
+    let ws_upstream = spawn_websocket_upstream(captured.clone()).await;
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &ws_upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+    assert_routed(
+        post_body(message_body("gpt-6-sol"), "tier-ws").await,
+        "websocket",
+    )
+    .await;
+    let sent = captured.lock().unwrap().clone().expect("response.create");
+    assert_eq!(sent["type"], "response.create");
+    assert_eq!(sent["model"], "gpt-6-sol");
+    assert_eq!(sent["service_tier"], "priority");
+
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}
+
+/// Claude Code's auto-review classifier rerouted to Codex takes no catalog
+/// default, as the Codex CLI's own review requests carry no `service_tier`;
+/// a configured tier still applies to it.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn auto_review_classifier_takes_no_catalog_default_service_tier() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let (upstream, captured) = spawn_codex_upstream(StatusCode::OK, tier_inventory()).await;
+    let _env = tier_env(&config, &upstream);
+    let _review_model_env = EnvGuard::set("CCP_AUTO_REVIEW_MODEL", "gpt-6-sol");
+    let (status, value) = get_models("/v1/models?provider=codex").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+
+    let classifier = json!({
+        "model": "gpt-6-sol",
+        "max_tokens": 64,
+        "stream": false,
+        "system": [{
+            "type": "text",
+            "text": "You are a security monitor for autonomous AI coding agents.\n\n## Context"
+        }],
+        "messages": [{"role":"user","content":"review this Bash command"}],
+        "tools": []
+    });
+    assert_routed(
+        post_body(classifier.clone(), "review-1").await,
+        "classifier",
+    )
+    .await;
+    let sent = last_sent(&captured);
+    assert_eq!(sent["model"], "gpt-6-sol");
+    assert!(sent.get("service_tier").is_none(), "{sent}");
+    assert_eq!(last_logged_tier(), (Value::Null, Value::Null));
+
+    // The same model outside the classifier takes its default.
+    assert_routed(
+        post_body(message_body("gpt-6-sol"), "review-2").await,
+        "main thread",
+    )
+    .await;
+    assert_eq!(last_sent(&captured)["service_tier"], "priority");
+
+    let _tier_env = EnvGuard::set("CCP_CODEX_SERVICE_TIER", "flex");
+    assert_routed(post_body(classifier, "review-3").await, "configured tier").await;
+    assert_eq!(last_sent(&captured)["service_tier"], "flex");
+    assert_eq!(last_logged_tier(), (json!("flex"), json!("config")));
+
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
 }

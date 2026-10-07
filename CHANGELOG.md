@@ -1,26 +1,34 @@
 ## Unreleased
 
-- Codex requests now carry the service tier the Codex CLI sends by default:
-  the model's `default_service_tier` from the Codex model listing the proxy
-  already fetches, and only when that model's own `service_tiers` lists it.
-  A listing that sets no default, or sets `default`, sends no tier. The
-  current listing sets no default for any model, so today nothing changes on
-  the wire. When the listing starts naming a default tier for a model,
-  requests to that model carry it, from the next successful listing on. A
-  model the proxy has not seen in a successful listing, such as one known
-  only from the compiled-in list or any model before the first listing after
-  a start, gets no default.
+- Codex requests now take the `service_tier` body field from the model's
+  `default_service_tier` in the Codex model listing the proxy already
+  fetches, as the Codex CLI fills that field, but only when the default is
+  `priority` or `flex` and the model's own `service_tiers` lists it. Any
+  other value, `fast`, `ultrafast` and `default` included, sends no tier and
+  is not mapped to one. This covers the `service_tier` field only: the proxy
+  sends no `x-codex-routing-hint` header. A model whose listing names no
+  default gets no tier, as before; when this was released, no model's
+  listing named one. When a listing names a default for a model, requests to
+  that model carry it from that successful listing on. A model the proxy has
+  not seen in a successful listing, such as one known only from the
+  compiled-in list or any model before the first listing after a start, gets
+  no default.
+- Claude Code's auto-review classifier, when it is sent to Codex, never takes
+  the catalog default; a configured tier or a `-fast` id still applies to it
+  as before.
 - The order is: `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier`, then a
   `-fast` model id, then the listing's default. To send no tier whatever the
   listing says, set `CCP_CODEX_SERVICE_TIER=default` or
   `"codex": {"serviceTier": "default"}`; like any configured tier, it also
   overrides a `-fast` id. To pin a tier instead, set `fast`, `priority` or
   `flex` as before.
-- `/v1/models` rows for Codex models now also carry the listing's
-  `service_tiers` and `default_service_tier`.
+- Codex rows in `/v1/models` now include the listing's `service_tiers` and
+  `default_service_tier` when they are set; empty or unset fields are
+  omitted.
 - The `codex_upstream_request_started` event in `proxy.log` now records
   `serviceTier` (the tier sent, or null) and `serviceTierSource` (`config`,
-  `suffix`, `catalog`, or null when no tier was chosen).
+  `suffix`, `catalog`, or null when none applies). A configured `default`
+  records `serviceTier: null` with `serviceTierSource: "config"`.
 
 ## v0.14.1 (2026-09-30)
 

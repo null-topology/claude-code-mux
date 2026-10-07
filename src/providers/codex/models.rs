@@ -86,10 +86,10 @@ pub struct UpstreamModel {
 }
 
 impl UpstreamModel {
-    /// The tier the Codex CLI sends for this model when the user chose none:
-    /// the catalog's `default_service_tier`, but only when the model's own
-    /// `service_tiers` lists it, and never the `default` sentinel, which
-    /// means standard routing.
+    /// The `service_tier` the Codex CLI puts in a request body for this model
+    /// when the user chose none: the catalog's `default_service_tier`, but only
+    /// when the model's own `service_tiers` lists it, and never the `default`
+    /// sentinel, which means standard routing.
     fn catalog_default_service_tier(&self) -> Option<String> {
         self.default_service_tier
             .as_deref()
@@ -583,10 +583,6 @@ mod tests {
 
     #[test]
     fn remembered_listing_keeps_default_service_tier_per_slug() {
-        use super::super::translate::request::{
-            ServiceTier, ServiceTierSource, resolve_service_tier,
-        };
-
         clear_discovered_models_for_tests();
         remember_discovered(&ModelInventory {
             models: vec![
@@ -601,14 +597,6 @@ mod tests {
         );
         assert_eq!(discovered_default_service_tier("gpt-5.5"), None);
         assert_eq!(discovered_default_service_tier("gpt-unlisted"), None);
-        let choice = resolve_service_tier("gpt-7-test", None).unwrap();
-        assert_eq!(choice.tier, Some(ServiceTier::Priority));
-        assert_eq!(choice.source, Some(ServiceTierSource::Catalog));
-        assert_eq!(resolve_service_tier("gpt-5.5", None).unwrap().tier, None);
-        assert_eq!(
-            resolve_service_tier("gpt-unlisted", None).unwrap().tier,
-            None
-        );
 
         // A listing that names nothing keeps the previous per-slug data.
         remember_discovered(&ModelInventory {
@@ -620,10 +608,11 @@ mod tests {
             Some("priority")
         );
 
-        // Before any listing, and for compiled-in ids, there is no default.
+        // Before any listing, no model has a catalog default, including
+        // compiled-in ids.
         clear_discovered_models_for_tests();
-        assert_eq!(resolve_service_tier("gpt-7-test", None).unwrap().tier, None);
-        assert_eq!(resolve_service_tier("gpt-5.5", None).unwrap().tier, None);
+        assert_eq!(discovered_default_service_tier("gpt-7-test"), None);
+        assert_eq!(discovered_default_service_tier("gpt-5.5"), None);
     }
 
     #[test]

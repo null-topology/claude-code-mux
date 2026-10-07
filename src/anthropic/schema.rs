@@ -11,6 +11,10 @@ pub struct MessagesRequest {
     pub stream: bool,
     #[serde(skip)]
     pub bypass_provider_model_override: bool,
+    /// The request takes no service tier from the provider's model listing;
+    /// a configured tier or a `-fast` id still applies.
+    #[serde(skip)]
+    pub bypass_catalog_service_tier: bool,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
