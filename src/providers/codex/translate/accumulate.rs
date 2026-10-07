@@ -333,6 +333,48 @@ mod tests {
     }
 
     #[test]
+    fn accumulate_content_filter_is_a_refusal() {
+        let upstream = sse_event(
+            "response.incomplete",
+            json!({
+                "response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"content_filter"},"usage":{"input_tokens":5,"output_tokens":0}}
+            }),
+        );
+        let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.5").unwrap();
+        assert_eq!(response["stop_reason"], "refusal");
+    }
+
+    #[test]
+    fn accumulate_incomplete_mid_item_keeps_the_text_and_the_stop_reason() {
+        for (reason, expected) in [
+            ("content_filter", "refusal"),
+            ("max_output_tokens", "max_tokens"),
+        ] {
+            let upstream = format!(
+                "{}{}{}",
+                sse_event(
+                    "response.output_item.added",
+                    json!({"output_index":0,"item":{"type":"message","id":"msg_up"}})
+                ),
+                sse_event(
+                    "response.output_text.delta",
+                    json!({"output_index":0,"delta":"partial"})
+                ),
+                sse_event(
+                    "response.incomplete",
+                    json!({
+                        "response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":reason},"usage":{}}
+                    })
+                ),
+            );
+            let response = accumulate_response(upstream.as_bytes(), "msg_1", "gpt-5.5")
+                .unwrap_or_else(|err| panic!("{reason}: {err:#}"));
+            assert_eq!(response["content"][0]["text"], "partial", "{reason}");
+            assert_eq!(response["stop_reason"], expected, "{reason}");
+        }
+    }
+
+    #[test]
     fn the_reported_usage_is_separate_from_the_response_body_usage() {
         let body = |usage: serde_json::Value| {
             format!(

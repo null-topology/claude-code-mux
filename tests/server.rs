@@ -1942,10 +1942,12 @@ async fn models_endpoint_respects_limit() {
 static AGENT_SUMMARY_LOCK: Mutex<()> = Mutex::new(());
 
 /// Pin the progress-label mode for the duration of a test: set or clear
-/// `CCP_AGENT_SUMMARY`, clear `CCP_AGENT_SUMMARY_MODEL` and point
-/// `CCP_CONFIG_DIR` at an empty directory, so neither the environment nor a
-/// `config.json` on the machine picks the mode or the label model. Tests that
-/// pin it run one at a time.
+/// `CCP_AGENT_SUMMARY`, clear `CCP_AGENT_SUMMARY_MODEL` and
+/// `CCP_AUTO_REVIEW_MODEL`, and point `CCP_CONFIG_DIR` at an empty directory,
+/// so neither the environment nor a `config.json` on the machine picks the
+/// mode, the label model or the auto-review model. A test may set the cleared
+/// keys after installing; they are restored on drop. Tests that pin it run one
+/// at a time.
 struct PinnedAgentSummary {
     previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _config_dir: tempfile::TempDir,
@@ -1961,6 +1963,7 @@ impl PinnedAgentSummary {
         let previous = [
             "CCP_AGENT_SUMMARY",
             "CCP_AGENT_SUMMARY_MODEL",
+            "CCP_AUTO_REVIEW_MODEL",
             "CCP_CONFIG_DIR",
         ]
         .map(|key| (key, std::env::var_os(key)))
@@ -1971,6 +1974,7 @@ impl PinnedAgentSummary {
                 None => std::env::remove_var("CCP_AGENT_SUMMARY"),
             }
             std::env::remove_var("CCP_AGENT_SUMMARY_MODEL");
+            std::env::remove_var("CCP_AUTO_REVIEW_MODEL");
             std::env::set_var("CCP_CONFIG_DIR", config_dir.path());
         }
         Self {
@@ -2578,6 +2582,18 @@ async fn an_upstream_request_id_is_kept_on_the_anthropic_route() {
     });
     tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
 
+    let response = post_json(
+        anthropic_app(address),
+        "/v1/messages",
+        messages_body("claude-opus-5"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(request_id(&response), "req_upstream");
+}
+
+/// The Anthropic passthrough, sending to `address`.
+fn anthropic_provider(address: std::net::SocketAddr) -> Arc<dyn Provider> {
     // The provider reads its base URL once, when it is built.
     let previous = std::env::var_os("CCP_ANTHROPIC_BASE_URL");
     unsafe {
@@ -2591,12 +2607,248 @@ async fn an_upstream_request_id_is_kept_on_the_anthropic_route() {
             None => std::env::remove_var("CCP_ANTHROPIC_BASE_URL"),
         }
     }
+    provider
+}
+
+/// An app whose only provider is the Anthropic passthrough, sending to
+/// `address`.
+fn anthropic_app(address: std::net::SocketAddr) -> axum::Router {
+    app(Arc::new(Registry::from_providers(
+        AliasProvider::Anthropic,
+        [anthropic_provider(address)],
+    )))
+}
+
+/// A mock Anthropic upstream that keeps the body of the last request it got,
+/// byte for byte, and answers with an empty message.
+async fn recording_upstream() -> (std::net::SocketAddr, Arc<Mutex<Option<axum::body::Bytes>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen: Arc<Mutex<Option<axum::body::Bytes>>> = Default::default();
+    let upstream = axum::Router::new().fallback({
+        let seen = seen.clone();
+        move |body: axum::body::Bytes| {
+            let seen = seen.clone();
+            async move {
+                *seen.lock().unwrap() = Some(body);
+                (
+                    [("content-type", "application/json")],
+                    r#"{"type":"message","content":[]}"#,
+                )
+            }
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    (address, seen)
+}
+
+/// Send `sent` to an app holding the Anthropic passthrough, pointed at a
+/// recording upstream, and a Codex provider that serves `gpt-6-luna`. Returns
+/// the status, the bytes Anthropic received and the models Codex was asked
+/// for.
+async fn send_to_anthropic_or_codex(
+    sent: String,
+) -> (StatusCode, Option<axum::body::Bytes>, Vec<Option<String>>) {
+    let (address, seen) = recording_upstream().await;
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let codex = Arc::new(IdentityCaptureProvider {
+        captured: Default::default(),
+        bodies: bodies.clone(),
+    }) as Arc<dyn Provider>;
     let app = app(Arc::new(Registry::from_providers(
         AliasProvider::Anthropic,
-        [provider],
+        [anthropic_provider(address), codex],
     )));
+    let status = post_json(app, "/v1/messages", Body::from(sent))
+        .await
+        .status();
+    let models = bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|body| body.model.clone())
+        .collect();
+    (status, seen.lock().unwrap().clone(), models)
+}
 
-    let response = post_json(app, "/v1/messages", messages_body("claude-opus-5")).await;
+/// The error message of a JSON error response.
+async fn error_message(response: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    body["error"]["message"].as_str().unwrap().to_string()
+}
+
+/// The start of the message a refused threaded request carries. Claude Code
+/// matches the token up to a character outside `[A-Za-z0-9_:.-]`, hence the
+/// trailing space.
+const THREAD_REJECTED: &str = "capability_rejected: beta_header:message-threads-2026-08-12 ";
+
+/// A message threads request whose new messages answer a tool call made
+/// earlier in the thread.
+fn thread_body(model: &str, thread_type: &str) -> Body {
+    Body::from(
+        json!({
+            "model": model,
+            "max_tokens": 16,
+            "thread": {"type": thread_type, "previous_message_id": "msg_01"},
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_01", "content": "done"}
+            ]}]
+        })
+        .to_string(),
+    )
+}
+
+/// A continuation holds only what came after the message it names, and a
+/// creation served off Anthropic would anchor the thread on an id Anthropic
+/// never issued. Either is refused before it reaches the provider, in the
+/// shape that makes the client drop threading and resend the full history,
+/// and the monitor row still names the route.
+#[tokio::test]
+async fn a_threaded_request_is_refused_on_a_translated_route() {
+    for thread_type in ["continue", "create"] {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(IdentityCaptureProvider {
+            captured: captured.clone(),
+            bodies: Default::default(),
+        }) as Arc<dyn Provider>;
+        let monitor = MonitorHandle::new(10);
+        let app = app_with_monitor(
+            Arc::new(Registry::from_providers(AliasProvider::Codex, [provider])),
+            Some(monitor.clone()),
+        );
+
+        let response = post_json(app, "/v1/messages", thread_body("gpt-5.5", thread_type)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{thread_type}");
+        assert!(!request_id(&response).is_empty(), "{thread_type}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["type"], "error", "{thread_type}");
+        assert_eq!(
+            body["error"]["type"], "invalid_request_error",
+            "{thread_type}"
+        );
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with(THREAD_REJECTED),
+            "{thread_type}: {message}"
+        );
+        assert!(captured.lock().unwrap().is_empty(), "{thread_type}");
+
+        let state = monitor.snapshot();
+        assert!(state.active.is_empty(), "{thread_type}");
+        let request = &state.recent[0];
+        assert_eq!(request.status, RequestStatus::Failed, "{thread_type}");
+        assert_eq!(request.http_status, Some(400), "{thread_type}");
+        assert_eq!(request.error.as_deref(), Some(message), "{thread_type}");
+        assert_eq!(request.provider.as_deref(), Some("codex"), "{thread_type}");
+        assert_eq!(request.model.as_deref(), Some("gpt-5.5"), "{thread_type}");
+    }
+}
+
+/// The guard keys on the route, not on Codex: every translator would lose the
+/// thread alike. A request that reached these providers would get their 501.
+#[tokio::test]
+async fn a_threaded_request_is_refused_on_every_translated_provider() {
+    for model in ["kimi-k2.6", "grok-4.5", "cursor:gpt-5.5"] {
+        let response = post_json(
+            app(routed_registry()),
+            "/v1/messages",
+            thread_body(model, "continue"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{model}");
+        let message = error_message(response).await;
+        assert!(message.starts_with(THREAD_REJECTED), "{model}: {message}");
+    }
+}
+
+/// Through the real Grok provider. Its translator refuses a top-level field it
+/// does not know with a 400 of its own, which carries no capability token and
+/// would leave the client threading; the guard answers before it runs.
+#[tokio::test]
+async fn a_thread_creation_is_refused_before_the_grok_translator() {
+    let response = post_json(
+        app(Arc::new(Registry::with_default_alias())),
+        "/v1/messages",
+        thread_body("grok-4.5", "create"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let message = error_message(response).await;
+    assert!(message.starts_with(THREAD_REJECTED), "{message}");
+}
+
+/// Anthropic holds the thread, so a continuation goes there as the client
+/// sent it, byte for byte.
+#[tokio::test]
+async fn a_thread_continuation_is_relayed_untouched_on_the_anthropic_route() {
+    let (address, seen) = recording_upstream().await;
+
+    // Spacing and key order no serializer would produce, so a rewrite shows.
+    let sent = r#"{ "thread" : {"type":"continue","previous_message_id":"msg_01"},
+  "model":"claude-opus-5", "max_tokens":16,
+  "messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"done"}]}] }"#;
+    let response = post_json(anthropic_app(address), "/v1/messages", Body::from(sent)).await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(request_id(&response), "req_upstream");
+    assert_eq!(seen.lock().unwrap().as_deref(), Some(sent.as_bytes()));
+}
+
+/// A classifier-shaped request for a Claude model, which a configured
+/// `CCP_AUTO_REVIEW_MODEL` reroutes. Spacing no serializer would produce, so a
+/// rewrite shows.
+const CLAUDE_CLASSIFIER: &str = r#"{ "model":"claude-opus-5", "max_tokens":512, "stream":false, "tools":[],
+  "system":[{"type":"text","text":"You are a security monitor for autonomous AI coding agents.\n\n## Context"}],
+  "messages":[{"role":"user","content":[{"type":"text","text":"Is this action safe?"}]}] }"#;
+
+/// The same classifier request, continuing a message thread.
+const THREADED_CLAUDE_CLASSIFIER: &str = r#"{ "thread" : {"type":"continue","previous_message_id":"msg_01"},
+  "model":"claude-opus-5", "max_tokens":512, "stream":false, "tools":[],
+  "system":[{"type":"text","text":"You are a security monitor for autonomous AI coding agents.\n\n## Context"}],
+  "messages":[{"role":"user","content":[{"type":"text","text":"Is this action safe?"}]}] }"#;
+
+/// The auto-review route would take a threaded request off Anthropic, where it
+/// would be refused and the client would drop threading for the whole
+/// session. It stays on Anthropic as the client sent it.
+#[tokio::test]
+async fn a_threaded_classifier_request_is_not_rerouted_off_anthropic() {
+    let _pinned = PinnedAgentSummary::install(None);
+    unsafe { std::env::set_var("CCP_AUTO_REVIEW_MODEL", "gpt-6-luna") };
+    let (status, seen, codex_models) =
+        send_to_anthropic_or_codex(THREADED_CLAUDE_CLASSIFIER.to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(seen.as_deref(), Some(THREADED_CLAUDE_CLASSIFIER.as_bytes()));
+    assert!(codex_models.is_empty());
+}
+
+/// Without a thread the auto-review route applies as before.
+#[tokio::test]
+async fn an_unthreaded_classifier_request_is_still_rerouted() {
+    let _pinned = PinnedAgentSummary::install(None);
+    unsafe { std::env::set_var("CCP_AUTO_REVIEW_MODEL", "gpt-6-luna") };
+    let (status, seen, codex_models) =
+        send_to_anthropic_or_codex(CLAUDE_CLASSIFIER.to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(seen.is_none());
+    assert_eq!(codex_models, [Some("gpt-6-luna".to_string())]);
+}
+
+/// The `upstream` label route keeps a threaded label on Anthropic too, with the
+/// label model pointed at Codex.
+#[tokio::test]
+async fn a_threaded_label_is_not_rerouted_off_anthropic() {
+    let _pinned = PinnedAgentSummary::install(Some("upstream"));
+    unsafe { std::env::set_var("CCP_AGENT_SUMMARY_MODEL", "gpt-6-luna") };
+    let mut body = progress_label_body();
+    body["model"] = json!("claude-opus-5");
+    body["thread"] = json!({"type": "continue", "previous_message_id": "msg_01"});
+    let sent = body.to_string();
+    let (status, seen, codex_models) = send_to_anthropic_or_codex(sent.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(seen.as_deref(), Some(sent.as_bytes()));
+    assert!(codex_models.is_empty());
 }
