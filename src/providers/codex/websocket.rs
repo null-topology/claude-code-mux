@@ -1272,6 +1272,9 @@ fn write_websocket_response_capture(
 // ---------------------------------------------------------------------------
 
 const MAX_HANDSHAKE_ERROR_DETAIL_BYTES: usize = 1024;
+/// How much of a rejection body is kept to read its class and a spent window
+/// from; the detail keeps at most `MAX_HANDSHAKE_ERROR_DETAIL_BYTES` of it.
+const MAX_HANDSHAKE_ERROR_BODY_BYTES: usize = 64 * 1024;
 const GENERIC_HANDSHAKE_ERROR_DETAIL: &str = "WebSocket upgrade was rejected";
 
 fn handshake_error_detail(body: Option<&[u8]>) -> String {
@@ -1295,6 +1298,43 @@ fn handshake_error_detail(body: Option<&[u8]>) -> String {
         end -= 1;
     }
     sanitized[..end].to_string()
+}
+
+/// A rejected upgrade, built the same way on the direct and the tunneled path.
+/// `body` is what was read of the rejection's body, `None` for a 407, which is
+/// never read. A `Retry-After` header is normalised the way a classified one
+/// is (`normalize_retry_after`); whether it reaches the client is up to the
+/// error mapping, which never sends it for a spent usage window or a quota.
+fn handshake_rejection_error(status: u16, headers: &HeaderMap, body: Option<&[u8]>) -> CodexError {
+    let retry_after = headers
+        .get(http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(super::events::normalize_retry_after);
+    let (detail, class, usage_limit) = match body {
+        Some(body) => {
+            let header_pairs: Vec<(String, String)> = headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    Some((name.to_string(), value.to_str().ok()?.to_string()))
+                })
+                .collect();
+            (
+                handshake_error_detail(Some(body)),
+                super::events::error_class_from_body(body),
+                super::events::usage_limit_from_response(body, &header_pairs).map(Box::new),
+            )
+        }
+        None => (GENERIC_HANDSHAKE_ERROR_DETAIL.to_string(), None, None),
+    };
+    CodexError {
+        status,
+        message: format!("WebSocket upgrade rejected with status {status}"),
+        detail: Some(detail),
+        retry_after,
+        usage_limit,
+        class,
+        origin: CodexErrorOrigin::WebSocketHandshake,
+    }
 }
 
 fn header_has_token(headers: &HeaderMap, name: &str, expected: &str) -> bool {
@@ -1410,12 +1450,12 @@ fn validate_websocket_upgrade(
 
 async fn bounded_handshake_error_body(mut response: reqwest::Response) -> Vec<u8> {
     let mut body = Vec::new();
-    while body.len() < MAX_HANDSHAKE_ERROR_DETAIL_BYTES {
+    while body.len() < MAX_HANDSHAKE_ERROR_BODY_BYTES {
         let chunk = match response.chunk().await {
             Ok(Some(chunk)) => chunk,
             Ok(None) | Err(_) => break,
         };
-        let remaining = MAX_HANDSHAKE_ERROR_DETAIL_BYTES - body.len();
+        let remaining = MAX_HANDSHAKE_ERROR_BODY_BYTES - body.len();
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
     body
@@ -1614,7 +1654,7 @@ fn parse_connect_response_head(response: &[u8]) -> Result<(u16, Option<String>),
             }
             std::str::from_utf8(&value[1..])
                 .ok()
-                .map(|value| value.trim().to_string())
+                .map(|value| super::events::normalize_retry_after(value.trim()))
         });
     Ok((status, retry_after))
 }
@@ -1759,37 +1799,16 @@ fn websocket_destination(url: &str) -> Result<(String, String), CodexError> {
 
 /// A rejected upgrade on the tunneled path. The rejection carries whatever
 /// body bytes arrived with its head, which may be all of a short body, part of
-/// it or nothing; the detail and class come from them the way the direct path
-/// reads its body, and a 407 is not read at all.
+/// it or nothing; they are read the way the direct path reads its body, and a
+/// 407 is not read at all.
 fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> CodexError {
     if let tokio_tungstenite::tungstenite::Error::Http(response) = error {
-        let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get(http::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
         let body = response
             .body()
             .as_deref()
             .filter(|_| response.status() != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-            .map(|body| &body[..body.len().min(MAX_HANDSHAKE_ERROR_DETAIL_BYTES)]);
-        let (detail, class) = match body {
-            Some(body) => (
-                handshake_error_detail(Some(body)),
-                super::events::error_class_from_body(body),
-            ),
-            None => (GENERIC_HANDSHAKE_ERROR_DETAIL.to_string(), None),
-        };
-        return CodexError {
-            status,
-            message: format!("WebSocket upgrade rejected with status {status}"),
-            detail: Some(detail),
-            retry_after,
-            usage_limit: None,
-            class,
-            origin: CodexErrorOrigin::WebSocketHandshake,
-        };
+            .map(|body| &body[..body.len().min(MAX_HANDSHAKE_ERROR_BODY_BYTES)]);
+        return handshake_rejection_error(response.status().as_u16(), response.headers(), body);
     }
     CodexError {
         status: 0,
@@ -1895,30 +1914,13 @@ async fn connect_via_http_upgrade(
     let response = request.send().await.map_err(reqwest_handshake_error)?;
     if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
         let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get(http::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let (detail, class) = if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
-        {
-            (GENERIC_HANDSHAKE_ERROR_DETAIL.to_string(), None)
+        let headers = response.headers().clone();
+        let body = if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16() {
+            None
         } else {
-            let body = bounded_handshake_error_body(response).await;
-            (
-                handshake_error_detail(Some(&body)),
-                super::events::error_class_from_body(&body),
-            )
+            Some(bounded_handshake_error_body(response).await)
         };
-        return Err(CodexError {
-            status,
-            message: format!("WebSocket upgrade rejected with status {status}"),
-            detail: Some(detail),
-            retry_after,
-            usage_limit: None,
-            class,
-            origin: CodexErrorOrigin::WebSocketHandshake,
-        });
+        return Err(handshake_rejection_error(status, &headers, body.as_deref()));
     }
 
     validate_websocket_upgrade(
@@ -3954,6 +3956,231 @@ mod tests {
         assert_eq!(err.detail.as_deref(), Some(GENERIC_HANDSHAKE_ERROR_DETAIL));
         assert_eq!(err.retry_after.as_deref(), Some("3"));
         assert_eq!(err.origin, CodexErrorOrigin::WebSocketHandshake);
+    }
+
+    fn raw_rejection(status_line: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
+        let headers: String = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
+        format!(
+            "HTTP/1.1 {status_line}\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    async fn direct_handshake_rejection(response: Vec<u8>) -> CodexError {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            socket.write_all(&response).await.unwrap();
+        });
+        match connect_with_timeout(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &format!("ws://{addr}/backend-api/codex/responses"),
+            &HeaderMap::new(),
+            1_000,
+        )
+        .await
+        {
+            Ok(_) => panic!("expected websocket handshake to fail"),
+            Err(err) => err,
+        }
+    }
+
+    async fn tunneled_handshake_rejection(response: Vec<u8>) -> CodexError {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = server_io.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buf[..read]);
+            }
+            server_io.write_all(&response).await.unwrap();
+        });
+        let request = tunneled_websocket_request(
+            "ws://codex.test/backend-api/codex/responses",
+            &HeaderMap::new(),
+            &generate_key(),
+        )
+        .unwrap();
+        match tokio_tungstenite::client_async(request, client_io).await {
+            Ok(_) => panic!("expected the tunneled upgrade to be rejected"),
+            Err(error) => tungstenite_handshake_error(error),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_upgrade_answers_retry_after_by_the_class_rules() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let date = "Wed, 21 Oct 2026 07:28:00 GMT";
+        let stop: &[(&str, &str)] = &[("x-should-retry", "false")];
+        let spent: &[(&str, &str)] = &[
+            ("x-should-retry", "false"),
+            ("anthropic-ratelimit-unified-status", "rejected"),
+        ];
+        // Status line, Retry-After sent, body, then the client's status,
+        // Retry-After and other headers.
+        let cases = [
+            (
+                "429 Too Many Requests",
+                Some("1.5"),
+                "",
+                429,
+                Some("2"),
+                &[][..],
+            ),
+            (
+                "503 Service Unavailable",
+                Some(date),
+                "",
+                503,
+                Some(date),
+                &[],
+            ),
+            ("429 Too Many Requests", None, "", 429, None, &[]),
+            (
+                "529 Site Overloaded",
+                Some("4"),
+                r#"{"error":{"code":"server_is_overloaded","message":"busy"}}"#,
+                529,
+                Some("4"),
+                &[],
+            ),
+            (
+                "429 Too Many Requests",
+                Some("0.2"),
+                r#"{"error":{"code":"rate_limit_exceeded","message":"Slow down."}}"#,
+                429,
+                Some("1"),
+                &[],
+            ),
+            (
+                "429 Too Many Requests",
+                Some("60"),
+                r#"{"error":{"code":"insufficient_quota","message":"No credits left."}}"#,
+                429,
+                None,
+                stop,
+            ),
+            (
+                "429 Too Many Requests",
+                Some("3600"),
+                r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":3600}}"#,
+                429,
+                None,
+                spent,
+            ),
+        ];
+        for (status_line, retry_after, body, status, expected, headers) in cases {
+            let sent = retry_after.map(|value| ("Retry-After", value));
+            let raw = raw_rejection(status_line, sent.as_slice(), body);
+            let direct = direct_handshake_rejection(raw.clone()).await;
+            let tunneled = tunneled_handshake_rejection(raw).await;
+            for err in [direct, tunneled] {
+                let response = super::super::map_codex_error_to_response(&err);
+                let case = format!("{status_line} {body}");
+                assert_eq!(response.status().as_u16(), status, "{case}");
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(http::header::RETRY_AFTER)
+                        .map(|value| value.to_str().unwrap()),
+                    expected,
+                    "{case}"
+                );
+                for (name, value) in headers {
+                    assert_eq!(response.headers()[*name], *value, "{case}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_rejection_body_still_reports_a_spent_window() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let message = format!("The usage limit has been reached. {}", "x".repeat(2048));
+        let body = serde_json::json!({"error": {
+            "type": "usage_limit_reached",
+            "message": message,
+            "resets_in_seconds": 3600
+        }})
+        .to_string();
+        assert!(body.len() > 2 * MAX_HANDSHAKE_ERROR_DETAIL_BYTES);
+        let raw = raw_rejection("429 Too Many Requests", &[("Retry-After", "3600")], &body);
+        let direct = direct_handshake_rejection(raw.clone()).await;
+        let tunneled = tunneled_handshake_rejection(raw).await;
+        for err in [direct, tunneled] {
+            assert!(err.usage_limit.is_some(), "{:?}", err.origin);
+            assert!(err.detail.as_ref().unwrap().len() <= MAX_HANDSHAKE_ERROR_DETAIL_BYTES);
+            let response = super::super::map_codex_error_to_response(&err);
+            assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()["x-should-retry"], "false");
+            assert_eq!(
+                response.headers()["anthropic-ratelimit-unified-status"],
+                "rejected"
+            );
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_upgrade_takes_the_spent_window_from_codex_headers() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let raw = raw_rejection(
+            "429 Too Many Requests",
+            &[
+                ("Retry-After", "9568"),
+                ("X-Codex-Primary-Window-Minutes", "300"),
+                ("X-Codex-Primary-Reset-After-Seconds", "9569"),
+                ("X-Codex-Primary-Reset-At", "1788879438"),
+                ("X-Codex-Secondary-Window-Minutes", "10080"),
+                ("X-Codex-Secondary-Reset-After-Seconds", "596369"),
+                ("X-Codex-Secondary-Reset-At", "1789466238"),
+            ],
+            r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":9568}}"#,
+        );
+        let direct = direct_handshake_rejection(raw.clone()).await;
+        let tunneled = tunneled_handshake_rejection(raw).await;
+        for err in [direct, tunneled] {
+            let response = super::super::map_codex_error_to_response(&err);
+            assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                response.headers()["anthropic-ratelimit-unified-reset"],
+                "1788879438"
+            );
+            assert_eq!(
+                response.headers()["anthropic-ratelimit-unified-representative-claim"],
+                "five_hour"
+            );
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+        }
+    }
+
+    #[test]
+    fn a_refused_connect_tunnel_normalizes_its_retry_after() {
+        let head = b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0.5\r\n\r\n";
+        let (status, retry_after) = parse_connect_response_head(head).unwrap();
+        assert_eq!(status, 503);
+        assert_eq!(retry_after.as_deref(), Some("1"));
+        let date = "Wed, 21 Oct 2026 07:28:00 GMT";
+        let head = format!("HTTP/1.1 502 Bad Gateway\r\nretry-after: {date}\r\n\r\n");
+        let (_, retry_after) = parse_connect_response_head(head.as_bytes()).unwrap();
+        assert_eq!(retry_after.as_deref(), Some(date));
     }
 
     #[tokio::test]

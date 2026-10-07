@@ -1959,6 +1959,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_response_header_delay_wins_over_its_message() {
+        let failure = events::classify_event_failure(&serde_json::json!({
+            "type": "response.failed",
+            "response": {"error": {
+                "code": "rate_limit_exceeded",
+                "message": "Rate limit reached. Please try again in 20s.",
+                "headers": {"retry-after": "2.5"}
+            }}
+        }))
+        .unwrap();
+        let response = map_codex_error_to_response(&classified_codex_error(
+            failure.class.unwrap(),
+            failure.status,
+            &failure.message,
+            failure.retry_after.as_deref(),
+        ));
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "3");
+    }
+
+    #[tokio::test]
     async fn a_throttle_names_its_delay_and_other_classes_do_not() {
         let from_field = map_codex_error_to_response(&classified_codex_error(
             events::CodexErrorClass::Throttled,
