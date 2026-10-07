@@ -1,5 +1,103 @@
 ## Unreleased
 
+- A request that belongs to a Claude Code message thread (a body with a
+  `thread` field, `"type": "create"` or `"continue"`, under the
+  `message-threads-2026-08-12` beta) is now refused with a 400 when its model
+  goes to Codex, Kimi, Grok or Cursor, instead of being forwarded. A thread
+  lives on Anthropic's side: a continuation carries only the messages after
+  the one it names, so a translated route would answer from part of the
+  conversation (the upstream report describes Codex failing on a
+  continuation that answers a tool call, and a plain message losing its
+  context), and a thread created on another backend would be anchored on a
+  message id Anthropic never issued. The refusal's message starts with
+  `capability_rejected: beta_header:message-threads-2026-08-12`, on which
+  Claude Code turns threading off for the rest of the session and sends the
+  full conversation from then on. That costs one extra round trip in a
+  session that threads. The proxy also never reroutes a threaded request away
+  from Anthropic: the auto-review override (`CCP_AUTO_REVIEW_MODEL`) and the
+  `upstream` progress-label route leave it on the model the client named, so
+  a side request cannot turn threading off for the main conversation. The
+  Anthropic route keeps threading and relays these requests unchanged. Each
+  refusal is logged as `message_thread_rejected` with the provider and model.
+  There is no setting to forward threaded requests again. Reported in
+  raine/claude-code-proxy#148.
+- A Codex answer stopped by the backend's content filter now reaches Claude
+  Code with `stop_reason: "refusal"` instead of `"max_tokens"`. Until now
+  every response that ended incomplete was reported as running out of output,
+  so Claude Code took a filtered answer for one cut off by the output limit.
+  Now it applies its own handling for a content refusal. A response that ended
+  incomplete for any other reason, or without one, still reports
+  `max_tokens`. This covers streaming and non-streaming requests on every
+  Codex transport. On the non-streaming and buffered paths, a response that
+  ended incomplete in the middle of an output item now reaches the client
+  with the text it had so far and its stop reason, instead of a 502. The
+  proxy still makes one attempt and leaves any retry to the client. The
+  OpenAI-compatible routes are unchanged. There is no setting to get the old
+  stop reason back.
+- The proxy now reads Codex `Retry-After` from the `headers` of a stream
+  error, rounds the value of a stream error, a rejected WebSocket upgrade and a
+  refused WebSocket proxy tunnel up to whole seconds like every classified
+  error, and recognises a spent usage window in a rejected upgrade's body:
+  - a `response.failed` or `error` stream event that carries `Retry-After` in
+    its error's `headers` now passes it on. It wins over a "try again in"
+    delay the message names, while a `retry_after` field or the event's own
+    `headers` still win over it;
+  - a `Retry-After` number from a stream error without a recognised code, a
+    rejected upgrade or a refused proxy tunnel is now rounded up to whole
+    seconds, at least 1, as classified errors already were; an HTTP date
+    passes as it came. Until now a fractional or zero value went through
+    unchanged;
+  - a rejected upgrade whose body reports a spent usage window
+    (`usage_limit_reached`) is answered like a spent window on every other
+    transport: a 429 with `x-should-retry: false`,
+    `anthropic-ratelimit-unified-status: rejected`, the reset time and the
+    exhausted window when the body or the `X-Codex-*` headers name them, and
+    no `Retry-After`. Until now it was a plain 429 that passed on any
+    `Retry-After` the upgrade carried. Under `auto` transport such a rejection
+    still falls back to HTTP first;
+  - a rejected upgrade's body is read up to 64 KiB, up from 1 KiB, so a
+    longer error body is still recognised; the error detail stays at 1 KiB.
+
+  There is no setting to get the previous behaviour back.
+- The Codex transport now defaults to `auto` instead of `websocket`, adapted
+  from raine/claude-code-proxy#173. Requests still go over a WebSocket first.
+  When the WebSocket cannot be set up before the request is sent, for example
+  because the handshake is refused or answered with a 429, the request goes
+  over HTTP instead of failing. A request already sent over the WebSocket is
+  never sent again over HTTP, so a connection that drops in the middle of an
+  answer still reports an error. Each fallback is logged to `proxy.log` as a
+  `codex_websocket_fallback_to_http` warning with the handshake status, so
+  you can see how often the WebSocket is refused. An unrecognised transport
+  value now falls back to `auto` as well, and the `transport` field of the
+  Codex request events in `proxy.log` says `auto`. A transport you have
+  already set is unchanged. `CCP_CODEX_TRANSPORT=websocket` (or `"transport": "websocket"`
+  under `codex` in `config.json`) brings back the WebSocket-only behaviour,
+  in which a refused handshake reaches Claude Code as an error, except for
+  compaction, which always goes over HTTP (see the next entry).
+- Claude Code's compaction summary request now always goes to Codex over
+  HTTP, whatever `CCP_CODEX_TRANSPORT` says, adapted from
+  raine/claude-code-proxy#168. The summary request is large, and over a
+  WebSocket its connection can close before the answer is complete. With
+  `CCP_CODEX_SERVER_COMPACTION` on, the proxy's own compaction call goes over
+  HTTP too. Every other request keeps the configured transport, including the
+  requests after a compaction. The summary request is now also recognised
+  when Claude Code sends system reminders after the summary prompt: the
+  prompt counts when it sits in a user message among the last eight messages
+  and every message after it is a user message holding only
+  `<system-reminder>` text, or a system message holding only text. A prompt
+  followed by anything else, such as an answer, a tool result or other text,
+  is not a summary request, so an ordinary turn that quotes the prompt is
+  left alone. A recognised request
+  gets the compaction effort cap (`CCP_COMPACT_EFFORT`) as well, and server
+  compaction when `CCP_CODEX_SERVER_COMPACTION` is on; server compaction now
+  removes the summary prompt from the message that holds it rather than from
+  the last message, so the prompt stays out of the stored history when
+  reminders follow it. The HTTP summary request sends the full context and
+  leaves no WebSocket continuation state, so, with
+  `CCP_CODEX_PREVIOUS_RESPONSE_ID` on, the next request also sends its full
+  context without `previous_response_id`. The `transport` field of the
+  summary's Codex request events in `proxy.log` says `http`. There is no
+  setting to send the summary over the WebSocket again.
 - Codex requests now take the `service_tier` body field from the model's
   `default_service_tier` in the Codex model listing the proxy already
   fetches, as the Codex CLI fills that field, but only when the default is

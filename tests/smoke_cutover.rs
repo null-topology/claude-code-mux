@@ -1702,6 +1702,79 @@ async fn smoke_codex_http_stream_empty_completion_is_an_end_turn() {
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
+fn content_filter_sse() -> Vec<u8> {
+    concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,",
+        "\"item\":{\"type\":\"message\",\"id\":\"msg_filtered\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,",
+        "\"delta\":\"partial\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,",
+        "\"item\":{\"type\":\"message\"}}\n\n",
+        "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_filtered\",",
+        "\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"},",
+        "\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n"
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_content_filter_is_a_refusal() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            content_filter_sse()
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"one"}]
+    }))
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body);
+
+    assert_eq!(status, StatusCode::OK, "body: {body_text}");
+    assert!(
+        body_text.contains(r#""stop_reason":"refusal""#) && body_text.contains("message_stop"),
+        "expected a complete refused turn in SSE body: {body_text}"
+    );
+
+    let response = call_messages("gpt-5.5").await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body);
+
+    assert_eq!(status, StatusCode::OK, "body: {body_text}");
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["stop_reason"], "refusal", "body: {body_text}");
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a refusal is an answer, not a failure to re-issue"
+    );
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_auto_review_uses_codex_default_and_configured_override() {

@@ -1175,16 +1175,6 @@ impl CodexHttpClient {
         .map(OwnerAwareCodexResponse::into_response)
     }
 
-    pub(crate) async fn post_codex_for_owner(
-        &self,
-        body: &ResponsesRequest,
-        ctx: &RequestContext,
-        continuation: Option<&super::continuation::ContinuationReservation>,
-    ) -> Result<OwnerAwareCodexResponse, CodexError> {
-        self.post_codex_with_transport(body, ctx, continuation, crate::config::codex_transport())
-            .await
-    }
-
     pub async fn post_search(
         &self,
         body: &SearchRequest,
@@ -1362,6 +1352,7 @@ impl CodexHttpClient {
             .await?;
         match websocket.recv().await {
             Some(Err(err)) if should_fallback_to_http(&err) => {
+                log_websocket_fallback_to_http(ctx, &err);
                 self.stream_codex_http_events_for_owner(body, ctx).await
             }
             Some(item) => {
@@ -1637,7 +1628,7 @@ impl CodexHttpClient {
         rx
     }
 
-    async fn post_codex_with_transport(
+    pub(crate) async fn post_codex_with_transport(
         &self,
         body: &ResponsesRequest,
         ctx: &RequestContext,
@@ -1767,6 +1758,7 @@ impl CodexHttpClient {
                             if self.auto_http_fallback_enabled && should_fallback_to_http(&err) =>
                         {
                             // Fall back to HTTP only if WebSocket failed before sending
+                            log_websocket_fallback_to_http(ctx, &err);
                             let body_json =
                                 serde_json::to_string(body).map_err(|e| CodexError {
                                     status: 500,
@@ -2901,6 +2893,41 @@ fn should_fallback_to_http(err: &CodexError) -> bool {
     err.origin == CodexErrorOrigin::WebSocketHandshake
         && err.status != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
         && err.detail.as_deref() != Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL)
+}
+
+/// The longest `detail` a fallback log line carries, in characters.
+const FALLBACK_LOG_DETAIL_CHARS: usize = 300;
+
+/// Logs a WebSocket setup failure that `auto` answers over HTTP, so a refused
+/// WebSocket stays visible. The line carries only what the handshake itself
+/// returned: its status (0 when none came), class, usage-limit flag,
+/// `Retry-After` and the rejection text or connect error, cut short. It
+/// carries nothing from the request.
+fn log_websocket_fallback_to_http(ctx: &RequestContext, err: &CodexError) {
+    let detail: String = err
+        .detail
+        .as_deref()
+        .unwrap_or(&err.message)
+        .chars()
+        .take(FALLBACK_LOG_DETAIL_CHARS)
+        .collect();
+    let mut fields = serde_json::Map::from_iter([
+        ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+        ("status".to_string(), serde_json::json!(err.status)),
+        (
+            "class".to_string(),
+            serde_json::json!(err.class.map(|class| format!("{class:?}"))),
+        ),
+        (
+            "usageLimit".to_string(),
+            serde_json::json!(err.usage_limit.is_some()),
+        ),
+        ("detail".to_string(), serde_json::json!(detail)),
+    ]);
+    if let Some(retry_after) = &err.retry_after {
+        fields.insert("retryAfter".to_string(), serde_json::json!(retry_after));
+    }
+    create_logger("codex").warn("codex_websocket_fallback_to_http", Some(fields));
 }
 
 fn should_retry_without_continuation(

@@ -48,8 +48,8 @@ Code's own usage warnings and limit messages working for both.
 - **Relays the Claude route byte for byte**, on Claude Code's own subscription
   login, so Anthropic's prompt cache keeps working. [How it works](#how-it-works)
 - **Translates Anthropic Messages to the OpenAI Responses API** for Codex, over
-  a WebSocket by default, with reasoning that survives a switch between
-  backends. [How it works](#how-it-works)
+  a WebSocket by default, falling back to HTTP if the handshake fails.
+  Reasoning survives a switch between backends. [How it works](#how-it-works)
 - **Lists the models your login can actually use.** `/v1/models` asks the Codex
   backend on every call instead of serving a list compiled into the binary.
   [Listing models](#listing-models)
@@ -406,8 +406,9 @@ flowchart LR
   performs is turning a signature-less `thinking` block into tagged text, and
   it only reserializes a request that has one.
 - **The Codex route** maps the Messages API onto the Responses API over a
-  WebSocket per conversation (`CCP_CODEX_TRANSPORT` picks `websocket`, `http`
-  or `auto`) and reads the ChatGPT login from the Codex CLI's
+  WebSocket per conversation, falling back to HTTP when the WebSocket cannot
+  be opened (`CCP_CODEX_TRANSPORT` picks `auto`, the default, `websocket` or
+  `http`), and reads the ChatGPT login from the Codex CLI's
   `~/.codex/auth.json`. When the token is refreshed it is written back so the
   Codex CLI keeps working. `previous_response_id` continuation state is kept
   per conversation as well, but it is off unless
@@ -780,7 +781,8 @@ A reading whose reset time has already passed is dropped rather than published.
 Both Codex transports behave the same way. On HTTP the live stream also reads
 the window length and the reset clock from the response headers when the limit
 event itself does not carry them. A 429 on the WebSocket handshake is the one
-exception: it reaches the client as a plain 429.
+exception: with `CCP_CODEX_TRANSPORT=websocket` it reaches the client as a
+plain 429, while `auto` sends the request over HTTP instead.
 
 ## Configuration
 
@@ -912,7 +914,7 @@ This is the complete list of variables the proxy reads.
 | `CCP_CODEX_ORIGINATOR` | built-in | The `originator` the ChatGPT backend sees. A compatibility contract; changing it changes what the server is told. |
 | `CCP_CODEX_USER_AGENT` | built-in | Same, for the `User-Agent`. |
 | `CCP_CODEX_FORWARD_HEADERS` | unset | Comma-separated names of client request headers to pass on to Codex, e.g. `x-gateway-token` for an authenticating gateway in front of the backend. Config key `codex.forwardHeaders` (a list). Each named header goes on every Codex call a `/v1/messages` request causes: the WebSocket handshake, HTTP, web search, and a model listing; a `/v1/models` listing carries them too. The OpenAI-compatible routes forward nothing. A pooled WebSocket keeps the values it was opened with. A header the proxy sets itself is never replaced, the client's connection headers (`host`, `content-length`, hop-by-hop) are never forwarded, and forwarded values are redacted in traffic captures. The listing at start has no client request and goes without them. |
-| `CCP_CODEX_TRANSPORT` | `websocket` | `websocket`, `http`, or `auto`. Rate-limit handling is the same on each. |
+| `CCP_CODEX_TRANSPORT` | `auto` | `auto`, `websocket`, or `http`. `auto` uses a WebSocket and switches to HTTP only when the WebSocket could not be set up before the request was sent, for example a refused handshake; a request already sent over the WebSocket is never sent again over HTTP. `websocket` never falls back. Whatever the setting, Claude Code's compaction summary and the opt-in server compaction call go over HTTP. Rate-limit handling is the same on each. |
 | `CCP_CODEX_EFFORT` | unset | Reasoning effort sent to Codex, e.g. `high`. `none` is sent as is, and then no reasoning summary and no encrypted reasoning are requested. |
 | `CCP_COMPACT_EFFORT` | `low` | Effort cap for compaction turns only. It never raises an effort the request named, and a compaction turn that names no effort gets the cap. `off` disables the cap, `none` asks for no reasoning. |
 | `CCP_CODEX_SERVICE_TIER` | unset | Service tier for every Codex request: `fast`, `priority`, `flex`, or `default` for no tier at all. Without a configured tier, a `-fast` id requests priority; otherwise the listing's default applies only when it is `priority` or `flex` and appears in the model's `service_tiers`, and never to the auto-review classifier. |
@@ -974,7 +976,7 @@ the default. Eleven variables have no key in the file and are environment-only:
   "agentSummary": "native",
   "log": { "verbose": false, "stderr": false },
   "codex": {
-    "transport": "websocket",
+    "transport": "auto",
     "lanePolicy": "full",
     "serverCompaction": false,
     "responsesApi": false,
@@ -1205,8 +1207,9 @@ still contain a title, as part of a recorded title reply.
   Esc during a tool use, then switching and continuing) can fail, because the
   next model cannot verify reasoning that came from the other plan. Starting
   the next step fresh avoids it.
-- A 429 on the Codex WebSocket handshake reaches the client as a plain 429
-  rather than as the spent-window answer.
+- With `CCP_CODEX_TRANSPORT=websocket`, a 429 on the Codex WebSocket
+  handshake reaches the client as a plain 429 rather than as the spent-window
+  answer.
 - Codex models are not in Claude Code's built-in catalog, so without a
   `modelPicker` row Claude Code assumes a 200k context window for them.
 - The monitor's per-request ledger grows with the number of requests a session

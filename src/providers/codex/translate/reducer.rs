@@ -57,6 +57,7 @@ pub type StopReason = &'static str;
 pub const STOP_END_TURN: &str = "end_turn";
 pub const STOP_TOOL_USE: &str = "tool_use";
 pub const STOP_MAX_TOKENS: &str = "max_tokens";
+pub const STOP_REFUSAL: &str = "refusal";
 
 pub type TerminalType = &'static str;
 pub const TERM_COMPLETED: &str = "response.completed";
@@ -264,7 +265,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     let mut response_id: Option<String> = None;
     let mut terminal_type: Option<String> = None;
     let mut continuation_eligible = false;
-    let mut incomplete = false;
+    let mut incomplete: Option<StopReason> = None;
     let mut web_search_requests = 0usize;
     let mut _saw_terminal = false;
     let mut event_count = 0usize;
@@ -799,16 +800,16 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 .map(|s| s.to_string());
             final_usage = p.get("response").map(parse_codex_usage);
             if response_is_incomplete(&p, &t) {
-                incomplete = true;
+                incomplete = Some(incomplete_stop_reason(&p));
             }
             continuation_eligible =
-                (t == "response.completed" || t == "response.done") && !incomplete;
+                (t == "response.completed" || t == "response.done") && incomplete.is_none();
             continue;
         }
     }
 
     let open_blocks = describe_open_blocks(&blocks_by_output_index);
-    if !_saw_terminal || !open_blocks.is_empty() {
+    if !_saw_terminal || (!open_blocks.is_empty() && incomplete.is_none()) {
         let diagnostics = UpstreamStreamDiagnostics {
             event_count,
             last_event_type,
@@ -834,8 +835,19 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         &mut output_items_by_index,
     );
 
-    let stop_reason: StopReason = if incomplete {
-        STOP_MAX_TOKENS
+    // An incomplete response can stop in the middle of an output item. Its
+    // open blocks are closed as they stand, as the live stream closes them.
+    let mut still_open: Vec<_> = blocks_by_output_index.into_iter().collect();
+    still_open.sort_by_key(|(output_index, _)| *output_index);
+    for (_, state) in still_open {
+        match state {
+            BlockState::Text { index, .. } => out.push(ReducerEvent::TextStop { index }),
+            BlockState::Tool { index, .. } => out.push(ReducerEvent::ToolStop { index }),
+        }
+    }
+
+    let stop_reason: StopReason = if let Some(stop_reason) = incomplete {
+        stop_reason
     } else if saw_tool_use {
         STOP_TOOL_USE
     } else {
@@ -925,6 +937,22 @@ fn response_is_incomplete(payload: &serde_json::Value, event_type: &str) -> bool
             .and_then(|d| d.get("reason"))
             .and_then(|v| v.as_str())
             .is_some()
+}
+
+/// Maps an incomplete response to an Anthropic stop reason. A content-filtered
+/// response maps to `refusal`; any other reason, or a missing reason, maps to
+/// `max_tokens`. The Codex CLI also treats a content filter apart from the
+/// output cap (`codex-rs/codex-api/src/sse/responses.rs` at rust-v0.160.1).
+pub(crate) fn incomplete_stop_reason(payload: &serde_json::Value) -> StopReason {
+    match payload
+        .get("response")
+        .and_then(|r| r.get("incomplete_details"))
+        .and_then(|d| d.get("reason"))
+        .and_then(|v| v.as_str())
+    {
+        Some("content_filter") => STOP_REFUSAL,
+        _ => STOP_MAX_TOKENS,
+    }
 }
 
 fn should_buffer_tool_args(name: &str) -> bool {
@@ -1543,6 +1571,46 @@ mod tests {
             assert!(!continuation_eligible);
         } else {
             panic!("expected Finish");
+        }
+    }
+
+    #[test]
+    fn reduce_incomplete_stop_reason_follows_the_reason() {
+        let cases = [
+            (
+                "response.incomplete",
+                json!({"response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"content_filter"},"usage":{}}}),
+                "refusal",
+            ),
+            (
+                "response.completed",
+                json!({"response":{"id":"resp_1","status":"completed","incomplete_details":{"reason":"content_filter"},"usage":{}}}),
+                "refusal",
+            ),
+            (
+                "response.incomplete",
+                json!({"response":{"id":"resp_1","status":"incomplete","incomplete_details":null,"usage":{}}}),
+                "max_tokens",
+            ),
+            (
+                "response.done",
+                json!({"response":{"id":"resp_1","status":"incomplete","usage":{}}}),
+                "max_tokens",
+            ),
+        ];
+        for (event_type, payload, expected) in cases {
+            let upstream = sse(event_type, payload);
+            let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
+            let Some(ReducerEvent::Finish {
+                stop_reason,
+                continuation_eligible,
+                ..
+            }) = out.last()
+            else {
+                panic!("expected Finish for {event_type}");
+            };
+            assert_eq!(*stop_reason, expected, "{event_type}");
+            assert!(!continuation_eligible, "{event_type}");
         }
     }
 

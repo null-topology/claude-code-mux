@@ -1043,7 +1043,7 @@ pub fn codex_transport() -> CodexTransport {
     {
         return transport;
     }
-    CodexTransport::WebSocket
+    CodexTransport::Auto
 }
 
 // ---------------------------------------------------------------------------
@@ -1224,11 +1224,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_transport_defaults_to_websocket() {
+    fn codex_transport_defaults_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _cleared = clear_env();
         let result = codex_transport();
-        assert_eq!(result, CodexTransport::WebSocket);
+        assert_eq!(result, CodexTransport::Auto);
     }
 
     #[test]
@@ -1248,19 +1248,71 @@ mod tests {
     }
 
     #[test]
-    fn codex_transport_invalid_env_falls_back_to_websocket() {
+    fn codex_transport_invalid_env_falls_back_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _cleared = clear_env();
         let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "invalid");
-        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+        assert_eq!(codex_transport(), CodexTransport::Auto);
     }
 
     #[test]
-    fn codex_transport_empty_env_falls_back_to_websocket() {
+    fn codex_transport_empty_env_falls_back_to_auto() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _cleared = clear_env();
         let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "");
-        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+        assert_eq!(codex_transport(), CodexTransport::Auto);
+    }
+
+    #[test]
+    fn codex_transport_file_value_applies_and_env_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_dir = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        for (file_value, expected) in [
+            ("http", CodexTransport::Http),
+            ("websocket", CodexTransport::WebSocket),
+            ("auto", CodexTransport::Auto),
+        ] {
+            std::fs::write(
+                config.path().join("config.json"),
+                format!(r#"{{"codex":{{"transport":"{file_value}"}}}}"#),
+            )
+            .unwrap();
+            assert_eq!(codex_transport(), expected, "file {file_value}");
+            for unusable in ["", "invalid"] {
+                let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", unusable);
+                assert_eq!(
+                    codex_transport(),
+                    expected,
+                    "file {file_value}, env {unusable:?}"
+                );
+            }
+            let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+            assert_eq!(codex_transport(), CodexTransport::WebSocket);
+            let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+            assert_eq!(codex_transport(), CodexTransport::Http);
+        }
+    }
+
+    #[test]
+    fn codex_transport_invalid_or_empty_file_value_falls_back_to_auto() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_dir = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        for file_value in ["", "invalid", "WebSocket"] {
+            std::fs::write(
+                config.path().join("config.json"),
+                format!(r#"{{"codex":{{"transport":"{file_value}"}}}}"#),
+            )
+            .unwrap();
+            assert_eq!(
+                codex_transport(),
+                CodexTransport::Auto,
+                "file {file_value:?}"
+            );
+        }
     }
 
     #[test]
@@ -1926,7 +1978,7 @@ mod tests {
         )
         .unwrap();
         let _outer_config = EnvGuard::set("CCP_CONFIG_DIR", outer.path());
-        let _outer_transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
+        let _outer_transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
         let _uncleared = EnvGuard::set("CCP_TEST_SENTINEL_UNCLEARED", "keep");
 
         {
@@ -1935,7 +1987,7 @@ mod tests {
             assert_ne!(inside.as_os_str(), outer.path().as_os_str());
             assert!(!Path::new(&inside).join("config.json").exists());
             assert!(std::env::var_os("CCP_CODEX_TRANSPORT").is_none());
-            assert_eq!(codex_transport(), CodexTransport::WebSocket);
+            assert_eq!(codex_transport(), CodexTransport::Auto);
             assert_eq!(
                 std::env::var_os("CCP_TEST_SENTINEL_UNCLEARED").as_deref(),
                 Some(std::ffi::OsStr::new("keep"))
@@ -1948,9 +2000,9 @@ mod tests {
         );
         assert_eq!(
             std::env::var_os("CCP_CODEX_TRANSPORT").as_deref(),
-            Some(std::ffi::OsStr::new("auto"))
+            Some(std::ffi::OsStr::new("websocket"))
         );
-        assert_eq!(codex_transport(), CodexTransport::Auto);
+        assert_eq!(codex_transport(), CodexTransport::WebSocket);
         assert_eq!(
             std::env::var_os("CCP_TEST_SENTINEL_UNCLEARED").as_deref(),
             Some(std::ffi::OsStr::new("keep"))

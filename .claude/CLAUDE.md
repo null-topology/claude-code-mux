@@ -151,7 +151,18 @@ Request path:
    pick a provider via the registry, apply the auto-review override (Claude
    Code's non-streaming, tool-free security classifier is rerouted to
    `CCP_AUTO_REVIEW_MODEL`, default `gpt-6-luna` on codex), then call the
-   provider and record log, monitor and traffic capture. Every response it
+   provider and record log, monitor and traffic capture. A `/v1/messages`
+   body with a `thread` object whose `type` is a string (message threads
+   beta, `create` or `continue`) and whose final provider is not anthropic is
+   refused before the provider runs with a 400 whose message starts
+   `capability_rejected: beta_header:message-threads-2026-08-12`, on which
+   Claude Code drops threading for the session and resends the full history:
+   a `continue` holds only the newest messages, and a `create` served off
+   Anthropic would anchor the thread on an id Anthropic never issued. The
+   refusal calls `provider_selected` for the monitor and records no session
+   state. A threaded request whose model routes to anthropic is never
+   rerouted (`apply_auto_review_model` and the `upstream` label route skip
+   it) and is relayed untouched. Every response `dispatch_request`
    returns, early rejections and the local agent-summary answer (with
    `CCP_AGENT_SUMMARY=local`) included,
    carries a `request-id` header with the proxy's `req_id` unless the upstream
@@ -194,8 +205,24 @@ Request path:
      the `Passthrough` bytes verbatim; the only rewrite is turning a
      signature-less `thinking` block into tagged text. Holds no credentials.
    - `codex/`: by far the largest. Maps Anthropic Messages onto the OpenAI
-     Responses API. Transport defaults to WebSocket (`CCP_CODEX_TRANSPORT` =
-     `http|websocket|auto`) with a per-conversation pool in `websocket.rs`.
+     Responses API. A response that ended incomplete finishes with
+     `stop_reason: max_tokens`, or `refusal` when its
+     `incomplete_details.reason` is `content_filter` (`incomplete_stop_reason`
+     in `translate/reducer.rs`, shared by the buffered and live paths).
+     Transport (`CCP_CODEX_TRANSPORT` = `auto|websocket|http`)
+     defaults to `auto`: a WebSocket from a per-conversation pool in
+     `websocket.rs`, falling back to HTTP only when the handshake failed
+     before anything was sent (`should_fallback_to_http` in `client.rs`). A
+     request already sent over the WebSocket is never replayed over HTTP, and
+     `websocket` never falls back. Each fallback, live and buffered, logs a
+     `codex_websocket_fallback_to_http` warning
+     (`log_websocket_fallback_to_http`) with `reqId`, the handshake `status`
+     (0 when none came), `class`, `usageLimit`, `retryAfter` and a `detail`
+     holding the rejection text or connect error cut to 300 characters, never
+     anything from the request. Claude Code's compaction summary goes over
+     HTTP whatever the setting (`transport_for_request` in `mod.rs`), and so
+     does the opt-in server compaction call (`request_compaction` in
+     `compaction.rs`).
      `continuation.rs` keeps `previous_response_id` state keyed by
      `ConversationIdentity` (session plus agent headers) so subagents do not
      clobber each other; `compaction.rs` does server-side compaction;
@@ -656,7 +683,9 @@ window is spent, and emits a `codex.rate_limits` event during healthy streams.
 Every transport answers a spent window once, without retrying, with
 `x-should-retry: false` plus `anthropic-ratelimit-unified-status: rejected`,
 `-reset` and `-representative-claim`: the live WebSocket and live HTTP
-streams, a non-2xx startup status whose body or `X-Codex-*` response headers
+streams, a rejected WebSocket upgrade whose body reports the limit
+(`handshake_rejection_error` in `websocket.rs`, direct upgrade and CONNECT
+tunnel alike), a non-2xx startup status whose body or `X-Codex-*` response headers
 carry the limit, the buffered paths (`usage_limit_from_response` runs ahead of
 `first_reportable_failure`, so a buffered WebSocket relay shares the branch),
 and an opt-in server compaction request, which aborts instead of spending the
@@ -701,7 +730,16 @@ code decides over the status and the message heuristics:
 
 A classified `Retry-After` is normalised (`normalize_retry_after`): a number
 is rounded up to whole seconds, at least 1; anything else (an HTTP date)
-passes as it came. `CodexError.class` carries the class to `map_codex_error_to_response`
+passes as it came. In a stream event (`classify_event_failure`, where the
+error is the event's `error` or else `/response/error`) the first of these
+gives the value: `error.retry_after`, `error.retry_after_seconds`, the event's
+`retry_after_seconds`, the event's `headers` (`retry-after`, then
+`Retry-After`), then the error's own `headers` the same way, which is where
+`response.failed` carries them (`codex-rs/codex-api/src/sse/responses_error.rs`
+at rust-v0.162.0-alpha.17). Any of them wins over the message's delay. That
+value, a rejected upgrade's `Retry-After` header and a refused CONNECT
+tunnel's are normalised when they are read, so an unclassified 429 or 5xx
+passes them on in that form too. `CodexError.class` carries the class to `map_codex_error_to_response`
 (`classified_error_response`); a mid-stream error keeps its status and takes
 the class's error type. An unknown code keeps the old handling, and
 `usage_limit_reached` keeps precedence over all of these. An opt-in server
@@ -709,8 +747,10 @@ compaction refused as quota or `usage_not_included` answers the client with
 that class and does not send the normal request; any other compaction failure
 falls back to it. The WebSocket handshake reads the rejection body on both
 the direct upgrade and the HTTP CONNECT tunnel (on the tunnel only the bytes
-that arrived with the response head), never for a 407. Under `auto` transport
-a handshake failure, classified or not, falls back to HTTP unless the
+that arrived with the response head), never for a 407. It keeps up to 64 KiB
+of the body to read the class and a spent window from, and at most 1 KiB of
+its message as the detail. Under `auto` transport
+(the default) a handshake failure, classified or not, falls back to HTTP unless the
 WebSocket proxy refused it (`should_fallback_to_http` in `client.rs`), and
 that HTTP answer is classified on its own. The codes and their shapes follow
 the Codex CLI's own error handling; no test here runs them against the
@@ -724,8 +764,10 @@ appearing, compare against a fresh traffic capture before anything else.
 The proxy does not retry a failed Codex request: one attempt, then the error
 goes to the client, which owns the retry policy. The only resends left repair
 the proxy's own state (a forgotten `previous_response_id`, a 401 token refresh).
-A 429 on the WebSocket handshake reaches the client as a plain 429 unless its
-body names one of the codes above.
+The `auto` fallback to HTTP is not a resend: it happens only when the
+handshake failed, before the request went out. With `websocket` transport a
+429 on the WebSocket handshake reaches the client as a plain 429 unless its
+body names one of the codes above; under `auto` it falls back to HTTP.
 
 ## Naming and distribution
 
@@ -962,6 +1004,26 @@ currently serves, including `visibility` and `use_responses_lite` per model.
   requests no reasoning summary and no `reasoning.encrypted_content`
   (`reasoning_requested`). That last rule applies to every request, not only
   compaction.
+- A request is Claude Code's compaction summary when its system prompt holds
+  the summarizer marker, or when a user message among the newest eight holds
+  both prompt markers and every message after it is injected context
+  (`is_injected_context_message`): a user message made only of text that
+  starts with `<system-reminder>` once trimmed, or a `role: "system"` message
+  made only of text, which Claude Code sends mid-conversation to carry
+  reminders (`is_agent_summary_request` skips those too)
+  (`is_compact_messages_request`, `compact_prompt_message_index`,
+  `COMPACT_DETECTION_TAIL_MESSAGES` in `translate/request.rs`). The prompt as
+  the last message is the plain case. A prompt followed by anything else (an
+  assistant turn, a tool result, other text) was quoted or answered, and a
+  prompt further back is history; neither counts. The effort cap, the opt-in
+  server compaction and the HTTP routing all read this one detector. Server
+  compaction strips the prompt from the prompt's own message
+  (`without_compaction_instruction`, given the number of injected messages
+  after it; each becomes exactly one input item, a system one a `developer`
+  message), so the instruction never enters the stored native history. The
+  HTTP summary request sends the full context and leaves no WebSocket
+  continuation state, so the next request also sends its full context without
+  `previous_response_id`.
 
 ## Known limitation
 
