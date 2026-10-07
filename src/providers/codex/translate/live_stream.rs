@@ -8,7 +8,7 @@ use crate::traffic::TrafficCapture;
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
-    CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_TOOL_USE, map_codex_usage_to_anthropic,
+    CodexUsage, STOP_END_TURN, STOP_TOOL_USE, incomplete_stop_reason, map_codex_usage_to_anthropic,
     reported_usage_report,
 };
 
@@ -944,7 +944,7 @@ impl LiveStreamTranslator {
         }
         let incomplete = response_is_incomplete(payload);
         let stop_reason = if incomplete {
-            STOP_MAX_TOKENS
+            incomplete_stop_reason(payload)
         } else if self.saw_tool_use {
             STOP_TOOL_USE
         } else {
@@ -1534,6 +1534,63 @@ mod tests {
         assert_eq!(report.reported_prompt_tokens, Some(40));
         assert_eq!(report.closing.input_tokens, None);
         assert_eq!(report.closing.output_tokens, Some(64));
+    }
+
+    #[test]
+    fn a_content_filtered_response_finishes_as_a_terminal_refusal() {
+        for (event_type, status) in [
+            ("response.incomplete", "incomplete"),
+            ("response.completed", "completed"),
+        ] {
+            let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
+            translator
+                .accept(
+                    &json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "delta": "as far as it got"
+                    }),
+                    None,
+                )
+                .unwrap();
+            let finished = translator
+                .accept(
+                    &json!({
+                        "type": event_type,
+                        "response": {
+                            "id": "resp_1",
+                            "status": status,
+                            "incomplete_details": {"reason": "content_filter"},
+                            "usage": {"input_tokens": 40, "output_tokens": 3}
+                        }
+                    }),
+                    None,
+                )
+                .unwrap();
+
+            // A filtered answer is a complete turn the client sees as a
+            // refusal, not a truncation and not a protocol failure.
+            let rendered = String::from_utf8(finished).unwrap();
+            assert!(
+                rendered.contains(r#""stop_reason":"refusal""#),
+                "{event_type}: {rendered}"
+            );
+            assert!(
+                rendered.contains("message_stop"),
+                "{event_type}: {rendered}"
+            );
+            assert!(translator.emitted_terminal(), "{event_type}");
+        }
+    }
+
+    #[test]
+    fn an_incomplete_response_without_a_reason_finishes_as_max_tokens() {
+        let out = render(vec![json!({
+            "type": "response.incomplete",
+            "response": {"id": "resp_1", "status": "incomplete", "incomplete_details": null, "usage": {}}
+        })]);
+        assert!(out.contains(r#""stop_reason":"max_tokens""#), "{out}");
+        assert!(out.contains("message_stop"), "{out}");
     }
 
     #[test]

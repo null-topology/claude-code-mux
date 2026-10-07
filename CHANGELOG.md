@@ -21,6 +21,19 @@
   refusal is logged as `message_thread_rejected` with the provider and model.
   There is no setting to forward threaded requests again. Reported in
   raine/claude-code-proxy#148.
+- A Codex answer stopped by the backend's content filter now reaches Claude
+  Code with `stop_reason: "refusal"` instead of `"max_tokens"`. Until now
+  every response that ended incomplete was reported as running out of output,
+  so Claude Code took a filtered answer for one cut off by the output limit.
+  Now it applies its own handling for a content refusal. A response that ended
+  incomplete for any other reason, or without one, still reports
+  `max_tokens`. This covers streaming and non-streaming requests on every
+  Codex transport. On the non-streaming and buffered paths, a response that
+  ended incomplete in the middle of an output item now reaches the client
+  with the text it had so far and its stop reason, instead of a 502. The
+  proxy still makes one attempt and leaves any retry to the client. The
+  OpenAI-compatible routes are unchanged. There is no setting to get the old
+  stop reason back.
 
 ## v0.14.1 (2026-09-30)
 

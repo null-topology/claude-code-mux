@@ -205,7 +205,11 @@ Request path:
      the `Passthrough` bytes verbatim; the only rewrite is turning a
      signature-less `thinking` block into tagged text. Holds no credentials.
    - `codex/`: by far the largest. Maps Anthropic Messages onto the OpenAI
-     Responses API. Transport defaults to WebSocket (`CCP_CODEX_TRANSPORT` =
+     Responses API. A response that ended incomplete finishes with
+     `stop_reason: max_tokens`, or `refusal` when its
+     `incomplete_details.reason` is `content_filter` (`incomplete_stop_reason`
+     in `translate/reducer.rs`, shared by the buffered and live paths).
+     Transport defaults to WebSocket (`CCP_CODEX_TRANSPORT` =
      `http|websocket|auto`) with a per-conversation pool in `websocket.rs`.
      `continuation.rs` keeps `previous_response_id` state keyed by
      `ConversationIdentity` (session plus agent headers) so subagents do not
