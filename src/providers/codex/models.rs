@@ -42,6 +42,16 @@ pub struct ReasoningLevel {
     pub description: Option<String>,
 }
 
+/// One service tier the backend offers for a model.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ServiceTierOffer {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// The subset of a backend model entry the proxy forwards. Unknown fields are
 /// ignored so a backend schema change never breaks the listing.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -69,9 +79,25 @@ pub struct UpstreamModel {
     pub supported_reasoning_levels: Vec<ReasoningLevel>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_modalities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_tiers: Vec<ServiceTierOffer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_service_tier: Option<String>,
 }
 
 impl UpstreamModel {
+    /// The tier the Codex CLI sends for this model when the user chose none:
+    /// the catalog's `default_service_tier`, but only when the model's own
+    /// `service_tiers` lists it, and never the `default` sentinel, which
+    /// means standard routing.
+    fn catalog_default_service_tier(&self) -> Option<String> {
+        self.default_service_tier
+            .as_deref()
+            .filter(|tier| *tier != "default")
+            .filter(|tier| self.service_tiers.iter().any(|offer| offer.id == *tier))
+            .map(str::to_string)
+    }
+
     /// The row shape `/v1/models` advertises: the Anthropic-style fields first,
     /// then the backend facts a consumer needs to pick a model.
     pub fn to_listing_row(&self) -> Value {
@@ -317,8 +343,15 @@ pub async fn fetch_models<S: AuthStorage<StoredAuth>>(
 
 #[derive(Debug, Default)]
 struct Discovered {
-    /// slug -> `use_responses_lite` as the backend reported it.
-    models: HashMap<String, Option<bool>>,
+    models: HashMap<String, DiscoveredModel>,
+}
+
+#[derive(Debug, Default)]
+struct DiscoveredModel {
+    /// `use_responses_lite` as the backend reported it.
+    use_responses_lite: Option<bool>,
+    /// See `UpstreamModel::catalog_default_service_tier`.
+    default_service_tier: Option<String>,
 }
 
 static DISCOVERED: Lazy<RwLock<Arc<Discovered>>> = Lazy::new(|| RwLock::new(Arc::default()));
@@ -332,7 +365,15 @@ fn remember_discovered(inventory: &ModelInventory) {
     let models = inventory
         .models
         .iter()
-        .map(|model| (model.slug.clone(), model.use_responses_lite))
+        .map(|model| {
+            (
+                model.slug.clone(),
+                DiscoveredModel {
+                    use_responses_lite: model.use_responses_lite,
+                    default_service_tier: model.catalog_default_service_tier(),
+                },
+            )
+        })
         .collect();
     let mut guard = DISCOVERED
         .write()
@@ -354,7 +395,18 @@ pub fn is_discovered_model(slug: &str) -> bool {
 
 /// `use_responses_lite` as the backend reported it for a discovered slug.
 pub fn discovered_uses_responses_lite(slug: &str) -> Option<bool> {
-    discovered().models.get(slug).copied().flatten()
+    discovered()
+        .models
+        .get(slug)
+        .and_then(|model| model.use_responses_lite)
+}
+
+/// The tier id the last successful listing makes this slug's default, if any.
+pub fn discovered_default_service_tier(slug: &str) -> Option<String> {
+    discovered()
+        .models
+        .get(slug)
+        .and_then(|model| model.default_service_tier.clone())
 }
 
 /// Slugs from the last successful listing, sorted.
@@ -375,7 +427,7 @@ pub fn clear_discovered_models_for_tests() {
 pub fn remember_for_tests(slugs: &[&str]) {
     let models = slugs
         .iter()
-        .map(|slug| ((*slug).to_string(), None))
+        .map(|slug| ((*slug).to_string(), DiscoveredModel::default()))
         .collect();
     let mut guard = DISCOVERED
         .write()
@@ -416,6 +468,8 @@ mod tests {
                     "default_reasoning_level": "medium",
                     "supported_reasoning_levels": [{"effort": "low", "description": "fast"}, {"effort": "high"}],
                     "input_modalities": ["text", "image"],
+                    "service_tiers": [{"id": "priority", "name": "Fast", "description": "faster"}],
+                    "default_service_tier": null,
                     "model_messages": {"ignored": true}
                 },
                 {"display_name": "no slug"},
@@ -437,6 +491,8 @@ mod tests {
         assert_eq!(row["visibility"], "list");
         assert_eq!(row["use_responses_lite"], true);
         assert_eq!(row["supported_reasoning_levels"][0]["effort"], "low");
+        assert_eq!(row["service_tiers"][0]["id"], "priority");
+        assert!(row.get("default_service_tier").is_none());
         assert!(row.get("slug").is_none());
         assert!(row.get("model_messages").is_none());
 
@@ -471,6 +527,8 @@ mod tests {
                     default_reasoning_level: None,
                     supported_reasoning_levels: Vec::new(),
                     input_modalities: Vec::new(),
+                    service_tiers: Vec::new(),
+                    default_service_tier: None,
                 },
                 UpstreamModel {
                     slug: "gpt-5.5".into(),
@@ -485,6 +543,8 @@ mod tests {
                     default_reasoning_level: None,
                     supported_reasoning_levels: Vec::new(),
                     input_modalities: Vec::new(),
+                    service_tiers: Vec::new(),
+                    default_service_tier: None,
                 },
             ],
             fetched_at: String::new(),
@@ -495,6 +555,75 @@ mod tests {
         assert_eq!(discovered_slugs(), vec!["gpt-5.5", "gpt-7-test"]);
         clear_discovered_models_for_tests();
         assert!(discovered_slugs().is_empty());
+    }
+
+    fn tiered_model(slug: &str, default: Option<&str>, offered: &[&str]) -> UpstreamModel {
+        serde_json::from_value(json!({
+            "slug": slug,
+            "default_service_tier": default,
+            "service_tiers": offered.iter().map(|id| json!({"id": id})).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn catalog_default_service_tier_needs_a_listed_non_sentinel_tier() {
+        let default_of = |default, offered: &[&str]| {
+            tiered_model("gpt-7-test", default, offered).catalog_default_service_tier()
+        };
+        assert_eq!(default_of(None, &["priority"]), None);
+        assert_eq!(
+            default_of(Some("priority"), &["priority"]).as_deref(),
+            Some("priority")
+        );
+        assert_eq!(default_of(Some("default"), &["default", "priority"]), None);
+        assert_eq!(default_of(Some("priority"), &[]), None);
+        assert_eq!(default_of(Some("flex"), &["priority"]), None);
+    }
+
+    #[test]
+    fn remembered_listing_keeps_default_service_tier_per_slug() {
+        use super::super::translate::request::{
+            ServiceTier, ServiceTierSource, resolve_service_tier,
+        };
+
+        clear_discovered_models_for_tests();
+        remember_discovered(&ModelInventory {
+            models: vec![
+                tiered_model("gpt-7-test", Some("priority"), &["priority"]),
+                tiered_model("gpt-5.5", None, &["priority"]),
+            ],
+            fetched_at: String::new(),
+        });
+        assert_eq!(
+            discovered_default_service_tier("gpt-7-test").as_deref(),
+            Some("priority")
+        );
+        assert_eq!(discovered_default_service_tier("gpt-5.5"), None);
+        assert_eq!(discovered_default_service_tier("gpt-unlisted"), None);
+        let choice = resolve_service_tier("gpt-7-test", None).unwrap();
+        assert_eq!(choice.tier, Some(ServiceTier::Priority));
+        assert_eq!(choice.source, Some(ServiceTierSource::Catalog));
+        assert_eq!(resolve_service_tier("gpt-5.5", None).unwrap().tier, None);
+        assert_eq!(
+            resolve_service_tier("gpt-unlisted", None).unwrap().tier,
+            None
+        );
+
+        // A listing that names nothing keeps the previous per-slug data.
+        remember_discovered(&ModelInventory {
+            models: Vec::new(),
+            fetched_at: String::new(),
+        });
+        assert_eq!(
+            discovered_default_service_tier("gpt-7-test").as_deref(),
+            Some("priority")
+        );
+
+        // Before any listing, and for compiled-in ids, there is no default.
+        clear_discovered_models_for_tests();
+        assert_eq!(resolve_service_tier("gpt-7-test", None).unwrap().tier, None);
+        assert_eq!(resolve_service_tier("gpt-5.5", None).unwrap().tier, None);
     }
 
     #[test]

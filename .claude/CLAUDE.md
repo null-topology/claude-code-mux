@@ -781,6 +781,21 @@ lane for every model and ignores that flag entirely
 across calls or restarts, deliberately: a consumer that reads the listing as
 the truth about available models must see changes, not a stale fallback.
 
+The remembered listing also keeps, per slug, the tier the Codex CLI would
+send by default (`UpstreamModel::catalog_default_service_tier`): the entry's
+`default_service_tier` when its `service_tiers` lists that id, never the
+`default` sentinel. `resolve_service_tier` in
+`providers/codex/translate/request.rs` decides a request's tier on the model
+that goes on the wire, after the lane upgrade: `CCP_CODEX_SERVICE_TIER` /
+`codex.serviceTier` first (`default` there means no tier at all), then a
+`-fast` suffix (priority), then that catalog default, then none. Only
+`priority` and `flex` from the catalog go out; any other id sends nothing.
+The CLI drops an explicit tier the model does not list; the proxy sends a
+configured or suffix tier as is. The Codex CLI applies no tier of its own
+when the listing names none, and neither does the proxy. The OpenAI-compatible
+surfaces do not apply the catalog default. `codex_upstream_request_started`
+logs `serviceTier` and `serviceTierSource`.
+
 Routing reads a process-wide catalog in `src/registry.rs` (`LISTED_MODELS`):
 per provider, the ids of its last successful listing from a backend
 (`source: upstream`), which replaces that provider's compiled-in list; a

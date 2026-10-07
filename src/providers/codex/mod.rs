@@ -58,7 +58,8 @@ use self::translate::reducer::{
     finish_metadata_from_upstream, reported_usage_report_from_upstream,
 };
 use self::translate::request::{
-    TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
+    TranslateOptions, has_hosted_web_search, is_compact_messages_request, resolve_service_tier,
+    translate_request,
 };
 
 const LIVE_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -206,11 +207,24 @@ impl CodexProvider {
             .map(ConversationIdentity::cache_scope)
             .or_else(|| ctx.session_id.clone());
 
+        // Decided on the model that goes on the wire, after the lane upgrade.
+        let service_tier =
+            match resolve_service_tier(&resolved.model, resolved.service_tier.clone()) {
+                Ok(choice) => choice,
+                Err(e) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        e.to_string(),
+                    );
+                }
+            };
+
         let mut translated = match translate_request(
             &body,
             TranslateOptions {
                 session_id: cache_scope.clone(),
-                service_tier: resolved.service_tier.clone(),
+                service_tier: service_tier.tier.clone(),
                 model: resolved.model.clone(),
                 use_responses_lite,
             },
@@ -363,6 +377,14 @@ impl CodexProvider {
                 (
                     "turnStateSent".to_string(),
                     serde_json::json!(turn_state.sent),
+                ),
+                (
+                    "serviceTier".to_string(),
+                    serde_json::json!(service_tier.tier),
+                ),
+                (
+                    "serviceTierSource".to_string(),
+                    serde_json::json!(service_tier.source),
                 ),
             ])),
         );
@@ -617,13 +639,25 @@ impl Provider for CodexProvider {
         }
         let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
 
+        let service_tier =
+            match resolve_service_tier(&resolved.model, resolved.service_tier.clone()) {
+                Ok(choice) => choice,
+                Err(e) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        e.to_string(),
+                    );
+                }
+            };
+
         // The estimate below is computed here, against the translated request;
         // nothing is sent, so no model runs and none is named as having run.
         let translated = match translate_request(
             &body,
             TranslateOptions {
                 session_id: None,
-                service_tier: resolved.service_tier.clone(),
+                service_tier: service_tier.tier,
                 model: resolved.model.clone(),
                 use_responses_lite,
             },

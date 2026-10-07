@@ -915,7 +915,7 @@ This is the complete list of variables the proxy reads.
 | `CCP_CODEX_TRANSPORT` | `websocket` | `websocket`, `http`, or `auto`. Rate-limit handling is the same on each. |
 | `CCP_CODEX_EFFORT` | unset | Reasoning effort sent to Codex, e.g. `high`. `none` is sent as is, and then no reasoning summary and no encrypted reasoning are requested. |
 | `CCP_COMPACT_EFFORT` | `low` | Effort cap for compaction turns only. It never raises an effort the request named, and a compaction turn that names no effort gets the cap. `off` disables the cap, `none` asks for no reasoning. |
-| `CCP_CODEX_SERVICE_TIER` | unset | Service tier for every Codex request: `fast`, `priority` or `flex`. `-fast` ids request priority per call. |
+| `CCP_CODEX_SERVICE_TIER` | unset | Service tier for every Codex request: `fast`, `priority`, `flex`, or `default` for no tier at all. Unset, a `-fast` id requests priority for that call, and otherwise the model's `default_service_tier` from the Codex model listing applies when its `service_tiers` lists it. |
 | `CCP_CODEX_REASONING_SUMMARY` | unset | Reasoning summary mode requested from Codex, e.g. `auto`. |
 | `CCP_CODEX_MODEL` | unset | Send this Codex model regardless of what the client asked for. |
 | `CCP_CODEX_LANE_POLICY` | `full` | `full` keeps Codex models off the Responses Lite lane so they can answer with several tool calls at once; `inventory` follows the lane flag from the backend's own model listing. |
