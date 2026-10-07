@@ -1,5 +1,6 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use claude_code_mux::logging::log_file;
 use claude_code_mux::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_mux::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
 use claude_code_mux::{registry::Registry, server::app};
@@ -290,9 +291,45 @@ const HTTP_FALLBACK_SSE: &str = concat!(
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n",
 );
 
-/// A Codex origin that refuses every WebSocket upgrade with `status` and an
-/// empty body, and answers a POST with a complete Responses stream. Records
-/// the method of each request.
+/// The `codex_websocket_fallback_to_http` lines of the proxy log, oldest
+/// first. Read while `XDG_STATE_HOME` points at the test's own directory.
+fn fallback_log_lines() -> Vec<Value> {
+    std::fs::read_to_string(log_file())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["msg"] == "codex_websocket_fallback_to_http")
+        .collect()
+}
+
+/// The one warning a request leaves when its refused handshake falls back.
+fn assert_fallback_logged(logged: &[Value], status: StatusCode, context: &str) {
+    assert_eq!(logged.len(), 1, "{context}: {logged:?}");
+    assert_eq!(logged[0]["level"], "warn", "{context}");
+    let fields = &logged[0]["fields"];
+    assert!(
+        fields["reqId"].as_str().is_some_and(|id| !id.is_empty()),
+        "{context}: {fields}"
+    );
+    assert_eq!(fields["status"], status.as_u16(), "{context}: {fields}");
+    assert_eq!(
+        fields.get("class"),
+        Some(&Value::Null),
+        "{context}: {fields}"
+    );
+    assert_eq!(fields["usageLimit"], false, "{context}: {fields}");
+    assert_eq!(fields["retryAfter"], "7", "{context}: {fields}");
+    assert!(
+        fields["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.chars().count() <= 300),
+        "{context}: {fields}"
+    );
+}
+
+/// A Codex origin that refuses every WebSocket upgrade with `status`,
+/// `Retry-After: 7` and an empty body, and answers a POST with a complete
+/// Responses stream. Records the method of each request.
 async fn spawn_rejecting_websocket_origin(status: StatusCode) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -306,6 +343,7 @@ async fn spawn_rejecting_websocket_origin(status: StatusCode) -> (String, Arc<Mu
                 if request.headers().contains_key(http::header::UPGRADE) {
                     return http::Response::builder()
                         .status(status)
+                        .header("retry-after", "7")
                         .body(Body::empty())
                         .unwrap();
                 }
@@ -651,11 +689,15 @@ async fn codex_default_transport_falls_back_to_http_after_a_rate_limited_handsha
         clear_codex_websocket_pool_for_tests();
         let (origin_url, seen) =
             spawn_rejecting_websocket_origin(StatusCode::TOO_MANY_REQUESTS).await;
-        let (status, body) = {
+        let state_dir = TempDir::new().unwrap();
+        let (status, body, logged) = {
             let mut guards = clear_proxy_environment();
             guards.extend(configure_codex(config_dir.path(), &origin_url));
             guards.push(EnvGuard::unset("CCP_CODEX_TRANSPORT"));
-            call_messages_with_stream("transport-default-rate-limited", stream).await
+            guards.push(EnvGuard::set("XDG_STATE_HOME", state_dir.path()));
+            let (status, body) =
+                call_messages_with_stream("transport-default-rate-limited", stream).await;
+            (status, body, fallback_log_lines())
         };
         assert_eq!(status, StatusCode::OK, "stream {stream}: {body}");
         assert!(
@@ -663,18 +705,27 @@ async fn codex_default_transport_falls_back_to_http_after_a_rate_limited_handsha
             "stream {stream}: {body}"
         );
         assert_eq!(*seen.lock().unwrap(), ["GET", "POST"], "stream {stream}");
+        assert_fallback_logged(
+            &logged,
+            StatusCode::TOO_MANY_REQUESTS,
+            &format!("stream {stream}"),
+        );
     }
 
     // With `websocket` the handshake's 429 reaches the client as it came.
     clear_codex_websocket_pool_for_tests();
     let (origin_url, seen) = spawn_rejecting_websocket_origin(StatusCode::TOO_MANY_REQUESTS).await;
-    let (status, body) = {
+    let state_dir = TempDir::new().unwrap();
+    let (status, body, logged) = {
         let mut guards = clear_proxy_environment();
         guards.extend(configure_codex(config_dir.path(), &origin_url));
-        call_messages("transport-explicit-websocket-rate-limited").await
+        guards.push(EnvGuard::set("XDG_STATE_HOME", state_dir.path()));
+        let (status, body) = call_messages("transport-explicit-websocket-rate-limited").await;
+        (status, body, fallback_log_lines())
     };
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
     assert_eq!(*seen.lock().unwrap(), ["GET"]);
+    assert!(logged.is_empty(), "{logged:?}");
     clear_codex_websocket_pool_for_tests();
 }
 
@@ -688,11 +739,15 @@ async fn codex_default_transport_falls_back_to_http_only_before_sending() {
     for stream in [false, true] {
         clear_codex_websocket_pool_for_tests();
         let (origin_url, seen) = spawn_rejecting_websocket_origin(StatusCode::FORBIDDEN).await;
-        let (status, body) = {
+        let state_dir = TempDir::new().unwrap();
+        let (status, body, logged) = {
             let mut guards = clear_proxy_environment();
             guards.extend(configure_codex(config_dir.path(), &origin_url));
             guards.push(EnvGuard::unset("CCP_CODEX_TRANSPORT"));
-            call_messages_with_stream("transport-default-fallback", stream).await
+            guards.push(EnvGuard::set("XDG_STATE_HOME", state_dir.path()));
+            let (status, body) =
+                call_messages_with_stream("transport-default-fallback", stream).await;
+            (status, body, fallback_log_lines())
         };
         assert_eq!(status, StatusCode::OK, "stream {stream}: {body}");
         assert!(
@@ -705,17 +760,22 @@ async fn codex_default_transport_falls_back_to_http_only_before_sending() {
             ["GET", "GET", "POST"],
             "stream {stream}"
         );
+        assert_fallback_logged(&logged, StatusCode::FORBIDDEN, &format!("stream {stream}"));
     }
 
     clear_codex_websocket_pool_for_tests();
     let (origin_url, seen) = spawn_rejecting_websocket_origin(StatusCode::FORBIDDEN).await;
-    let (status, _) = {
+    let state_dir = TempDir::new().unwrap();
+    let (status, logged) = {
         let mut guards = clear_proxy_environment();
         guards.extend(configure_codex(config_dir.path(), &origin_url));
-        call_messages("transport-explicit-websocket").await
+        guards.push(EnvGuard::set("XDG_STATE_HOME", state_dir.path()));
+        let (status, _) = call_messages("transport-explicit-websocket").await;
+        (status, fallback_log_lines())
     };
     assert!(!status.is_success());
     assert_eq!(*seen.lock().unwrap(), ["GET", "GET"]);
+    assert!(logged.is_empty(), "{logged:?}");
 
     for stream in [false, true] {
         clear_codex_websocket_pool_for_tests();

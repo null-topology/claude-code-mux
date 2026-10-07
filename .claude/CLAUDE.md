@@ -199,7 +199,12 @@ Request path:
      `websocket.rs`, falling back to HTTP only when the handshake failed
      before anything was sent (`should_fallback_to_http` in `client.rs`). A
      request already sent over the WebSocket is never replayed over HTTP, and
-     `websocket` never falls back. Claude Code's compaction summary goes over
+     `websocket` never falls back. Each fallback, live and buffered, logs a
+     `codex_websocket_fallback_to_http` warning
+     (`log_websocket_fallback_to_http`) with `reqId`, the handshake `status`
+     (0 when none came), `class`, `usageLimit`, `retryAfter` and a `detail`
+     holding the rejection text or connect error cut to 300 characters, never
+     anything from the request. Claude Code's compaction summary goes over
      HTTP whatever the setting (`transport_for_request` in `mod.rs`), and so
      does the opt-in server compaction call (`request_compaction` in
      `compaction.rs`).
