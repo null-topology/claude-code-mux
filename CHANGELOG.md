@@ -1,3 +1,27 @@
+## Unreleased
+
+- A request that belongs to a Claude Code message thread (a body with a
+  `thread` field, `"type": "create"` or `"continue"`, under the
+  `message-threads-2026-08-12` beta) is now refused with a 400 when its model
+  goes to Codex, Kimi, Grok or Cursor, instead of being forwarded. A thread
+  lives on Anthropic's side: a continuation carries only the messages after
+  the one it names, so a translated route would answer from part of the
+  conversation (the upstream report describes Codex failing on a
+  continuation that answers a tool call, and a plain message losing its
+  context), and a thread created on another backend would be anchored on a
+  message id Anthropic never issued. The refusal's message starts with
+  `capability_rejected: beta_header:message-threads-2026-08-12`, on which
+  Claude Code turns threading off for the rest of the session and sends the
+  full conversation from then on. That costs one extra round trip in a
+  session that threads. The proxy also never reroutes a threaded request away
+  from Anthropic: the auto-review override (`CCP_AUTO_REVIEW_MODEL`) and the
+  `upstream` progress-label route leave it on the model the client named, so
+  a side request cannot turn threading off for the main conversation. The
+  Anthropic route keeps threading and relays these requests unchanged. Each
+  refusal is logged as `message_thread_rejected` with the provider and model.
+  There is no setting to forward threaded requests again. Reported in
+  raine/claude-code-proxy#148.
+
 ## v0.14.1 (2026-09-30)
 
 - The monitor's aggregate cache hit % (the `Hit` column of sessions and
