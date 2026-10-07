@@ -1,4 +1,4 @@
-## Unreleased
+## v0.15.0 (2026-10-07)
 
 - A request that belongs to a Claude Code message thread (a body with a
   `thread` field, `"type": "create"` or `"continue"`, under the
