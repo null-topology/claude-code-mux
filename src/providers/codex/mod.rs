@@ -58,7 +58,8 @@ use self::translate::reducer::{
     finish_metadata_from_upstream, reported_usage_report_from_upstream,
 };
 use self::translate::request::{
-    TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
+    TranslateOptions, compact_prompt_message_index, has_hosted_web_search,
+    is_compact_messages_request, translate_request,
 };
 
 const LIVE_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -257,7 +258,16 @@ impl CodexProvider {
             }
             let mut compaction_ctx = ctx.clone();
             compaction_ctx.monitor = None;
-            match request_compaction(self.client.as_ref(), &translated, &compaction_ctx).await {
+            let messages_after_prompt = compact_prompt_message_index(&body)
+                .map_or(0, |index| body.messages.len() - index - 1);
+            match request_compaction(
+                self.client.as_ref(),
+                &translated,
+                &compaction_ctx,
+                messages_after_prompt,
+            )
+            .await
+            {
                 Ok(native_history) => {
                     if store_compaction(session_id, attempt, native_history) {
                         log_compaction_event(
@@ -324,7 +334,8 @@ impl CodexProvider {
         let turn_id = continuation.turn_id();
         let turn_state =
             turn_state::plan_request(&ctx.req_id, conversation_identity.as_ref(), &body);
-        let configured_transport = config::codex_transport();
+        let configured_transport =
+            transport_for_request(config::codex_transport(), compact_boundary);
         let transport = configured_transport.as_str();
         let upstream_started_at = Instant::now();
         let log = create_logger("codex");
@@ -408,7 +419,7 @@ impl CodexProvider {
 
         let request_continuation = continuation.clone();
         let upstream = match client
-            .post_codex_for_owner(&translated, &ctx, Some(&continuation))
+            .post_codex_with_transport(&translated, &ctx, Some(&continuation), configured_transport)
             .await
         {
             Ok(r) => {
@@ -1423,6 +1434,20 @@ fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
     }
 }
 
+/// Claude Code's compaction summary goes over HTTP whatever the configured
+/// transport: it is a large request whose WebSocket connection can close
+/// before the terminal event. Every other request keeps the configured one.
+fn transport_for_request(
+    configured: config::CodexTransport,
+    compact_boundary: bool,
+) -> config::CodexTransport {
+    if compact_boundary {
+        config::CodexTransport::Http
+    } else {
+        configured
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_continuation_from_upstream(
     session_id: Option<&str>,
@@ -1811,6 +1836,23 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::*;
+
+    #[test]
+    fn compact_boundary_uses_http_without_rerouting_ordinary_requests() {
+        use config::CodexTransport;
+
+        for configured in [
+            CodexTransport::WebSocket,
+            CodexTransport::Auto,
+            CodexTransport::Http,
+        ] {
+            assert_eq!(
+                transport_for_request(configured, true),
+                CodexTransport::Http
+            );
+            assert_eq!(transport_for_request(configured, false), configured);
+        }
+    }
 
     #[test]
     fn a_refusal_keeps_the_state_of_the_window_that_refused_it() {

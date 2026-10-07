@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::anthropic::sse::parse_sse_events;
+use crate::config::CodexTransport;
 use crate::provider::RequestContext;
 use crate::providers::codex::client::{CodexError, CodexHttpClient};
 
@@ -72,13 +73,17 @@ struct CompactionRegistry {
 static REGISTRY: Mutex<Option<CompactionRegistry>> = Mutex::new(None);
 static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// `messages_after_prompt` counts the injected context messages (reminder-only
+/// user messages and text-only system messages) Claude Code sent after its
+/// compaction prompt (`compact_prompt_message_index`).
 pub async fn request_compaction(
     client: &CodexHttpClient,
     request: &ResponsesRequest,
     ctx: &RequestContext,
+    messages_after_prompt: usize,
 ) -> Result<Vec<ResponsesInputItem>, CompactionError> {
     let (envelope, conversation) = split_input_envelope(&request.input);
-    let conversation = without_compaction_instruction(conversation);
+    let conversation = without_compaction_instruction(conversation, messages_after_prompt);
     let mut compaction_request = request.clone();
     compaction_request.instructions = None;
     compaction_request.input = envelope
@@ -90,8 +95,11 @@ pub async fn request_compaction(
         .collect();
     compaction_request.include = Some(vec!["reasoning.encrypted_content".to_string()]);
 
+    // Over HTTP for the same reason as the summary request itself: it carries
+    // the whole conversation, and a WebSocket can close before its terminal
+    // event.
     let response = client
-        .post_codex_for_owner(&compaction_request, ctx, None)
+        .post_codex_with_transport(&compaction_request, ctx, None, CodexTransport::Http)
         .await
         .map_err(CompactionError::Upstream)?;
     let compaction = parse_compaction_response(&response.body)?;
@@ -283,10 +291,21 @@ fn split_input_envelope(
     input.split_at(prefix_len)
 }
 
-fn without_compaction_instruction(input: &[ResponsesInputItem]) -> Vec<ResponsesInputItem> {
+/// Drops Claude Code's compaction prompt from the conversation, so it never
+/// reaches the stored native history. Each message after the prompt translates
+/// to exactly one input item (a user message, or a developer message for a
+/// system one), so the prompt's message is the item `messages_after_prompt`
+/// places before the last one.
+fn without_compaction_instruction(
+    input: &[ResponsesInputItem],
+    messages_after_prompt: usize,
+) -> Vec<ResponsesInputItem> {
     let mut input = input.to_vec();
-    let remove_empty_message = if let Some(ResponsesInputItem::Message { role, content }) =
-        input.last_mut()
+    let Some(index) = input.len().checked_sub(messages_after_prompt + 1) else {
+        return input;
+    };
+    let remove_empty_message = if let ResponsesInputItem::Message { role, content } =
+        &mut input[index]
         && role == "user"
     {
         content.retain(|part| {
@@ -301,7 +320,7 @@ fn without_compaction_instruction(input: &[ResponsesInputItem]) -> Vec<Responses
         false
     };
     if remove_empty_message {
-        input.pop();
+        input.remove(index);
     }
     input
 }
@@ -599,6 +618,62 @@ mod tests {
         let attempt = begin_compaction(session_id, "gpt-5.6-sol");
         assert!(store_compaction(session_id, attempt, native_history));
         attempt
+    }
+
+    #[test]
+    fn compaction_prompt_is_removed_from_its_own_message_before_trailing_reminders() {
+        const PROMPT: &str = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour task is to create a detailed summary of the conversation so far.";
+        let reminder = "<system-reminder>note</system-reminder>";
+        let input: Vec<ResponsesInputItem> = serde_json::from_value(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"old conversation"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":PROMPT}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":reminder}]}
+        ]))
+        .unwrap();
+        let stripped = serde_json::to_value(without_compaction_instruction(&input, 1)).unwrap();
+        assert_eq!(
+            stripped,
+            json!([
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"old conversation"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":reminder}]}
+            ])
+        );
+
+        // A system message after the prompt arrives as one developer item.
+        let input: Vec<ResponsesInputItem> = serde_json::from_value(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"old conversation"}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":PROMPT}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":reminder}]},
+            {"type":"message","role":"developer","content":[{"type":"input_text","text":"system note"}]}
+        ]))
+        .unwrap();
+        let stripped = serde_json::to_value(without_compaction_instruction(&input, 2)).unwrap();
+        assert_eq!(
+            stripped,
+            json!([
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"old conversation"}]},
+                {"type":"message","role":"user","content":[{"type":"input_text","text":reminder}]},
+                {"type":"message","role":"developer","content":[{"type":"input_text","text":"system note"}]}
+            ])
+        );
+
+        // Other text in the prompt's message stays.
+        let input: Vec<ResponsesInputItem> = serde_json::from_value(json!([
+            {"type":"message","role":"user","content":[
+                {"type":"input_text","text":"kept"},
+                {"type":"input_text","text":PROMPT}
+            ]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":reminder}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":reminder}]}
+        ]))
+        .unwrap();
+        let stripped = serde_json::to_value(without_compaction_instruction(&input, 2)).unwrap();
+        assert_eq!(
+            stripped[0]["content"],
+            json!([{"type":"input_text","text":"kept"}])
+        );
+        assert_eq!(stripped.as_array().unwrap().len(), 3);
+        assert!(!stripped.to_string().contains("Your task is to create"));
     }
 
     #[test]

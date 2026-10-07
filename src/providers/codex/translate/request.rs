@@ -4,7 +4,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::anthropic::schema::MessagesRequest;
+use crate::anthropic::schema::{Message, MessagesRequest};
 use crate::config;
 use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
@@ -389,11 +389,65 @@ fn is_compact_message_content(content: &Value) -> bool {
     }
 }
 
+/// How many of the newest messages may hold Claude Code's compaction prompt.
+/// Claude Code can send reminders after the prompt, so it is not always the
+/// final message, while a prompt further back is history, not this request.
+const COMPACT_DETECTION_TAIL_MESSAGES: usize = 8;
+
+const SYSTEM_REMINDER_PREFIX: &str = "<system-reminder>";
+
+/// Whether `content` is a string or a non-empty list of text blocks whose texts
+/// all pass `accept`.
+fn is_text_only_content(content: &Value, accept: impl Fn(&str) -> bool) -> bool {
+    match content {
+        Value::String(text) => accept(text),
+        Value::Array(blocks) => {
+            !blocks.is_empty()
+                && blocks.iter().all(|block| {
+                    block.get("type").and_then(Value::as_str) == Some("text")
+                        && accept(block.get("text").and_then(Value::as_str).unwrap_or(""))
+                })
+        }
+        _ => false,
+    }
+}
+
+/// A message the client injects next to the conversation rather than a turn
+/// of it: a user message made only of `<system-reminder>` text, or a
+/// `role: "system"` message made only of text, which Claude Code sends
+/// mid-conversation to carry reminders. Each translates to exactly one input
+/// item.
+fn is_injected_context_message(message: &Message) -> bool {
+    match message.role.as_str() {
+        "user" => is_text_only_content(&message.content, |text| {
+            text.trim().starts_with(SYSTEM_REMINDER_PREFIX)
+        }),
+        "system" => is_text_only_content(&message.content, |_| true),
+        _ => false,
+    }
+}
+
+/// Index of the user message that holds Claude Code's compaction prompt. It
+/// must be among the newest `COMPACT_DETECTION_TAIL_MESSAGES`, and every
+/// message after it must be injected context (`is_injected_context_message`).
+/// A prompt followed by anything else (an assistant turn, a tool result, other
+/// text) was quoted or answered, so the request is not a summary.
+pub(crate) fn compact_prompt_message_index(request: &MessagesRequest) -> Option<usize> {
+    let is_prompt =
+        |message: &Message| message.role == "user" && is_compact_message_content(&message.content);
+    request
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .take(COMPACT_DETECTION_TAIL_MESSAGES)
+        .find(|(_, message)| is_prompt(message) || !is_injected_context_message(message))
+        .and_then(|(index, message)| is_prompt(message).then_some(index))
+}
+
 pub(crate) fn is_compact_messages_request(request: &MessagesRequest) -> bool {
     is_compact_request(flatten_system_text(request.extra.get("system")).as_deref())
-        || request.messages.last().is_some_and(|message| {
-            message.role == "user" && is_compact_message_content(&message.content)
-        })
+        || compact_prompt_message_index(request).is_some()
 }
 
 /// Reasoning-effort cap applied to compaction requests, or None when the
@@ -1981,24 +2035,140 @@ mod tests {
         assert!(is_compact_messages_request(&req));
     }
 
+    /// The prompt sits at index 1, after one ordinary user message.
+    fn compact_request_with_messages_after_prompt(trailing: Vec<Value>) -> MessagesRequest {
+        let mut messages = vec![
+            json!({"role": "user", "content": "prior turn"}),
+            json!({
+                "role": "user",
+                "content": concat!(
+                    "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n",
+                    "Your task is to create a detailed summary of the conversation so far."
+                )
+            }),
+        ];
+        messages.extend(trailing);
+        serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "messages": messages,
+            "system": "You are Claude Code."
+        }))
+        .unwrap()
+    }
+
+    /// Reminder-only user messages, alternating string and text-block content.
+    fn reminder_messages(count: usize) -> Vec<Value> {
+        (0..count)
+            .map(|index| {
+                if index % 2 == 0 {
+                    json!({
+                        "role": "user",
+                        "content": format!("<system-reminder>note {index}</system-reminder>")
+                    })
+                } else {
+                    json!({"role": "user", "content": [
+                        {"type": "text", "text": format!("\n <system-reminder>note {index}</system-reminder>")},
+                        {"type": "text", "text": "<system-reminder>more</system-reminder>\n"}
+                    ]})
+                }
+            })
+            .collect()
+    }
+
     #[test]
-    fn compact_message_markers_must_be_in_final_user_message() {
+    fn compact_request_detected_when_only_reminders_follow_compact_message() {
+        for trailing in [0, 1, 2, 7] {
+            let req = compact_request_with_messages_after_prompt(reminder_messages(trailing));
+            assert_eq!(compact_prompt_message_index(&req), Some(1), "{trailing}");
+            assert!(is_compact_messages_request(&req), "{trailing}");
+        }
+    }
+
+    #[test]
+    fn compact_request_detected_when_system_messages_follow_compact_message() {
+        let system_string = json!({"role": "system", "content": "Reminder for the model."});
+        let system_blocks = json!({"role": "system", "content": [
+            {"type": "text", "text": "First reminder."},
+            {"type": "text", "text": "Second reminder."}
+        ]});
+        let mut reminder_then_system = reminder_messages(1);
+        reminder_then_system.push(system_string.clone());
+        for trailing in [
+            vec![system_string.clone()],
+            vec![system_blocks],
+            reminder_then_system,
+        ] {
+            let label = Value::Array(trailing.clone());
+            let req = compact_request_with_messages_after_prompt(trailing);
+            assert_eq!(compact_prompt_message_index(&req), Some(1), "{label}");
+            assert!(is_compact_messages_request(&req), "{label}");
+        }
+
+        // A system message with anything but text is not injected context.
+        for follower in [
+            json!({"role": "system", "content": []}),
+            json!({"role": "system", "content": [
+                {"type": "text", "text": "Reminder."},
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}}
+            ]}),
+        ] {
+            let req = compact_request_with_messages_after_prompt(vec![follower.clone()]);
+            assert_eq!(compact_prompt_message_index(&req), None, "{follower}");
+        }
+    }
+
+    #[test]
+    fn historical_compact_message_outside_detection_tail_is_ignored() {
+        for trailing in [8, 20] {
+            let req = compact_request_with_messages_after_prompt(reminder_messages(trailing));
+            assert_eq!(compact_prompt_message_index(&req), None, "{trailing}");
+            assert!(!is_compact_messages_request(&req), "{trailing}");
+        }
+    }
+
+    #[test]
+    fn compact_message_followed_by_anything_but_reminders_is_ignored() {
+        let followers = [
+            json!({"role": "assistant", "content": "summary of what the prompt asks"}),
+            json!({"role": "user", "content": "continue normally"}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tool-1", "content": "result"}
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "<system-reminder>note</system-reminder>"},
+                {"type": "text", "text": "and now fix the bug"}
+            ]}),
+            json!({"role": "user", "content": []}),
+        ];
+        for follower in followers {
+            let mut trailing = reminder_messages(2);
+            trailing.push(follower.clone());
+            for trailing in [vec![follower.clone()], trailing] {
+                let req = compact_request_with_messages_after_prompt(trailing);
+                assert_eq!(compact_prompt_message_index(&req), None, "{follower}");
+                assert!(!is_compact_messages_request(&req), "{follower}");
+            }
+        }
+    }
+
+    #[test]
+    fn compact_message_from_assistant_is_ignored() {
         let req: MessagesRequest = serde_json::from_value(json!({
             "model": "gpt-5.6-sol",
             "messages": [
+                {"role": "user", "content": "what does the compaction prompt say?"},
                 {
-                    "role": "user",
+                    "role": "assistant",
                     "content": concat!(
                         "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n",
                         "Your task is to create a detailed summary of the conversation so far."
                     )
                 },
-                {"role": "user", "content": "continue normally"}
+                {"role": "user", "content": "thanks"}
             ],
             "system": "You are Claude Code."
         }))
         .unwrap();
-
         assert!(!is_compact_messages_request(&req));
     }
 
