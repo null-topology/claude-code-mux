@@ -2080,8 +2080,11 @@ async fn dispatch_request(
     }
 
     // The label route above may already have pinned its junior model; keep that.
-    body.bypass_provider_model_override |=
-        auto_review_route.is_some() && provider.name() == "codex";
+    let auto_review_on_codex = auto_review_route.is_some() && provider.name() == "codex";
+    body.bypass_provider_model_override |= auto_review_on_codex;
+    // The Codex CLI puts no `service_tier` in its own review requests, so the
+    // classifier takes no default tier from the model listing either.
+    body.bypass_catalog_service_tier = auto_review_on_codex;
 
     if let Some(route) = auto_review_route.as_ref() {
         log.info(

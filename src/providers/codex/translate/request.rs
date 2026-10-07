@@ -52,6 +52,26 @@ pub enum ServiceTier {
     Flex,
 }
 
+/// What decided the tier of a Codex request, in precedence order.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceTierSource {
+    /// `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier`.
+    Config,
+    /// A `-fast` suffix on the requested or configured model id.
+    Suffix,
+    /// The model's `default_service_tier` in the last successful listing.
+    Catalog,
+}
+
+/// The tier a Codex request carries and what decided it. A configured
+/// `default` decides on no tier, so `tier` can be `None` with a source.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceTierChoice {
+    pub tier: Option<ServiceTier>,
+    pub source: Option<ServiceTierSource>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponsesToolChoiceMode {
@@ -298,6 +318,7 @@ pub struct TranslateOptions {
     /// a main thread and a derived id for a subagent. It becomes
     /// `prompt_cache_key` and the routing headers of the upstream request.
     pub session_id: Option<String>,
+    /// Goes on the wire as given; `resolve_service_tier` decides it.
     pub service_tier: Option<ServiceTier>,
     pub model: String,
     pub use_responses_lite: bool,
@@ -482,9 +503,10 @@ fn compact_effort_cap_from(raw: Option<&str>) -> Option<Effort> {
     }
 }
 
-const VALID_SERVICE_TIERS: &[&str] = &["fast", "priority", "flex"];
+const VALID_SERVICE_TIERS: &[&str] = &["fast", "priority", "flex", "default"];
 
-fn normalize_service_tier(tier: &str) -> Result<ServiceTier, anyhow::Error> {
+/// `default` asks for standard routing: no tier, and no catalog default.
+fn normalize_service_tier(tier: &str) -> Result<Option<ServiceTier>, anyhow::Error> {
     if !VALID_SERVICE_TIERS.contains(&tier) {
         anyhow::bail!(
             "Invalid service tier override: \"{tier}\". Must be one of: {}",
@@ -492,19 +514,58 @@ fn normalize_service_tier(tier: &str) -> Result<ServiceTier, anyhow::Error> {
         );
     }
     match tier {
-        "flex" => Ok(ServiceTier::Flex),
-        _ => Ok(ServiceTier::Priority),
+        "flex" => Ok(Some(ServiceTier::Flex)),
+        "default" => Ok(None),
+        _ => Ok(Some(ServiceTier::Priority)),
     }
 }
 
-fn resolve_service_tier(
-    model_tier: Option<ServiceTier>,
-) -> Result<Option<ServiceTier>, anyhow::Error> {
-    let tier = config::codex_service_tier();
-    match tier {
-        Some(ref val) => Ok(Some(normalize_service_tier(val)?)),
-        None => Ok(model_tier),
+/// The tier for a request to `model` (the id that goes on the wire), given the
+/// tier its `-fast` suffix asked for. The configured tier wins, then the
+/// suffix, then, when `use_catalog_default` holds, the catalog default the
+/// Codex CLI would put in the request's `service_tier`; otherwise none.
+pub fn resolve_service_tier(
+    model: &str,
+    suffix_tier: Option<ServiceTier>,
+    use_catalog_default: bool,
+) -> Result<ServiceTierChoice, anyhow::Error> {
+    let catalog_default = use_catalog_default
+        .then(|| super::super::models::discovered_default_service_tier(model))
+        .flatten();
+    choose_service_tier(
+        config::codex_service_tier().as_deref(),
+        suffix_tier,
+        catalog_default.as_deref(),
+    )
+}
+
+fn choose_service_tier(
+    configured: Option<&str>,
+    suffix_tier: Option<ServiceTier>,
+    catalog_default: Option<&str>,
+) -> Result<ServiceTierChoice, anyhow::Error> {
+    if let Some(configured) = configured {
+        return Ok(ServiceTierChoice {
+            tier: normalize_service_tier(configured)?,
+            source: Some(ServiceTierSource::Config),
+        });
     }
+    if let Some(tier) = suffix_tier {
+        return Ok(ServiceTierChoice {
+            tier: Some(tier),
+            source: Some(ServiceTierSource::Suffix),
+        });
+    }
+    // Only ids the proxy can name go out; any other catalog id sends nothing.
+    let catalog_tier = match catalog_default {
+        Some("priority") => Some(ServiceTier::Priority),
+        Some("flex") => Some(ServiceTier::Flex),
+        _ => None,
+    };
+    Ok(ServiceTierChoice {
+        source: catalog_tier.as_ref().map(|_| ServiceTierSource::Catalog),
+        tier: catalog_tier,
+    })
 }
 
 pub fn normalize_strict_json_schema(schema: &Value) -> Value {
@@ -600,7 +661,7 @@ fn translate_request_inner(
         tools: None,
         include: None,
         client_metadata: None,
-        service_tier: None,
+        service_tier: opts.service_tier,
         prompt_cache_key: None,
         reasoning: None,
     };
@@ -666,13 +727,6 @@ fn translate_request_inner(
 
     if let Some(sid) = opts.session_id {
         out.prompt_cache_key = Some(sid);
-    }
-
-    if apply_codex_config {
-        let service_tier = resolve_service_tier(opts.service_tier)?;
-        if let Some(ref tier) = service_tier {
-            out.service_tier = Some(tier.clone());
-        }
     }
 
     let effort = read_effort(req)?;
@@ -1394,6 +1448,99 @@ mod tests {
             service_tier: None,
             model: "gpt-5.5".to_string(),
             use_responses_lite: false,
+        }
+    }
+
+    fn tier_choice(
+        tier: Option<ServiceTier>,
+        source: Option<ServiceTierSource>,
+    ) -> ServiceTierChoice {
+        ServiceTierChoice { tier, source }
+    }
+
+    #[test]
+    fn catalog_default_applies_only_when_nothing_else_chose() {
+        use ServiceTierSource::{Catalog, Config, Suffix};
+
+        // No catalog default (null, missing or `default` in the listing all
+        // arrive here as none): no tier.
+        assert_eq!(
+            choose_service_tier(None, None, None).unwrap(),
+            tier_choice(None, None)
+        );
+        assert_eq!(
+            choose_service_tier(None, None, Some("priority")).unwrap(),
+            tier_choice(Some(ServiceTier::Priority), Some(Catalog))
+        );
+        assert_eq!(
+            choose_service_tier(None, None, Some("flex")).unwrap(),
+            tier_choice(Some(ServiceTier::Flex), Some(Catalog))
+        );
+        // An id the proxy cannot name goes out as no tier.
+        assert_eq!(
+            choose_service_tier(None, None, Some("ultrafast")).unwrap(),
+            tier_choice(None, None)
+        );
+        assert_eq!(
+            choose_service_tier(Some("flex"), None, Some("priority")).unwrap(),
+            tier_choice(Some(ServiceTier::Flex), Some(Config))
+        );
+        assert_eq!(
+            choose_service_tier(None, Some(ServiceTier::Priority), Some("flex")).unwrap(),
+            tier_choice(Some(ServiceTier::Priority), Some(Suffix))
+        );
+        assert_eq!(
+            choose_service_tier(Some("flex"), Some(ServiceTier::Priority), None).unwrap(),
+            tier_choice(Some(ServiceTier::Flex), Some(Config))
+        );
+        // A configured `default` opts out of the suffix and the catalog alike.
+        assert_eq!(
+            choose_service_tier(
+                Some("default"),
+                Some(ServiceTier::Priority),
+                Some("priority")
+            )
+            .unwrap(),
+            tier_choice(None, Some(Config))
+        );
+        assert!(choose_service_tier(Some("turbo"), None, None).is_err());
+    }
+
+    #[test]
+    fn service_tier_goes_on_the_wire_as_given_on_both_lanes() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        for use_responses_lite in [false, true] {
+            let tiered = translate_request(
+                &req,
+                TranslateOptions {
+                    service_tier: Some(ServiceTier::Priority),
+                    use_responses_lite,
+                    ..opts()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(&tiered).unwrap()["service_tier"],
+                "priority"
+            );
+            let untiered = translate_request(
+                &req,
+                TranslateOptions {
+                    use_responses_lite,
+                    ..opts()
+                },
+            )
+            .unwrap();
+            assert!(
+                serde_json::to_value(&untiered)
+                    .unwrap()
+                    .get("service_tier")
+                    .is_none()
+            );
         }
     }
 

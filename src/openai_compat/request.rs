@@ -168,6 +168,7 @@ pub fn parse_request(
             messages,
             stream: true,
             bypass_provider_model_override: false,
+            bypass_catalog_service_tier: false,
             extra,
         },
         requested_model,
