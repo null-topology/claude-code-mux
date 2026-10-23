@@ -52,12 +52,16 @@ pub enum ServiceTier {
     Flex,
 }
 
-/// What decided the tier of a Codex request, in precedence order.
+/// What decided the tier of a Codex request. Precedence is
+/// `CCP_CODEX_SERVICE_TIER`, `codex.serviceTierByModel`, `codex.serviceTier`,
+/// the suffix, then the catalog.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceTierSource {
     /// `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier`.
     Config,
+    /// The model's entry in `codex.serviceTierByModel`.
+    ConfigModel,
     /// A `-fast` suffix on the requested or configured model id.
     Suffix,
     /// The model's `default_service_tier` in the last successful listing.
@@ -506,12 +510,22 @@ fn compact_effort_cap_from(raw: Option<&str>) -> Option<Effort> {
 const VALID_SERVICE_TIERS: &[&str] = &["fast", "priority", "flex", "default"];
 
 /// `default` asks for standard routing: no tier, and no catalog default.
-fn normalize_service_tier(tier: &str) -> Result<Option<ServiceTier>, anyhow::Error> {
+/// `entry_of` is the model whose `serviceTierByModel` entry gave `tier`, which
+/// a refusal names; a tier from the env variable or `serviceTier` has none.
+fn normalize_service_tier(
+    tier: &str,
+    entry_of: Option<&str>,
+) -> Result<Option<ServiceTier>, anyhow::Error> {
     if !VALID_SERVICE_TIERS.contains(&tier) {
-        anyhow::bail!(
-            "Invalid service tier override: \"{tier}\". Must be one of: {}",
-            VALID_SERVICE_TIERS.join(", ")
-        );
+        let valid = VALID_SERVICE_TIERS.join(", ");
+        match entry_of {
+            Some(model) => anyhow::bail!(
+                "Invalid service tier in codex.serviceTierByModel[\"{model}\"]: \"{tier}\". Must be one of: {valid}"
+            ),
+            None => {
+                anyhow::bail!("Invalid service tier override: \"{tier}\". Must be one of: {valid}")
+            }
+        }
     }
     match tier {
         "flex" => Ok(Some(ServiceTier::Flex)),
@@ -521,9 +535,11 @@ fn normalize_service_tier(tier: &str) -> Result<Option<ServiceTier>, anyhow::Err
 }
 
 /// The tier for a request to `model` (the id that goes on the wire), given the
-/// tier its `-fast` suffix asked for. The configured tier wins, then the
-/// suffix, then, when `use_catalog_default` holds, the catalog default the
-/// Codex CLI would put in the request's `service_tier`; otherwise none.
+/// tier its `-fast` suffix asked for. The configured tier wins (the env
+/// variable, then the model's `serviceTierByModel` entry, then `serviceTier`),
+/// then the suffix, then, when `use_catalog_default` holds, the catalog
+/// default the Codex CLI would put in the request's `service_tier`; otherwise
+/// none.
 pub fn resolve_service_tier(
     model: &str,
     suffix_tier: Option<ServiceTier>,
@@ -532,22 +548,33 @@ pub fn resolve_service_tier(
     let catalog_default = use_catalog_default
         .then(|| super::super::models::discovered_default_service_tier(model))
         .flatten();
+    let configured = config::codex_service_tier_for_model(model);
     choose_service_tier(
-        config::codex_service_tier().as_deref(),
+        model,
+        configured.as_ref().map(|configured| {
+            let source = if configured.per_model {
+                ServiceTierSource::ConfigModel
+            } else {
+                ServiceTierSource::Config
+            };
+            (configured.raw.as_str(), source)
+        }),
         suffix_tier,
         catalog_default.as_deref(),
     )
 }
 
 fn choose_service_tier(
-    configured: Option<&str>,
+    model: &str,
+    configured: Option<(&str, ServiceTierSource)>,
     suffix_tier: Option<ServiceTier>,
     catalog_default: Option<&str>,
 ) -> Result<ServiceTierChoice, anyhow::Error> {
-    if let Some(configured) = configured {
+    if let Some((configured, source)) = configured {
+        let entry_of = (source == ServiceTierSource::ConfigModel).then_some(model);
         return Ok(ServiceTierChoice {
-            tier: normalize_service_tier(configured)?,
-            source: Some(ServiceTierSource::Config),
+            tier: normalize_service_tier(configured, entry_of)?,
+            source: Some(source),
         });
     }
     if let Some(tier) = suffix_tier {
@@ -1464,46 +1491,131 @@ mod tests {
 
         // No catalog default (null, missing or `default` in the listing all
         // arrive here as none): no tier.
+        let model = "gpt-6-sol";
         assert_eq!(
-            choose_service_tier(None, None, None).unwrap(),
+            choose_service_tier(model, None, None, None).unwrap(),
             tier_choice(None, None)
         );
         assert_eq!(
-            choose_service_tier(None, None, Some("priority")).unwrap(),
+            choose_service_tier(model, None, None, Some("priority")).unwrap(),
             tier_choice(Some(ServiceTier::Priority), Some(Catalog))
         );
         assert_eq!(
-            choose_service_tier(None, None, Some("flex")).unwrap(),
+            choose_service_tier(model, None, None, Some("flex")).unwrap(),
             tier_choice(Some(ServiceTier::Flex), Some(Catalog))
         );
         // An id the proxy cannot name goes out as no tier.
         assert_eq!(
-            choose_service_tier(None, None, Some("ultrafast")).unwrap(),
+            choose_service_tier(model, None, None, Some("ultrafast")).unwrap(),
             tier_choice(None, None)
         );
         assert_eq!(
-            choose_service_tier(Some("flex"), None, Some("priority")).unwrap(),
+            choose_service_tier(model, Some(("flex", Config)), None, Some("priority")).unwrap(),
             tier_choice(Some(ServiceTier::Flex), Some(Config))
         );
         assert_eq!(
-            choose_service_tier(None, Some(ServiceTier::Priority), Some("flex")).unwrap(),
+            choose_service_tier(model, None, Some(ServiceTier::Priority), Some("flex")).unwrap(),
             tier_choice(Some(ServiceTier::Priority), Some(Suffix))
         );
         assert_eq!(
-            choose_service_tier(Some("flex"), Some(ServiceTier::Priority), None).unwrap(),
+            choose_service_tier(
+                model,
+                Some(("flex", Config)),
+                Some(ServiceTier::Priority),
+                None
+            )
+            .unwrap(),
             tier_choice(Some(ServiceTier::Flex), Some(Config))
         );
         // A configured `default` opts out of the suffix and the catalog alike.
         assert_eq!(
             choose_service_tier(
-                Some("default"),
+                model,
+                Some(("default", Config)),
                 Some(ServiceTier::Priority),
                 Some("priority")
             )
             .unwrap(),
             tier_choice(None, Some(Config))
         );
-        assert!(choose_service_tier(Some("turbo"), None, None).is_err());
+        assert!(choose_service_tier(model, Some(("turbo", Config)), None, None).is_err());
+    }
+
+    #[test]
+    fn per_model_tier_beats_the_suffix_and_the_catalog() {
+        use ServiceTierSource::ConfigModel;
+
+        let model = "gpt-6-sol";
+        assert_eq!(
+            choose_service_tier(model, Some(("flex", ConfigModel)), None, None).unwrap(),
+            tier_choice(Some(ServiceTier::Flex), Some(ConfigModel))
+        );
+        assert_eq!(
+            choose_service_tier(
+                model,
+                Some(("flex", ConfigModel)),
+                Some(ServiceTier::Priority),
+                Some("priority")
+            )
+            .unwrap(),
+            tier_choice(Some(ServiceTier::Flex), Some(ConfigModel))
+        );
+        assert_eq!(
+            choose_service_tier(model, Some(("fast", ConfigModel)), None, Some("flex")).unwrap(),
+            tier_choice(Some(ServiceTier::Priority), Some(ConfigModel))
+        );
+        // `default` for one model sends no tier and still names the map.
+        assert_eq!(
+            choose_service_tier(
+                model,
+                Some(("default", ConfigModel)),
+                Some(ServiceTier::Priority),
+                Some("priority")
+            )
+            .unwrap(),
+            tier_choice(None, Some(ConfigModel))
+        );
+        assert!(choose_service_tier(model, Some(("turbo", ConfigModel)), None, None).is_err());
+        // A non-string entry arrives as its JSON text and is refused too.
+        assert!(choose_service_tier(model, Some(("1", ConfigModel)), None, None).is_err());
+        assert!(choose_service_tier(model, Some(("true", ConfigModel)), None, None).is_err());
+    }
+
+    #[test]
+    fn an_invalid_tier_names_the_source_it_came_from() {
+        use ServiceTierSource::{Config, ConfigModel};
+
+        let error = |configured| {
+            choose_service_tier("gpt-6-astra", Some(configured), None, None)
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            error(("priorty", ConfigModel)),
+            "Invalid service tier in codex.serviceTierByModel[\"gpt-6-astra\"]: \"priorty\". \
+             Must be one of: fast, priority, flex, default"
+        );
+        // A non-string entry is named by its JSON text.
+        assert_eq!(
+            error(("5", ConfigModel)),
+            "Invalid service tier in codex.serviceTierByModel[\"gpt-6-astra\"]: \"5\". \
+             Must be one of: fast, priority, flex, default"
+        );
+        // The env variable and the global `serviceTier` keep their message,
+        // which names no model.
+        assert_eq!(
+            error(("priorty", Config)),
+            "Invalid service tier override: \"priorty\". \
+             Must be one of: fast, priority, flex, default"
+        );
+    }
+
+    #[test]
+    fn config_model_source_is_logged_in_snake_case() {
+        assert_eq!(
+            serde_json::to_value(ServiceTierSource::ConfigModel).unwrap(),
+            serde_json::json!("config_model")
+        );
     }
 
     #[test]

@@ -1,7 +1,10 @@
+use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::paths;
 
@@ -32,7 +35,7 @@ pub struct LoadedConfig {
     pub config_dir: PathBuf,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct FileConfig {
     #[serde(rename = "bindAddress")]
     pub bind_address: Option<String>,
@@ -80,6 +83,8 @@ struct CodexConfig {
     pub transcriptions_api: Option<bool>,
     #[serde(rename = "serviceTier")]
     pub service_tier: Option<String>,
+    #[serde(rename = "serviceTierByModel")]
+    pub service_tier_by_model: Option<serde_json::Value>,
     #[serde(rename = "reasoningSummary")]
     pub reasoning_summary: Option<String>,
     #[serde(rename = "effort")]
@@ -117,7 +122,7 @@ struct GrokConfig {
     pub client_version: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct FileLog {
     pub verbose: Option<bool>,
     pub stderr: Option<bool>,
@@ -132,10 +137,57 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
     }
 }
 
+/// How long a parsed `config.json` is reused before the file is read again.
+const CONFIG_FILE_TTL: Duration = Duration::from_secs(30);
+
+/// Parsed `config.json` per path with the time it was read. A missing file is
+/// kept as `None` too, so it is not looked for on every call; a file that could
+/// not be read or parsed is not kept at all.
+type ConfigFileCache = HashMap<PathBuf, (Instant, Option<FileConfig>)>;
+
+static CONFIG_FILE_CACHE: Lazy<Mutex<ConfigFileCache>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
 fn read_file_config(config_dir: &Path) -> Option<FileConfig> {
+    read_file_config_at(config_dir, Instant::now())
+}
+
+fn read_file_config_at(config_dir: &Path, now: Instant) -> Option<FileConfig> {
     let path = config_dir.join("config.json");
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+    {
+        let cache = CONFIG_FILE_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((read_at, parsed)) = cache.get(&path)
+            && now.saturating_duration_since(*read_at) < CONFIG_FILE_TTL
+        {
+            return parsed.clone();
+        }
+    }
+    // Only a parsed file and a missing one are kept. Any other read error, or
+    // a file that does not parse (one caught while it is being rewritten, for
+    // instance), costs this call alone: the next one reads the file again.
+    let parsed = match fs::read_to_string(&path) {
+        Ok(raw) => match serde_json::from_str::<FileConfig>(&raw) {
+            Ok(parsed) => Some(parsed),
+            Err(_) => return None,
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return None,
+    };
+    let mut cache = CONFIG_FILE_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    cache.retain(|_, (read_at, _)| now.saturating_duration_since(*read_at) < CONFIG_FILE_TTL);
+    cache.insert(path, (now, parsed.clone()));
+    parsed
+}
+
+/// Forget every parsed `config.json`, so the next read goes to the file.
+pub fn clear_config_file_cache_for_tests() {
+    CONFIG_FILE_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
 }
 
 pub fn load_config() -> LoadedConfig {
@@ -242,67 +294,98 @@ pub fn log_stderr() -> bool {
     load_config().log_stderr
 }
 
+/// One line of the config override summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSummaryLine {
+    /// The line as [`config_override_summary_lines`] gives it. A file setting
+    /// may carry the value it was given, such as `port: 8080`.
+    pub text: String,
+    /// The same statement naming only the setting and its source, never a
+    /// value, which is what `serve` writes to `proxy.log`.
+    pub logged: String,
+    /// The source held a value that could not be used and was skipped.
+    pub ignored: bool,
+}
+
+impl ConfigSummaryLine {
+    /// A setting in effect, named without its value.
+    fn set(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            logged: text.to_string(),
+            ignored: false,
+        }
+    }
+
+    /// A `config.json` setting in effect, given with its value; the logged
+    /// form names the key only.
+    fn set_to(key: &str, value: impl std::fmt::Display) -> Self {
+        Self {
+            text: format!("{key}: {value}"),
+            logged: format!("{key} (config)"),
+            ignored: false,
+        }
+    }
+
+    /// A source whose value could not be used and was skipped, diagnosed
+    /// without echoing what was set.
+    fn ignored(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            logged: text.to_string(),
+            ignored: true,
+        }
+    }
+}
+
 pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
+    config_override_summary(cfg)
+        .into_iter()
+        .map(|line| line.text)
+        .collect()
+}
+
+/// Every setting an env variable or `config.json` overrides, and every source
+/// whose value was unusable and skipped, in [`config_override_summary_lines`]
+/// order.
+pub fn config_override_summary(cfg: &LoadedConfig) -> Vec<ConfigSummaryLine> {
     let file = read_file_config(&cfg.config_dir);
     let env: HashMap<_, _> = std::env::vars().collect();
     let lane_settings = codex_lane_settings(&env, file.as_ref().and_then(|f| f.codex.as_ref()));
     let mut out = Vec::new();
-    if env.contains_key("CCP_BIND_ADDRESS") {
-        out.push("bindAddress (env)".to_string());
-    }
-    if env.contains_key("PORT") {
-        out.push("port (env)".to_string());
-    }
-    if env.contains_key("CCP_ALIAS_PROVIDER") {
-        out.push("aliasProvider (env)".to_string());
-    }
-    if env.contains_key("CCP_LOG_VERBOSE") {
-        out.push("log.verbose (env)".to_string());
-    }
-    if env.contains_key("CCP_LOG_STDERR") {
-        out.push("log.stderr (env)".to_string());
-    }
-    if env.contains_key("CCP_CODEX_RESPONSES_API") {
-        out.push("codex.responsesApi (env)".to_string());
-    }
-    if env.contains_key("CCP_CODEX_IMAGES_API") {
-        out.push("codex.imagesApi (env)".to_string());
-    }
-    if env.contains_key("CCP_CODEX_IMAGES_BASE_URL") {
-        out.push("codex.imagesBaseUrl (env)".to_string());
-    }
-    if env.contains_key("CCP_CODEX_TRANSCRIPTIONS_API") {
-        out.push("codex.transcriptionsApi (env)".to_string());
-    }
-    if env.contains_key("CCP_KIMI_OAUTH_HOST") {
-        out.push("kimi.oauthHost (env)".to_string());
-    }
-    if env.contains_key("CCP_KIMI_BASE_URL") {
-        out.push("kimi.baseUrl (env)".to_string());
-    }
-    if env.contains_key("CCP_CURSOR_BASE_URL") {
-        out.push("cursor.baseUrl (env)".to_string());
-    }
-    if env.contains_key("CCP_CURSOR_CLIENT_VERSION") {
-        out.push("cursor.clientVersion (env)".to_string());
-    }
-    if env.contains_key("CCP_KIMI_USER_AGENT") {
-        out.push("kimi.userAgent (env)".to_string());
-    }
-    if env.contains_key("CCP_GROK_BASE_URL") {
-        out.push("grok.baseUrl (env)".to_string());
-    }
-    if env.contains_key("CCP_GROK_CLIENT_VERSION") {
-        out.push("grok.clientVersion (env)".to_string());
+    for (key, name) in [
+        ("CCP_BIND_ADDRESS", "bindAddress (env)"),
+        ("PORT", "port (env)"),
+        ("CCP_ALIAS_PROVIDER", "aliasProvider (env)"),
+        ("CCP_LOG_VERBOSE", "log.verbose (env)"),
+        ("CCP_LOG_STDERR", "log.stderr (env)"),
+        ("CCP_CODEX_RESPONSES_API", "codex.responsesApi (env)"),
+        ("CCP_CODEX_IMAGES_API", "codex.imagesApi (env)"),
+        ("CCP_CODEX_IMAGES_BASE_URL", "codex.imagesBaseUrl (env)"),
+        (
+            "CCP_CODEX_TRANSCRIPTIONS_API",
+            "codex.transcriptionsApi (env)",
+        ),
+        ("CCP_KIMI_OAUTH_HOST", "kimi.oauthHost (env)"),
+        ("CCP_KIMI_BASE_URL", "kimi.baseUrl (env)"),
+        ("CCP_CURSOR_BASE_URL", "cursor.baseUrl (env)"),
+        ("CCP_CURSOR_CLIENT_VERSION", "cursor.clientVersion (env)"),
+        ("CCP_KIMI_USER_AGENT", "kimi.userAgent (env)"),
+        ("CCP_GROK_BASE_URL", "grok.baseUrl (env)"),
+        ("CCP_GROK_CLIENT_VERSION", "grok.clientVersion (env)"),
+    ] {
+        if env.contains_key(key) {
+            out.push(ConfigSummaryLine::set(name));
+        }
     }
     if env
         .get("CCP_CODEX_REASONING_SUMMARY")
         .is_some_and(|raw| !raw.is_empty())
     {
-        out.push("CCP_CODEX_REASONING_SUMMARY (env)".to_string());
+        out.push(ConfigSummaryLine::set("CCP_CODEX_REASONING_SUMMARY (env)"));
     }
     if env.contains_key("CCP_CODEX_SERVER_COMPACTION") {
-        out.push("CCP_CODEX_SERVER_COMPACTION (env)".to_string());
+        out.push(ConfigSummaryLine::set("CCP_CODEX_SERVER_COMPACTION (env)"));
     }
     for (source, setting) in lane_settings {
         if source.is_env()
@@ -315,30 +398,30 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
         .get("CCP_AUTO_REVIEW_MODEL")
         .is_some_and(|raw| !raw.is_empty())
     {
-        out.push("CCP_AUTO_REVIEW_MODEL (env)".to_string());
+        out.push(ConfigSummaryLine::set("CCP_AUTO_REVIEW_MODEL (env)"));
     }
     if let Some(file_cfg) = file {
         if let Some(bind_address) = file_cfg.bind_address {
-            out.push(format!("bindAddress: {bind_address}"));
+            out.push(ConfigSummaryLine::set_to("bindAddress", bind_address));
         }
         if let Some(p) = file_cfg.port {
-            out.push(format!("port: {p}"));
+            out.push(ConfigSummaryLine::set_to("port", p));
         }
         if let Some(alias) = file_cfg.alias_provider {
-            out.push(format!("aliasProvider: {alias}"));
+            out.push(ConfigSummaryLine::set_to("aliasProvider", alias));
         }
         if file_cfg
             .auto_review_model
             .is_some_and(|model| !model.is_empty())
         {
-            out.push("autoReviewModel (config)".to_string());
+            out.push(ConfigSummaryLine::set("autoReviewModel (config)"));
         }
         if let Some(log) = file_cfg.log {
             if let Some(v) = log.verbose {
-                out.push(format!("log.verbose: {v}"));
+                out.push(ConfigSummaryLine::set_to("log.verbose", v));
             }
             if let Some(v) = log.stderr {
-                out.push(format!("log.stderr: {v}"));
+                out.push(ConfigSummaryLine::set_to("log.stderr", v));
             }
         }
         if let Some(codex) = file_cfg.codex {
@@ -346,10 +429,10 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
                 .reasoning_summary
                 .is_some_and(|value| !value.is_empty())
             {
-                out.push("codex.reasoningSummary (config)".to_string());
+                out.push(ConfigSummaryLine::set("codex.reasoningSummary (config)"));
             }
             if let Some(enabled) = codex.server_compaction {
-                out.push(format!("codex.serverCompaction: {enabled}"));
+                out.push(ConfigSummaryLine::set_to("codex.serverCompaction", enabled));
             }
             for (source, setting) in lane_settings {
                 if !source.is_env()
@@ -359,16 +442,27 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
                 }
             }
             if codex.responses_api == Some(true) {
-                out.push("codex.responsesApi: true".to_string());
+                out.push(ConfigSummaryLine::set_to("codex.responsesApi", true));
             }
             if codex.images_api == Some(true) {
-                out.push("codex.imagesApi: true".to_string());
+                out.push(ConfigSummaryLine::set_to("codex.imagesApi", true));
             }
             if codex.images_base_url.is_some() {
-                out.push("codex.imagesBaseUrl (config)".to_string());
+                out.push(ConfigSummaryLine::set("codex.imagesBaseUrl (config)"));
             }
             if codex.transcriptions_api == Some(true) {
-                out.push("codex.transcriptionsApi: true".to_string());
+                out.push(ConfigSummaryLine::set_to("codex.transcriptionsApi", true));
+            }
+            match &codex.service_tier_by_model {
+                None | Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::Object(entries)) => {
+                    if !entries.is_empty() {
+                        out.push(ConfigSummaryLine::set("codex.serviceTierByModel (config)"));
+                    }
+                }
+                Some(_) => out.push(ConfigSummaryLine::ignored(
+                    "codex.serviceTierByModel: invalid value; expected an object; ignored",
+                )),
             }
         }
     }
@@ -739,32 +833,37 @@ fn codex_lane_settings(
 /// One config-summary line for a lane source, or nothing when it is unset. A
 /// valid source is named, an unusable one is diagnosed without echoing what was
 /// set.
-fn codex_lane_summary_line(source: CodexLaneSource, setting: CodexLaneSetting) -> Option<String> {
+fn codex_lane_summary_line(
+    source: CodexLaneSource,
+    setting: CodexLaneSetting,
+) -> Option<ConfigSummaryLine> {
     match (source, setting) {
         (_, CodexLaneSetting::Unset) => None,
         (CodexLaneSource::PolicyEnv, CodexLaneSetting::Valid(_)) => {
-            Some("CCP_CODEX_LANE_POLICY (env)".to_string())
+            Some(ConfigSummaryLine::set("CCP_CODEX_LANE_POLICY (env)"))
         }
-        (CodexLaneSource::PolicyEnv, CodexLaneSetting::Invalid) => Some(
-            "CCP_CODEX_LANE_POLICY (env): invalid value; expected full|inventory; ignored"
-                .to_string(),
-        ),
+        (CodexLaneSource::PolicyEnv, CodexLaneSetting::Invalid) => {
+            Some(ConfigSummaryLine::ignored(
+                "CCP_CODEX_LANE_POLICY (env): invalid value; expected full|inventory; ignored",
+            ))
+        }
         (CodexLaneSource::FullLaneEnv, CodexLaneSetting::Valid(_)) => {
-            Some("CCP_CODEX_FULL_LANE (env)".to_string())
+            Some(ConfigSummaryLine::set("CCP_CODEX_FULL_LANE (env)"))
         }
-        (CodexLaneSource::FullLaneEnv, CodexLaneSetting::Invalid) => {
-            Some("CCP_CODEX_FULL_LANE (env): invalid boolean; ignored".to_string())
-        }
-        (CodexLaneSource::PolicyFile, CodexLaneSetting::Valid(policy)) => {
-            Some(format!("codex.lanePolicy: {}", policy.as_str()))
-        }
+        (CodexLaneSource::FullLaneEnv, CodexLaneSetting::Invalid) => Some(
+            ConfigSummaryLine::ignored("CCP_CODEX_FULL_LANE (env): invalid boolean; ignored"),
+        ),
+        (CodexLaneSource::PolicyFile, CodexLaneSetting::Valid(policy)) => Some(
+            ConfigSummaryLine::set_to("codex.lanePolicy", policy.as_str()),
+        ),
         (CodexLaneSource::PolicyFile, CodexLaneSetting::Invalid) => {
-            Some("codex.lanePolicy: invalid value; expected full|inventory; ignored".to_string())
+            Some(ConfigSummaryLine::ignored(
+                "codex.lanePolicy: invalid value; expected full|inventory; ignored",
+            ))
         }
-        (CodexLaneSource::FullLaneFile, CodexLaneSetting::Valid(policy)) => Some(format!(
-            "codex.fullLane: {}",
-            policy == CodexLanePolicy::Full
-        )),
+        (CodexLaneSource::FullLaneFile, CodexLaneSetting::Valid(policy)) => Some(
+            ConfigSummaryLine::set_to("codex.fullLane", policy == CodexLanePolicy::Full),
+        ),
         // A `codex.fullLane` of the wrong type fails the whole file, so an
         // invalid legacy file value never reaches this arm.
         (CodexLaneSource::FullLaneFile, CodexLaneSetting::Invalid) => None,
@@ -881,18 +980,55 @@ pub fn codex_images_base_url() -> String {
     "https://chatgpt.com/backend-api/codex".to_string()
 }
 
-pub fn codex_service_tier() -> Option<String> {
+/// A configured Codex service tier as written, and whether it was set for the
+/// model alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredServiceTier {
+    /// The tier name. A `serviceTierByModel` entry that is not a string is
+    /// carried as its JSON text, which no tier name matches, so it is refused
+    /// like a misspelt name.
+    pub raw: String,
+    /// It came from `codex.serviceTierByModel`.
+    pub per_model: bool,
+}
+
+/// The configured service tier for a request to `model`, the id that goes on
+/// the wire: `CCP_CODEX_SERVICE_TIER`, then `codex.serviceTierByModel[model]`,
+/// then `codex.serviceTier`. The map is looked up by exact id; a map that is
+/// not an object is ignored and a `null` entry counts as absent.
+pub fn codex_service_tier_for_model(model: &str) -> Option<ConfiguredServiceTier> {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_SERVICE_TIER") {
-        return Some(raw.clone());
+        return Some(ConfiguredServiceTier {
+            raw: raw.clone(),
+            per_model: false,
+        });
     }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-    {
-        return codex.service_tier;
+    let codex = read_file_config(&paths::config_dir())?.codex?;
+    let entry = codex
+        .service_tier_by_model
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .and_then(|entries| entries.get(model));
+    match entry {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(raw)) => {
+            return Some(ConfiguredServiceTier {
+                raw: raw.clone(),
+                per_model: true,
+            });
+        }
+        Some(other) => {
+            return Some(ConfiguredServiceTier {
+                raw: other.to_string(),
+                per_model: true,
+            });
+        }
     }
-    None
+    codex.service_tier.map(|raw| ConfiguredServiceTier {
+        raw,
+        per_model: false,
+    })
 }
 
 pub fn codex_effort() -> Option<String> {
@@ -1138,6 +1274,7 @@ mod tests {
         "CCP_CODEX_TRANSCRIPTIONS_API",
         "CCP_AUTO_REVIEW_MODEL",
         "CCP_AGENT_SUMMARY",
+        "CCP_CODEX_SERVICE_TIER",
     ];
 
     struct ClearedEnv {
@@ -1279,6 +1416,7 @@ mod tests {
                 format!(r#"{{"codex":{{"transport":"{file_value}"}}}}"#),
             )
             .unwrap();
+            clear_config_file_cache_for_tests();
             assert_eq!(codex_transport(), expected, "file {file_value}");
             for unusable in ["", "invalid"] {
                 let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", unusable);
@@ -1307,6 +1445,7 @@ mod tests {
                 format!(r#"{{"codex":{{"transport":"{file_value}"}}}}"#),
             )
             .unwrap();
+            clear_config_file_cache_for_tests();
             assert_eq!(
                 codex_transport(),
                 CodexTransport::Auto,
@@ -1524,6 +1663,7 @@ mod tests {
             r#"{"codex":{"serverCompaction":true}}"#,
         )
         .unwrap();
+        clear_config_file_cache_for_tests();
         assert!(codex_server_compaction());
         let _disabled_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "false");
         assert!(!codex_server_compaction());
@@ -1546,13 +1686,17 @@ mod tests {
             r#"{"codex":{"fullLane":false}}"#,
         )
         .unwrap();
+        clear_config_file_cache_for_tests();
         assert!(!codex_full_lane());
         let _enabled_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "true");
         assert!(codex_full_lane());
     }
 
+    /// Write `config.json` and forget any earlier parse of it, so the next
+    /// read sees this body.
     fn write_config(config: &tempfile::TempDir, body: &str) {
         std::fs::write(config.path().join("config.json"), body).unwrap();
+        clear_config_file_cache_for_tests();
     }
 
     #[test]
@@ -1966,6 +2110,353 @@ mod tests {
                 "missing {expected:?} in {lines:?}"
             );
         }
+    }
+
+    fn tier(raw: &str, per_model: bool) -> Option<ConfiguredServiceTier> {
+        Some(ConfiguredServiceTier {
+            raw: raw.to_string(),
+            per_model,
+        })
+    }
+
+    #[test]
+    fn codex_service_tier_orders_env_model_entry_and_global_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert_eq!(codex_service_tier_for_model("toy-model"), None);
+
+        write_config(
+            &config,
+            r#"{"codex":{"serviceTier":"flex","serviceTierByModel":{"toy-model":"priority","toy-mini":"default"}}}"#,
+        );
+        // An entry beats the global file value, `default` included.
+        assert_eq!(
+            codex_service_tier_for_model("toy-model"),
+            tier("priority", true)
+        );
+        assert_eq!(
+            codex_service_tier_for_model("toy-mini"),
+            tier("default", true)
+        );
+        // A model without an entry falls through to the global value, and the
+        // key must match the id exactly.
+        for other in ["toy-other", "toy-model-fast", "TOY-MODEL", "toy"] {
+            assert_eq!(
+                codex_service_tier_for_model(other),
+                tier("flex", false),
+                "{other}"
+            );
+        }
+
+        // The env variable beats an entry.
+        let _tier_env = EnvGuard::set("CCP_CODEX_SERVICE_TIER", "fast");
+        assert_eq!(
+            codex_service_tier_for_model("toy-model"),
+            tier("fast", false)
+        );
+        assert_eq!(
+            codex_service_tier_for_model("toy-other"),
+            tier("fast", false)
+        );
+    }
+
+    #[test]
+    fn codex_service_tier_treats_null_as_absent_and_passes_other_entries_on() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        write_config(
+            &config,
+            r#"{"codex":{"serviceTier":"flex","serviceTierByModel":{"toy-null":null,"toy-num":5,"toy-bool":true,"toy-typo":"turbo"}}}"#,
+        );
+        assert_eq!(
+            codex_service_tier_for_model("toy-null"),
+            tier("flex", false)
+        );
+        // Anything else is the entry's own: a misspelt name as written, a
+        // non-string value as JSON text, which the request refuses.
+        assert_eq!(codex_service_tier_for_model("toy-num"), tier("5", true));
+        assert_eq!(codex_service_tier_for_model("toy-bool"), tier("true", true));
+        assert_eq!(
+            codex_service_tier_for_model("toy-typo"),
+            tier("turbo", true)
+        );
+
+        write_config(
+            &config,
+            r#"{"codex":{"serviceTierByModel":{"toy-null":null}}}"#,
+        );
+        assert_eq!(codex_service_tier_for_model("toy-null"), None);
+    }
+
+    #[test]
+    fn codex_service_tier_by_model_that_is_not_an_object_is_ignored() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        for map in [r#"["toy-quince"]"#, r#""priority""#, "7", "true"] {
+            write_config(
+                &config,
+                &format!(
+                    r#"{{"codex":{{"serviceTier":"flex","transport":"http","serviceTierByModel":{map}}}}}"#
+                ),
+            );
+            assert_eq!(
+                codex_service_tier_for_model("toy-quince"),
+                tier("flex", false),
+                "{map}"
+            );
+            // The rest of the file still applies.
+            assert_eq!(codex_transport(), CodexTransport::Http, "{map}");
+
+            let lines = config_override_summary_lines(&load_config());
+            assert!(
+                lines.iter().any(|line| line
+                    == "codex.serviceTierByModel: invalid value; expected an object; ignored"),
+                "{map}: {lines:?}"
+            );
+            for secret in ["toy-quince", "priority"] {
+                assert!(
+                    !lines.iter().any(|line| line.contains(secret)),
+                    "raw value {secret:?} leaked into {lines:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn config_summary_flags_ignored_sources_and_logs_no_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        write_config(
+            &config,
+            r#"{"bindAddress":"127.0.0.9","port":18999,"aliasProvider":"toy-alias",
+                "log":{"verbose":true,"stderr":false},
+                "codex":{"serverCompaction":true,"lanePolicy":"quince","fullLane":true,
+                         "responsesApi":true,"serviceTierByModel":["toy-quince"]}}"#,
+        );
+        let _policy_env = EnvGuard::set("CCP_CODEX_LANE_POLICY", "banana");
+        let _legacy_env = EnvGuard::set("CCP_CODEX_FULL_LANE", "perhaps");
+        let _port_env = EnvGuard::set("PORT", "18998");
+
+        let summary = config_override_summary(&load_config());
+        // The plain lines are the summary's text, unchanged.
+        assert_eq!(
+            config_override_summary_lines(&load_config()),
+            summary
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let ignored: Vec<_> = summary
+            .iter()
+            .filter(|line| line.ignored)
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(
+            ignored,
+            [
+                "CCP_CODEX_LANE_POLICY (env): invalid value; expected full|inventory; ignored",
+                "CCP_CODEX_FULL_LANE (env): invalid boolean; ignored",
+                "codex.lanePolicy: invalid value; expected full|inventory; ignored",
+                "codex.serviceTierByModel: invalid value; expected an object; ignored",
+            ]
+        );
+
+        // A line that carries a value is logged by its key alone.
+        for (text, logged) in [
+            ("bindAddress: 127.0.0.9", "bindAddress (config)"),
+            ("port: 18999", "port (config)"),
+            ("aliasProvider: toy-alias", "aliasProvider (config)"),
+            ("log.verbose: true", "log.verbose (config)"),
+            ("log.stderr: false", "log.stderr (config)"),
+            (
+                "codex.serverCompaction: true",
+                "codex.serverCompaction (config)",
+            ),
+            ("codex.fullLane: true", "codex.fullLane (config)"),
+            ("codex.responsesApi: true", "codex.responsesApi (config)"),
+        ] {
+            let line = summary
+                .iter()
+                .find(|line| line.text == text)
+                .unwrap_or_else(|| panic!("missing {text:?} in {summary:?}"));
+            assert_eq!(line.logged, logged);
+            assert!(!line.ignored, "{line:?}");
+        }
+        for line in &summary {
+            for value in [
+                "127.0.0.9",
+                "18999",
+                "18998",
+                "toy-alias",
+                "true",
+                "false",
+                "quince",
+                "banana",
+                "perhaps",
+            ] {
+                assert!(
+                    !line.logged.contains(value),
+                    "value {value:?} in logged line {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_service_tier_by_model_summary_names_the_map_without_its_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        write_config(
+            &config,
+            r#"{"codex":{"serviceTierByModel":{"toy-quince":"priority"}}}"#,
+        );
+        let lines = config_override_summary_lines(&load_config());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "codex.serviceTierByModel (config)"),
+            "{lines:?}"
+        );
+        for secret in ["toy-quince", "priority"] {
+            assert!(
+                !lines.iter().any(|line| line.contains(secret)),
+                "raw value {secret:?} leaked into {lines:?}"
+            );
+        }
+
+        // An empty or null map configures nothing and is not announced.
+        for map in ["{}", "null"] {
+            write_config(
+                &config,
+                &format!(r#"{{"codex":{{"serviceTierByModel":{map}}}}}"#),
+            );
+            let lines = config_override_summary_lines(&load_config());
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.starts_with("codex.serviceTierByModel")),
+                "{map}: {lines:?}"
+            );
+        }
+    }
+
+    fn cached_transport_at(config: &tempfile::TempDir, now: Instant) -> Option<String> {
+        read_file_config_at(config.path(), now)
+            .and_then(|file| file.codex)
+            .and_then(|codex| codex.transport)
+    }
+
+    #[test]
+    fn config_file_cache_serves_reads_within_its_lifetime() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let path = config.path().join("config.json");
+
+        write_config(&config, r#"{"codex":{"transport":"http"}}"#);
+        assert_eq!(codex_transport(), CodexTransport::Http);
+
+        // Within the lifetime the file is not read again: neither a removed
+        // nor a rewritten file is seen.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(codex_transport(), CodexTransport::Http);
+        std::fs::write(&path, r#"{"codex":{"transport":"websocket"}}"#).unwrap();
+        assert_eq!(codex_transport(), CodexTransport::Http);
+
+        // Once it has passed, the next read goes to the file.
+        let later = Instant::now() + CONFIG_FILE_TTL;
+        assert_eq!(
+            cached_transport_at(&config, later).as_deref(),
+            Some("websocket")
+        );
+        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+
+        // The test helper forgets the parse at once.
+        std::fs::write(&path, r#"{"codex":{"transport":"http"}}"#).unwrap();
+        assert_eq!(codex_transport(), CodexTransport::WebSocket);
+        clear_config_file_cache_for_tests();
+        assert_eq!(codex_transport(), CodexTransport::Http);
+    }
+
+    #[test]
+    fn config_file_cache_keeps_a_missing_file_for_its_lifetime() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let path = config.path().join("config.json");
+
+        assert_eq!(codex_transport(), CodexTransport::Auto);
+        assert!(config_file_is_cached());
+        std::fs::write(&path, r#"{"codex":{"transport":"http"}}"#).unwrap();
+        assert_eq!(codex_transport(), CodexTransport::Auto);
+        let later = Instant::now() + CONFIG_FILE_TTL;
+        assert_eq!(cached_transport_at(&config, later).as_deref(), Some("http"));
+    }
+
+    /// Whether the cache holds an entry for the current config dir's file.
+    fn config_file_is_cached() -> bool {
+        CONFIG_FILE_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&paths::config_dir().join("config.json"))
+    }
+
+    #[test]
+    fn config_file_cache_does_not_keep_a_file_that_did_not_parse() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let path = config.path().join("config.json");
+
+        // A file caught while it is being rewritten costs that one read: the
+        // next one goes to the file again and sees the finished body.
+        write_config(&config, r#"{"codex":{"transport":"#);
+        assert_eq!(codex_transport(), CodexTransport::Auto);
+        assert!(!config_file_is_cached());
+        std::fs::write(&path, r#"{"codex":{"transport":"http"}}"#).unwrap();
+        assert_eq!(codex_transport(), CodexTransport::Http);
+        assert!(config_file_is_cached());
+    }
+
+    #[test]
+    fn config_file_cache_does_not_keep_a_read_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        let path = config.path().join("config.json");
+
+        // A directory in the file's place fails the read with an error other
+        // than NotFound.
+        std::fs::create_dir(&path).unwrap();
+        assert_ne!(
+            std::fs::read_to_string(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(codex_transport(), CodexTransport::Auto);
+        assert!(!config_file_is_cached());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, r#"{"codex":{"transport":"http"}}"#).unwrap();
+        assert_eq!(codex_transport(), CodexTransport::Http);
     }
 
     #[test]

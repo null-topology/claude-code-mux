@@ -5,6 +5,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
+use claude_code_mux::config::clear_config_file_cache_for_tests;
 use claude_code_mux::logging::log_file;
 use claude_code_mux::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_mux::providers::codex::models::{
@@ -1439,6 +1440,89 @@ async fn auto_review_classifier_takes_no_catalog_default_service_tier() {
     assert_eq!(last_sent(&captured)["service_tier"], "flex");
     assert_eq!(last_logged_tier(), (json!("flex"), json!("config")));
 
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+}
+
+/// A `codex.serviceTierByModel` entry in `config.json` decides the wire
+/// `service_tier` for the model that goes on the wire, over the global
+/// `codex.serviceTier`, a `-fast` suffix and the catalog default.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn service_tier_by_model_entry_decides_the_wire_tier() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    // Every expected result differs from what the global value (flex), the
+    // suffix (priority) or the catalog (priority for gpt-6-sol, none for
+    // gpt-6-luna and gpt-5.5) would give, and the two entries differ from
+    // each other, so the web search case shows which id the lookup used.
+    std::fs::write(
+        config.path().join("config.json"),
+        json!({
+            "codex": {
+                "serviceTier": "flex",
+                "serviceTierByModel": {"gpt-6-sol": "default", "gpt-6-luna": "fast"}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    clear_config_file_cache_for_tests();
+    let (upstream, captured) = spawn_codex_upstream(StatusCode::OK, tier_inventory()).await;
+    let _env = tier_env(&config, &upstream);
+    let (status, value) = get_models("/v1/models?provider=codex").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+
+    // The entry beats the global value and the catalog default.
+    assert_routed(
+        post_body(message_body("gpt-6-luna"), "by-model-1").await,
+        "entry",
+    )
+    .await;
+    let sent = last_sent(&captured);
+    assert_eq!(sent["model"], "gpt-6-luna");
+    assert_eq!(sent["service_tier"], "priority", "{sent}");
+    assert_eq!(
+        last_logged_tier(),
+        (json!("priority"), json!("config_model"))
+    );
+
+    // An entry of `default` beats the suffix too: no tier at all.
+    assert_routed(
+        post_body(message_body("gpt-6-sol-fast"), "by-model-2").await,
+        "entry over suffix",
+    )
+    .await;
+    let sent = last_sent(&captured);
+    assert_eq!(sent["model"], "gpt-6-sol");
+    assert!(sent.get("service_tier").is_none(), "{sent}");
+    assert_eq!(last_logged_tier(), (Value::Null, json!("config_model")));
+
+    // A model without an entry takes the global value.
+    assert_routed(
+        post_body(message_body("gpt-5.5"), "by-model-3").await,
+        "no entry",
+    )
+    .await;
+    let sent = last_sent(&captured);
+    assert_eq!(sent["model"], "gpt-5.5");
+    assert_eq!(sent["service_tier"], "flex", "{sent}");
+    assert_eq!(last_logged_tier(), (json!("flex"), json!("config")));
+
+    // Hosted web search sends gpt-6-luna as gpt-6-sol, whose entry applies.
+    let mut search = message_body("gpt-6-luna");
+    search["tools"] = json!([{"type": "web_search_20250305", "name": "web_search"}]);
+    assert_routed(post_body(search, "by-model-4").await, "web search").await;
+    let sent = last_sent(&captured);
+    assert_eq!(sent["model"], "gpt-6-sol");
+    assert!(sent.get("service_tier").is_none(), "{sent}");
+    assert_eq!(last_logged_tier(), (Value::Null, json!("config_model")));
+
+    clear_config_file_cache_for_tests();
     clear_discovered_models_for_tests();
     clear_listed_models_for_tests();
     clear_all_continuations_for_tests();

@@ -241,7 +241,23 @@ Request path:
    dir `~/.config/claude-code-proxy`, state dir
    `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy`, `CCP_CONFIG_DIR`
    overrides only the config dir), `config.rs` (precedence: `CCP_*` env, then
-   `config.json` in the config dir, then default).
+   `config.json` in the config dir, then default). `read_file_config` keeps
+   the parsed file per path in a process-wide cache for `CONFIG_FILE_TTL`
+   (30 s), a missing file (`NotFound`) included as `None`, so an edit lands
+   within 30 s. Any other read error and a file that does not parse are not
+   cached: that call gets `None` and the next one reads the file again, so a
+   file caught mid-write costs one request. A test that rewrites a config it
+   has already read calls `clear_config_file_cache_for_tests` (the
+   `write_config` helper does).
+
+`serve` logs `config::config_override_summary` once at startup
+(`log_config_summary` in `main.rs`, after `suppress_stderr` in monitor mode):
+one `config summary` event per line on the `server` logger, the line in the
+`line` field. `ConfigSummaryLine::ignored` (a source whose value was unusable
+and skipped) picks warn, everything else info. The logged form is
+`ConfigSummaryLine::logged`, which names a setting and its source and never a
+value (`port (config)`); `text`, which `config_override_summary_lines` returns
+and the config tests read, may carry a file value (`port: 8080`).
 
 The Codex lane setting has a chain of its own in `config.rs`:
 `CCP_CODEX_LANE_POLICY` (`full|inventory`, default `full`), then the legacy
@@ -249,7 +265,8 @@ The Codex lane setting has a chain of its own in `config.rs`:
 `codex.fullLane`. The first source that parses wins. For both env keys and for
 `codex.lanePolicy`, a value that does not parse is invalid rather than unset:
 it is skipped and reported by `config_override_summary_lines`, which names the
-source without echoing what was set. `codex.lanePolicy` is deserialized as a
+source without echoing what was set, and logged at startup as a `config
+summary` warning. `codex.lanePolicy` is deserialized as a
 raw `Value`, so an unusable value there is ignored on its own instead of
 failing the whole file; the legacy `codex.fullLane` keeps its boolean grammar
 and a wrong type there still fails the whole file in serde, which is why its
@@ -829,9 +846,24 @@ the entry's `default_service_tier` when its `service_tiers` lists that id,
 never the `default` sentinel, which is how the Codex CLI fills that field.
 `resolve_service_tier` in `providers/codex/translate/request.rs` decides a
 request's tier on the model that goes on the wire, after the lane upgrade:
-`CCP_CODEX_SERVICE_TIER` / `codex.serviceTier` first (`default` there means
-no tier at all), then a `-fast` suffix (priority), then that catalog default,
-then none. Only `priority` and `flex` from the catalog go out; any other id,
+`CCP_CODEX_SERVICE_TIER`, then that model's entry in
+`codex.serviceTierByModel` (exact id, no `-fast` or `[1m]`, no globs; source
+`config_model`), then `codex.serviceTier` (`default` in any of the three
+means no tier at all), then a `-fast` suffix (priority), then that catalog
+default, then none. `config::codex_service_tier_for_model` applies the first
+three. The map is a raw `Value`: one that is not an object is ignored and
+named in `config_override_summary_lines` without its contents (a `config
+summary` warning at startup), a `null` map or `null` entry counts as absent,
+and any other entry that is not a valid tier, a non-string one passed on as
+its JSON text, gives a 400 that names it
+(`Invalid service tier in codex.serviceTierByModel["<model>"]: ...`, from
+`normalize_service_tier` when the source is `ConfigModel`); the env variable
+and `serviceTier` keep `Invalid service tier override: ...`. The map and
+`serviceTier` apply only where `resolve_service_tier` runs, the Codex
+provider's Anthropic Messages path: `/v1/messages`, `count_tokens` and the
+auto-review classifier, whose entry is keyed by its effective model
+(`gpt-6-luna` by default). The OpenAI-compatible `/v1/responses` (a native
+relay) and `/v1/chat/completions` take neither. Only `priority` and `flex` from the catalog go out; any other id,
 `fast` and `ultrafast` included, sends nothing and is never mapped to a
 tier. Claude Code's auto-review classifier sent to Codex skips the catalog
 step (`MessagesRequest::bypass_catalog_service_tier`, set in

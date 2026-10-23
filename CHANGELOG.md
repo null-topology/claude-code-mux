@@ -1,3 +1,49 @@
+## Unreleased
+
+- New `config.json` key `codex.serviceTierByModel` sets the Codex service tier
+  per model: an object from model id to tier, with the `serviceTier` values
+  (`fast`, `priority`, `flex`, `default`). The key must match the id that goes
+  to Codex exactly (after `codex.model` and the web search lane upgrade,
+  without `-fast` or `[1m]`); there are no wildcards and no environment
+  variable for it. A request now takes the first of
+  `CCP_CODEX_SERVICE_TIER`, the model's entry, `codex.serviceTier`, a `-fast`
+  suffix and the listing's default, so an entry overrides `serviceTier` and
+  the suffix for its model, and `default` there sends no tier for it. Like
+  `serviceTier`, the map applies to Anthropic Messages requests routed to
+  Codex: `/v1/messages`, the `count_tokens` check and Claude Code's
+  auto-review classifier, whose entry is keyed by its model (`gpt-6-luna` by
+  default); the OpenAI-compatible `/v1/responses` and `/v1/chat/completions`
+  surfaces take neither. A `null` entry counts as absent, and so does a `null`
+  map. An entry that is not a valid tier name answers that model's requests
+  with a 400 naming the entry, such as `Invalid service tier in
+  codex.serviceTierByModel["gpt-6-astra"]: "priorty". Must be one of: ...`.
+  A value that is not an object is ignored and logged at startup as a
+  `config summary` warning:
+  `codex.serviceTierByModel: invalid value; expected an object; ignored`.
+  Without the key nothing changes.
+- `codex_upstream_request_started` in `proxy.log` can now carry
+  `serviceTierSource: "config_model"`, for a tier taken from
+  `codex.serviceTierByModel`. `config` still means `CCP_CODEX_SERVICE_TIER` or
+  `codex.serviceTier`. A log reader that matches the known sources needs the
+  new value.
+- The proxy now keeps the parsed `config.json` in memory for 30 seconds
+  instead of reading the file again on every request. An edit to the file
+  reaches the settings read per request within 30 seconds rather than on the
+  next one; a missing file stays missing for up to 30 seconds after it is
+  created. A file that cannot be read or does not parse, such as one caught
+  mid-write, is not kept: only the request that saw it runs without the file.
+  There is no setting to turn this off; to apply an edit at once, restart the
+  proxy.
+- `serve` now writes the config override summary to `proxy.log` at startup,
+  one `config summary` event per line with the line in its `line` field. Each
+  line names a setting and its source (`port (env)`, `port (config)`), never
+  the value it carried. A source whose value was unusable and skipped, such as
+  `codex.lanePolicy: invalid value; expected full|inventory; ignored`, is a
+  warning, which also reaches stderr when the monitor is off; every other line
+  is info. Until now this summary was not emitted anywhere, although an
+  unusable `codex.lanePolicy` or lane env value was documented as reported at
+  startup.
+
 ## v0.15.0 (2026-10-07)
 
 - A request that belongs to a Claude Code message thread (a body with a
