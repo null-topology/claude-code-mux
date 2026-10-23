@@ -1,4 +1,4 @@
-## Unreleased
+## v0.16.0 (2026-10-23)
 
 - New `config.json` key `codex.serviceTierByModel` sets the Codex service tier
   per model: an object from model id to tier, with the `serviceTier` values
