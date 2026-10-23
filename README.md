@@ -877,10 +877,14 @@ Claude route.
 
 Settings are read from `CCP_*` environment variables first, then from
 `config.json` in the config directory, then defaults. An environment value the
-grammar does not accept is skipped rather than obeyed. The startup config
-summary lists what was overridden: an environment setting is named by its
-variable and source only, never with the value it carried, while a value read
-from `config.json` is mostly printed as it stands.
+grammar does not accept is skipped rather than obeyed. At startup `serve`
+writes a config summary to `proxy.log`: one `config summary` event per setting
+an environment variable or `config.json` overrides, with the setting in its
+`line` field, named by its key and source only, never with the value it
+carried (`port (env)`, `port (config)`). A source whose value was unusable and
+skipped is logged as a warning that says so
+(`codex.lanePolicy: invalid value; expected full|inventory; ignored`), every
+other line at info. With the monitor off, warnings are also written to stderr.
 
 This is the complete list of variables the proxy reads.
 
@@ -917,7 +921,7 @@ This is the complete list of variables the proxy reads.
 | `CCP_CODEX_TRANSPORT` | `auto` | `auto`, `websocket`, or `http`. `auto` uses a WebSocket and switches to HTTP only when the WebSocket could not be set up before the request was sent, for example a refused handshake; a request already sent over the WebSocket is never sent again over HTTP. `websocket` never falls back. Whatever the setting, Claude Code's compaction summary and the opt-in server compaction call go over HTTP. Rate-limit handling is the same on each. |
 | `CCP_CODEX_EFFORT` | unset | Reasoning effort sent to Codex, e.g. `high`. `none` is sent as is, and then no reasoning summary and no encrypted reasoning are requested. |
 | `CCP_COMPACT_EFFORT` | `low` | Effort cap for compaction turns only. It never raises an effort the request named, and a compaction turn that names no effort gets the cap. `off` disables the cap, `none` asks for no reasoning. |
-| `CCP_CODEX_SERVICE_TIER` | unset | Service tier for every Codex request: `fast`, `priority`, `flex`, or `default` for no tier at all. Without a configured tier, a `-fast` id requests priority; otherwise the listing's default applies only when it is `priority` or `flex` and appears in the model's `service_tiers`, and never to the auto-review classifier. |
+| `CCP_CODEX_SERVICE_TIER` | unset | Service tier for Anthropic Messages requests routed to Codex (`/v1/messages`, the `count_tokens` check, the auto-review classifier; not the OpenAI-compatible `/v1/responses` and `/v1/chat/completions`): `fast`, `priority`, `flex`, or `default` for no tier at all. It wins over every file setting, `codex.serviceTierByModel` included. Without a configured tier, a `-fast` id requests priority; otherwise the listing's default applies only when it is `priority` or `flex` and appears in the model's `service_tiers`, and never to the auto-review classifier. |
 | `CCP_CODEX_REASONING_SUMMARY` | unset | Reasoning summary mode requested from Codex, e.g. `auto`. |
 | `CCP_CODEX_MODEL` | unset | Send this Codex model regardless of what the client asked for. |
 | `CCP_CODEX_LANE_POLICY` | `full` | `full` keeps Codex models off the Responses Lite lane so they can answer with several tool calls at once; `inventory` follows the lane flag from the backend's own model listing. |
@@ -989,18 +993,61 @@ the default. Eleven variables have no key in the file and are environment-only:
 | --- | --- |
 | top level | `bindAddress`, `port`, `aliasProvider`, `autoReviewModel`, `agentSummary` |
 | `log` | `verbose`, `stderr` |
-| `codex` | `baseUrl`, `originator`, `userAgent`, `clientVersion`, `previousResponseId`, `lanePolicy`, `fullLane` (legacy), `serverCompaction`, `responsesApi`, `imagesApi`, `imagesBaseUrl`, `transcriptionsApi`, `serviceTier`, `reasoningSummary`, `effort`, `model`, `transport` |
+| `codex` | `baseUrl`, `originator`, `userAgent`, `clientVersion`, `previousResponseId`, `lanePolicy`, `fullLane` (legacy), `serverCompaction`, `responsesApi`, `imagesApi`, `imagesBaseUrl`, `transcriptionsApi`, `serviceTier`, `serviceTierByModel`, `reasoningSummary`, `effort`, `model`, `transport` |
 | `kimi` | `baseUrl`, `oauthHost`, `userAgent` |
 | `grok` | `baseUrl`, `clientVersion` |
 | `cursor` | `baseUrl`, `clientVersion`, `agentBundle` |
 
 The lane setting reads four sources in order and takes the first that parses:
 `CCP_CODEX_LANE_POLICY`, the legacy `CCP_CODEX_FULL_LANE`, `codex.lanePolicy`,
-the legacy `codex.fullLane`. A value the grammar does not accept is reported in
-the startup summary — for an unusable environment value,
+the legacy `codex.fullLane`. A value the grammar does not accept is logged at
+startup as a `config summary` warning in `proxy.log` — for an unusable
+environment value,
 `CCP_CODEX_LANE_POLICY (env): invalid value; expected full|inventory; ignored`
 — and the next source decides. Note that a wrong **type** under `codex.fullLane`
 fails the whole file in parsing, so the file is then ignored entirely.
+
+`codex.serviceTierByModel` sets the service tier per model and has no
+environment variable. Each key is a model id exactly as it goes to Codex: after
+`codex.model` and the web search lane upgrade, without a `-fast` suffix or a
+`[1m]` marker, with no wildcards or prefixes. Each value takes the
+`serviceTier` grammar (`fast`, `priority`, `flex`, `default`). Like
+`serviceTier`, it applies to Anthropic Messages requests routed to Codex:
+`/v1/messages`, the `count_tokens` check and Claude Code's auto-review
+classifier, whose entry is keyed by its model (`gpt-6-luna` unless
+`CCP_AUTO_REVIEW_MODEL` or `autoReviewModel` names another). The OpenAI-compatible `/v1/responses`
+and `/v1/chat/completions` surfaces take neither.
+
+```json
+{
+  "codex": {
+    "serviceTier": "flex",
+    "serviceTierByModel": { "gpt-6-astra": "priority", "gpt-6-luna": "default" }
+  }
+}
+```
+
+A request takes the first of: `CCP_CODEX_SERVICE_TIER`, the model's entry in
+`codex.serviceTierByModel`, `codex.serviceTier`, a `-fast` suffix, the
+listing's default. So an entry overrides `serviceTier` and the suffix for its
+model, and `default` there sends no tier for that model whatever comes after
+it. A `null` entry counts as absent, and so does a `null` map, as `null` does
+for every other key. An entry that is not a valid tier name, a non-string value
+included, answers that model's requests with a 400 that names the entry:
+`Invalid service tier in codex.serviceTierByModel["gpt-6-astra"]: "priorty".
+Must be one of: fast, priority, flex, default`. A `serviceTierByModel` that is
+not an object is ignored, the rest of the file still applies, and it is logged
+at startup as a `config summary` warning in `proxy.log`:
+`codex.serviceTierByModel: invalid value; expected an object; ignored`. The
+`codex_upstream_request_started` log line names a tier from the map as
+`serviceTierSource: "config_model"`.
+
+The proxy keeps the parsed file in memory for 30 seconds, so an edit to
+`config.json` reaches the settings it reads per request within 30 seconds
+rather than on the next request. A missing file is kept for those 30 seconds
+too. A file that cannot be read or does not parse, such as one caught while it
+is being rewritten, is not kept: that request runs without the file, and the
+next one reads it again.
 
 ### File locations
 

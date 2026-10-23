@@ -113,6 +113,7 @@ fn main() -> Result<()> {
             });
             match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
                 ServeMode::Plain => {
+                    log_config_summary();
                     print_server_banner(&bind_address, effective_port, &registry);
                     runtime
                         .block_on(server::serve(ServerConfig {
@@ -124,6 +125,9 @@ fn main() -> Result<()> {
                 }
                 ServeMode::Monitor => {
                     let _stderr_guard = logging::suppress_stderr();
+                    // Logged once stderr is suppressed, so a warning mirrored
+                    // there cannot land on the monitor's screen.
+                    log_config_summary();
                     let monitor = MonitorHandle::default();
                     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
                     let (shutdown_complete_tx, shutdown_complete_rx) = std::sync::mpsc::channel();
@@ -348,6 +352,46 @@ fn alias_names() -> usize {
     ANTHROPIC_STYLE_ALIASES.len()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryLevel {
+    Info,
+    Warn,
+}
+
+/// The level each config summary line is logged at, with the form of the
+/// line that names no value: a source whose value was unusable and skipped is
+/// a warning, every other line is info.
+fn config_summary_events(lines: Vec<config::ConfigSummaryLine>) -> Vec<(SummaryLevel, String)> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let level = if line.ignored {
+                SummaryLevel::Warn
+            } else {
+                SummaryLevel::Info
+            };
+            (level, line.logged)
+        })
+        .collect()
+}
+
+/// Write the config override summary to `proxy.log` once at startup, one
+/// `config summary` event per line.
+fn log_config_summary() {
+    let logger = logging::create_logger("server");
+    let summary = config::config_override_summary(&config::load_config());
+    for (level, line) in config_summary_events(summary) {
+        let fields = Some(serde_json::Map::from_iter([(
+            "line".to_string(),
+            serde_json::Value::String(line),
+        )]));
+        match level {
+            SummaryLevel::Info => logger.info("config summary", fields),
+            SummaryLevel::Warn => logger.warn("config summary", fields),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +421,41 @@ mod tests {
     #[test]
     fn listen_url_brackets_ipv6_addresses() {
         assert_eq!(listen_url("::1", 18765), "http://[::1]:18765");
+    }
+
+    #[test]
+    fn config_summary_warns_only_for_ignored_sources_and_logs_the_value_free_form() {
+        let line = |text: &str, logged: &str, ignored| config::ConfigSummaryLine {
+            text: text.to_string(),
+            logged: logged.to_string(),
+            ignored,
+        };
+        let events = config_summary_events(vec![
+            line("port: 18999", "port (config)", false),
+            line(
+                "CCP_CODEX_LANE_POLICY (env)",
+                "CCP_CODEX_LANE_POLICY (env)",
+                false,
+            ),
+            line(
+                "codex.lanePolicy: invalid value; expected full|inventory; ignored",
+                "codex.lanePolicy: invalid value; expected full|inventory; ignored",
+                true,
+            ),
+        ]);
+        assert_eq!(
+            events,
+            [
+                (SummaryLevel::Info, "port (config)".to_string()),
+                (
+                    SummaryLevel::Info,
+                    "CCP_CODEX_LANE_POLICY (env)".to_string()
+                ),
+                (
+                    SummaryLevel::Warn,
+                    "codex.lanePolicy: invalid value; expected full|inventory; ignored".to_string()
+                ),
+            ]
+        );
     }
 }
