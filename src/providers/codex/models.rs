@@ -16,15 +16,18 @@ use std::time::Duration;
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::auth::AuthStorage;
 use crate::config;
+use crate::provider::{ModelCapabilities, model_info};
 
 use super::auth::constants::{CODEX_CLIENT_VERSION, ORIGINATOR};
 use super::auth::manager::CodexAuthManager;
 use super::auth::token_store::{StoredAuth, codex_auth_file};
 use super::client::forward_client_headers;
+use super::translate::model_allowlist::full_lane_web_search_model;
+use super::translate::request::to_codex_effort;
 
 /// Upper bound for one listing round-trip; Claude Code's own gateway
 /// discovery gives up after five seconds, so the proxy must answer sooner.
@@ -52,7 +55,7 @@ pub struct ServiceTierOffer {
     pub description: Option<String>,
 }
 
-/// The subset of a backend model entry the proxy forwards. Unknown fields are
+/// The subset of a backend model entry the proxy reads. Unknown fields are
 /// ignored so a backend schema change never breaks the listing.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct UpstreamModel {
@@ -98,25 +101,85 @@ impl UpstreamModel {
             .map(str::to_string)
     }
 
-    /// The row shape `/v1/models` advertises: the Anthropic-style fields first,
-    /// then the backend facts a consumer needs to pick a model.
+    /// The `/v1/models` row for this model, in the Anthropic Models API shape.
+    /// The backend serves prompts past `context_window` up to
+    /// `max_context_window`, so the larger window is the usable input limit.
+    /// `max_tokens` is null: the translator sends no output cap
+    /// (`translate_request_inner` never sets `max_output_tokens`) and the
+    /// listing names none.
     pub fn to_listing_row(&self) -> Value {
-        let mut row = json!({
-            "type": "model",
-            "object": "model",
-            "id": self.slug,
-            "display_name": self.display_name.clone().unwrap_or_else(|| self.slug.clone()),
-        });
-        let extra = serde_json::to_value(self).unwrap_or_default();
-        if let (Some(row), Some(extra)) = (row.as_object_mut(), extra.as_object()) {
-            for (key, value) in extra {
-                if matches!(key.as_str(), "slug" | "display_name") {
-                    continue;
-                }
-                row.insert(key.clone(), value.clone());
-            }
+        let display_name = self.display_name.as_deref().unwrap_or(&self.slug);
+        let max_input_tokens = self.max_context_window.or(self.context_window);
+        let capabilities = self.capabilities();
+        model_info(
+            &self.slug,
+            display_name,
+            max_input_tokens,
+            None,
+            Some(&capabilities),
+        )
+    }
+
+    /// What an Anthropic Messages request for this model can use through the
+    /// Codex translator: a feature counts only when the translator carries it
+    /// to the backend as the same feature.
+    pub fn capabilities(&self) -> ModelCapabilities {
+        // `read_effort` accepts the level and `to_codex_effort` sends it as the
+        // Codex effort of the same name; the model must list that level.
+        let effort = |level: &str| {
+            to_codex_effort(Some(level)).is_some_and(|effort| effort.to_string() == level)
+                && self
+                    .supported_reasoning_levels
+                    .iter()
+                    .any(|listed| listed.effort == level)
+        };
+        ModelCapabilities {
+            // No batch endpoint, citation mapping or code execution on this route.
+            batch: false,
+            citations: false,
+            code_execution: false,
+            // `translate_request_inner` reads no `context_management` edits.
+            clear_thinking_20251015: false,
+            clear_tool_uses_20250919: false,
+            compact_20260112: false,
+            // `read_effort` accepts low, medium, high, xhigh and max, and
+            // `to_codex_effort` sends each as the Codex effort of the same name.
+            // The level sent can still differ from the one requested:
+            // `CCP_CODEX_EFFORT` replaces it on every request, and the
+            // compaction effort cap replaces it on Claude Code's compaction
+            // summary.
+            effort_low: effort("low"),
+            effort_medium: effort("medium"),
+            effort_high: effort("high"),
+            effort_xhigh: effort("xhigh"),
+            effort_max: effort("max"),
+            // `build_input` sends image blocks, and images in tool results, as
+            // `input_image` parts; the model must take image input.
+            image_input: self.input_modalities.iter().any(|m| m == "image"),
+            // `parse_content_block` drops `document` blocks.
+            pdf_input: false,
+            // `read_tools` turns a code execution tool into a plain function.
+            server_code_execution: false,
+            // `read_tools` maps the hosted `web_search_20250305` tool onto the
+            // backend's `web_search`; any other web search tool version becomes
+            // a plain function, so only that version is carried.
+            // `apply_model_lane_for_request` runs it on another model when
+            // `full_lane_web_search_model` substitutes one.
+            server_web_search: full_lane_web_search_model(&self.slug) == self.slug,
+            // `read_output_format` sends an `output_config.format` JSON schema
+            // as a strict `json_schema` text format. Strict tool use is not
+            // carried: `function_tool` sends every tool with `strict: false`.
+            structured_outputs: true,
+            // Reasoning is driven by the effort alone (`translate_request_inner`);
+            // the request's `thinking` field is never read, so `enabled` and
+            // `adaptive` do nothing, while `disabled` and `between_tools` are
+            // accepted and never rejected.
+            thinking: !self.supported_reasoning_levels.is_empty(),
+            thinking_adaptive: false,
+            thinking_between_tools: true,
+            thinking_disabled: true,
+            thinking_enabled: false,
         }
-        row
     }
 }
 
@@ -438,6 +501,7 @@ pub fn remember_for_tests(slugs: &[&str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn models_endpoint_replaces_responses_suffix_or_appends() {
@@ -483,22 +547,93 @@ mod tests {
         assert_eq!(first.supported_reasoning_levels.len(), 2);
         assert_eq!(first.input_modalities, vec!["text", "image"]);
 
+        assert_eq!(first.service_tiers[0].id, "priority");
+
+        // The row is an Anthropic `ModelInfo`; nothing of the catalog entry
+        // beyond it is forwarded.
         let row = first.to_listing_row();
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "capabilities",
+                "created_at",
+                "deprecated_at",
+                "display_name",
+                "id",
+                "lifecycle",
+                "line",
+                "max_input_tokens",
+                "max_tokens",
+                "retires_at",
+                "type",
+            ]
+        );
         assert_eq!(row["type"], "model");
         assert_eq!(row["id"], "gpt-7-test");
         assert_eq!(row["display_name"], "Test");
-        assert_eq!(row["description"], "A test model");
-        assert_eq!(row["visibility"], "list");
-        assert_eq!(row["use_responses_lite"], true);
-        assert_eq!(row["supported_reasoning_levels"][0]["effort"], "low");
-        assert_eq!(row["service_tiers"][0]["id"], "priority");
-        assert!(row.get("default_service_tier").is_none());
-        assert!(row.get("slug").is_none());
-        assert!(row.get("model_messages").is_none());
+        assert_eq!(row["max_input_tokens"], 872000);
+        assert!(row["max_tokens"].is_null());
+        assert_eq!(row["capabilities"]["effort"]["low"]["supported"], true);
 
         let bare = inventory.models[1].to_listing_row();
         assert_eq!(bare["display_name"], "gpt-5.5");
-        assert!(bare.get("description").is_none());
+        assert!(bare["max_input_tokens"].is_null());
+    }
+
+    fn catalog_model(entry: Value) -> UpstreamModel {
+        serde_json::from_value(entry).unwrap()
+    }
+
+    #[test]
+    fn max_input_tokens_prefers_the_largest_window_the_catalog_names() {
+        let both = catalog_model(json!({
+            "slug": "a", "context_window": 272000, "max_context_window": 872000
+        }));
+        let window_only = catalog_model(json!({"slug": "b", "context_window": 500000}));
+        let neither = catalog_model(json!({"slug": "c"}));
+        assert_eq!(both.to_listing_row()["max_input_tokens"], 872000);
+        assert_eq!(window_only.to_listing_row()["max_input_tokens"], 500000);
+        assert!(neither.to_listing_row()["max_input_tokens"].is_null());
+    }
+
+    #[test]
+    fn capabilities_follow_what_the_translator_carries() {
+        let model = catalog_model(json!({
+            "slug": "gpt-6-sol",
+            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "xhigh"}],
+            "input_modalities": ["text", "image"]
+        }));
+        let caps = model.capabilities();
+        assert!(caps.effort_low && caps.effort_xhigh);
+        assert!(!caps.effort_medium && !caps.effort_high && !caps.effort_max);
+        assert!(caps.thinking && caps.image_input && caps.server_web_search);
+        assert!(caps.structured_outputs);
+        assert!(caps.thinking_disabled && caps.thinking_between_tools);
+        assert!(!caps.thinking_enabled && !caps.thinking_adaptive);
+        assert!(!caps.pdf_input && !caps.batch && !caps.citations && !caps.code_execution);
+        assert!(!caps.server_code_execution);
+        assert!(!caps.clear_thinking_20251015 && !caps.clear_tool_uses_20250919);
+        assert!(!caps.compact_20260112);
+
+        // A model with no reasoning levels and no image input.
+        let plain = catalog_model(json!({"slug": "gpt-plain"})).capabilities();
+        assert!(!plain.thinking && !plain.image_input);
+        assert!(!plain.effort_low && !plain.effort_max);
+        assert!(plain.thinking_disabled);
+
+        // Hosted search on a model the full lane swaps for another runs on
+        // that other model, so the listed one does not get it.
+        for slug in ["gpt-5.6-luna", "gpt-6-luna"] {
+            let caps = catalog_model(json!({"slug": slug})).capabilities();
+            assert!(!caps.server_web_search, "{slug}");
+        }
     }
 
     #[test]

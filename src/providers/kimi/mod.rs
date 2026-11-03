@@ -13,13 +13,15 @@ use crate::anthropic::error::json_error;
 use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{
-    CliHandlers, Generation, GenerationBody, Provider, ProviderError, ProviderErrorKind,
-    RequestContext,
+    CliHandlers, Generation, GenerationBody, ModelListing, Provider, ProviderError,
+    ProviderErrorKind, RequestContext,
 };
 use crate::providers::kimi::auth::token_store::file_store;
 use crate::providers::kimi::translate::accumulate::accumulate_response;
 use crate::providers::kimi::translate::model_allowlist::{assert_allowed_model, resolve_model};
-use crate::providers::kimi::translate::request::{TranslateOptions, translate_request};
+use crate::providers::kimi::translate::request::{
+    TranslateOptions, max_tokens_cap, translate_request,
+};
 use crate::providers::kimi::translate::stream::translate_stream_bytes;
 use crate::registry::KIMI_MODELS;
 
@@ -52,6 +54,12 @@ impl Provider for KimiProvider {
 
     fn supported_models(&self) -> Vec<String> {
         KIMI_MODELS.iter().map(|s| s.to_string()).collect()
+    }
+
+    async fn list_models(&self, _client_headers: Option<&http::HeaderMap>) -> ModelListing {
+        ModelListing::bundled_with_limits(self.name(), self.supported_models(), |model| {
+            (None, max_tokens_cap(model).map(u64::from))
+        })
     }
 
     fn has_credentials(&self) -> bool {

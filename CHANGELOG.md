@@ -1,3 +1,79 @@
+## Unreleased
+
+- Breaking: `GET /v1/models` now answers in the Anthropic List Models shape
+  and carries nothing else. The body has exactly `data`, `first_id`,
+  `has_more` and `last_id` (both ids null on an empty page); the top-level
+  `object`, the `providers[]` block and the per-row `provider` field are gone.
+  Every row is an Anthropic `ModelInfo` with exactly `type: "model"`, `id`,
+  `display_name`, `created_at` (always `1970-01-01T00:00:00Z`, the API's value
+  for an unknown release date), `capabilities`, `deprecated_at: null`,
+  `lifecycle: "active"`, `line: null`, `max_input_tokens`, `max_tokens` and
+  `retires_at: null`. Each id appears once: when two backends list the same
+  id, the row of the backend routing sends it to is kept. There is no switch
+  back to the old shape. What `providers[]` said about each backend (who
+  holds the login, where the rows came from, whether the backend answered) is
+  still printed by `claude-code-mux models [--full]`, whose output is
+  unchanged, and `?provider=<name>` still fails with 502 and the reason when
+  that backend cannot list.
+- Breaking: Codex rows no longer carry the backend's catalog fields
+  (`description`, `visibility`, `priority`, `supported_in_api`,
+  `use_responses_lite`, `context_window`, `max_context_window`,
+  `default_reasoning_level`, `supported_reasoning_levels`,
+  `input_modalities`, `service_tiers`, `default_service_tier`). Hidden models
+  are still listed. The Codex CLI's own `models_cache.json`, next to its
+  `auth.json`, still holds those fields. Routing, the lane table under
+  `CCP_CODEX_LANE_POLICY=inventory` and the catalog service tier keep reading
+  the listing as before.
+- Codex rows report the model's context window as `max_input_tokens`: the
+  listing's `max_context_window` (872000 for every current Codex model), else
+  its `context_window`, else null. `max_tokens` is null, because the proxy
+  sends no output cap to Codex, and `display_name` is the listing's, else the
+  id. Claude Code does not read this window from the endpoint, since gateway
+  model discovery stays off; a `modelPicker` row still gets its window from
+  settings.
+- Codex rows carry the full Anthropic `capabilities` tree, and a leaf is true
+  only when the Codex translator carries that request feature to the backend:
+  the effort levels the model lists; `thinking.supported` when it lists any,
+  with `thinking.types.enabled` and `adaptive` false (the request's `thinking`
+  field is not read, the effort drives reasoning) and `disabled` and
+  `between_tools` true (never rejected); image input as the listing says;
+  structured outputs through `output_config.format`; and hosted web search
+  with the `web_search_20250305` tool, except on `gpt-5.6-luna` and
+  `gpt-6-luna`, whose searches the proxy runs on another model. PDF input,
+  batch, citations, code execution and context management are false. Kimi,
+  Grok and Cursor rows have `capabilities: null` and the `display_name`
+  `"<id> (<provider>)"`; Kimi rows report `max_tokens: 32000`, the cap the
+  translator enforces, except `k3` and `kimi-k3`, and every other limit on
+  these rows is null.
+- Breaking: the aggregate `GET /v1/models` now fails with 502 `api_error`,
+  naming the backend and its status, when a backend the proxy holds a saved
+  login for cannot list. It used to answer 200 and report the failure in
+  `providers[]`; without that block a partial answer would read as that
+  backend's models being gone. A backend without a login that cannot list is
+  left out silently.
+- New `GET /v1/models/{model_id}` (Anthropic Get Model) answers with the row
+  the list would show for that id, from the same listing pass and with the
+  same 502 rule, or 404 `not_found_error` with the message `model: <id>`. An
+  id containing `/` works written literally or as `%2F`.
+- `GET /v1/models` takes the Anthropic query parameters. `after_id` and
+  `before_id` are exclusive cursors over the answer's own order: both at once
+  is a 400, an empty value counts as absent, and a cursor that names no row
+  is a 400 naming it. `limit` must be an integer from 1 to 1000, else 400;
+  without it every row is returned in one page, unlike the Anthropic API's
+  default of 20. `lifecycle` (repeated, as `lifecycle[]`, or comma-separated)
+  accepts `active`, `deprecated` and `retired` and answers anything else with
+  a 400; every row is active, so a filter without `active` gives an empty
+  page. `?provider=<name>` stays as the proxy's own filter, with a 400 for an
+  unknown name. Other parameters and the `anthropic-version` and
+  `anthropic-workspace-id` headers are accepted and ignored. Every error,
+  including a malformed `?limit=abc` that used to get a plain-text 400, now
+  uses the Anthropic envelope `{"type": "error", "error": {"type": ...,
+  "message": ...}}`.
+- Every response of `/v1/models` and `/v1/models/{model_id}`, errors
+  included, carries a `request-id` header.
+- Unchanged: no row id contains `claude` or `anthropic` in any case, and
+  every listing still feeds routing as before.
+
 ## v0.16.0 (2026-10-23)
 
 - New `config.json` key `codex.serviceTierByModel` sets the Codex service tier

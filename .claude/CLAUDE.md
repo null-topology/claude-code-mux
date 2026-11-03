@@ -142,7 +142,8 @@ Request path:
    Other commands: `models [--full]`, `<provider> auth {login,device,status,logout}`,
    hidden `demo`.
 2. `src/server.rs`: axum router. Always `/healthz`, `/v1/messages`,
-   `/v1/messages/count_tokens`, `/v1/models`. Optional OpenAI-compatible
+   `/v1/messages/count_tokens`, `/v1/models`, `/v1/models/{model_id}`.
+   Optional OpenAI-compatible
    surfaces gated by `AppFeatures`: `/v1/responses` and `/v1/chat/completions`
    (`CCP_CODEX_RESPONSES_API`), `/v1/images/*` (`CCP_CODEX_IMAGES_API`),
    `/v1/audio/transcriptions` (`CCP_CODEX_TRANSCRIPTIONS_API`).
@@ -169,11 +170,34 @@ Request path:
    already set one (the passthrough relays Anthropic's); Claude Code records it
    as `requestId` in transcripts. The stamping lives in `dispatch_request`, not
    in `monitor_response_body`, so the OpenAI-compatible surfaces do not get it.
-   `handler_models` (`/v1/models`) calls `Provider::list_models` on every
-   registered provider (or the one named by `?provider=`), tags each row with
-   `provider`, and adds a top-level `providers[]` block with `auth`, `source`,
-   `status`, `detail`, `fetched_at` per provider. The filtered form fails with
-   502 when that provider cannot list; the aggregate form is always 200.
+   `handler_models` (`/v1/models`) answers Anthropic List Models: exactly
+   `data`, `first_id`, `has_more` and `last_id`, each row a `ModelInfo` built
+   by `provider::model_info`. `collect_model_rows` calls
+   `Provider::list_models` on every registered provider (or the one named by
+   `?provider=`, unknown name 400), passes each listing to `record_listing`,
+   and answers 502 `api_error` when the named provider cannot list or, in the
+   aggregate, when a provider whose `has_credentials()` holds (checked on
+   tokio's blocking pool) cannot; a provider without a login that cannot list
+   adds no rows and no error. `dedupe_model_rows` keeps one row per id (the
+   one of the provider routing picks when two list it, else the first) and
+   drops every id containing `claude` or `anthropic` in any case.
+   `ModelsQuery::parse` reads the raw query string, so every rejection is an
+   Anthropic JSON error: `limit` 1-1000 (absent means every row, not
+   Anthropic's 20), `after_id` and `before_id` never together (an empty value
+   counts as absent), `lifecycle` repeated, `lifecycle[]` or comma-separated
+   over `active|deprecated|retired` (every row is active, so a filter without
+   `active` empties the page); other parameters are ignored.
+   `page_model_rows` applies the exclusive cursors and `limit` over the
+   answer's order and answers 400 for a cursor that names no row.
+   `handler_model` (`/v1/models/{model_id}`) runs the same listing pass and
+   failure rule and returns the row the list would show, or 404
+   `not_found_error` with `model: <id>`; an id containing `/` works literally
+   or as `%2F`. It is served by two routes, `/v1/models/` and the catch-all
+   `/v1/models/{*model_id}` (axum's catch-all matches no empty remainder),
+   and takes the path as `Result<Path<String>, PathRejection>`: an empty id or
+   one that does not percent-decode to UTF-8 answers that 404 with the path
+   as sent and runs no listing pass. Both handlers stamp a fresh `request-id`
+   through `with_request_id`, errors included.
 3. `src/registry.rs`: model to provider. `ANTHROPIC_STYLE_ALIASES` and any
    `claude-*` id go to the alias provider (`CCP_ALIAS_PROVIDER`, default
    anthropic); `cursor:` prefixes go to cursor; anything else must match a
@@ -190,9 +214,14 @@ Request path:
 4. `src/provider.rs`: the `Provider` trait, `RequestContext` (request id,
    session, traffic, monitor, and `Passthrough` with the raw bytes and headers
    for byte-exact relays), `ProviderError`, `CliHandlers`, and `ModelListing`
-   (what `list_models` returns; the default impl advertises `supported_models()`
-   as `source: bundled`, anthropic overrides to `auth: client` with no rows,
-   codex overrides to ask its backend).
+   (what `list_models` returns: `auth`, `source`, `status`, `detail`,
+   `fetched_at`, which the `models` command and the 502 messages read, and
+   rows built by `model_info`, the one constructor of an Anthropic `ModelInfo`,
+   with `ModelCapabilities` writing the whole capabilities tree; the default
+   impl advertises `supported_models()` as `source: bundled` with
+   `capabilities: null` (`ModelListing::bundled`; kimi uses
+   `bundled_with_limits` for its `max_tokens` cap), anthropic overrides to
+   `auth: client` with no rows, codex overrides to ask its backend).
 5. `src/providers/<name>/`: one directory per backend with the same shape:
    `auth/`, `client.rs`, `translate/` (`request.rs` Anthropic to native,
    `stream.rs` and `reducer.rs` native events to typed events,
@@ -830,9 +859,16 @@ compatibility contracts, not the user-facing name. Do not rename them:
 `/v1/models` and the `models` command do not read a compiled-in Codex list.
 `providers/codex/models.rs` calls `GET {api root}/models?client_version=X` on
 the Codex CLI's bearer (the completions URL with `/responses` replaced by
-`/models`), forwards the entries as the backend sent them, and remembers the
-slugs so routing and `assert_allowed_model` accept them; under the `inventory`
-lane policy `use_responses_lite` from the listing overrides the compiled-in
+`/models`), turns each entry into an Anthropic `ModelInfo` row
+(`UpstreamModel::to_listing_row`: `display_name` from the entry, else the
+slug; `max_input_tokens` from `max_context_window`, else `context_window`,
+else null; `max_tokens` null, as the translator sends no output cap;
+`capabilities` from `UpstreamModel::capabilities`, where a leaf is true only
+when the Codex translator carries that feature), keeps hidden entries, and
+remembers the slugs so
+routing and `assert_allowed_model` accept them. The other catalog fields stay
+in `UpstreamModel` for the proxy's own use and are not in the rows. Under the
+`inventory` lane policy `use_responses_lite` from the listing overrides the compiled-in
 lane table, while under the default `full` policy the proxy forces the full
 lane for every model and ignores that flag entirely
 (`uses_responses_lite_with_full_lane` in
@@ -890,7 +926,7 @@ goes to the provider whose current listing has named it the longest (the
 catalog numbers each recorded listing). The catalog is filled at three
 points, all through `record_listing`:
 
-- every `/v1/models` call (`handler_models`);
+- every `/v1/models` and `/v1/models/{model_id}` call (`collect_model_rows`);
 - `serve` start: `main.rs` spawns `Registry::refresh_listings` beside the
   server, so binding never waits and a failed listing is only logged;
 - a routing miss: a `/v1/messages` or `count_tokens` request for an id that is
@@ -917,7 +953,8 @@ compiled-in list keeps routing. It is logged as a warning, `model listing
 named no models; routing keeps the previous one`. Every recorded listing is
 logged at info as `model listing recorded` with `provider`, `models`,
 `previous_models` (null for the first), `added` and `removed`, and no model
-bodies. `/v1/models` still reports such an empty answer as it came.
+bodies. `/v1/models` still takes such an answer as a successful listing: that
+provider adds no rows and no error.
 
 Hosted web search sits outside the policy: a request carrying the hosted
 `web_search_20250305` tool is forced onto the full lane, and there a non-forced
@@ -947,8 +984,9 @@ a model there is optional; when done, keep `src/registry.rs` and
 
 `/v1/models` deliberately emits no Anthropic rows: the proxy holds no
 Anthropic credential, and Claude Code lists its own models. The anthropic
-entry in `providers[]` says so (`auth: client`). No id in `data[]` may contain
-`claude` or `anthropic`, because Claude Code's gateway discovery keeps such
+`ModelListing` says so (`auth: client`), which the `models` command prints.
+No id in `data[]` may contain `claude` or `anthropic` (`dedupe_model_rows`
+drops them in any case), because Claude Code's gateway discovery keeps such
 ids as picker rows.
 
 ## How Codex models get into Claude Code's picker

@@ -8,8 +8,11 @@ use claude_code_mux::{
     config::AliasProvider,
     monitor::{MonitorHandle, RequestStatus, UsageQuality},
     openai_compat::MAX_OPENAI_REQUEST_BYTES,
-    provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
-    registry::Registry,
+    provider::{
+        CliHandlers, Generation, GenerationBody, ListingSource, ModelListing, Provider,
+        ProviderError, RequestContext,
+    },
+    registry::{Registry, clear_listed_models_for_tests},
     request_identity::ConversationIdentity,
     server::{
         AppFeatures, app, app_with_features, app_with_monitor, app_with_options,
@@ -1807,93 +1810,647 @@ impl Drop for NoSavedLogins {
     }
 }
 
-fn provider_entry<'a>(value: &'a Value, name: &str) -> &'a Value {
-    value["providers"]
+/// The keys of an Anthropic `ModelInfo` row, sorted.
+const MODEL_INFO_KEYS: [&str; 11] = [
+    "capabilities",
+    "created_at",
+    "deprecated_at",
+    "display_name",
+    "id",
+    "lifecycle",
+    "line",
+    "max_input_tokens",
+    "max_tokens",
+    "retires_at",
+    "type",
+];
+
+fn sorted_keys(value: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .unwrap_or_else(|| panic!("not an object: {value}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+fn row_ids(value: &Value) -> Vec<&str> {
+    value["data"]
         .as_array()
-        .unwrap()
+        .unwrap_or_else(|| panic!("no data in {value}"))
         .iter()
-        .find(|entry| entry["provider"] == name)
-        .unwrap_or_else(|| panic!("provider {name} missing from {value}"))
+        .map(|row| row["id"].as_str().unwrap())
+        .collect()
+}
+
+/// A provider whose listing and saved-login check the test fixes. `models`
+/// is its compiled-in list, which routing reads; `listed` is what it lists,
+/// or `None` for a listing that fails. `upstream` marks the listing as one
+/// from a backend, which the routing catalog records; a bundled one it
+/// ignores.
+struct ListingStub {
+    name: &'static str,
+    models: Vec<&'static str>,
+    listed: Option<Vec<&'static str>>,
+    logged_in: bool,
+    upstream: bool,
+}
+
+impl ListingStub {
+    fn listing(name: &'static str, listed: &[&'static str]) -> Self {
+        Self {
+            name,
+            models: Vec::new(),
+            listed: Some(listed.to_vec()),
+            logged_in: true,
+            upstream: false,
+        }
+    }
+
+    fn upstream_listing(name: &'static str, listed: &[&'static str]) -> Self {
+        Self {
+            upstream: true,
+            ..Self::listing(name, listed)
+        }
+    }
+
+    fn failing(name: &'static str, logged_in: bool) -> Self {
+        Self {
+            name,
+            models: Vec::new(),
+            listed: None,
+            logged_in,
+            upstream: false,
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for ListingStub {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        self.models.iter().map(|id| id.to_string()).collect()
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn list_models(&self, _client_headers: Option<&axum::http::HeaderMap>) -> ModelListing {
+        match &self.listed {
+            Some(listed) => {
+                let mut listing = ModelListing::bundled(
+                    self.name,
+                    listed.iter().map(|id| id.to_string()).collect(),
+                );
+                if self.upstream {
+                    listing.source = ListingSource::Upstream;
+                }
+                listing
+            }
+            None => ModelListing::unavailable(self.name, "unreachable", "stub down".to_string()),
+        }
+    }
+
+    fn has_credentials(&self) -> bool {
+        self.logged_in
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+}
+
+fn listing_registry(stubs: Vec<ListingStub>) -> Arc<Registry> {
+    Arc::new(Registry::from_providers(
+        AliasProvider::Anthropic,
+        stubs
+            .into_iter()
+            .map(|stub| Arc::new(stub) as Arc<dyn Provider>),
+    ))
+}
+
+fn listing_app(stubs: Vec<ListingStub>) -> axum::Router {
+    app(listing_registry(stubs))
+}
+
+fn five_model_app() -> axum::Router {
+    listing_app(vec![ListingStub::listing(
+        "stub",
+        &["m1", "m2", "m3", "m4", "m5"],
+    )])
+}
+
+/// Like `get_models`, with request headers, and the raw response kept so a
+/// test can read its headers.
+async fn get_models_response(
+    app: axum::Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> (axum::response::Response, Value) {
+    let mut request = Request::builder().method(Method::GET).uri(uri);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = app
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let value: Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| panic!("{uri}: not JSON: {}", String::from_utf8_lossy(&bytes)));
+    (
+        axum::response::Response::from_parts(parts, Body::empty()),
+        value,
+    )
 }
 
 #[tokio::test]
-async fn models_endpoint_tags_rows_and_describes_every_provider() {
+async fn models_list_has_exactly_the_anthropic_keys() {
     let _no_logins = NoSavedLogins::install();
     let app = app(Arc::new(Registry::with_default_alias()));
-    let (status, value) = get_models(app, "/v1/models?limit=1000").await;
+    let (status, value) = get_models(app, "/v1/models").await;
 
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        sorted_keys(&value),
+        ["data", "first_id", "has_more", "last_id"]
+    );
     let data = value["data"].as_array().unwrap();
     assert!(!data.is_empty());
-    for entry in data {
-        assert_eq!(entry["type"], "model");
-        assert!(entry["display_name"].as_str().is_some());
-        assert!(entry["provider"].as_str().is_some(), "{entry}");
+    for row in data {
+        assert_eq!(sorted_keys(row), MODEL_INFO_KEYS, "{row}");
+        assert_eq!(row["type"], "model");
+        assert_eq!(row["created_at"], "1970-01-01T00:00:00Z");
+        assert_eq!(row["lifecycle"], "active");
+        for key in ["deprecated_at", "line", "retires_at", "max_input_tokens"] {
+            assert!(row[key].is_null(), "{key} in {row}");
+        }
+        // The bundled backends describe no capabilities.
+        assert!(row["capabilities"].is_null(), "{row}");
     }
+    // Without `limit` every row comes back.
     assert_eq!(value["has_more"], json!(false));
     assert_eq!(value["first_id"], data[0]["id"]);
     assert_eq!(value["last_id"], data[data.len() - 1]["id"]);
 
-    // Backends without a listing call advertise their compiled-in lists and
-    // say so; the rows keep the `<id> (<provider>)` display tag.
-    let kimi_row = data
-        .iter()
-        .find(|m| m["id"] == "kimi-for-coding")
-        .expect("kimi advertised");
-    assert_eq!(kimi_row["provider"], "kimi");
-    assert_eq!(kimi_row["display_name"], "kimi-for-coding (kimi)");
-    let kimi = provider_entry(&value, "kimi");
-    assert_eq!(kimi["auth"], "proxy");
-    assert_eq!(kimi["source"], "bundled");
-    assert_eq!(kimi["status"], "ok");
-    assert_eq!(provider_entry(&value, "grok")["source"], "bundled");
-    assert_eq!(provider_entry(&value, "cursor")["source"], "bundled");
-
-    // Codex lists only what its backend answers; with no credentials it
-    // answers nothing and says why.
-    let codex = provider_entry(&value, "codex");
-    assert_eq!(codex["auth"], "proxy");
-    assert_eq!(codex["source"], "none");
-    assert_eq!(codex["status"], "unauthorized");
-    assert!(
-        codex["detail"]
-            .as_str()
-            .unwrap()
-            .contains("No Codex credentials")
+    let row = |id: &str| {
+        data.iter()
+            .find(|row| row["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from {value}"))
+    };
+    assert_eq!(
+        row("kimi-for-coding")["display_name"],
+        "kimi-for-coding (kimi)"
     );
-    assert!(codex["fetched_at"].is_null());
-    assert!(!data.iter().any(|m| m["provider"] == "codex"));
+    assert_eq!(row("grok-4.5")["display_name"], "grok-4.5 (grok)");
+    // Kimi clamps the output of every model but k3.
+    assert_eq!(row("kimi-for-coding")["max_tokens"], json!(32000));
+    assert_eq!(row("k2.6")["max_tokens"], json!(32000));
+    assert!(row("kimi-k3")["max_tokens"].is_null());
+    assert!(row("grok-4.5")["max_tokens"].is_null());
 
-    // The Anthropic passthrough holds no credential and Claude Code lists its
-    // own models, so the provider is described and its rows are not emitted.
-    // No id may contain "claude" or "anthropic": Claude Code's gateway
-    // discovery would turn it into a picker row.
-    let anthropic = provider_entry(&value, "anthropic");
-    assert_eq!(anthropic["auth"], "client");
-    assert_eq!(anthropic["source"], "none");
-    assert_eq!(anthropic["status"], "not_listed");
-    assert!(anthropic["detail"].as_str().unwrap().contains("client"));
-    let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    // Codex has no login here, so its failed listing adds neither rows nor an
+    // error. Anthropic adds no rows, and no id may name a Claude model:
+    // Claude Code's gateway discovery would turn it into a picker row.
+    let ids = row_ids(&value);
+    assert!(!ids.iter().any(|id| id.starts_with("gpt-")), "{ids:?}");
     assert!(!ids.contains(&"opus"));
-    assert!(
-        !ids.iter()
-            .any(|id| id.to_ascii_lowercase().contains("claude")
-                || id.to_ascii_lowercase().contains("anthropic"))
-    );
+    assert!(!ids.iter().any(|id| {
+        let id = id.to_ascii_lowercase();
+        id.contains("claude") || id.contains("anthropic")
+    }));
 }
 
 #[tokio::test]
-async fn models_endpoint_provider_filter_narrows_rows_and_provider_block() {
+async fn models_keep_provider_order_then_listing_order() {
+    let app = listing_app(vec![
+        ListingStub::listing("kimi", &["k-late"]),
+        ListingStub::listing("grok", &["g-z", "g-a"]),
+    ]);
+    let (status, value) = get_models(app, "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row_ids(&value), ["g-z", "g-a", "k-late"]);
+}
+
+#[tokio::test]
+async fn models_list_leaves_out_ids_naming_a_claude_model() {
+    let app = listing_app(vec![ListingStub::listing(
+        "stub",
+        &["claude-sonnet-5", "Anthropic-mirror", "plain-model"],
+    )]);
+    let (status, value) = get_models(app.clone(), "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row_ids(&value), ["plain-model"]);
+    let (status, _) = get_models(app, "/v1/models/claude-sonnet-5").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn models_list_keeps_one_row_per_id_from_the_routed_provider() {
+    // "dedupe-shared" is on kimi's compiled-in list, so routing sends it to
+    // kimi although grok lists it first; nothing routes "dedupe-loose", so
+    // the first row wins.
+    let mut kimi = ListingStub::listing("kimi", &["dedupe-shared", "dedupe-loose"]);
+    kimi.models = vec!["dedupe-shared"];
+    let app = listing_app(vec![
+        ListingStub::listing("grok", &["dedupe-shared", "dedupe-loose"]),
+        kimi,
+    ]);
+    let (status, value) = get_models(app, "/v1/models").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row_ids(&value), ["dedupe-loose", "dedupe-shared"]);
+    assert_eq!(value["data"][0]["display_name"], "dedupe-loose (grok)");
+    assert_eq!(value["data"][1]["display_name"], "dedupe-shared (kimi)");
+}
+
+#[tokio::test]
+async fn models_pages_forward_with_after_id_and_limit() {
+    let cases: [(&str, &[&str], bool); 7] = [
+        ("/v1/models?limit=2", &["m1", "m2"], true),
+        ("/v1/models?limit=1", &["m1"], true),
+        (
+            "/v1/models?limit=1000",
+            &["m1", "m2", "m3", "m4", "m5"],
+            false,
+        ),
+        ("/v1/models?after_id=m2&limit=2", &["m3", "m4"], true),
+        ("/v1/models?after_id=m3&limit=2", &["m4", "m5"], false),
+        ("/v1/models?after_id=m2", &["m3", "m4", "m5"], false),
+        ("/v1/models?after_id=m5", &[], false),
+    ];
+    for (uri, expected, has_more) in cases {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {value}");
+        assert_eq!(row_ids(&value), expected, "{uri}");
+        assert_eq!(value["has_more"], json!(has_more), "{uri}");
+        assert_eq!(value["first_id"], json!(expected.first()), "{uri}");
+        assert_eq!(value["last_id"], json!(expected.last()), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn models_pages_backward_with_before_id_and_limit() {
+    let cases: [(&str, &[&str], bool); 4] = [
+        ("/v1/models?before_id=m5&limit=2", &["m3", "m4"], true),
+        ("/v1/models?before_id=m3&limit=5", &["m1", "m2"], false),
+        ("/v1/models?before_id=m4", &["m1", "m2", "m3"], false),
+        ("/v1/models?before_id=m1", &[], false),
+    ];
+    for (uri, expected, has_more) in cases {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {value}");
+        assert_eq!(row_ids(&value), expected, "{uri}");
+        assert_eq!(value["has_more"], json!(has_more), "{uri}");
+        assert_eq!(value["first_id"], json!(expected.first()), "{uri}");
+        assert_eq!(value["last_id"], json!(expected.last()), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn models_reject_bad_paging_parameters_with_a_json_error() {
+    let cases = [
+        ("/v1/models?limit=0", "limit"),
+        ("/v1/models?limit=1001", "limit"),
+        ("/v1/models?limit=abc", "limit"),
+        ("/v1/models?limit=-1", "limit"),
+        ("/v1/models?limit=1.5", "limit"),
+        ("/v1/models?limit=", "limit"),
+        (
+            "/v1/models?after_id=m1&before_id=m3",
+            "after_id and before_id",
+        ),
+        ("/v1/models?after_id=nope", "after_id"),
+        ("/v1/models?before_id=nope", "before_id"),
+    ];
+    for (uri, named) in cases {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {value}");
+        assert_eq!(value["type"], "error", "{uri}");
+        assert_eq!(value["error"]["type"], "invalid_request_error", "{uri}");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains(named), "{uri}: {message}");
+    }
+}
+
+#[tokio::test]
+async fn models_lifecycle_filter_accepts_every_array_form() {
+    let all = ["m1", "m2", "m3", "m4", "m5"];
+    let none: [&str; 0] = [];
+    let cases: [(&str, &[&str]); 7] = [
+        ("/v1/models?lifecycle=active", &all),
+        ("/v1/models?lifecycle=active,retired", &all),
+        ("/v1/models?lifecycle[]=retired&lifecycle[]=active", &all),
+        ("/v1/models?lifecycle%5B%5D=active", &all),
+        ("/v1/models?lifecycle=deprecated&lifecycle=retired", &none),
+        ("/v1/models?lifecycle=deprecated,retired,deprecated", &none),
+        ("/v1/models?lifecycle[]=retired", &none),
+    ];
+    for (uri, expected) in cases {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {value}");
+        assert_eq!(row_ids(&value), expected, "{uri}");
+        if expected.is_empty() {
+            assert!(value["first_id"].is_null(), "{uri}");
+            assert!(value["last_id"].is_null(), "{uri}");
+            assert_eq!(value["has_more"], json!(false), "{uri}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn models_lifecycle_filter_rejects_unknown_values() {
+    for uri in [
+        "/v1/models?lifecycle=bogus",
+        "/v1/models?lifecycle=active,bogus",
+        "/v1/models?lifecycle[]=active&lifecycle[]=Active",
+        "/v1/models?lifecycle=",
+    ] {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {value}");
+        assert_eq!(value["error"]["type"], "invalid_request_error", "{uri}");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("lifecycle"),
+            "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn models_retrieve_answers_the_listed_row() {
+    let app = listing_app(vec![ListingStub::listing("stub", &["m1", "gpt-6.1-sol"])]);
+    let (_, list) = get_models(app.clone(), "/v1/models").await;
+    let (status, row) = get_models(app, "/v1/models/gpt-6.1-sol").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sorted_keys(&row), MODEL_INFO_KEYS);
+    assert_eq!(row, list["data"][1]);
+    assert_eq!(row["id"], "gpt-6.1-sol");
+}
+
+#[tokio::test]
+async fn models_retrieve_answers_404_for_an_unlisted_id() {
+    let app = listing_app(vec![ListingStub::listing("stub", &["m1"])]);
+    let (status, value) = get_models(app, "/v1/models/gpt-unknown.2").await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], "not_found_error");
+    assert_eq!(value["error"]["message"], "model: gpt-unknown.2");
+}
+
+#[tokio::test]
+async fn models_retrieve_finds_a_bundled_row() {
+    let _no_logins = NoSavedLogins::install();
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let (status, row) = get_models(app.clone(), "/v1/models/kimi-for-coding").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row["display_name"], "kimi-for-coding (kimi)");
+    let (status, _) = get_models(app, "/v1/models/opus").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn models_fail_when_a_provider_with_a_login_cannot_list() {
+    for uri in ["/v1/models", "/v1/models/a1"] {
+        let app = listing_app(vec![
+            ListingStub::listing("alpha", &["a1"]),
+            ListingStub::failing("beta", true),
+        ]);
+        let (status, value) = get_models(app, uri).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{uri}: {value}");
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "api_error");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("beta model listing unavailable (unreachable)"),
+            "{uri}: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn models_omit_a_provider_without_a_login_that_cannot_list() {
+    let app = listing_app(vec![
+        ListingStub::listing("alpha", &["a1"]),
+        ListingStub::failing("beta", false),
+    ]);
+    let (status, value) = get_models(app.clone(), "/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(row_ids(&value), ["a1"]);
+    let (status, _) = get_models(app.clone(), "/v1/models/a1").await;
+    assert_eq!(status, StatusCode::OK);
+    // Naming the provider still fails hard, login or not.
+    let (status, value) = get_models(app, "/v1/models?provider=beta").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+    assert_eq!(value["error"]["type"], "api_error");
+}
+
+#[tokio::test]
+async fn models_responses_carry_a_fresh_request_id() {
+    let app = listing_app(vec![ListingStub::listing("stub", &["m1"])]);
+    let failing = listing_app(vec![ListingStub::failing("stub", true)]);
+    let cases = [
+        (app.clone(), "/v1/models", StatusCode::OK),
+        (app.clone(), "/v1/models?limit=0", StatusCode::BAD_REQUEST),
+        (
+            app.clone(),
+            "/v1/models?provider=nope",
+            StatusCode::BAD_REQUEST,
+        ),
+        (app.clone(), "/v1/models/m1", StatusCode::OK),
+        (app.clone(), "/v1/models/nope", StatusCode::NOT_FOUND),
+        (failing.clone(), "/v1/models", StatusCode::BAD_GATEWAY),
+        (failing, "/v1/models/m1", StatusCode::BAD_GATEWAY),
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for (app, uri, expected) in cases {
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{uri}");
+        let id = request_id(&response).to_string();
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "{uri}: {id:?}");
+        assert!(seen.insert(id), "{uri} reused a request id");
+    }
+}
+
+/// The aggregate list fails when an earlier provider with a login cannot
+/// list, and the backend listing of a later provider is still recorded, so
+/// an id only that listing names routes to it.
+#[tokio::test]
+async fn models_record_a_later_listing_when_an_earlier_provider_fails() {
+    clear_listed_models_for_tests();
+    let registry = listing_registry(vec![
+        ListingStub::failing("alpha", true),
+        ListingStub::upstream_listing("beta", &["beta-listed-only"]),
+    ]);
+    assert!(
+        registry
+            .provider_for_model("beta-listed-only", None)
+            .is_none()
+    );
+
+    let (status, value) = get_models(app(registry.clone()), "/v1/models").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("alpha model listing unavailable (unreachable)"),
+        "{message}"
+    );
+    assert_eq!(
+        registry
+            .provider_for_model("beta-listed-only", None)
+            .map(|provider| provider.name()),
+        Some("beta")
+    );
+    clear_listed_models_for_tests();
+}
+
+/// `anthropic-version` and `anthropic-workspace-id` change nothing.
+#[tokio::test]
+async fn models_ignore_the_anthropic_request_headers() {
+    let headers = [
+        ("anthropic-version", "2023-06-01"),
+        ("anthropic-workspace-id", "wrkspc_test"),
+    ];
+    for uri in ["/v1/models", "/v1/models/m2"] {
+        let (plain, plain_body) = get_models_response(five_model_app(), uri, &[]).await;
+        let (with, with_body) = get_models_response(five_model_app(), uri, &headers).await;
+        assert_eq!(plain.status(), StatusCode::OK, "{uri}: {plain_body}");
+        assert_eq!(with.status(), StatusCode::OK, "{uri}: {with_body}");
+        assert_eq!(with_body, plain_body, "{uri}");
+    }
+}
+
+/// Every path under `/v1/models/` gets the JSON envelope and a request id:
+/// an empty id and a path that does not decode to UTF-8 answer 404 with the
+/// remainder as sent, and an id holding `/` is looked up as sent or as `%2F`.
+#[tokio::test]
+async fn models_retrieve_answers_every_path_under_the_route() {
+    // A listing pass would answer 502 here, so the 404s also show none ran.
+    let failing = listing_app(vec![ListingStub::failing("stub", true)]);
+    for (uri, message) in [
+        ("/v1/models/", "model: "),
+        ("/v1/models/%FF", "model: %FF"),
+        ("/v1/models/org/%FF", "model: org/%FF"),
+    ] {
+        let (response, value) = get_models_response(failing.clone(), uri, &[]).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}: {value}");
+        assert_eq!(value["type"], "error", "{uri}");
+        assert_eq!(value["error"]["type"], "not_found_error", "{uri}");
+        assert_eq!(value["error"]["message"], message, "{uri}");
+        let id = request_id(&response);
+        assert!(uuid::Uuid::parse_str(id).is_ok(), "{uri}: {id:?}");
+    }
+
+    let app = listing_app(vec![ListingStub::listing("stub", &["m1", "org/model-1"])]);
+    for uri in ["/v1/models/org/model-1", "/v1/models/org%2Fmodel-1"] {
+        let (response, row) = get_models_response(app.clone(), uri, &[]).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}: {row}");
+        assert_eq!(row["id"], "org/model-1", "{uri}");
+        let id = request_id(&response);
+        assert!(uuid::Uuid::parse_str(id).is_ok(), "{uri}: {id:?}");
+    }
+    let (response, value) = get_models_response(app, "/v1/models/org/nope", &[]).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND, "{value}");
+    assert_eq!(value["error"]["message"], "model: org/nope");
+}
+
+/// A `lifecycle` filter without `active` answers the empty page without
+/// resolving a cursor; the parameter checks still come first.
+#[tokio::test]
+async fn models_lifecycle_without_active_ignores_the_cursors() {
+    for uri in [
+        "/v1/models?lifecycle=deprecated&after_id=m2",
+        "/v1/models?lifecycle=retired&before_id=m4&limit=1",
+        "/v1/models?lifecycle=deprecated&after_id=nope",
+    ] {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {value}");
+        assert_eq!(
+            sorted_keys(&value),
+            ["data", "first_id", "has_more", "last_id"]
+        );
+        assert_eq!(value["data"], json!([]), "{uri}");
+        assert!(value["first_id"].is_null(), "{uri}");
+        assert!(value["last_id"].is_null(), "{uri}");
+        assert_eq!(value["has_more"], json!(false), "{uri}");
+    }
+    let (status, value) = get_models(
+        five_model_app(),
+        "/v1/models?lifecycle=deprecated&after_id=m1&before_id=m3",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("after_id and before_id"),
+        "{value}"
+    );
+}
+
+/// An empty `after_id=` or `before_id=` counts as absent, the check for both
+/// cursors included; the other cursor is still resolved.
+#[tokio::test]
+async fn models_treat_an_empty_cursor_as_absent() {
+    let all = ["m1", "m2", "m3", "m4", "m5"];
+    let cases: [(&str, &[&str], bool); 6] = [
+        ("/v1/models?after_id=", &all, false),
+        ("/v1/models?before_id=", &all, false),
+        ("/v1/models?after_id=&limit=2", &["m1", "m2"], true),
+        ("/v1/models?before_id=&limit=2", &["m1", "m2"], true),
+        ("/v1/models?after_id=&before_id=m3", &["m1", "m2"], false),
+        ("/v1/models?before_id=&after_id=m3", &["m4", "m5"], false),
+    ];
+    for (uri, expected, has_more) in cases {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {value}");
+        assert_eq!(row_ids(&value), expected, "{uri}");
+        assert_eq!(value["has_more"], json!(has_more), "{uri}");
+    }
+    let (status, value) = get_models(five_model_app(), "/v1/models?after_id=&before_id=nope").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("before_id:"), "{message}");
+}
+
+#[tokio::test]
+async fn models_endpoint_provider_filter_narrows_rows() {
     let _no_logins = NoSavedLogins::install();
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, value) = get_models(app, "/v1/models?provider=kimi").await;
 
     assert_eq!(status, StatusCode::OK);
-    let data = value["data"].as_array().unwrap();
-    assert!(!data.is_empty());
-    assert!(data.iter().all(|m| m["provider"] == "kimi"));
-    assert_eq!(value["providers"].as_array().unwrap().len(), 1);
-    assert_eq!(value["providers"][0]["provider"], "kimi");
+    assert_eq!(
+        row_ids(&value),
+        ["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"]
+    );
 }
 
 #[tokio::test]
@@ -2339,11 +2896,19 @@ async fn the_permission_classifier_is_routed_even_when_it_opens_with_the_marker(
 }
 
 #[tokio::test]
-async fn models_endpoint_tolerates_unknown_query_params() {
-    let _no_logins = NoSavedLogins::install();
-    let app = app(Arc::new(Registry::with_default_alias()));
-    let (status, _) = get_models(app, "/v1/models?limit=1000&after_id=x").await;
-    assert_eq!(status, StatusCode::OK);
+async fn models_endpoint_ignores_unknown_query_params() {
+    let (_, plain) = get_models(five_model_app(), "/v1/models").await;
+    let (status, value) = get_models(
+        five_model_app(),
+        "/v1/models?beta=true&foo%5B%5D=bar&page=2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(
+        sorted_keys(&value),
+        ["data", "first_id", "has_more", "last_id"]
+    );
+    assert_eq!(value, plain);
 }
 
 /// The `request-id` header a response carries, or "" when it has none.
