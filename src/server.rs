@@ -544,6 +544,7 @@ fn invalid_models_request(message: impl Into<String>) -> Response {
 /// of the answer unnoticed, while one without a login contributes no rows.
 /// Rows come back tagged with their provider, in registry order and each
 /// provider's own order.
+#[allow(clippy::result_large_err)]
 async fn collect_model_rows(
     state: &AppState,
     selected: &[String],
