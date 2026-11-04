@@ -27,7 +27,7 @@ use claude_code_mux::{
     },
 };
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tower::util::ServiceExt;
 
@@ -1777,17 +1777,41 @@ async fn get_models(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     (status, value)
 }
 
+/// Held by every test that touches state the whole process shares: the
+/// environment, the Anthropic catalog cache and its fetch flights, the
+/// Anthropic listing timeout, the routing catalog of recorded listings, and
+/// the `proxy.log` that `XDG_STATE_HOME` points at. The test runner runs
+/// tests in parallel threads, so without it one test's variables, cached
+/// catalog or log lines reach another. A test that failed while holding it
+/// does not fail the ones after it.
+static SHARED_STATE: Mutex<()> = Mutex::new(());
+
+fn lock_shared_state() -> MutexGuard<'static, ()> {
+    SHARED_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A loopback address nothing listens on. A port freed by dropping a
+/// listener does not do: a test running beside this one can bind it next,
+/// while no listener bound to port 0 is ever given a port this low.
+const CLOSED_LOOPBACK: &str = "http://127.0.0.1:9";
+
 /// Point every saved-login lookup and the state dir at an empty temporary
 /// directory for the duration of a test, so neither `/v1/models` nor the
 /// refresh an unknown model starts can read the developer's real logins,
 /// reach the macOS Keychain or call a backend. No provider then holds a
-/// login. The Claude model catalog is served by a loopback mock, and its
-/// cache starts empty. No proxy variable is set, and loopback is exempt from
-/// any proxy, so a mock is always reached directly.
+/// login. The Claude model catalog is served by a loopback mock, its cache
+/// starts empty and the listing timeout is the default one. Loopback is
+/// exempt from any proxy, so a mock is always reached directly, while a
+/// proxy the environment names stays in place for anything else. The guard
+/// holds [`SHARED_STATE`] until it is dropped, so tests that install it run
+/// one at a time, and a test must drop one before it installs the next.
 struct NoSavedLogins {
     previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
     catalog: MockHttp,
     dir: tempfile::TempDir,
+    _shared: MutexGuard<'static, ()>,
 }
 
 impl NoSavedLogins {
@@ -1801,8 +1825,9 @@ impl NoSavedLogins {
     }
 
     fn with_catalog_url(url: String, catalog: MockHttp) -> Self {
+        let shared = lock_shared_state();
         let dir = tempfile::TempDir::new().unwrap();
-        let vars: [(&'static str, Option<std::ffi::OsString>); 13] = [
+        let vars: [(&'static str, Option<std::ffi::OsString>); 7] = [
             ("HOME", Some(dir.path().into())),
             ("CCP_CONFIG_DIR", Some(dir.path().join("config").into())),
             (
@@ -1813,12 +1838,6 @@ impl NoSavedLogins {
             ("CCP_ANTHROPIC_CATALOG_URL", Some(url.into())),
             ("NO_PROXY", Some("127.0.0.1,localhost".into())),
             ("no_proxy", Some("127.0.0.1,localhost".into())),
-            ("HTTP_PROXY", None),
-            ("HTTPS_PROXY", None),
-            ("ALL_PROXY", None),
-            ("http_proxy", None),
-            ("https_proxy", None),
-            ("all_proxy", None),
         ];
         let previous = vars
             .iter()
@@ -1833,11 +1852,21 @@ impl NoSavedLogins {
             }
         }
         clear_anthropic_catalog_cache_for_tests();
+        set_anthropic_listing_timeout_for_tests(None);
         Self {
             previous,
             catalog,
             dir,
+            _shared: shared,
         }
+    }
+
+    /// Shorten the Anthropic listing timeout until the returned guard is
+    /// dropped. It borrows this guard, so the timeout can only change while
+    /// the shared state lock is held.
+    fn listing_timeout(&self, timeout: Duration) -> ListingTimeout<'_> {
+        set_anthropic_listing_timeout_for_tests(Some(timeout));
+        ListingTimeout(std::marker::PhantomData)
     }
 
     /// Save a toy kimi login, so kimi counts as logged in.
@@ -1851,11 +1880,18 @@ impl NoSavedLogins {
         .unwrap();
     }
 
-    /// The fields of every `proxy.log` event with this message.
+    /// The fields of every `proxy.log` event with this message. Tests that
+    /// do not hold the lock log to the same file meanwhile, and the logger
+    /// writes an event and its newline separately, so another event can land
+    /// between the two. A line is therefore read as a run of events.
     fn logged(&self, msg: &str) -> Vec<Value> {
-        self.log_text()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        let text = self.log_text();
+        text.lines()
+            .flat_map(|line| {
+                serde_json::Deserializer::from_str(line)
+                    .into_iter::<Value>()
+                    .map_while(Result::ok)
+            })
             .filter(|event| event["msg"] == msg)
             .map(|event| event["fields"].clone())
             .collect()
@@ -1868,7 +1904,9 @@ impl NoSavedLogins {
 
 impl Drop for NoSavedLogins {
     fn drop(&mut self) {
+        // The lock is a field, released only after this body has run.
         clear_anthropic_catalog_cache_for_tests();
+        set_anthropic_listing_timeout_for_tests(None);
         for (key, value) in self.previous.drain(..) {
             unsafe {
                 match value {
@@ -2413,9 +2451,11 @@ async fn models_name_the_earlier_provider_when_a_later_one_fails_first() {
 /// does a slow login check beside another provider's slow listing.
 #[tokio::test]
 async fn models_ask_providers_concurrently() {
-    let delay = Duration::from_millis(400);
+    let delay = Duration::from_millis(1000);
     // Run one after the other, either case takes at least twice the delay.
-    let bound = Duration::from_millis(700);
+    // The bound sits just under that, leaving a loaded machine most of a
+    // delay of slack.
+    let bound = Duration::from_millis(1900);
     let cases = [
         (
             "slow listings",
@@ -2494,8 +2534,11 @@ async fn models_responses_carry_a_fresh_request_id() {
 /// The aggregate list fails when an earlier provider with a login cannot
 /// list, and the backend listing of a later provider is still recorded, so
 /// an id only that listing names routes to it.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn models_record_a_later_listing_when_an_earlier_provider_fails() {
+    // The routing catalog is process-wide.
+    let _shared = lock_shared_state();
     clear_listed_models_for_tests();
     let registry = listing_registry(vec![
         ListingStub::failing("alpha", true),
@@ -2786,17 +2829,12 @@ fn anthropic_listing_app(base: &str) -> axum::Router {
     )))
 }
 
-/// Shortens the Anthropic listing timeout until dropped.
-struct ListingTimeout;
+/// The Anthropic listing timeout that [`NoSavedLogins::listing_timeout`]
+/// shortened, restored when dropped. The timeout is process-wide, so the
+/// guard lives no longer than the `NoSavedLogins` that holds the lock.
+struct ListingTimeout<'a>(std::marker::PhantomData<&'a NoSavedLogins>);
 
-impl ListingTimeout {
-    fn set(timeout: Duration) -> Self {
-        set_anthropic_listing_timeout_for_tests(Some(timeout));
-        Self
-    }
-}
-
-impl Drop for ListingTimeout {
+impl Drop for ListingTimeout<'_> {
     fn drop(&mut self) {
         set_anthropic_listing_timeout_for_tests(None);
     }
@@ -2862,11 +2900,13 @@ async fn concurrent_listings_share_one_catalog_fetch() {
 /// that copy without fetching again.
 #[tokio::test]
 async fn a_catalog_fetch_outlives_a_call_that_stopped_waiting() {
-    let delay = Duration::from_millis(1500);
+    // The catalog answers well after the call stops waiting and well before
+    // the fetch's own budget of four seconds runs out.
+    let delay = Duration::from_millis(2000);
     let catalog =
         MockHttp::start(move |_| MockReply::json(200, mock_http::CATALOG_FIXTURE).delayed(delay));
     let no_logins = NoSavedLogins::with_catalog(catalog);
-    let _timeout = ListingTimeout::set(Duration::from_millis(300));
+    let _timeout = no_logins.listing_timeout(Duration::from_millis(300));
     let app = app(Arc::new(Registry::with_default_alias()));
 
     let (status, value) = get_models(app.clone(), "/v1/models").await;
@@ -2877,7 +2917,18 @@ async fn a_catalog_fetch_outlives_a_call_that_stopped_waiting() {
         "{message}"
     );
 
-    tokio::time::sleep(delay + Duration::from_millis(700)).await;
+    // The fetch leaves the flight map once it has stored the catalog. Wait
+    // for that rather than for a fixed time, which a loaded machine can
+    // outlast.
+    let url = no_logins.catalog.catalog_url();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while anthropic_catalog_flight_pending_for_tests(&url) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the catalog fetch never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let (status, value) = get_models(app, "/v1/models").await;
     assert_eq!(status, StatusCode::OK, "{value}");
     assert_eq!(row_ids(&value), CATALOG_IDS);
@@ -2942,14 +2993,7 @@ async fn an_unstarted_catalog_flight_fails_once_and_leaves() {
 /// catalog that cannot be read fails both routes. A failure is not cached.
 #[tokio::test]
 async fn models_fail_when_the_claude_catalog_is_unavailable() {
-    let refused = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!(
-            "http://{}{}",
-            listener.local_addr().unwrap(),
-            mock_http::CATALOG_PATH
-        )
-    };
+    let refused = format!("{CLOSED_LOOPBACK}{}", mock_http::CATALOG_PATH);
     let no_first_party = json!({
         "version": 8,
         "surfaces": {"cc": {"model_selector_config": [
@@ -2961,7 +3005,7 @@ async fn models_fail_when_the_claude_catalog_is_unavailable() {
     // status and the text the 502 message carries.
     type CatalogDown = (&'static str, Option<(u16, String)>, u64, &'static str);
     let cases: [CatalogDown; 4] = [
-        ("network", None, 0, "unreachable"),
+        ("network", None, 0, "catalog unreachable"),
         (
             "status",
             Some((500, r#"{"error":"down"}"#.to_string())),
@@ -3115,7 +3159,10 @@ async fn a_bearer_token_and_beta_header_are_relayed_as_sent() {
 /// the credential nor anything of the answer.
 #[tokio::test]
 async fn a_failed_relay_serves_the_catalog_and_logs_no_credential() {
-    let _timeout = ListingTimeout::set(Duration::from_millis(300));
+    // Only the slow relay runs on a shortened listing timeout, which also
+    // bounds the wait for the catalog after it, so the timeout leaves the
+    // catalog plenty and the relay answers long after it.
+    let timeout = Duration::from_millis(1500);
     let cases: [(&str, u64, u16, &str, u64); 4] = [
         (
             "status",
@@ -3126,10 +3173,11 @@ async fn a_failed_relay_serves_the_catalog_and_logs_no_credential() {
         ),
         ("body", 200, 200, "secret-body-text", 0),
         ("body", 200, 200, r#"{"rows":"secret-body-text"}"#, 0),
-        ("timeout", 0, 200, r#"{"data":[]}"#, 1500),
+        ("timeout", 0, 200, r#"{"data":[]}"#, 15_000),
     ];
     for (class, status, code, body, delay) in cases {
         let no_logins = NoSavedLogins::install();
+        let _timeout = (class == "timeout").then(|| no_logins.listing_timeout(timeout));
         let upstream = MockHttp::start(move |_| {
             MockReply::json(code, body).delayed(Duration::from_millis(delay))
         });
@@ -3258,8 +3306,12 @@ async fn retrieve_finds_a_relayed_row_with_a_credential() {
 /// fetches again.
 #[tokio::test]
 async fn concurrent_listings_share_one_failed_catalog_fetch() {
+    // A failure is not cached, so a listing that reached the catalog only
+    // after the fetch ended would fetch again. The fetch stays open long
+    // enough for a loaded machine to start all five, and well inside the
+    // listing timeout.
     let catalog = MockHttp::start(|_| {
-        MockReply::json(503, r#"{"error":"down"}"#).delayed(Duration::from_millis(300))
+        MockReply::json(503, r#"{"error":"down"}"#).delayed(Duration::from_millis(1500))
     });
     let no_logins = NoSavedLogins::with_catalog(catalog);
     let app = app(Arc::new(Registry::with_default_alias()));
@@ -3453,11 +3505,7 @@ async fn a_body_over_the_cap_is_a_body_failure() {
 #[tokio::test]
 async fn a_refused_relay_serves_the_catalog() {
     let no_logins = NoSavedLogins::install();
-    let closed = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", listener.local_addr().unwrap())
-    };
-    let app = anthropic_listing_app(&closed);
+    let app = anthropic_listing_app(CLOSED_LOOPBACK);
     let (response, value) =
         get_models_response(app, "/v1/models", &[("x-api-key", TOY_API_KEY)]).await;
 
@@ -3624,6 +3672,7 @@ async fn a_failing_later_page_drops_the_relayed_rows() {
 
 /// The default registry with its Anthropic passthrough sending to `base`.
 fn default_registry_with_anthropic_at(base: &str) -> Arc<Registry> {
+    let _base_url = lock_anthropic_base_url();
     let previous = std::env::var_os("CCP_ANTHROPIC_BASE_URL");
     unsafe {
         std::env::set_var("CCP_ANTHROPIC_BASE_URL", base);
@@ -3697,15 +3746,15 @@ async fn an_anthropic_listing_leaves_routing_as_it_was() {
     clear_listed_models_for_tests();
 }
 
-static AGENT_SUMMARY_LOCK: Mutex<()> = Mutex::new(());
-
 /// Pin the progress-label mode for the duration of a test: set or clear
 /// `CCP_AGENT_SUMMARY`, clear `CCP_AGENT_SUMMARY_MODEL` and
 /// `CCP_AUTO_REVIEW_MODEL`, and point `CCP_CONFIG_DIR` at an empty directory,
 /// so neither the environment nor a `config.json` on the machine picks the
 /// mode, the label model or the auto-review model. A test may set the cleared
-/// keys after installing; they are restored on drop. Tests that pin it run one
-/// at a time.
+/// keys after installing; they are restored on drop. The guard holds
+/// [`SHARED_STATE`], so it runs neither beside another test that pins it nor
+/// beside one that installs [`NoSavedLogins`], which sets `CCP_CONFIG_DIR`
+/// too.
 struct PinnedAgentSummary {
     previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _config_dir: tempfile::TempDir,
@@ -3714,9 +3763,7 @@ struct PinnedAgentSummary {
 
 impl PinnedAgentSummary {
     fn install(mode: Option<&str>) -> Self {
-        let lock = AGENT_SUMMARY_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = lock_shared_state();
         let config_dir = tempfile::TempDir::new().unwrap();
         let previous = [
             "CCP_AGENT_SUMMARY",
@@ -4363,9 +4410,23 @@ fn anthropic_provider(address: std::net::SocketAddr) -> Arc<dyn Provider> {
     anthropic_provider_at(&format!("http://{address}"))
 }
 
+/// Held while a test points `CCP_ANTHROPIC_BASE_URL` at its own mock to
+/// build a provider, so two tests building at once cannot swap mocks or
+/// leave the other's URL behind. It is separate from [`SHARED_STATE`]
+/// because tests holding that build providers too, and it is only ever
+/// taken after it, never before.
+static ANTHROPIC_BASE_URL: Mutex<()> = Mutex::new(());
+
+fn lock_anthropic_base_url() -> MutexGuard<'static, ()> {
+    ANTHROPIC_BASE_URL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The Anthropic passthrough, sending to `base`.
 fn anthropic_provider_at(base: &str) -> Arc<dyn Provider> {
     // The provider reads its base URL once, when it is built.
+    let _base_url = lock_anthropic_base_url();
     let previous = std::env::var_os("CCP_ANTHROPIC_BASE_URL");
     unsafe {
         std::env::set_var("CCP_ANTHROPIC_BASE_URL", base);
