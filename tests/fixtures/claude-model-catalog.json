@@ -1,0 +1,60 @@
+{
+  "$schema": "https://example.invalid/model-catalog.schema.json",
+  "version": 7,
+  "issued_at": "2026-11-01T00:00:00Z",
+  "expires_at": "2026-12-01T00:00:00Z",
+  "key_id": "test-key",
+  "signature": "dGVzdC1zaWduYXR1cmU=",
+  "surfaces": {
+    "cc": {
+      "model_selector_config": [
+        {
+          "models": [
+            {
+              "id": "claude-opus-5-5",
+              "name": "Opus 5.5",
+              "offered_on": ["first_party", "bedrock", "vertex"],
+              "runtime": {
+                "max_input_tokens": 1000000,
+                "max_output_tokens": 128000,
+                "family": "opus"
+              }
+            },
+            {
+              "id": "claude-sonnet-5-5",
+              "name": "Sonnet 5.5",
+              "runtime": {
+                "max_input_tokens": 1000000,
+                "max_output_tokens": 64000,
+                "family": "sonnet"
+              }
+            },
+            {
+              "id": "claude-bedrock-only-1",
+              "name": "Bedrock Only",
+              "offered_on": ["bedrock"],
+              "runtime": {
+                "max_input_tokens": 200000,
+                "max_output_tokens": 32000,
+                "family": "haiku"
+              }
+            },
+            {
+              "id": "claude-haiku-5-5",
+              "offered_on": ["first_party"]
+            }
+          ]
+        },
+        {
+          "models": [
+            {
+              "id": "claude-opus-5-5",
+              "name": "Opus 5.5 (second selector)",
+              "offered_on": ["first_party"]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

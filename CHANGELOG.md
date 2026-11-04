@@ -4,17 +4,20 @@
   and carries nothing else. The body has exactly `data`, `first_id`,
   `has_more` and `last_id` (both ids null on an empty page); the top-level
   `object`, the `providers[]` block and the per-row `provider` field are gone.
-  Every row is an Anthropic `ModelInfo` with exactly `type: "model"`, `id`,
-  `display_name`, `created_at` (always `1970-01-01T00:00:00Z`, the API's value
-  for an unknown release date), `capabilities`, `deprecated_at: null`,
-  `lifecycle: "active"`, `line: null`, `max_input_tokens`, `max_tokens` and
-  `retires_at: null`. Each id appears once: when two backends list the same
-  id, the row of the backend routing sends it to is kept. There is no switch
-  back to the old shape. What `providers[]` said about each backend (who
-  holds the login, where the rows came from, whether the backend answered) is
-  still printed by `claude-code-mux models [--full]`, whose output is
-  unchanged, and `?provider=<name>` still fails with 502 and the reason when
-  that backend cannot list.
+  Every row the proxy builds is an Anthropic `ModelInfo` with exactly
+  `type: "model"`, `id`, `display_name`, `created_at` (always
+  `1970-01-01T00:00:00Z`, the API's value for an unknown release date),
+  `capabilities`, `deprecated_at: null`, `lifecycle: "active"`, `line`
+  (null except on Claude rows from the public catalog), `max_input_tokens`,
+  `max_tokens` and `retires_at: null`; Claude rows relayed from Anthropic are
+  Anthropic's own (see below). Each id appears once: when two backends list
+  the same id, the row of the backend routing sends it to is kept. There is
+  no switch back to the old shape. What `providers[]` said about each backend
+  (who holds the login, where the rows came from, whether the backend
+  answered) is still printed by `claude-code-mux models [--full]`, whose
+  output is unchanged except for the Anthropic line, and `?provider=<name>`
+  fails with 502 and the reason when that backend has no saved login or
+  cannot list.
 - Breaking: Codex rows no longer carry the backend's catalog fields
   (`description`, `visibility`, `priority`, `supported_in_api`,
   `use_responses_lite`, `context_window`, `max_context_window`,
@@ -45,34 +48,123 @@
   `"<id> (<provider>)"`; Kimi rows report `max_tokens: 32000`, the cap the
   translator enforces, except `k3` and `kimi-k3`, and every other limit on
   these rows is null.
+- `GET /v1/models` and `GET /v1/models/{model_id}` now list Claude models,
+  first in the answer. When the request carries a non-empty `x-api-key` or
+  `authorization` header, the proxy relays the listing to Anthropic's own
+  `GET /v1/models` (at `CCP_ANTHROPIC_BASE_URL`) with the caller's headers as
+  sent, minus the ones the messages relay drops (`host`, `content-length`,
+  `accept-encoding` and the hop-by-hop headers) and `content-type`, plus
+  `anthropic-version: 2023-06-01` only when the request has none. It asks for
+  `limit=1000`, follows `has_more` for at most 10 pages, and passes the
+  request's `lifecycle` parameters on as written. A relay that stops with
+  rows still to come, at the tenth page or on a page that says `has_more`
+  without a usable cursor, keeps the rows it has and logs a warning. Those
+  rows are Anthropic's, untouched, `capabilities` and `lifecycle` included.
+  Because the `lifecycle` pairs go to Anthropic as spelled, on this path a
+  cursor resolves over the rows Anthropic returned for that filter, and a
+  Get Model with a credential sees the rows Anthropic lists by default. The
+  relay follows no redirect, so a 3xx is a failed relay. Without a
+  credential, or when the relay fails in any way (an error status such as
+  401, a timeout, a body without a `data` array, a failing later page, whose
+  earlier rows are then dropped), the rows come from the public Claude model
+  catalog, `https://downloads.claude.ai/model-catalog/v1/catalog.json`: the
+  models it offers on Anthropic's own API (an `offered_on` that is absent or
+  names `first_party`; a null or empty one leaves the model out), with
+  `display_name` from the catalog's name, `max_input_tokens` and
+  `max_tokens` from its runtime limits, `line` from its model family and
+  `capabilities: null`. The catalog is fetched with no credential and no
+  client header, follows redirects, and is kept for 10 minutes from a
+  successful fetch. Callers that arrive while a fetch of the same URL is in
+  flight wait for it and all get its result, a failure included; a failed
+  fetch is not kept, so a request after it tries again, and there is no
+  stale copy to fall back on. A relay page or a catalog body over 4 MiB is
+  a failure. The relay, all its pages together, and each catalog fetch,
+  waiting for one in flight included, get 4 seconds. A fetch whose callers
+  stopped waiting still runs to its end, and a catalog it reads is kept for
+  the requests after it. The catalog's
+  signature is not checked: its rows are informational. Routing of
+  `claude-*` ids and the aliases does not read any Claude listing, and no
+  Claude listing enters the routing catalog.
+- New `CCP_ANTHROPIC_CATALOG_URL` fetches the catalog from another URL, such
+  as a mirror or a copy served over HTTP on a machine without access to the
+  default one. It is environment-only, and an empty value means the default.
+  There is no switch that leaves the Claude rows out; `?provider=<name>` for
+  another backend asks only that backend and lists no Claude row.
+- Breaking: a backend without a saved login is no longer asked and adds no
+  rows. Kimi, Grok and Cursor used to list their bundled ids with or without
+  a login; they now appear only once that backend has one (`claude-code-mux
+  <provider> auth login`), and Codex rows only while the Codex CLI's
+  `auth.json` exists. `?provider=<name>` for such a backend answers 502
+  `api_error` with `<name> model listing unavailable (no saved login)`
+  instead of its rows. Anthropic is asked on every call, though the proxy
+  holds no login for it. `claude-code-mux models` still prints every
+  backend's list, login or not.
 - Breaking: the aggregate `GET /v1/models` now fails with 502 `api_error`,
-  naming the backend and its status, when a backend the proxy holds a saved
-  login for cannot list. It used to answer 200 and report the failure in
-  `providers[]`; without that block a partial answer would read as that
-  backend's models being gone. A backend without a login that cannot list is
-  left out silently.
+  naming the backend and its status, when a backend it asks cannot list:
+  Anthropic, or a backend the proxy holds a saved login for. It used to answer
+  200 and report the failure in `providers[]`; without that block a partial
+  answer would read as that backend's models being gone. For Anthropic that
+  means no relay succeeded and the catalog could not be fetched, which
+  answers `anthropic model listing unavailable (unreachable): public model
+  catalog unreachable` (or `answered <status>`, `timed out`, `body is not a
+  catalog`, `names no model`, `fetch did not complete`). A proxy that cannot
+  reach the catalog
+  therefore answers the aggregate list and every `/v1/models/{model_id}` with
+  502 unless the request carries a credential Anthropic accepts;
+  `?provider=codex` still answers, and `CCP_ANTHROPIC_CATALOG_URL` can point
+  at a reachable copy. The backends are asked at the same time, each one as
+  soon as its own login check passes; when more than one fails, the first in
+  the answer's order names the error, whichever failed first.
 - New `GET /v1/models/{model_id}` (Anthropic Get Model) answers with the row
-  the list would show for that id, from the same listing pass and with the
-  same 502 rule, or 404 `not_found_error` with the message `model: <id>`. An
-  id containing `/` works written literally or as `%2F`.
+  the list would show for that id, from the same listing pass, request
+  headers and 502 rule, or 404 `not_found_error` with the message
+  `model: <id>`. With a credential, a Claude id gets Anthropic's relayed row,
+  else the catalog's. No lifecycle filter applies. An id containing `/` works
+  written literally or as `%2F`.
 - `GET /v1/models` takes the Anthropic query parameters. `after_id` and
   `before_id` are exclusive cursors over the answer's own order: both at once
   is a 400, an empty value counts as absent, and a cursor that names no row
-  is a 400 naming it. `limit` must be an integer from 1 to 1000, else 400;
-  without it every row is returned in one page, unlike the Anthropic API's
-  default of 20. `lifecycle` (repeated, as `lifecycle[]`, or comma-separated)
-  accepts `active`, `deprecated` and `retired` and answers anything else with
-  a 400; every row is active, so a filter without `active` gives an empty
-  page. `?provider=<name>` stays as the proxy's own filter, with a 400 for an
-  unknown name. Other parameters and the `anthropic-version` and
-  `anthropic-workspace-id` headers are accepted and ignored. Every error,
+  is a 400 naming it. A cursor is looked up among all rows before the
+  lifecycle filter, so one naming a row the filter leaves out still works.
+  `limit` must be an integer from 1 to 1000, else 400; without it every row
+  is returned in one page, unlike the Anthropic API's default of 20.
+  `lifecycle` (repeated, as `lifecycle[]`, or comma-separated) accepts
+  `active`, `deprecated` and `retired` and answers anything else with a 400.
+  It filters each row by its own `lifecycle`, a row without one or with any
+  other value counting as active; without the parameter, active and
+  deprecated rows are listed and
+  retired ones left out. Every row the proxy builds is active, so only
+  relayed Anthropic rows can be anything else. `?provider=<name>` stays as
+  the proxy's own filter, with a 400 for an unknown name. Other parameters
+  are ignored. Request headers such as `anthropic-version`,
+  `anthropic-beta` and `anthropic-workspace-id` matter only to the relay,
+  which passes them on; without a credential they are ignored. Every error,
   including a malformed `?limit=abc` that used to get a plain-text 400, now
   uses the Anthropic envelope `{"type": "error", "error": {"type": ...,
   "message": ...}}`.
 - Every response of `/v1/models` and `/v1/models/{model_id}`, errors
   included, carries a `request-id` header.
-- Unchanged: no row id contains `claude` or `anthropic` in any case, and
-  every listing still feeds routing as before.
+- Ids containing `claude` or `anthropic` are no longer left out of the
+  listing; the earlier rule that dropped them is gone. Claude Code's gateway
+  model discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) keeps only
+  such ids, so a client that turns it on now gets this listing's Claude rows
+  as picker rows. `modelPicker` rows are not affected. The Codex listing feeds
+  routing as before.
+- `proxy.log` has four new events on the `anthropic` logger: a warning
+  `anthropic model listing relay failed; using the public catalog`, a
+  warning `anthropic model listing truncated` with the number of `pages`
+  read, an info `anthropic model catalog fetched` with the catalog's
+  `version` and the number of `models` kept, and a warning `anthropic model
+  catalog fetch failed`. The two failure warnings carry `status` (0 when
+  none came) and a short `class` (`status`, `timeout`, `network`, `body`,
+  also for a body over 4 MiB, `empty` for a catalog that names no model,
+  and `task` for a catalog fetch that ended without a result, such as one
+  cut short by shutdown). None of them logs a header, a body or a query.
+- `claude-code-mux models` now prints the catalog's Claude ids for
+  Anthropic, as `anthropic: <ids> [public catalog, not verified]`, or
+  `anthropic: unavailable (unreachable: <reason>)` when the catalog cannot be
+  fetched, instead of a line saying credentials are forwarded from the
+  client. The command now reaches the catalog URL to do so.
 
 ## v0.16.0 (2026-10-23)
 

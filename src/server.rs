@@ -12,7 +12,7 @@ use crate::{
         stream::openai_response as render_openai_response,
     },
     project,
-    provider::{RequestContext, ResponseOutcome},
+    provider::{ListingRequest, RequestContext, ResponseOutcome},
     providers::codex::{
         chat_completions::{ChatCompletionsBackend, request::translate_request},
         images::{
@@ -460,8 +460,8 @@ async fn healthz() -> Json<serde_json::Value> {
 /// Largest `limit` the Anthropic Models API accepts.
 const MAX_MODELS_LIMIT: usize = 1000;
 
-/// The `lifecycle` values the Anthropic Models API accepts. Every row the
-/// proxy lists is `active`.
+/// The `lifecycle` values the Anthropic Models API accepts. Rows the proxy
+/// builds are `active`; rows relayed from Anthropic carry their own.
 const MODEL_LIFECYCLES: [&str; 3] = ["active", "deprecated", "retired"];
 
 /// The `/v1/models` query: the Anthropic List Models parameters plus
@@ -522,12 +522,28 @@ impl ModelsQuery {
         Ok(query)
     }
 
-    /// Whether the lifecycle filter keeps an `active` row.
-    fn keeps_active(&self) -> bool {
-        self.lifecycle
-            .as_ref()
-            .is_none_or(|set| set.contains("active"))
+    /// Whether the lifecycle filter keeps a row of this lifecycle. Without a
+    /// `lifecycle` parameter it keeps `active` and `deprecated`.
+    fn keeps(&self, lifecycle: &str) -> bool {
+        match &self.lifecycle {
+            Some(set) => set.contains(lifecycle),
+            None => matches!(lifecycle, "active" | "deprecated"),
+        }
     }
+}
+
+/// The `lifecycle` and `lifecycle[]` pairs of a raw query string, each as
+/// the client wrote it, for a provider that passes the filter on.
+fn lifecycle_pairs(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split('&')
+        .filter(|pair| {
+            url::form_urlencoded::parse(pair.as_bytes())
+                .next()
+                .is_some_and(|(key, _)| key == "lifecycle" || key == "lifecycle[]")
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 fn invalid_models_request(message: impl Into<String>) -> Response {
@@ -538,49 +554,67 @@ fn invalid_models_request(message: impl Into<String>) -> Response {
 /// retrieve routes. Every listing goes to `record_listing` before any failure
 /// is answered, so the routing catalog sees the same listings either way.
 ///
-/// When `explicit` (the client named the provider), a listing that is not ok
-/// fails the request. Otherwise a failed listing fails it only when that
-/// provider holds a login, so a backend with saved credentials never drops out
-/// of the answer unnoticed, while one without a login contributes no rows.
-/// Rows come back tagged with their provider, in registry order and each
-/// provider's own order.
+/// A provider is asked only when it holds a saved login (checked on the
+/// blocking pool) or when `listing_required` holds for it. Any other
+/// contributes no rows, and when the client named it (`explicit`) the request
+/// fails with 502 and `no saved login`. Each provider's check and, when it
+/// passes, its listing run as one future, all providers at once, so a slow
+/// check holds back only its own provider. Once all have answered, the
+/// listings are recorded in registry order. A listing that is not ok fails
+/// the request, the first in registry order giving the message whichever
+/// failed first, so a backend with saved credentials never drops out of the
+/// answer unnoticed. Rows come back tagged with their provider, in registry
+/// order and each provider's own order.
 #[allow(clippy::result_large_err)]
 async fn collect_model_rows(
     state: &AppState,
     selected: &[String],
     explicit: bool,
-    headers: &http::HeaderMap,
+    request: ListingRequest<'_>,
 ) -> Result<Vec<(&'static str, Value)>, Response> {
-    let mut rows = Vec::new();
-    let mut failure = None;
-    for name in selected {
-        let Some(provider) = state.registry.provider(name) else {
-            continue;
-        };
-        let listing = provider.list_models(Some(headers)).await;
-        record_listing(&listing);
-        if !listing.is_ok() {
-            if failure.is_some() {
-                continue;
-            }
-            let fails = explicit || {
-                let provider = Arc::clone(&provider);
-                tokio::task::spawn_blocking(move || provider.has_credentials())
+    let providers: Vec<_> = selected
+        .iter()
+        .filter_map(|name| state.registry.provider(name))
+        .collect();
+    let listings = futures_util::future::join_all(providers.iter().map(|provider| {
+        let provider = Arc::clone(provider);
+        async move {
+            let asked = provider.listing_required() || {
+                let checked = Arc::clone(&provider);
+                tokio::task::spawn_blocking(move || checked.has_credentials())
                     .await
                     .unwrap_or(false)
             };
-            if fails {
-                failure = Some(json_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    format!(
-                        "{} model listing unavailable ({}): {}",
-                        listing.provider,
-                        listing.status,
-                        listing.detail.as_deref().unwrap_or("no detail")
-                    ),
-                ));
+            if asked {
+                Some(provider.list_models_for(request).await)
+            } else {
+                None
             }
+        }
+    }))
+    .await;
+    let mut rows = Vec::new();
+    let mut failure = None;
+    for (provider, listing) in providers.iter().zip(listings) {
+        let Some(listing) = listing else {
+            if explicit && failure.is_none() {
+                failure = Some(listing_unavailable(format!(
+                    "{} model listing unavailable (no saved login)",
+                    provider.name()
+                )));
+            }
+            continue;
+        };
+        record_listing(&listing);
+        if !listing.is_ok() {
+            failure.get_or_insert_with(|| {
+                listing_unavailable(format!(
+                    "{} model listing unavailable ({}): {}",
+                    listing.provider,
+                    listing.status,
+                    listing.detail.as_deref().unwrap_or("no detail")
+                ))
+            });
             continue;
         }
         rows.extend(
@@ -596,25 +630,33 @@ async fn collect_model_rows(
     }
 }
 
+fn listing_unavailable(message: String) -> Response {
+    json_error(StatusCode::BAD_GATEWAY, "api_error", message)
+}
+
 fn model_row_id(row: &Value) -> Option<&str> {
     row.get("id").and_then(Value::as_str)
 }
 
+/// A row's lifecycle: its `lifecycle` when that is `active`, `deprecated` or
+/// `retired`. A row with none, a non-string one or any other string counts
+/// as `active`.
+fn model_row_lifecycle(row: &Value) -> &str {
+    match row.get("lifecycle").and_then(Value::as_str) {
+        Some(lifecycle @ ("active" | "deprecated" | "retired")) => lifecycle,
+        _ => "active",
+    }
+}
+
 /// One row per id, in the order the rows came. When several providers list
 /// the same id, the row kept is the one of the provider routing would send
-/// that id to, else the first. Rows without an id, and ids that name a Claude
-/// model, are left out: the proxy holds no Anthropic credential and Claude
-/// Code keeps such ids as picker rows.
+/// that id to, else the first. Rows without an id are left out.
 fn dedupe_model_rows(registry: &Registry, rows: Vec<(&'static str, Value)>) -> Vec<Value> {
     let mut positions: std::collections::HashMap<String, Vec<usize>> = Default::default();
     for (index, (_, row)) in rows.iter().enumerate() {
         let Some(id) = model_row_id(row) else {
             continue;
         };
-        let lowered = id.to_ascii_lowercase();
-        if lowered.contains("claude") || lowered.contains("anthropic") {
-            continue;
-        }
         positions.entry(id.to_string()).or_default().push(index);
     }
     let mut kept = std::collections::HashSet::new();
@@ -636,48 +678,68 @@ fn dedupe_model_rows(registry: &Registry, rows: Vec<(&'static str, Value)>) -> V
         .collect()
 }
 
-/// Applies the cursors and `limit` to the rows in their answer order.
-/// `has_more` says whether rows remain in the direction of the request. A
-/// cursor that names no row in the answer is an error naming the parameter.
+/// Applies the cursors, the lifecycle filter and `limit` to the rows in their
+/// answer order. A cursor is looked up among all the rows, so one naming a
+/// row the filter leaves out is still valid; one that names no row is an
+/// error naming the parameter. The page comes from the rows the filter keeps
+/// past the cursor, and `has_more` says whether more of them remain in the
+/// direction of the request.
 fn page_model_rows(rows: Vec<Value>, query: &ModelsQuery) -> Result<(Vec<Value>, bool), String> {
     let position = |param: &str, id: &str| {
         rows.iter()
             .position(|row| model_row_id(row) == Some(id))
             .ok_or_else(|| format!("{param}: no model with id \"{id}\" in this listing"))
     };
+    let before = query
+        .before_id
+        .as_deref()
+        .map(|id| position("before_id", id))
+        .transpose()?;
+    let after = query
+        .after_id
+        .as_deref()
+        .map(|id| position("after_id", id))
+        .transpose()?;
+    let mut kept: Vec<Value> = rows
+        .into_iter()
+        .enumerate()
+        .filter(|(index, row)| {
+            after.is_none_or(|after| *index > after)
+                && before.is_none_or(|before| *index < before)
+                && query.keeps(model_row_lifecycle(row))
+        })
+        .map(|(_, row)| row)
+        .collect();
     let limit = query.limit.unwrap_or(usize::MAX);
-    let (start, end, has_more) = if let Some(before_id) = query.before_id.as_deref() {
-        let end = position("before_id", before_id)?;
-        let start = end.saturating_sub(limit);
-        (start, end, start > 0)
+    let has_more = kept.len() > limit;
+    if before.is_some() {
+        // Paging backward keeps the rows just before the cursor.
+        kept.drain(..kept.len().saturating_sub(limit));
     } else {
-        let start = match query.after_id.as_deref() {
-            Some(after_id) => position("after_id", after_id)? + 1,
-            None => 0,
-        };
-        let end = start.saturating_add(limit).min(rows.len());
-        (start, end, end < rows.len())
-    };
-    let page = rows.into_iter().skip(start).take(end - start).collect();
-    Ok((page, has_more))
+        kept.truncate(limit);
+    }
+    Ok((kept, has_more))
 }
 
 /// Anthropic List Models (`GET /v1/models`): `data`, `first_id`, `has_more`
-/// and `last_id`, each row an Anthropic `ModelInfo` built by
-/// `provider::model_info`.
+/// and `last_id`, each row an Anthropic `ModelInfo`.
 ///
 /// A provider that holds a login asks its backend on every call, so the rows
 /// are what that login may use right now, not a list compiled into the proxy.
 /// Codex is the one that does today; kimi, grok and cursor still advertise
-/// their bundled lists. Anthropic contributes no rows: the proxy forwards the
-/// caller's credential and holds none, and Claude Code lists its own models.
+/// their bundled lists. A provider without a saved login is not asked and
+/// adds no rows. Anthropic is always asked: with a credential on the request
+/// (`x-api-key` or `authorization`) the rows are Anthropic's own listing for
+/// it, relayed as they came, else they come from the public Claude model
+/// catalog.
 ///
 /// `after_id`, `before_id`, `limit` and `lifecycle` follow the Anthropic API;
-/// without `limit` every row is returned. `anthropic-version` and
-/// `anthropic-workspace-id` are accepted and ignored. `?provider=<name>`
-/// narrows the answer to one provider and asks only that backend; when that
-/// provider cannot list, the request fails with 502 so a consumer never
-/// mistakes an empty answer for "no models".
+/// without `limit` every row is returned. `lifecycle` filters every row by
+/// its own lifecycle and is passed on to the Anthropic relay as written.
+/// `?provider=<name>` narrows the answer to one provider and asks only that
+/// backend; when that provider has no saved login or cannot list, the request
+/// fails with 502 so a consumer never mistakes an empty answer for "no
+/// models".
 async fn handler_models(
     State(state): State<Arc<AppState>>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
@@ -709,20 +771,19 @@ async fn list_models_response(
         }
         _ => (names, false),
     };
-    let rows = match collect_model_rows(state, &selected, explicit, headers).await {
+    let lifecycle_pairs = lifecycle_pairs(raw_query);
+    let request = ListingRequest {
+        headers: Some(headers),
+        lifecycle_pairs: &lifecycle_pairs,
+    };
+    let rows = match collect_model_rows(state, &selected, explicit, request).await {
         Ok(rows) => rows,
         Err(response) => return response,
     };
     let rows = dedupe_model_rows(&state.registry, rows);
-    // Every row is active, so a filter without `active` leaves an empty page
-    // and the cursors have no row to name.
-    let (data, has_more) = if query.keeps_active() {
-        match page_model_rows(rows, &query) {
-            Ok(page) => page,
-            Err(message) => return invalid_models_request(message),
-        }
-    } else {
-        (Vec::new(), false)
+    let (data, has_more) = match page_model_rows(rows, &query) {
+        Ok(page) => page,
+        Err(message) => return invalid_models_request(message),
     };
     axum::response::IntoResponse::into_response(Json(json!({
         "data": data,
@@ -733,8 +794,8 @@ async fn list_models_response(
 }
 
 /// Anthropic Get Model (`GET /v1/models/{model_id}`): the row the list
-/// would show for that id, from the same listing pass and failure rule as an
-/// unfiltered list, or 404 `not_found_error`.
+/// would show for that id, from the same listing pass, client headers and
+/// failure rule as a list, with no lifecycle filter, or 404 `not_found_error`.
 ///
 /// The id is the whole percent-decoded remainder of the path, so one holding
 /// `/`, sent as is or as `%2F`, is looked up like any other. An empty id, and
@@ -769,7 +830,11 @@ async fn retrieve_model_response(
     headers: &http::HeaderMap,
 ) -> Response {
     let names = state.registry.list_provider_names();
-    let rows = match collect_model_rows(state, &names, false, headers).await {
+    let request = ListingRequest {
+        headers: Some(headers),
+        lifecycle_pairs: &[],
+    };
+    let rows = match collect_model_rows(state, &names, false, request).await {
         Ok(rows) => rows,
         Err(response) => return response,
     };

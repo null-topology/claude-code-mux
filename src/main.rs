@@ -4,7 +4,7 @@ use claude_code_mux::{
     config, logging,
     monitor::MonitorHandle,
     paths,
-    provider::{ListingAuth, ListingSource},
+    provider::ListingSource,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
     server::{self, ServerConfig},
     tui::{self, MonitorExit, MonitorUiConfig},
@@ -253,22 +253,18 @@ fn print_models(registry: &Registry, full: bool) {
     }
 }
 
-/// `models`: what each backend lists right now, on the proxy's own login,
-/// the same answer `GET /v1/models` gives. A provider whose backend did not
-/// answer is printed with the reason instead of a compiled-in list.
+/// `models`: what each backend lists right now, on the proxy's own login.
+/// Every backend is asked whether or not it has a saved login, unlike
+/// `GET /v1/models`, which asks only the providers that hold one. A provider
+/// whose backend did not answer is printed with the reason instead of a
+/// compiled-in list. Claude models come from the public catalog, as no client
+/// credential is at hand.
 async fn print_live_models(registry: &Registry, full: bool) {
     for name in ["codex", "kimi", "grok", "cursor", "anthropic"] {
         let Some(provider) = registry.provider(name) else {
             continue;
         };
         let listing = provider.list_models(None).await;
-        if listing.auth == ListingAuth::Client {
-            println!(
-                "{name}: {}",
-                listing.detail.as_deref().unwrap_or("not listed")
-            );
-            continue;
-        }
         if !listing.is_ok() {
             println!(
                 "{name}: unavailable ({}: {})",
@@ -286,6 +282,8 @@ async fn print_live_models(registry: &Registry, full: bool) {
         let source = match listing.source {
             ListingSource::Upstream => "upstream",
             ListingSource::Bundled => "bundled list, not verified",
+            ListingSource::Relayed => "relayed",
+            ListingSource::Catalog => "public catalog, not verified",
             ListingSource::None => "none",
         };
         if full || name != "cursor" {

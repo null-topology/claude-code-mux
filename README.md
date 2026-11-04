@@ -52,7 +52,8 @@ Code's own usage warnings and limit messages working for both.
   Reasoning survives a switch between backends. [How it works](#how-it-works)
 - **Lists the models your login can actually use.** `/v1/models` asks the Codex
   backend on every call instead of serving a list compiled into the binary,
-  and answers in the Anthropic Models API shape.
+  lists Claude models from Anthropic or the public Claude model catalog, and
+  answers in the Anthropic Models API shape.
   [Listing models](#listing-models)
 - **Turns Codex quota into the rate-limit headers Claude Code reads**, so a
   Codex model shows the same usage warnings and limit messages as a Claude one.
@@ -88,8 +89,10 @@ Neither upstream project has these; the details and the evidence are in
 - **`/v1/models` in the Anthropic Models API shape.** List and Get Model with
   cursors, `limit` and `lifecycle`; Codex rows report the backend's maximum
   context window as `max_input_tokens` and the capabilities the translator
-  carries; a backend with a saved login that cannot list fails the answer
-  loudly, and `?provider=` asks one backend only.
+  carries; Claude rows from Anthropic on the caller's credential, else from
+  the public catalog; only backends with a saved login listed; a backend
+  that cannot list fails the answer loudly, and `?provider=` asks one
+  backend only.
 - **Codex quota as `anthropic-ratelimit-unified-*` utilization headers** on
   every healthy response, so Claude Code's usage warning works on Codex models.
   The spent-window answer with `x-should-retry: false` started here as well and
@@ -206,8 +209,9 @@ what routes: a model it stops listing stops routing, and until it has
 answered, the list built into the proxy is used. An answer that names no
 model at all is ignored, so the last good list keeps routing, and each list
 the proxy takes over is noted in its log with how many models it names. The
-backends asked this way are the ones that report a saved login; the
-`models` command and `/v1/models` ask every backend regardless.
+backends asked this way are the ones that report a saved login, and
+`/v1/models` asks the same ones; the `models` command asks every backend
+regardless. Claude ids never depend on a listing: they route by name.
 
 Two suffixes are understood on any id:
 
@@ -307,16 +311,51 @@ endpoint. It is not the recommended path: discovery only runs when
 `ANTHROPIC_AUTH_TOKEN`, an API key, or an `apiKeyHelper` is configured, and
 any of those moves Claude Code off the subscription path, where the native
 rate-limit events stop arriving for every model. `modelPicker` keeps the
-subscription path intact.
+subscription path intact. Discovery also keeps only ids that contain `claude`
+or `anthropic`, so it would add the Claude rows of the listing below to the
+picker and none of the Codex ones.
 
 ### Listing models
 
 `GET /v1/models` answers with what each backend can list right now, not with a
-list compiled into the proxy. A backend the proxy holds a login for is asked
-on every call; today that is Codex, whose backend has a metadata call that
-returns the models the logged-in ChatGPT account may use. It spends no
-completion quota and still answers while a usage window is spent, so the
-listing is checkable under a rate limit.
+list compiled into the proxy. A backend the proxy holds a saved login for is
+asked on every call, and a backend without one is not asked and adds no rows.
+Codex is the backend with a metadata call that returns the models the
+logged-in ChatGPT account may use. It spends no completion quota and still
+answers while a usage window is spent, so the listing is checkable under a
+rate limit.
+
+Claude rows are listed on every call. When the request carries a non-empty
+`x-api-key` or `authorization` header, the proxy relays the listing to
+Anthropic's own `GET /v1/models` at `CCP_ANTHROPIC_BASE_URL` with the
+request's headers as sent, minus the ones the messages relay drops (`host`,
+`content-length`, `accept-encoding` and the hop-by-hop headers) and
+`content-type`, plus `anthropic-version: 2023-06-01` when the request has
+none. It asks for `limit=1000`, follows `has_more` for at most 10 pages and
+passes the request's `lifecycle` parameters on as written; the rows are
+Anthropic's, untouched. The relay follows no redirect, so a 3xx is a failed
+relay, and a failing later page drops the rows of the earlier ones. A relay
+that stops with rows still to come, at the tenth page or on a page that says
+`has_more` without a usable cursor, keeps the rows it has. Without a
+credential, or when the relay fails in any way, the rows come from the public
+Claude model catalog,
+`https://downloads.claude.ai/model-catalog/v1/catalog.json`
+(`CCP_ANTHROPIC_CATALOG_URL` changes it), fetched with no credential and no
+client header, following redirects, and kept for 10 minutes after a
+successful fetch. Callers that arrive while a fetch of the same URL is in
+flight wait for it and all get its result, a failure included; a failed
+fetch is not kept, so a request after it tries again, and there is no older
+copy to fall back on. A relay page or a catalog body over 4 MiB is a
+failure. The relay, all its pages together, and each catalog fetch, waiting
+for one in flight included, get 4 seconds. A fetch whose callers stopped
+waiting still runs to its end, and a catalog it reads is kept for the
+requests after it. The catalog's signature is not
+checked: its rows are informational, and routing of Claude ids never reads
+them. `proxy.log` records a failed relay as `anthropic model listing relay
+failed; using the public catalog`, a relay that stopped early as `anthropic
+model listing truncated` with the number of `pages`, and each fetch as
+`anthropic model catalog fetched` or `anthropic model catalog fetch failed`,
+with a status and a short class and never a header, a body or a query.
 
 The answer follows the Anthropic Models API
 ([List Models](https://platform.claude.com/docs/en/api/models/list)) and
@@ -325,6 +364,10 @@ contains only the fields that API defines:
 ```json
 {
   "data": [
+    {"type": "model", "id": "claude-opus-5", "display_name": "…",
+     "created_at": "1970-01-01T00:00:00Z", "capabilities": null,
+     "deprecated_at": null, "lifecycle": "active", "line": "opus",
+     "max_input_tokens": …, "max_tokens": …, "retires_at": null},
     {"type": "model", "id": "gpt-6-astra", "display_name": "…",
      "created_at": "1970-01-01T00:00:00Z",
      "capabilities": {"batch": {"supported": false}, "effort": {…}, …},
@@ -336,20 +379,28 @@ contains only the fields that API defines:
      "deprecated_at": null, "lifecycle": "active", "line": null,
      "max_input_tokens": null, "max_tokens": 32000, "retires_at": null}
   ],
-  "first_id": "gpt-6-astra",
+  "first_id": "claude-opus-5",
   "has_more": false,
   "last_id": "…"
 }
 ```
 
-- `created_at` is always the epoch, which the API uses for an unknown release
-  date. Every row is `active`, and `deprecated_at`, `line` and `retires_at`
-  are null.
+- On every row the proxy builds, `created_at` is the epoch, which the API uses
+  for an unknown release date, the row is `active`, and `deprecated_at` and
+  `retires_at` are null; `line` is null too, except on catalog Claude rows.
+- Claude rows from the catalog: the models it offers on Anthropic's own API,
+  that is with an `offered_on` that is absent or names `first_party` (a null
+  or empty one leaves the model out); `display_name` is the catalog's name, else the id; `max_input_tokens` and
+  `max_tokens` are its runtime limits, else null; `line` is its model family
+  when that is `haiku`, `sonnet`, `opus`, `fable` or `mythos`, else null; and
+  `capabilities` is null. Relayed Claude rows are Anthropic's as they came,
+  `capabilities`, `lifecycle` and dates included.
 - Codex rows: `display_name` is the backend's, else the id;
   `max_input_tokens` is the listing's `max_context_window` (872000 for every
   current Codex model), else its `context_window`, else null; `max_tokens` is
   null, because the proxy sends Codex no output cap.
-- Kimi, Grok and Cursor rows come from the list compiled into this build:
+- Kimi, Grok and Cursor rows come from the list compiled into this build and
+  appear only once that backend has a saved login:
   `display_name` is `<id> (<provider>)` and `capabilities` is null. Kimi's
   `max_tokens` is 32000, the cap its translator enforces, except on `k3` and
   `kimi-k3`; every other limit on these rows is null.
@@ -375,13 +426,11 @@ included, without its catalog fields: `visibility`, `use_responses_lite`,
 `service_tiers`, the reasoning levels and the rest stay out of the rows, and
 the Codex CLI's `models_cache.json`, next to its `auth.json`, holds them. Each
 id appears once; when two backends list the same id, the row of the backend
-routing sends it to is kept. Anthropic has no rows: the proxy holds no
-Anthropic credential and Claude Code already lists its own models. No id in
-`data` contains `claude` or `anthropic`, which is what keeps Claude Code's
-gateway discovery from turning a marker into a picker row. Claude Code does
-not read `max_input_tokens` from here either, since gateway discovery stays
-off (see [Why not gateway model discovery](#why-not-gateway-model-discovery));
-a `modelPicker` row gets its context window from its settings.
+routing sends it to is kept. Claude rows come first, then the other backends'
+rows by backend name. Claude Code does not read `max_input_tokens` from here,
+since gateway discovery stays off (see
+[Why not gateway model discovery](#why-not-gateway-model-discovery)); a
+`modelPicker` row gets its context window from its settings.
 
 Query parameters follow the Anthropic API, except that `limit` has no
 default page size and `provider` is an extra filter:
@@ -390,43 +439,66 @@ default page size and `provider` is an extra filter:
   out the id they name. Both at once is a 400, an empty value counts as
   absent, and a cursor that names no row in the answer is a 400 naming it, so
   a model that disappeared between pages never looks like the end of the
-  list.
+  list. A cursor is looked up among all rows before the `lifecycle` filter,
+  so one naming a row the filter leaves out still works.
 - `limit` is an integer from 1 to 1000, else a 400. Without it every row comes
   back in one page, unlike the Anthropic API's default of 20. `has_more` says
   whether rows remain in the direction asked.
 - `lifecycle` may be repeated, written `lifecycle[]`, or comma-separated, with
   the values `active`, `deprecated` and `retired`; anything else is a 400.
-  Every row is active, so a filter without `active` gives an empty page.
+  It filters each row by its own `lifecycle`, a row without one or with any
+  other value counting as active; without it, active and deprecated rows are
+  listed. Rows the proxy builds are all active, so only relayed Anthropic rows
+  can be deprecated or retired. The relay passes the parameter on to
+  Anthropic as spelled, so on that path a cursor resolves over the rows
+  Anthropic returned for that filter, and a Get Model with a credential sees
+  the rows Anthropic lists by default.
 - `provider=<name>` is the proxy's own: `GET /v1/models?provider=codex` asks
-  that backend only. An unknown name is a 400, and when that backend cannot
-  list, the request fails with 502 and the reason, so a consumer never
-  mistakes an empty answer for "no models".
+  that backend only. An unknown name is a 400. A backend without a saved
+  login answers 502 with `<name> model listing unavailable (no saved login)`,
+  and one that cannot list answers 502 with the reason, so a consumer never
+  mistakes an empty answer for "no models". `provider=anthropic` is always
+  asked.
 
-Any other parameter, and the `anthropic-version` and `anthropic-workspace-id`
-headers, are accepted and ignored. Errors use the Anthropic envelope,
+Any other parameter is accepted and ignored. Request headers such as
+`anthropic-version`, `anthropic-beta` and `anthropic-workspace-id` reach
+Anthropic only with the relay and are ignored without a credential. Errors use
+the Anthropic envelope,
 `{"type": "error", "error": {"type": "invalid_request_error", "message": "…"}}`.
 
-Without `?provider=`, a backend the proxy holds a saved login for that cannot
-list fails the whole answer with 502 `api_error`, naming the backend and its
-status, such as `unauthorized` when the backend refused the login or
-`unreachable` on a transport error, timeout or 5xx: a partial list would read
-as that backend's models being gone. A backend with no saved login that cannot
-list is left out silently. `claude-code-mux models` prints every backend's
-state, including why a listing failed.
+Without `?provider=`, a backend the proxy asks that cannot list fails the whole
+answer with 502 `api_error`, naming the backend and its status, such as
+`unauthorized` when the backend refused the login or `unreachable` on a
+transport error, timeout or 5xx: a partial list would read as that backend's
+models being gone. For Anthropic that means no relay succeeded and the catalog
+could not be fetched: `anthropic model listing unavailable (unreachable):
+public model catalog unreachable`, or `answered <status>`, `timed out`,
+`body is not a catalog`, `names no model`, `fetch did not complete`. A proxy
+that cannot reach the catalog therefore answers the whole list and every Get
+Model with 502 unless the request carries a credential Anthropic accepts;
+`?provider=codex` still answers. The backends are asked at the same time,
+each one as soon as its own login check passes; when more than one fails, the
+first in the answer's order names the error, whichever failed first.
+`claude-code-mux models`
+prints every backend's state, including why
+a listing failed.
 
 `GET /v1/models/{model_id}`
 ([Get Model](https://platform.claude.com/docs/en/api/models/retrieve)) answers
-with the row the list would show for that id, from the same listing and with
-the same 502 rule, or 404 `not_found_error` with the message `model: <id>`.
-An id containing `/` works written literally or as `%2F`. Every response of
-both routes, errors included, carries a `request-id` header.
+with the row the list would show for that id, from the same listing, request
+headers and 502 rule, or 404 `not_found_error` with the message `model: <id>`.
+With a credential a Claude id gets Anthropic's relayed row, else the
+catalog's, and no `lifecycle` filter applies. An id containing `/` works
+written literally or as `%2F`. Every response of both routes, errors
+included, carries a `request-id` header.
 
 A model the backend listed routes to codex from then on, `-fast` variant
 included, even if this build did not know it. That is why an id the compiled-in
-catalog does not contain can still be accepted. The listing itself is never
-cached: every call is a fresh answer from the backend, only the slugs it named
-are remembered in memory for routing, and a restart forgets them along with
-every other piece of conversation state (see [How it works](#how-it-works)).
+catalog does not contain can still be accepted. The Codex listing itself is
+never cached: every call is a fresh answer from the backend, only the slugs it
+named are remembered in memory for routing, and a restart forgets them along
+with every other piece of conversation state (see
+[How it works](#how-it-works)).
 
 The listing call requires a `client_version` query parameter. The proxy sends
 the version recorded in the Codex CLI's `~/.codex/models_cache.json` when that
@@ -963,7 +1035,8 @@ This is the complete list of variables the proxy reads.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `CCP_ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Where the passthrough relays to. Point it at a gateway or a mock; the relay stays byte-exact either way. |
+| `CCP_ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Where the passthrough relays to. Point it at a gateway or a mock; the relay stays byte-exact either way. A `/v1/models` call with a credential is relayed here too. |
+| `CCP_ANTHROPIC_CATALOG_URL` | `https://downloads.claude.ai/model-catalog/v1/catalog.json` | Where the public Claude model catalog behind the Claude rows of `/v1/models` is fetched from when a call carries no credential or the relay fails (see [Listing models](#listing-models)). Point it at a mirror or a copy served over HTTP. An empty value means the default. |
 
 **Codex backend**
 
@@ -1022,9 +1095,10 @@ including the WebSocket transport.
 
 `config.json` in the config directory holds most of the same settings in
 camelCase. An environment variable always wins over the file, and the file over
-the default. Eleven variables have no key in the file and are environment-only:
+the default. Twelve variables have no key in the file and are environment-only:
 `CCP_CONFIG_DIR` (it locates the file), `CLAUDE_CONFIG_DIR`,
-`CCP_CODEX_AUTH_FILE`, `CCP_ANTHROPIC_BASE_URL`, `CCP_COMPACT_EFFORT`,
+`CCP_CODEX_AUTH_FILE`, `CCP_ANTHROPIC_BASE_URL`,
+`CCP_ANTHROPIC_CATALOG_URL`, `CCP_COMPACT_EFFORT`,
 `CCP_CODEX_QUOTA_WARN_AT`, `CCP_GROK_TOOL_IMAGE`, `CCP_CURSOR_AUTH_TOKEN`,
 `CCP_AGENT_SUMMARY_MODEL`, `CCP_USER_AGENT` and `CCP_TRAFFIC_LOG`.
 
@@ -1195,8 +1269,9 @@ run `claude-code-mux models` for the ids each one currently offers.
 | Cursor | the `cursor:`, `cursor-plan:` and `cursor-ask:` prefixes (for example `cursor:gpt-5.5`) plus the bare legacy ids `cursor`, `cursor-agent`, `cursor-composer`, `cursor-composer-fast`, `cursor-plan`, `cursor-ask`, `composer-2.5`, `composer-2.5-fast` | `claude-code-mux cursor auth login`, or `CCP_CURSOR_AUTH_TOKEN`. `auth device` is not implemented. |
 
 Their ids come from a list compiled into the build, not from the backend, so
-`/v1/models` lists them without asking the backend and `claude-code-mux
-models` marks them `bundled list, not verified`. Each has its own `CCP_*`
+`/v1/models` lists them without asking the backend, once that backend has a
+saved login, and `claude-code-mux models` marks them `bundled list, not
+verified`. Each has its own `CCP_*`
 overrides in [Proxy side](#proxy-side).
 
 ## Commands
@@ -1204,7 +1279,7 @@ overrides in [Proxy side](#proxy-side).
 | Command | What it does |
 | --- | --- |
 | `claude-code-mux serve [--port N] [--no-monitor]` | Run the proxy. This is the default command, so a bare `claude-code-mux` does the same. The monitor opens only when stdout is a terminal. |
-| `claude-code-mux models [--full]` | List model ids per backend: what Codex lists for your login right now, the bundled lists for the others. `--full` prints every alias rather than a summary. |
+| `claude-code-mux models [--full]` | List model ids per backend: what Codex lists for your login right now, the Claude ids of the public model catalog for Anthropic, the bundled lists for the others. `--full` prints every alias rather than a summary. |
 | `claude-code-mux demo` | Open the monitor on simulated traffic, with no server listening. |
 | `claude-code-mux codex auth status` | Show the Codex CLI login the proxy will use. `codex auth login` and `codex auth device` only point you at `codex login`, and `codex auth logout` at `codex logout`: the proxy has no Codex login of its own and never deletes that file, writing to it only to store a refreshed token. |
 | `claude-code-mux kimi\|grok\|cursor auth login\|device\|status\|logout` | Manage the other backends' logins. `device` is a real device-code flow on Grok, an alias of `login` on Kimi, and not implemented on Cursor. |
@@ -1249,8 +1324,8 @@ it ignores the structured rate-limit headers entirely, and
 **A Codex model refuses and the weekly window is spent.** That is the
 `usage_limit_reached` answer, surfaced once with the reset time rather than
 after every retry. There is nothing to configure; switch to a Claude model or
-wait for the reset. `GET /v1/models` still answers while a window is spent, so
-it is a usable liveness check.
+wait for the reset. `GET /v1/models?provider=codex` still answers while a
+window is spent, so it is a usable liveness check.
 
 **Requests are much larger than expected.** Claude Code disables lazy tool
 loading behind a non-Anthropic base URL. Set `ENABLE_TOOL_SEARCH=true`; the
@@ -1334,7 +1409,7 @@ backend was contacted.
 | `claude-*` and alias routing | remapped to another backend; the alias target is codex or kimi, codex by default | passthrough to `api.anthropic.com` on the client's own login, and the default | same as fcakyon, plus usage read off the relayed bytes and a `list_models` override |
 | Codex authentication | its own browser, device and PKCE login | reads the Codex CLI's `auth.json`; `codex auth login` points at `codex login` | same as fcakyon |
 | Codex model inventory | compiled-in lists | compiled-in lists | live listing from the Codex backend, never cached |
-| `/v1/models` shape | flat list from the compiled-in registry | same | the Anthropic Models API shape (list with cursors, `limit` and `lifecycle`, and Get Model), Codex context window and capabilities per row, `?provider=` and a 502 when a backend with a login cannot list |
+| `/v1/models` shape | flat list from the compiled-in registry | same | the Anthropic Models API shape (list with cursors, `limit` and `lifecycle`, and Get Model), Codex context window and capabilities per row, Claude rows relayed from Anthropic on the caller's credential or read from the public catalog, rows only for backends with a saved login, `?provider=` and a 502 when a backend it asks cannot list |
 | Codex quota as rate-limit headers | `usage_limit_reached` answered once with `x-should-retry: false`, status, reset and claim; no utilization on healthy responses | not recognized | the same spent-window answer, plus `-5h-*` / `-7d-*` utilization and `-surpassed-threshold` on every healthy response |
 | Codex retries | a live stream and an empty completion retried up to 10 times each, the buffered transport up to 3 | same | one attempt; the client owns the retry policy |
 | Deferred tool loading | `tool_reference` blocks dropped in the grok translator | same | mapped onto Codex's native tool search |
@@ -1364,8 +1439,8 @@ not defects.
 - Grok's hosted-search text projection and its `CCP_GROK_*` search switches.
 
 **What this fork has that neither of them does.** Live Codex model discovery
-and a `/v1/models` in the Anthropic Models API shape with per-model limits and
-capabilities; Codex quota translated into Anthropic rate-limit
+and a `/v1/models` in the Anthropic Models API shape with per-model limits,
+capabilities and Claude rows; Codex quota translated into Anthropic rate-limit
 headers; deferred tool loading mapped onto Codex's tool search; a native,
 local or junior-model mode for the subagent progress label; a
 per-conversation prompt-cache scope; the

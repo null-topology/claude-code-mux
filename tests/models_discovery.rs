@@ -7,6 +7,7 @@ use axum::response::Response;
 use axum::routing::get;
 use claude_code_mux::config::clear_config_file_cache_for_tests;
 use claude_code_mux::logging::log_file;
+use claude_code_mux::providers::anthropic::models::clear_anthropic_catalog_cache_for_tests;
 use claude_code_mux::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_mux::providers::codex::models::{
     clear_discovered_models_for_tests, is_discovered_model,
@@ -23,6 +24,11 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use tower::util::ServiceExt;
+
+#[path = "support/mock_http.rs"]
+mod mock_http;
+
+use mock_http::MockHttp;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -206,6 +212,11 @@ async fn spawn_codex_upstream_with_delay(
 
 async fn get_models(uri: &str) -> (StatusCode, Value) {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    // Every listing also asks for the Claude rows: a loopback catalog serves
+    // them, so they never come from the public one.
+    let catalog = MockHttp::catalog();
+    let _catalog_env = EnvGuard::set("CCP_ANTHROPIC_CATALOG_URL", catalog.catalog_url());
+    clear_anthropic_catalog_cache_for_tests();
     let response = app(Arc::new(Registry::with_default_alias()))
         .oneshot(
             Request::builder()
@@ -1191,6 +1202,59 @@ async fn an_empty_listing_keeps_routing_and_every_recorded_listing_is_logged() {
     }
 }
 
+/// The aggregate listing asks Codex only with a saved Codex login: without
+/// one there are only Claude rows and the backend is never asked; with the
+/// toy `auth.json` the backend's rows sit beside the Claude rows.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn models_list_includes_codex_rows_only_with_a_saved_codex_login() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    let config = TempDir::new().unwrap();
+    let (upstream, captured) = spawn_codex_upstream(StatusCode::OK, upstream_inventory()).await;
+    let _home_env = EnvGuard::set("HOME", config.path());
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path().join("config"));
+    let _state_env = EnvGuard::set("XDG_STATE_HOME", config.path().join("state"));
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _version_env = EnvGuard::set("CCP_CODEX_CLIENT_VERSION", "9.9.9");
+    let claude_ids = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
+
+    let missing_auth = EnvGuard::set(
+        "CCP_CODEX_AUTH_FILE",
+        config.path().join("missing-auth.json"),
+    );
+    let (status, value) = get_models("/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(row_ids(&value), claude_ids);
+    assert_eq!(listings(&captured), 0);
+    // The login check kept Codex out, not a listing that failed to load the
+    // missing auth file.
+    assert!(
+        logged("codex model listing unavailable").is_empty(),
+        "{:?}",
+        logged("codex model listing unavailable")
+    );
+    drop(missing_auth);
+
+    let _codex_auth = write_codex_auth(config.path());
+    let (status, value) = get_models("/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let (claude, codex): (Vec<&str>, Vec<&str>) = row_ids(&value)
+        .into_iter()
+        .partition(|id| id.starts_with("claude-"));
+    assert_eq!(claude, claude_ids, "{value}");
+    assert_eq!(
+        codex,
+        ["gpt-7-test", "gpt-5.5", "codex-auto-review"],
+        "{value}"
+    );
+    assert_eq!(listings(&captured), 1);
+
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+}
+
 /// Stops the proxy process when the test ends, whether it passed or not.
 struct ChildGuard(std::process::Child);
 
@@ -1233,6 +1297,10 @@ async fn serve_lists_models_at_start_so_the_first_request_needs_no_refresh() {
         .env("CCP_CODEX_CLIENT_VERSION", "9.9.9")
         .env("CCP_CODEX_IMAGES_BASE_URL", closed)
         .env("CCP_ANTHROPIC_BASE_URL", closed)
+        .env(
+            "CCP_ANTHROPIC_CATALOG_URL",
+            format!("{closed}/model-catalog/v1/catalog.json"),
+        )
         .env("CCP_KIMI_BASE_URL", closed)
         .env("CCP_KIMI_OAUTH_HOST", closed)
         .env("CCP_GROK_BASE_URL", closed)

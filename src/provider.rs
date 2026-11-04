@@ -47,6 +47,11 @@ pub enum ListingSource {
     Upstream,
     /// A list compiled into this build; nothing was verified.
     Bundled,
+    /// The backend answered a listing call made on the caller's own
+    /// credential, relayed from the client request.
+    Relayed,
+    /// A public catalog the vendor publishes, fetched with no credential.
+    Catalog,
     /// No rows are produced for this provider.
     None,
 }
@@ -56,9 +61,22 @@ impl ListingSource {
         match self {
             ListingSource::Upstream => "upstream",
             ListingSource::Bundled => "bundled",
+            ListingSource::Relayed => "relayed",
+            ListingSource::Catalog => "catalog",
             ListingSource::None => "none",
         }
     }
+}
+
+/// What a listing is asked with: the headers of the client request that
+/// caused it, `None` when the proxy lists on its own, and the `lifecycle`
+/// pairs of that request's query exactly as the client wrote them
+/// (`lifecycle=deprecated`, `lifecycle%5B%5D=active`), for a provider that
+/// passes the filter on to its backend.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListingRequest<'a> {
+    pub headers: Option<&'a axum::http::HeaderMap>,
+    pub lifecycle_pairs: &'a [String],
 }
 
 /// `created_at` of every row the proxy lists. The Anthropic Models API allows
@@ -77,6 +95,26 @@ pub fn model_info(
     max_tokens: Option<u64>,
     capabilities: Option<&ModelCapabilities>,
 ) -> serde_json::Value {
+    model_info_in_line(
+        id,
+        display_name,
+        max_input_tokens,
+        max_tokens,
+        capabilities,
+        None,
+    )
+}
+
+/// [`model_info`] for a row that names its Claude line (`haiku`, `sonnet`,
+/// `opus`, ...), or none.
+pub fn model_info_in_line(
+    id: &str,
+    display_name: &str,
+    max_input_tokens: Option<u64>,
+    max_tokens: Option<u64>,
+    capabilities: Option<&ModelCapabilities>,
+    line: Option<&str>,
+) -> serde_json::Value {
     serde_json::json!({
         "type": "model",
         "id": id,
@@ -85,7 +123,7 @@ pub fn model_info(
         "capabilities": capabilities.map(ModelCapabilities::to_value),
         "deprecated_at": null,
         "lifecycle": "active",
-        "line": null,
+        "line": line,
         "max_input_tokens": max_input_tokens,
         "max_tokens": max_tokens,
         "retires_at": null,
@@ -223,19 +261,6 @@ impl ModelListing {
         }
     }
 
-    /// A provider whose credential is the caller's: nothing to list.
-    pub fn client_side(provider: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            provider,
-            auth: ListingAuth::Client,
-            source: ListingSource::None,
-            status: "not_listed",
-            detail: Some(detail.into()),
-            fetched_at: None,
-            models: Vec::new(),
-        }
-    }
-
     /// A listing the backend did not give: no rows, the reason in `status`.
     pub fn unavailable(provider: &'static str, status: &'static str, detail: String) -> Self {
         Self {
@@ -271,12 +296,27 @@ pub trait Provider: Send + Sync {
         ModelListing::bundled(self.name(), self.supported_models())
     }
 
+    /// [`Self::list_models`] with the rest of the client request a provider
+    /// may pass on, today the `lifecycle` filter. `/v1/models` calls this
+    /// one; the default ignores everything but the headers.
+    async fn list_models_for(&self, request: ListingRequest<'_>) -> ModelListing {
+        self.list_models(request.headers).await
+    }
+
+    /// Whether `/v1/models` asks this provider on every call whether or not
+    /// it holds a login, and fails when its listing is not ok. The default,
+    /// `false`, lists a provider only when [`Self::has_credentials`] holds.
+    fn listing_required(&self) -> bool {
+        false
+    }
+
     /// Whether a saved login for this provider exists, read locally with no
     /// network call. The registry calls [`Self::list_models`] only on
     /// providers that have one, when `serve` starts and when a request names
     /// a model nothing routes, on the blocking pool, so a check may block.
-    /// The default, for a provider that holds no credential of its own, is
-    /// `false`.
+    /// `/v1/models` lists the same way, unless [`Self::listing_required`]
+    /// holds. The default, for a provider that holds no credential of its
+    /// own, is `false`.
     fn has_credentials(&self) -> bool {
         false
     }
