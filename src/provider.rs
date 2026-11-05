@@ -47,6 +47,11 @@ pub enum ListingSource {
     Upstream,
     /// A list compiled into this build; nothing was verified.
     Bundled,
+    /// The backend answered a listing call made on the caller's own
+    /// credential, relayed from the client request.
+    Relayed,
+    /// A public catalog the vendor publishes, fetched with no credential.
+    Catalog,
     /// No rows are produced for this provider.
     None,
 }
@@ -56,12 +61,155 @@ impl ListingSource {
         match self {
             ListingSource::Upstream => "upstream",
             ListingSource::Bundled => "bundled",
+            ListingSource::Relayed => "relayed",
+            ListingSource::Catalog => "catalog",
             ListingSource::None => "none",
         }
     }
 }
 
-/// What `/v1/models` says about one provider next to its rows.
+/// What a listing is asked with: the headers of the client request that
+/// caused it, `None` when the proxy lists on its own, and the `lifecycle`
+/// pairs of that request's query exactly as the client wrote them
+/// (`lifecycle=deprecated`, `lifecycle%5B%5D=active`), for a provider that
+/// passes the filter on to its backend.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListingRequest<'a> {
+    pub headers: Option<&'a axum::http::HeaderMap>,
+    pub lifecycle_pairs: &'a [String],
+}
+
+/// `created_at` of every row the proxy lists. The Anthropic Models API allows
+/// the epoch when a model's release date is unknown, and the proxy knows none.
+pub const MODEL_CREATED_AT: &str = "1970-01-01T00:00:00Z";
+
+/// One `/v1/models` row in the Anthropic Models API `ModelInfo` shape. Every
+/// row the proxy lists is built here, so the key set cannot drift: `type`,
+/// `id`, `display_name`, `created_at`, `capabilities`, `deprecated_at`,
+/// `lifecycle`, `line`, `max_input_tokens`, `max_tokens` and `retires_at`.
+/// Every row is active and belongs to no Claude line.
+pub fn model_info(
+    id: &str,
+    display_name: &str,
+    max_input_tokens: Option<u64>,
+    max_tokens: Option<u64>,
+    capabilities: Option<&ModelCapabilities>,
+) -> serde_json::Value {
+    model_info_in_line(
+        id,
+        display_name,
+        max_input_tokens,
+        max_tokens,
+        capabilities,
+        None,
+    )
+}
+
+/// [`model_info`] for a row that names its Claude line (`haiku`, `sonnet`,
+/// `opus`, ...), or none.
+pub fn model_info_in_line(
+    id: &str,
+    display_name: &str,
+    max_input_tokens: Option<u64>,
+    max_tokens: Option<u64>,
+    capabilities: Option<&ModelCapabilities>,
+    line: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "model",
+        "id": id,
+        "display_name": display_name,
+        "created_at": MODEL_CREATED_AT,
+        "capabilities": capabilities.map(ModelCapabilities::to_value),
+        "deprecated_at": null,
+        "lifecycle": "active",
+        "line": line,
+        "max_input_tokens": max_input_tokens,
+        "max_tokens": max_tokens,
+        "retires_at": null,
+    })
+}
+
+/// The Anthropic Models API `ModelCapabilities` object, one flag per leaf.
+/// [`Self::to_value`] writes the whole key tree whatever the flags say; a
+/// group's own `supported` is true when any of its members is, except
+/// `thinking`, whose `supported` is a flag of its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelCapabilities {
+    pub batch: bool,
+    pub citations: bool,
+    pub code_execution: bool,
+    pub clear_thinking_20251015: bool,
+    pub clear_tool_uses_20250919: bool,
+    pub compact_20260112: bool,
+    pub effort_low: bool,
+    pub effort_medium: bool,
+    pub effort_high: bool,
+    pub effort_xhigh: bool,
+    pub effort_max: bool,
+    pub image_input: bool,
+    pub pdf_input: bool,
+    pub server_code_execution: bool,
+    pub server_web_search: bool,
+    pub structured_outputs: bool,
+    pub thinking: bool,
+    pub thinking_adaptive: bool,
+    pub thinking_between_tools: bool,
+    pub thinking_disabled: bool,
+    pub thinking_enabled: bool,
+}
+
+impl ModelCapabilities {
+    pub fn to_value(&self) -> serde_json::Value {
+        fn leaf(supported: bool) -> serde_json::Value {
+            serde_json::json!({ "supported": supported })
+        }
+        serde_json::json!({
+            "batch": leaf(self.batch),
+            "citations": leaf(self.citations),
+            "code_execution": leaf(self.code_execution),
+            "context_management": {
+                "supported": self.clear_thinking_20251015
+                    || self.clear_tool_uses_20250919
+                    || self.compact_20260112,
+                "clear_thinking_20251015": leaf(self.clear_thinking_20251015),
+                "clear_tool_uses_20250919": leaf(self.clear_tool_uses_20250919),
+                "compact_20260112": leaf(self.compact_20260112),
+            },
+            "effort": {
+                "supported": self.effort_low
+                    || self.effort_medium
+                    || self.effort_high
+                    || self.effort_xhigh
+                    || self.effort_max,
+                "low": leaf(self.effort_low),
+                "medium": leaf(self.effort_medium),
+                "high": leaf(self.effort_high),
+                "xhigh": leaf(self.effort_xhigh),
+                "max": leaf(self.effort_max),
+            },
+            "image_input": leaf(self.image_input),
+            "pdf_input": leaf(self.pdf_input),
+            "server_tools": {
+                "supported": self.server_code_execution || self.server_web_search,
+                "code_execution": leaf(self.server_code_execution),
+                "web_search": leaf(self.server_web_search),
+            },
+            "structured_outputs": leaf(self.structured_outputs),
+            "thinking": {
+                "supported": self.thinking,
+                "types": {
+                    "adaptive": leaf(self.thinking_adaptive),
+                    "between_tools": leaf(self.thinking_between_tools),
+                    "disabled": leaf(self.thinking_disabled),
+                    "enabled": leaf(self.thinking_enabled),
+                },
+            },
+        })
+    }
+}
+
+/// What a provider lists for `/v1/models`, plus the status of that listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelListing {
     pub provider: &'static str,
@@ -72,22 +220,34 @@ pub struct ModelListing {
     pub detail: Option<String>,
     /// RFC 3339 time of the upstream answer, when `source` is `upstream`.
     pub fetched_at: Option<String>,
-    /// Row objects without the `provider` key; the handler adds it.
+    /// Rows built by [`model_info`], in the order the provider gives them.
     pub models: Vec<serde_json::Value>,
 }
 
 impl ModelListing {
-    /// The compiled-in list, advertised as such.
+    /// The compiled-in list, advertised as such, with no token limits.
     pub fn bundled(provider: &'static str, models: Vec<String>) -> Self {
+        Self::bundled_with_limits(provider, models, |_| (None, None))
+    }
+
+    /// The compiled-in list, with `limits` giving each id's
+    /// `(max_input_tokens, max_tokens)`. Bundled rows carry no capabilities.
+    pub fn bundled_with_limits(
+        provider: &'static str,
+        models: Vec<String>,
+        limits: impl Fn(&str) -> (Option<u64>, Option<u64>),
+    ) -> Self {
         let models = models
             .into_iter()
             .map(|model| {
-                serde_json::json!({
-                    "type": "model",
-                    "object": "model",
-                    "id": model,
-                    "display_name": format!("{model} ({provider})"),
-                })
+                let (max_input_tokens, max_tokens) = limits(&model);
+                model_info(
+                    &model,
+                    &format!("{model} ({provider})"),
+                    max_input_tokens,
+                    max_tokens,
+                    None,
+                )
             })
             .collect();
         Self {
@@ -98,19 +258,6 @@ impl ModelListing {
             detail: None,
             fetched_at: None,
             models,
-        }
-    }
-
-    /// A provider whose credential is the caller's: nothing to list.
-    pub fn client_side(provider: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            provider,
-            auth: ListingAuth::Client,
-            source: ListingSource::None,
-            status: "not_listed",
-            detail: Some(detail.into()),
-            fetched_at: None,
-            models: Vec::new(),
         }
     }
 
@@ -149,12 +296,27 @@ pub trait Provider: Send + Sync {
         ModelListing::bundled(self.name(), self.supported_models())
     }
 
+    /// [`Self::list_models`] with the rest of the client request a provider
+    /// may pass on, today the `lifecycle` filter. `/v1/models` calls this
+    /// one; the default ignores everything but the headers.
+    async fn list_models_for(&self, request: ListingRequest<'_>) -> ModelListing {
+        self.list_models(request.headers).await
+    }
+
+    /// Whether `/v1/models` asks this provider on every call whether or not
+    /// it holds a login, and fails when its listing is not ok. The default,
+    /// `false`, lists a provider only when [`Self::has_credentials`] holds.
+    fn listing_required(&self) -> bool {
+        false
+    }
+
     /// Whether a saved login for this provider exists, read locally with no
     /// network call. The registry calls [`Self::list_models`] only on
     /// providers that have one, when `serve` starts and when a request names
     /// a model nothing routes, on the blocking pool, so a check may block.
-    /// The default, for a provider that holds no credential of its own, is
-    /// `false`.
+    /// `/v1/models` lists the same way, unless [`Self::listing_required`]
+    /// holds. The default, for a provider that holds no credential of its
+    /// own, is `false`.
     fn has_credentials(&self) -> bool {
         false
     }
@@ -353,6 +515,123 @@ pub struct Passthrough {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every path from the root to a leaf value, dot-joined and sorted. Each
+    /// leaf must be a boolean, so an object in place of a flag shows up too.
+    fn bool_paths(value: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    bool_paths(child, &path, out);
+                }
+            }
+            serde_json::Value::Bool(_) => out.push(prefix.to_string()),
+            other => panic!("{prefix} holds {other}, not a flag"),
+        }
+    }
+
+    #[test]
+    fn capabilities_have_exactly_the_anthropic_key_tree() {
+        let mut paths = Vec::new();
+        bool_paths(&ModelCapabilities::default().to_value(), "", &mut paths);
+        paths.sort_unstable();
+        let mut expected = vec![
+            "batch.supported",
+            "citations.supported",
+            "code_execution.supported",
+            "context_management.supported",
+            "context_management.clear_thinking_20251015.supported",
+            "context_management.clear_tool_uses_20250919.supported",
+            "context_management.compact_20260112.supported",
+            "effort.supported",
+            "effort.low.supported",
+            "effort.medium.supported",
+            "effort.high.supported",
+            "effort.xhigh.supported",
+            "effort.max.supported",
+            "image_input.supported",
+            "pdf_input.supported",
+            "server_tools.supported",
+            "server_tools.code_execution.supported",
+            "server_tools.web_search.supported",
+            "structured_outputs.supported",
+            "thinking.supported",
+            "thinking.types.adaptive.supported",
+            "thinking.types.between_tools.supported",
+            "thinking.types.disabled.supported",
+            "thinking.types.enabled.supported",
+        ];
+        expected.sort_unstable();
+        assert_eq!(paths, expected);
+    }
+
+    #[test]
+    fn a_capability_group_is_supported_when_any_member_is() {
+        let none = ModelCapabilities::default().to_value();
+        for group in ["context_management", "effort", "server_tools", "thinking"] {
+            assert_eq!(none[group]["supported"], false, "{group}");
+        }
+        let some = ModelCapabilities {
+            compact_20260112: true,
+            effort_max: true,
+            server_web_search: true,
+            ..ModelCapabilities::default()
+        }
+        .to_value();
+        assert_eq!(some["context_management"]["supported"], true);
+        assert_eq!(some["effort"]["supported"], true);
+        assert_eq!(some["effort"]["low"]["supported"], false);
+        assert_eq!(some["server_tools"]["supported"], true);
+        assert_eq!(some["server_tools"]["code_execution"]["supported"], false);
+    }
+
+    #[test]
+    fn model_info_has_exactly_the_anthropic_keys() {
+        let row = model_info("m", "M", Some(10), None, None);
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "capabilities",
+                "created_at",
+                "deprecated_at",
+                "display_name",
+                "id",
+                "lifecycle",
+                "line",
+                "max_input_tokens",
+                "max_tokens",
+                "retires_at",
+                "type",
+            ]
+        );
+        assert_eq!(row["type"], "model");
+        assert_eq!(row["created_at"], MODEL_CREATED_AT);
+        assert_eq!(row["lifecycle"], "active");
+        assert_eq!(row["max_input_tokens"], 10);
+        for key in [
+            "capabilities",
+            "deprecated_at",
+            "line",
+            "max_tokens",
+            "retires_at",
+        ] {
+            assert!(row[key].is_null(), "{key}");
+        }
+        let with_caps = model_info("m", "M", None, None, Some(&ModelCapabilities::default()));
+        assert!(with_caps["capabilities"].is_object());
+    }
 
     #[test]
     fn the_first_failure_wins_and_a_later_finish_cannot_erase_it() {

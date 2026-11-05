@@ -24,6 +24,11 @@ fn version_aliases_print_expected_version() -> Result<(), Box<dyn std::error::Er
 fn no_codex_auth(cmd: &mut Command, temp: &TempDir) {
     cmd.env("CCP_CODEX_AUTH_FILE", temp.path().join("missing-auth.json"));
     cmd.env("CCP_CONFIG_DIR", temp.path());
+    // A closed loopback port: the Claude rows never reach the public catalog.
+    cmd.env(
+        "CCP_ANTHROPIC_CATALOG_URL",
+        "http://127.0.0.1:9/model-catalog/v1/catalog.json",
+    );
 }
 
 #[test]

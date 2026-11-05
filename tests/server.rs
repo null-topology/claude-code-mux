@@ -8,8 +8,18 @@ use claude_code_mux::{
     config::AliasProvider,
     monitor::{MonitorHandle, RequestStatus, UsageQuality},
     openai_compat::MAX_OPENAI_REQUEST_BYTES,
-    provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
-    registry::Registry,
+    provider::{
+        CliHandlers, Generation, GenerationBody, ListingSource, ModelListing, Provider,
+        ProviderError, RequestContext,
+    },
+    providers::anthropic::models::{
+        MAX_BODY_BYTES, anthropic_catalog_flight_pending_for_tests,
+        clear_anthropic_catalog_cache_for_tests, expire_anthropic_catalog_cache_for_tests,
+        insert_ended_anthropic_catalog_flight_for_tests,
+        insert_unstarted_anthropic_catalog_flight_for_tests,
+        set_anthropic_listing_timeout_for_tests,
+    },
+    registry::{Registry, clear_listed_models_for_tests},
     request_identity::ConversationIdentity,
     server::{
         AppFeatures, app, app_with_features, app_with_monitor, app_with_options,
@@ -17,8 +27,14 @@ use claude_code_mux::{
     },
 };
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 use tower::util::ServiceExt;
+
+#[path = "support/mock_http.rs"]
+mod mock_http;
+
+use mock_http::{Framing, MockHttp, MockReply};
 
 fn body_string(json: &str) -> Body {
     Body::from(json.to_string())
@@ -1761,41 +1777,136 @@ async fn get_models(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     (status, value)
 }
 
+/// Held by every test that touches state the whole process shares: the
+/// environment, the Anthropic catalog cache and its fetch flights, the
+/// Anthropic listing timeout, the routing catalog of recorded listings, and
+/// the `proxy.log` that `XDG_STATE_HOME` points at. The test runner runs
+/// tests in parallel threads, so without it one test's variables, cached
+/// catalog or log lines reach another. A test that failed while holding it
+/// does not fail the ones after it.
+static SHARED_STATE: Mutex<()> = Mutex::new(());
+
+fn lock_shared_state() -> MutexGuard<'static, ()> {
+    SHARED_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A loopback address nothing listens on. A port freed by dropping a
+/// listener does not do: a test running beside this one can bind it next,
+/// while no listener bound to port 0 is ever given a port this low.
+const CLOSED_LOOPBACK: &str = "http://127.0.0.1:9";
+
 /// Point every saved-login lookup and the state dir at an empty temporary
 /// directory for the duration of a test, so neither `/v1/models` nor the
 /// refresh an unknown model starts can read the developer's real logins,
-/// reach the macOS Keychain or call a backend. Codex then reports itself as
-/// unauthorized.
+/// reach the macOS Keychain or call a backend. No provider then holds a
+/// login. The Claude model catalog is served by a loopback mock, its cache
+/// starts empty and the listing timeout is the default one. Loopback is
+/// exempt from any proxy, so a mock is always reached directly, while a
+/// proxy the environment names stays in place for anything else. The guard
+/// holds [`SHARED_STATE`] until it is dropped, so tests that install it run
+/// one at a time, and a test must drop one before it installs the next.
 struct NoSavedLogins {
     previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    _dir: tempfile::TempDir,
+    catalog: MockHttp,
+    dir: tempfile::TempDir,
+    _shared: MutexGuard<'static, ()>,
 }
 
 impl NoSavedLogins {
     fn install() -> Self {
+        Self::with_catalog(MockHttp::catalog())
+    }
+
+    /// The same, with the catalog URL pointing at `catalog`.
+    fn with_catalog(catalog: MockHttp) -> Self {
+        Self::with_catalog_url(catalog.catalog_url(), catalog)
+    }
+
+    fn with_catalog_url(url: String, catalog: MockHttp) -> Self {
+        let shared = lock_shared_state();
         let dir = tempfile::TempDir::new().unwrap();
-        let vars = [
-            ("HOME", dir.path().to_path_buf()),
-            ("CCP_CONFIG_DIR", dir.path().join("config")),
-            ("CCP_CODEX_AUTH_FILE", dir.path().join("missing-auth.json")),
-            ("XDG_STATE_HOME", dir.path().join("state")),
+        let vars: [(&'static str, Option<std::ffi::OsString>); 7] = [
+            ("HOME", Some(dir.path().into())),
+            ("CCP_CONFIG_DIR", Some(dir.path().join("config").into())),
+            (
+                "CCP_CODEX_AUTH_FILE",
+                Some(dir.path().join("missing-auth.json").into()),
+            ),
+            ("XDG_STATE_HOME", Some(dir.path().join("state").into())),
+            ("CCP_ANTHROPIC_CATALOG_URL", Some(url.into())),
+            ("NO_PROXY", Some("127.0.0.1,localhost".into())),
+            ("no_proxy", Some("127.0.0.1,localhost".into())),
         ];
         let previous = vars
             .iter()
             .map(|(key, _)| (*key, std::env::var_os(key)))
             .collect();
         for (key, value) in vars {
-            unsafe { std::env::set_var(key, value) };
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
         }
+        clear_anthropic_catalog_cache_for_tests();
+        set_anthropic_listing_timeout_for_tests(None);
         Self {
             previous,
-            _dir: dir,
+            catalog,
+            dir,
+            _shared: shared,
         }
+    }
+
+    /// Shorten the Anthropic listing timeout until the returned guard is
+    /// dropped. It borrows this guard, so the timeout can only change while
+    /// the shared state lock is held.
+    fn listing_timeout(&self, timeout: Duration) -> ListingTimeout<'_> {
+        set_anthropic_listing_timeout_for_tests(Some(timeout));
+        ListingTimeout(std::marker::PhantomData)
+    }
+
+    /// Save a toy kimi login, so kimi counts as logged in.
+    fn save_kimi_login(&self) {
+        let dir = self.dir.path().join("config").join("kimi");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"access":"a","refresh":"r","expires":4102444800000,"scope":"openid","userId":"u"}"#,
+        )
+        .unwrap();
+    }
+
+    /// The fields of every `proxy.log` event with this message. Tests that
+    /// do not hold the lock log to the same file meanwhile, and the logger
+    /// writes an event and its newline separately, so another event can land
+    /// between the two. A line is therefore read as a run of events.
+    fn logged(&self, msg: &str) -> Vec<Value> {
+        let text = self.log_text();
+        text.lines()
+            .flat_map(|line| {
+                serde_json::Deserializer::from_str(line)
+                    .into_iter::<Value>()
+                    .map_while(Result::ok)
+            })
+            .filter(|event| event["msg"] == msg)
+            .map(|event| event["fields"].clone())
+            .collect()
+    }
+
+    fn log_text(&self) -> String {
+        std::fs::read_to_string(claude_code_mux::logging::log_file()).unwrap_or_default()
     }
 }
 
 impl Drop for NoSavedLogins {
     fn drop(&mut self) {
+        // The lock is a field, released only after this body has run.
+        clear_anthropic_catalog_cache_for_tests();
+        set_anthropic_listing_timeout_for_tests(None);
         for (key, value) in self.previous.drain(..) {
             unsafe {
                 match value {
@@ -1807,93 +1918,799 @@ impl Drop for NoSavedLogins {
     }
 }
 
-fn provider_entry<'a>(value: &'a Value, name: &str) -> &'a Value {
-    value["providers"]
+/// The keys of an Anthropic `ModelInfo` row, sorted.
+const MODEL_INFO_KEYS: [&str; 11] = [
+    "capabilities",
+    "created_at",
+    "deprecated_at",
+    "display_name",
+    "id",
+    "lifecycle",
+    "line",
+    "max_input_tokens",
+    "max_tokens",
+    "retires_at",
+    "type",
+];
+
+fn sorted_keys(value: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .unwrap_or_else(|| panic!("not an object: {value}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+fn row_ids(value: &Value) -> Vec<&str> {
+    value["data"]
         .as_array()
-        .unwrap()
+        .unwrap_or_else(|| panic!("no data in {value}"))
         .iter()
-        .find(|entry| entry["provider"] == name)
-        .unwrap_or_else(|| panic!("provider {name} missing from {value}"))
+        .map(|row| row["id"].as_str().unwrap())
+        .collect()
+}
+
+/// A provider whose listing and saved-login check the test fixes. `models`
+/// is its compiled-in list, which routing reads; `listed` is what it lists,
+/// or `None` for a listing that fails. `upstream` marks the listing as one
+/// from a backend, which the routing catalog records; a bundled one it
+/// ignores. `delay` is how long the listing takes to answer, `check_delay`
+/// how long the saved-login check takes.
+struct ListingStub {
+    name: &'static str,
+    models: Vec<&'static str>,
+    listed: Option<Vec<&'static str>>,
+    logged_in: bool,
+    upstream: bool,
+    delay: Duration,
+    check_delay: Duration,
+}
+
+impl ListingStub {
+    fn listing(name: &'static str, listed: &[&'static str]) -> Self {
+        Self {
+            name,
+            models: Vec::new(),
+            listed: Some(listed.to_vec()),
+            logged_in: true,
+            upstream: false,
+            delay: Duration::ZERO,
+            check_delay: Duration::ZERO,
+        }
+    }
+
+    fn delayed(self, delay: Duration) -> Self {
+        Self { delay, ..self }
+    }
+
+    fn checked_slowly(self, check_delay: Duration) -> Self {
+        Self {
+            check_delay,
+            ..self
+        }
+    }
+
+    fn upstream_listing(name: &'static str, listed: &[&'static str]) -> Self {
+        Self {
+            upstream: true,
+            ..Self::listing(name, listed)
+        }
+    }
+
+    fn failing(name: &'static str, logged_in: bool) -> Self {
+        Self {
+            name,
+            models: Vec::new(),
+            listed: None,
+            logged_in,
+            upstream: false,
+            delay: Duration::ZERO,
+            check_delay: Duration::ZERO,
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for ListingStub {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        self.models.iter().map(|id| id.to_string()).collect()
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn list_models(&self, _client_headers: Option<&axum::http::HeaderMap>) -> ModelListing {
+        tokio::time::sleep(self.delay).await;
+        match &self.listed {
+            Some(listed) => {
+                let mut listing = ModelListing::bundled(
+                    self.name,
+                    listed.iter().map(|id| id.to_string()).collect(),
+                );
+                if self.upstream {
+                    listing.source = ListingSource::Upstream;
+                }
+                listing
+            }
+            None => ModelListing::unavailable(self.name, "unreachable", "stub down".to_string()),
+        }
+    }
+
+    fn has_credentials(&self) -> bool {
+        // The server runs this check on the blocking pool.
+        std::thread::sleep(self.check_delay);
+        self.logged_in
+    }
+
+    async fn handle_messages(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        _body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
+    }
+}
+
+fn listing_registry(stubs: Vec<ListingStub>) -> Arc<Registry> {
+    Arc::new(Registry::from_providers(
+        AliasProvider::Anthropic,
+        stubs
+            .into_iter()
+            .map(|stub| Arc::new(stub) as Arc<dyn Provider>),
+    ))
+}
+
+fn listing_app(stubs: Vec<ListingStub>) -> axum::Router {
+    app(listing_registry(stubs))
+}
+
+fn five_model_app() -> axum::Router {
+    listing_app(vec![ListingStub::listing(
+        "stub",
+        &["m1", "m2", "m3", "m4", "m5"],
+    )])
+}
+
+/// Like `get_models`, with request headers, and the raw response kept so a
+/// test can read its headers.
+async fn get_models_response(
+    app: axum::Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> (axum::response::Response, Value) {
+    let mut request = Request::builder().method(Method::GET).uri(uri);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = app
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let value: Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| panic!("{uri}: not JSON: {}", String::from_utf8_lossy(&bytes)));
+    (
+        axum::response::Response::from_parts(parts, Body::empty()),
+        value,
+    )
 }
 
 #[tokio::test]
-async fn models_endpoint_tags_rows_and_describes_every_provider() {
+async fn models_list_has_exactly_the_anthropic_keys() {
     let _no_logins = NoSavedLogins::install();
     let app = app(Arc::new(Registry::with_default_alias()));
-    let (status, value) = get_models(app, "/v1/models?limit=1000").await;
+    let (status, value) = get_models(app, "/v1/models").await;
 
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        sorted_keys(&value),
+        ["data", "first_id", "has_more", "last_id"]
+    );
     let data = value["data"].as_array().unwrap();
-    assert!(!data.is_empty());
-    for entry in data {
-        assert_eq!(entry["type"], "model");
-        assert!(entry["display_name"].as_str().is_some());
-        assert!(entry["provider"].as_str().is_some(), "{entry}");
+    // No provider holds a login and the request carries no credential, so
+    // the only rows are the first-party models of the public Claude catalog,
+    // each once: the bedrock-only model and the repeat from the second
+    // selector are left out.
+    assert_eq!(
+        row_ids(&value),
+        ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+    );
+    for row in data {
+        assert_eq!(sorted_keys(row), MODEL_INFO_KEYS, "{row}");
+        assert_eq!(row["type"], "model");
+        assert_eq!(row["created_at"], "1970-01-01T00:00:00Z");
+        assert_eq!(row["lifecycle"], "active");
+        for key in ["deprecated_at", "retires_at"] {
+            assert!(row[key].is_null(), "{key} in {row}");
+        }
+        // The catalog describes no capabilities.
+        assert!(row["capabilities"].is_null(), "{row}");
     }
+    // Without `limit` every row comes back.
     assert_eq!(value["has_more"], json!(false));
     assert_eq!(value["first_id"], data[0]["id"]);
     assert_eq!(value["last_id"], data[data.len() - 1]["id"]);
 
-    // Backends without a listing call advertise their compiled-in lists and
-    // say so; the rows keep the `<id> (<provider>)` display tag.
-    let kimi_row = data
-        .iter()
-        .find(|m| m["id"] == "kimi-for-coding")
-        .expect("kimi advertised");
-    assert_eq!(kimi_row["provider"], "kimi");
-    assert_eq!(kimi_row["display_name"], "kimi-for-coding (kimi)");
-    let kimi = provider_entry(&value, "kimi");
-    assert_eq!(kimi["auth"], "proxy");
-    assert_eq!(kimi["source"], "bundled");
-    assert_eq!(kimi["status"], "ok");
-    assert_eq!(provider_entry(&value, "grok")["source"], "bundled");
-    assert_eq!(provider_entry(&value, "cursor")["source"], "bundled");
+    let opus = &data[0];
+    assert_eq!(opus["display_name"], "Opus 5.5");
+    assert_eq!(opus["max_input_tokens"], json!(1_000_000));
+    assert_eq!(opus["max_tokens"], json!(128_000));
+    assert_eq!(opus["line"], "opus");
+    assert_eq!(data[1]["line"], "sonnet");
+    assert_eq!(data[1]["max_tokens"], json!(64_000));
+    // A catalog model without a name or runtime keeps its id and no limits.
+    let haiku = &data[2];
+    assert_eq!(haiku["display_name"], "claude-haiku-5-5");
+    for key in ["max_input_tokens", "max_tokens", "line"] {
+        assert!(haiku[key].is_null(), "{key} in {haiku}");
+    }
+}
 
-    // Codex lists only what its backend answers; with no credentials it
-    // answers nothing and says why.
-    let codex = provider_entry(&value, "codex");
-    assert_eq!(codex["auth"], "proxy");
-    assert_eq!(codex["source"], "none");
-    assert_eq!(codex["status"], "unauthorized");
-    assert!(
-        codex["detail"]
-            .as_str()
-            .unwrap()
-            .contains("No Codex credentials")
+/// A provider without a saved login is not asked and adds no rows, Codex
+/// included; one that holds a login lists as before.
+#[tokio::test]
+async fn models_list_only_providers_that_hold_a_login() {
+    let no_logins = NoSavedLogins::install();
+    no_logins.save_kimi_login();
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let (status, value) = get_models(app, "/v1/models").await;
+
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let data = value["data"].as_array().unwrap();
+    let row = |id: &str| {
+        data.iter()
+            .find(|row| row["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from {value}"))
+    };
+    assert_eq!(
+        row("kimi-for-coding")["display_name"],
+        "kimi-for-coding (kimi)"
     );
-    assert!(codex["fetched_at"].is_null());
-    assert!(!data.iter().any(|m| m["provider"] == "codex"));
+    // Kimi clamps the output of every model but k3.
+    assert_eq!(row("kimi-for-coding")["max_tokens"], json!(32000));
+    assert_eq!(row("k2.6")["max_tokens"], json!(32000));
+    assert!(row("kimi-k3")["max_tokens"].is_null());
+    assert!(row("kimi-k3")["line"].is_null());
+    assert_eq!(row("claude-opus-5-5")["display_name"], "Opus 5.5");
 
-    // The Anthropic passthrough holds no credential and Claude Code lists its
-    // own models, so the provider is described and its rows are not emitted.
-    // No id may contain "claude" or "anthropic": Claude Code's gateway
-    // discovery would turn it into a picker row.
-    let anthropic = provider_entry(&value, "anthropic");
-    assert_eq!(anthropic["auth"], "client");
-    assert_eq!(anthropic["source"], "none");
-    assert_eq!(anthropic["status"], "not_listed");
-    assert!(anthropic["detail"].as_str().unwrap().contains("client"));
-    let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
-    assert!(!ids.contains(&"opus"));
-    assert!(
-        !ids.iter()
-            .any(|id| id.to_ascii_lowercase().contains("claude")
-                || id.to_ascii_lowercase().contains("anthropic"))
+    let ids = row_ids(&value);
+    assert!(!ids.iter().any(|id| id.starts_with("gpt-")), "{ids:?}");
+    assert!(!ids.iter().any(|id| id.starts_with("grok-")), "{ids:?}");
+    assert!(!ids.iter().any(|id| id.starts_with("cursor")), "{ids:?}");
+}
+
+#[tokio::test]
+async fn models_keep_provider_order_then_listing_order() {
+    let app = listing_app(vec![
+        ListingStub::listing("kimi", &["k-late"]),
+        ListingStub::listing("grok", &["g-z", "g-a"]),
+    ]);
+    let (status, value) = get_models(app, "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row_ids(&value), ["g-z", "g-a", "k-late"]);
+}
+
+#[tokio::test]
+async fn models_list_keeps_ids_naming_a_claude_model() {
+    let app = listing_app(vec![ListingStub::listing(
+        "stub",
+        &["claude-sonnet-5", "Anthropic-mirror", "plain-model"],
+    )]);
+    let (status, value) = get_models(app.clone(), "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        row_ids(&value),
+        ["claude-sonnet-5", "Anthropic-mirror", "plain-model"]
+    );
+    let (status, row) = get_models(app, "/v1/models/claude-sonnet-5").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row["id"], "claude-sonnet-5");
+}
+
+#[tokio::test]
+async fn models_list_keeps_one_row_per_id_from_the_routed_provider() {
+    // "dedupe-shared" is on kimi's compiled-in list, so routing sends it to
+    // kimi although grok lists it first; nothing routes "dedupe-loose", so
+    // the first row wins.
+    let mut kimi = ListingStub::listing("kimi", &["dedupe-shared", "dedupe-loose"]);
+    kimi.models = vec!["dedupe-shared"];
+    let app = listing_app(vec![
+        ListingStub::listing("grok", &["dedupe-shared", "dedupe-loose"]),
+        kimi,
+    ]);
+    let (status, value) = get_models(app, "/v1/models").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row_ids(&value), ["dedupe-loose", "dedupe-shared"]);
+    assert_eq!(value["data"][0]["display_name"], "dedupe-loose (grok)");
+    assert_eq!(value["data"][1]["display_name"], "dedupe-shared (kimi)");
+}
+
+#[tokio::test]
+async fn models_pages_forward_with_after_id_and_limit() {
+    let cases: [(&str, &[&str], bool); 7] = [
+        ("/v1/models?limit=2", &["m1", "m2"], true),
+        ("/v1/models?limit=1", &["m1"], true),
+        (
+            "/v1/models?limit=1000",
+            &["m1", "m2", "m3", "m4", "m5"],
+            false,
+        ),
+        ("/v1/models?after_id=m2&limit=2", &["m3", "m4"], true),
+        ("/v1/models?after_id=m3&limit=2", &["m4", "m5"], false),
+        ("/v1/models?after_id=m2", &["m3", "m4", "m5"], false),
+        ("/v1/models?after_id=m5", &[], false),
+    ];
+    for (uri, expected, has_more) in cases {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {value}");
+        assert_eq!(row_ids(&value), expected, "{uri}");
+        assert_eq!(value["has_more"], json!(has_more), "{uri}");
+        assert_eq!(value["first_id"], json!(expected.first()), "{uri}");
+        assert_eq!(value["last_id"], json!(expected.last()), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn models_pages_backward_with_before_id_and_limit() {
+    let cases: [(&str, &[&str], bool); 4] = [
+        ("/v1/models?before_id=m5&limit=2", &["m3", "m4"], true),
+        ("/v1/models?before_id=m3&limit=5", &["m1", "m2"], false),
+        ("/v1/models?before_id=m4", &["m1", "m2", "m3"], false),
+        ("/v1/models?before_id=m1", &[], false),
+    ];
+    for (uri, expected, has_more) in cases {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {value}");
+        assert_eq!(row_ids(&value), expected, "{uri}");
+        assert_eq!(value["has_more"], json!(has_more), "{uri}");
+        assert_eq!(value["first_id"], json!(expected.first()), "{uri}");
+        assert_eq!(value["last_id"], json!(expected.last()), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn models_reject_bad_paging_parameters_with_a_json_error() {
+    let cases = [
+        ("/v1/models?limit=0", "limit"),
+        ("/v1/models?limit=1001", "limit"),
+        ("/v1/models?limit=abc", "limit"),
+        ("/v1/models?limit=-1", "limit"),
+        ("/v1/models?limit=1.5", "limit"),
+        ("/v1/models?limit=", "limit"),
+        (
+            "/v1/models?after_id=m1&before_id=m3",
+            "after_id and before_id",
+        ),
+        ("/v1/models?after_id=nope", "after_id"),
+        ("/v1/models?before_id=nope", "before_id"),
+    ];
+    for (uri, named) in cases {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {value}");
+        assert_eq!(value["type"], "error", "{uri}");
+        assert_eq!(value["error"]["type"], "invalid_request_error", "{uri}");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains(named), "{uri}: {message}");
+    }
+}
+
+#[tokio::test]
+async fn models_lifecycle_filter_accepts_every_array_form() {
+    let all = ["m1", "m2", "m3", "m4", "m5"];
+    let none: [&str; 0] = [];
+    let cases: [(&str, &[&str]); 7] = [
+        ("/v1/models?lifecycle=active", &all),
+        ("/v1/models?lifecycle=active,retired", &all),
+        ("/v1/models?lifecycle[]=retired&lifecycle[]=active", &all),
+        ("/v1/models?lifecycle%5B%5D=active", &all),
+        ("/v1/models?lifecycle=deprecated&lifecycle=retired", &none),
+        ("/v1/models?lifecycle=deprecated,retired,deprecated", &none),
+        ("/v1/models?lifecycle[]=retired", &none),
+    ];
+    for (uri, expected) in cases {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {value}");
+        assert_eq!(row_ids(&value), expected, "{uri}");
+        if expected.is_empty() {
+            assert!(value["first_id"].is_null(), "{uri}");
+            assert!(value["last_id"].is_null(), "{uri}");
+            assert_eq!(value["has_more"], json!(false), "{uri}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn models_lifecycle_filter_rejects_unknown_values() {
+    for uri in [
+        "/v1/models?lifecycle=bogus",
+        "/v1/models?lifecycle=active,bogus",
+        "/v1/models?lifecycle[]=active&lifecycle[]=Active",
+        "/v1/models?lifecycle=",
+    ] {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {value}");
+        assert_eq!(value["error"]["type"], "invalid_request_error", "{uri}");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("lifecycle"),
+            "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn models_retrieve_answers_the_listed_row() {
+    let app = listing_app(vec![ListingStub::listing("stub", &["m1", "gpt-6.1-sol"])]);
+    let (_, list) = get_models(app.clone(), "/v1/models").await;
+    let (status, row) = get_models(app, "/v1/models/gpt-6.1-sol").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sorted_keys(&row), MODEL_INFO_KEYS);
+    assert_eq!(row, list["data"][1]);
+    assert_eq!(row["id"], "gpt-6.1-sol");
+}
+
+#[tokio::test]
+async fn models_retrieve_answers_404_for_an_unlisted_id() {
+    let app = listing_app(vec![ListingStub::listing("stub", &["m1"])]);
+    let (status, value) = get_models(app, "/v1/models/gpt-unknown.2").await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], "not_found_error");
+    assert_eq!(value["error"]["message"], "model: gpt-unknown.2");
+}
+
+#[tokio::test]
+async fn models_retrieve_finds_a_bundled_row() {
+    let no_logins = NoSavedLogins::install();
+    no_logins.save_kimi_login();
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let (status, row) = get_models(app.clone(), "/v1/models/kimi-for-coding").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row["display_name"], "kimi-for-coding (kimi)");
+    let (status, _) = get_models(app, "/v1/models/opus").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn models_retrieve_finds_a_claude_catalog_row() {
+    let _no_logins = NoSavedLogins::install();
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let (_, list) = get_models(app.clone(), "/v1/models").await;
+    let (status, row) = get_models(app.clone(), "/v1/models/claude-sonnet-5-5").await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    assert_eq!(sorted_keys(&row), MODEL_INFO_KEYS);
+    assert_eq!(row, list["data"][1]);
+    // A model the catalog offers elsewhere only is not a row.
+    let (status, _) = get_models(app, "/v1/models/claude-bedrock-only-1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn models_fail_when_a_provider_with_a_login_cannot_list() {
+    for uri in ["/v1/models", "/v1/models/a1"] {
+        let app = listing_app(vec![
+            ListingStub::listing("alpha", &["a1"]),
+            ListingStub::failing("beta", true),
+        ]);
+        let (status, value) = get_models(app, uri).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{uri}: {value}");
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "api_error");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("beta model listing unavailable (unreachable)"),
+            "{uri}: {message}"
+        );
+    }
+}
+
+/// The 502 names the first failing provider in registry order, not the one
+/// that failed first.
+#[tokio::test]
+async fn models_name_the_earlier_provider_when_a_later_one_fails_first() {
+    for uri in ["/v1/models", "/v1/models/a1"] {
+        let app = listing_app(vec![
+            ListingStub::failing("alpha", true).delayed(Duration::from_millis(200)),
+            ListingStub::failing("beta", true),
+        ]);
+        let (status, value) = get_models(app, uri).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{uri}: {value}");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("alpha model listing unavailable (unreachable)"),
+            "{uri}: {message}"
+        );
+        assert!(!message.contains("beta"), "{uri}: {message}");
+    }
+}
+
+/// Providers are asked at once, and each one's login check leads straight
+/// into its own listing: two slow listings take about as long as one, and so
+/// does a slow login check beside another provider's slow listing.
+#[tokio::test]
+async fn models_ask_providers_concurrently() {
+    let delay = Duration::from_millis(1000);
+    // Run one after the other, either case takes at least twice the delay.
+    // The bound sits just under that, leaving a loaded machine most of a
+    // delay of slack.
+    let bound = Duration::from_millis(1900);
+    let cases = [
+        (
+            "slow listings",
+            ListingStub::listing("alpha", &["a1"]).delayed(delay),
+            ListingStub::listing("beta", &["b1"]).delayed(delay),
+        ),
+        (
+            "slow check beside a slow listing",
+            ListingStub::listing("alpha", &["a1"]).checked_slowly(delay),
+            ListingStub::listing("beta", &["b1"]).delayed(delay),
+        ),
+    ];
+    for (case, alpha, beta) in cases {
+        let app = listing_app(vec![alpha, beta]);
+        let started = std::time::Instant::now();
+        let (status, value) = get_models(app, "/v1/models").await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::OK, "{case}: {value}");
+        assert_eq!(row_ids(&value), ["a1", "b1"], "{case}");
+        assert!(elapsed >= delay, "{case}: {elapsed:?}");
+        assert!(elapsed < bound, "{case}: {elapsed:?}");
+    }
+}
+
+#[tokio::test]
+async fn models_omit_a_provider_without_a_login_that_cannot_list() {
+    let app = listing_app(vec![
+        ListingStub::listing("alpha", &["a1"]),
+        ListingStub::failing("beta", false),
+    ]);
+    let (status, value) = get_models(app.clone(), "/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(row_ids(&value), ["a1"]);
+    let (status, _) = get_models(app.clone(), "/v1/models/a1").await;
+    assert_eq!(status, StatusCode::OK);
+    // Naming a provider without a login fails hard, and says why.
+    let (status, value) = get_models(app, "/v1/models?provider=beta").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+    assert_eq!(value["error"]["type"], "api_error");
+    assert_eq!(
+        value["error"]["message"],
+        "beta model listing unavailable (no saved login)"
     );
 }
 
 #[tokio::test]
-async fn models_endpoint_provider_filter_narrows_rows_and_provider_block() {
-    let _no_logins = NoSavedLogins::install();
-    let app = app(Arc::new(Registry::with_default_alias()));
-    let (status, value) = get_models(app, "/v1/models?provider=kimi").await;
+async fn models_responses_carry_a_fresh_request_id() {
+    let app = listing_app(vec![ListingStub::listing("stub", &["m1"])]);
+    let failing = listing_app(vec![ListingStub::failing("stub", true)]);
+    let cases = [
+        (app.clone(), "/v1/models", StatusCode::OK),
+        (app.clone(), "/v1/models?limit=0", StatusCode::BAD_REQUEST),
+        (
+            app.clone(),
+            "/v1/models?provider=nope",
+            StatusCode::BAD_REQUEST,
+        ),
+        (app.clone(), "/v1/models/m1", StatusCode::OK),
+        (app.clone(), "/v1/models/nope", StatusCode::NOT_FOUND),
+        (failing.clone(), "/v1/models", StatusCode::BAD_GATEWAY),
+        (failing, "/v1/models/m1", StatusCode::BAD_GATEWAY),
+    ];
+    let mut seen = std::collections::HashSet::new();
+    for (app, uri, expected) in cases {
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{uri}");
+        let id = request_id(&response).to_string();
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "{uri}: {id:?}");
+        assert!(seen.insert(id), "{uri} reused a request id");
+    }
+}
 
+/// The aggregate list fails when an earlier provider with a login cannot
+/// list, and the backend listing of a later provider is still recorded, so
+/// an id only that listing names routes to it.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn models_record_a_later_listing_when_an_earlier_provider_fails() {
+    // The routing catalog is process-wide.
+    let _shared = lock_shared_state();
+    clear_listed_models_for_tests();
+    let registry = listing_registry(vec![
+        ListingStub::failing("alpha", true),
+        ListingStub::upstream_listing("beta", &["beta-listed-only"]),
+    ]);
+    assert!(
+        registry
+            .provider_for_model("beta-listed-only", None)
+            .is_none()
+    );
+
+    let (status, value) = get_models(app(registry.clone()), "/v1/models").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("alpha model listing unavailable (unreachable)"),
+        "{message}"
+    );
+    assert_eq!(
+        registry
+            .provider_for_model("beta-listed-only", None)
+            .map(|provider| provider.name()),
+        Some("beta")
+    );
+    clear_listed_models_for_tests();
+}
+
+/// `anthropic-version` and `anthropic-workspace-id` change nothing.
+#[tokio::test]
+async fn models_ignore_the_anthropic_request_headers() {
+    let headers = [
+        ("anthropic-version", "2023-06-01"),
+        ("anthropic-workspace-id", "wrkspc_test"),
+    ];
+    for uri in ["/v1/models", "/v1/models/m2"] {
+        let (plain, plain_body) = get_models_response(five_model_app(), uri, &[]).await;
+        let (with, with_body) = get_models_response(five_model_app(), uri, &headers).await;
+        assert_eq!(plain.status(), StatusCode::OK, "{uri}: {plain_body}");
+        assert_eq!(with.status(), StatusCode::OK, "{uri}: {with_body}");
+        assert_eq!(with_body, plain_body, "{uri}");
+    }
+}
+
+/// Every path under `/v1/models/` gets the JSON envelope and a request id:
+/// an empty id and a path that does not decode to UTF-8 answer 404 with the
+/// remainder as sent, and an id holding `/` is looked up as sent or as `%2F`.
+#[tokio::test]
+async fn models_retrieve_answers_every_path_under_the_route() {
+    // A listing pass would answer 502 here, so the 404s also show none ran.
+    let failing = listing_app(vec![ListingStub::failing("stub", true)]);
+    for (uri, message) in [
+        ("/v1/models/", "model: "),
+        ("/v1/models/%FF", "model: %FF"),
+        ("/v1/models/org/%FF", "model: org/%FF"),
+    ] {
+        let (response, value) = get_models_response(failing.clone(), uri, &[]).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}: {value}");
+        assert_eq!(value["type"], "error", "{uri}");
+        assert_eq!(value["error"]["type"], "not_found_error", "{uri}");
+        assert_eq!(value["error"]["message"], message, "{uri}");
+        let id = request_id(&response);
+        assert!(uuid::Uuid::parse_str(id).is_ok(), "{uri}: {id:?}");
+    }
+
+    let app = listing_app(vec![ListingStub::listing("stub", &["m1", "org/model-1"])]);
+    for uri in ["/v1/models/org/model-1", "/v1/models/org%2Fmodel-1"] {
+        let (response, row) = get_models_response(app.clone(), uri, &[]).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}: {row}");
+        assert_eq!(row["id"], "org/model-1", "{uri}");
+        let id = request_id(&response);
+        assert!(uuid::Uuid::parse_str(id).is_ok(), "{uri}: {id:?}");
+    }
+    let (response, value) = get_models_response(app, "/v1/models/org/nope", &[]).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND, "{value}");
+    assert_eq!(value["error"]["message"], "model: org/nope");
+}
+
+/// A cursor is resolved over every row, whatever the `lifecycle` filter
+/// keeps: one naming a row the filter drops is valid, one naming no row is
+/// not. The parameter checks still come first.
+#[tokio::test]
+async fn models_lifecycle_filter_resolves_cursors_over_every_row() {
+    for uri in [
+        "/v1/models?lifecycle=deprecated&after_id=m2",
+        "/v1/models?lifecycle=retired&before_id=m4&limit=1",
+    ] {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {value}");
+        assert_eq!(
+            sorted_keys(&value),
+            ["data", "first_id", "has_more", "last_id"]
+        );
+        assert_eq!(value["data"], json!([]), "{uri}");
+        assert!(value["first_id"].is_null(), "{uri}");
+        assert!(value["last_id"].is_null(), "{uri}");
+        assert_eq!(value["has_more"], json!(false), "{uri}");
+    }
+    let (status, value) = get_models(
+        five_model_app(),
+        "/v1/models?lifecycle=deprecated&after_id=nope",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("after_id:"), "{message}");
+    let (status, value) = get_models(
+        five_model_app(),
+        "/v1/models?lifecycle=deprecated&after_id=m1&before_id=m3",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("after_id and before_id"),
+        "{value}"
+    );
+}
+
+/// An empty `after_id=` or `before_id=` counts as absent, the check for both
+/// cursors included; the other cursor is still resolved.
+#[tokio::test]
+async fn models_treat_an_empty_cursor_as_absent() {
+    let all = ["m1", "m2", "m3", "m4", "m5"];
+    let cases: [(&str, &[&str], bool); 6] = [
+        ("/v1/models?after_id=", &all, false),
+        ("/v1/models?before_id=", &all, false),
+        ("/v1/models?after_id=&limit=2", &["m1", "m2"], true),
+        ("/v1/models?before_id=&limit=2", &["m1", "m2"], true),
+        ("/v1/models?after_id=&before_id=m3", &["m1", "m2"], false),
+        ("/v1/models?before_id=&after_id=m3", &["m4", "m5"], false),
+    ];
+    for (uri, expected, has_more) in cases {
+        let (status, value) = get_models(five_model_app(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {value}");
+        assert_eq!(row_ids(&value), expected, "{uri}");
+        assert_eq!(value["has_more"], json!(has_more), "{uri}");
+    }
+    let (status, value) = get_models(five_model_app(), "/v1/models?after_id=&before_id=nope").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.starts_with("before_id:"), "{message}");
+}
+
+#[tokio::test]
+async fn models_endpoint_provider_filter_narrows_rows() {
+    let no_logins = NoSavedLogins::install();
+    let app = app(Arc::new(Registry::with_default_alias()));
+    // Without a login, naming kimi fails rather than answering no rows.
+    let (status, value) = get_models(app.clone(), "/v1/models?provider=kimi").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+    assert_eq!(value["error"]["type"], "api_error");
+    assert_eq!(
+        value["error"]["message"],
+        "kimi model listing unavailable (no saved login)"
+    );
+
+    no_logins.save_kimi_login();
+    let (status, value) = get_models(app.clone(), "/v1/models?provider=kimi").await;
     assert_eq!(status, StatusCode::OK);
-    let data = value["data"].as_array().unwrap();
-    assert!(!data.is_empty());
-    assert!(data.iter().all(|m| m["provider"] == "kimi"));
-    assert_eq!(value["providers"].as_array().unwrap().len(), 1);
-    assert_eq!(value["providers"][0]["provider"], "kimi");
+    assert_eq!(
+        row_ids(&value),
+        ["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"]
+    );
+    // Naming anthropic asks the catalog alone.
+    let (status, value) = get_models(app, "/v1/models?provider=anthropic").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        row_ids(&value),
+        ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+    );
 }
 
 #[tokio::test]
@@ -1922,7 +2739,7 @@ async fn models_endpoint_provider_filter_fails_hard_when_listing_unavailable() {
         value["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("codex model listing unavailable (unauthorized)")
+            .contains("codex model listing unavailable (no saved login)")
     );
 }
 
@@ -1939,15 +2756,1005 @@ async fn models_endpoint_respects_limit() {
     assert_eq!(value["last_id"], data[1]["id"]);
 }
 
-static AGENT_SUMMARY_LOCK: Mutex<()> = Mutex::new(());
+/// The Claude rows the catalog fixture yields.
+const CATALOG_IDS: [&str; 3] = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
+
+/// A toy API key; it must never reach a log line.
+const TOY_API_KEY: &str = "sk-ant-toy-key-0123456789";
+
+/// Rows a mock of Anthropic's own listing answers, one per lifecycle and
+/// one with a field the proxy does not know, which must come back as is.
+fn relayed_rows() -> [Value; 4] {
+    let row = |id: &str, lifecycle: &str| {
+        json!({
+            "type": "model",
+            "id": id,
+            "display_name": format!("Relayed {id}"),
+            "created_at": "2026-05-01T00:00:00Z",
+            "capabilities": {
+                "effort": {"supported": true, "max": {"supported": false}},
+                "thinking": {"supported": true, "types": {"adaptive": {"supported": true}}}
+            },
+            "deprecated_at": null,
+            "lifecycle": lifecycle,
+            "line": "opus",
+            "max_input_tokens": 1_000_000,
+            "max_tokens": 128_000,
+            "retires_at": null
+        })
+    };
+    let mut deprecated = row("claude-relayed-b", "deprecated");
+    deprecated["deprecated_at"] = json!("2026-10-01T00:00:00Z");
+    deprecated["retires_at"] = json!("2027-01-01T00:00:00Z");
+    let mut unknown_field = row("claude-relayed-c", "active");
+    unknown_field["future_field"] = json!({"kept": [1, 2]});
+    [
+        row("claude-relayed-a", "active"),
+        deprecated,
+        unknown_field,
+        row("claude-relayed-r", "retired"),
+    ]
+}
+
+/// A mock of Anthropic's `GET /v1/models` that pages: the first two rows,
+/// then the other two with a row without an id between them.
+fn relay_upstream() -> MockHttp {
+    MockHttp::start(|request| {
+        let [a, b, c, r] = relayed_rows();
+        let body = match request.query("after_id").as_deref() {
+            None => json!({
+                "data": [a, b],
+                "first_id": "claude-relayed-a",
+                "has_more": true,
+                "last_id": "claude-relayed-b",
+            }),
+            Some("claude-relayed-b") => json!({
+                "data": [c, {"type": "model"}, r],
+                "first_id": "claude-relayed-c",
+                "has_more": false,
+                "last_id": "claude-relayed-r",
+            }),
+            Some(_) => json!({"data": [], "has_more": false}),
+        };
+        MockReply::json(200, body.to_string())
+    })
+}
+
+/// An app whose only provider is the Anthropic passthrough, sending to
+/// `base`.
+fn anthropic_listing_app(base: &str) -> axum::Router {
+    app(Arc::new(Registry::from_providers(
+        AliasProvider::Anthropic,
+        [anthropic_provider_at(base)],
+    )))
+}
+
+/// The Anthropic listing timeout that [`NoSavedLogins::listing_timeout`]
+/// shortened, restored when dropped. The timeout is process-wide, so the
+/// guard lives no longer than the `NoSavedLogins` that holds the lock.
+struct ListingTimeout<'a>(std::marker::PhantomData<&'a NoSavedLogins>);
+
+impl Drop for ListingTimeout<'_> {
+    fn drop(&mut self) {
+        set_anthropic_listing_timeout_for_tests(None);
+    }
+}
+
+/// The catalog is fetched once and then served from memory, until the
+/// cached copy expires. The fetch carries nothing of the client request.
+#[tokio::test]
+async fn claude_catalog_is_cached_until_it_expires() {
+    let no_logins = NoSavedLogins::install();
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let client_headers = [
+        ("anthropic-version", "2023-06-01"),
+        ("anthropic-beta", "toy-beta"),
+    ];
+    for uri in [
+        "/v1/models",
+        "/v1/models/claude-opus-5-5",
+        "/v1/models?limit=1",
+    ] {
+        let (response, value) = get_models_response(app.clone(), uri, &client_headers).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}: {value}");
+    }
+    assert_eq!(no_logins.catalog.count(), 1);
+    let request = &no_logins.catalog.requests()[0];
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.target, mock_http::CATALOG_PATH);
+    for header in ["anthropic-version", "anthropic-beta", "x-api-key"] {
+        assert!(request.header(header).is_none(), "{header}");
+    }
+    let fetched = no_logins.logged("anthropic model catalog fetched");
+    assert_eq!(fetched.len(), 1, "{fetched:?}");
+    assert_eq!(fetched[0]["version"], json!(7));
+    assert_eq!(fetched[0]["models"], json!(3));
+
+    expire_anthropic_catalog_cache_for_tests();
+    let (status, value) = get_models(app, "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row_ids(&value), CATALOG_IDS);
+    assert_eq!(no_logins.catalog.count(), 2);
+}
+
+/// Listings that arrive while the catalog is being fetched wait for that
+/// fetch instead of starting their own.
+#[tokio::test]
+async fn concurrent_listings_share_one_catalog_fetch() {
+    let catalog = MockHttp::start(|_| {
+        MockReply::json(200, mock_http::CATALOG_FIXTURE).delayed(Duration::from_millis(300))
+    });
+    let no_logins = NoSavedLogins::with_catalog(catalog);
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let answers =
+        futures_util::future::join_all((0..5).map(|_| get_models(app.clone(), "/v1/models"))).await;
+    for (status, value) in answers {
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(row_ids(&value), CATALOG_IDS);
+    }
+    assert_eq!(no_logins.catalog.count(), 1);
+}
+
+/// A call that stops waiting for the catalog does not stop the fetch: it
+/// runs to its end and stores the catalog, and a later call is served from
+/// that copy without fetching again.
+#[tokio::test]
+async fn a_catalog_fetch_outlives_a_call_that_stopped_waiting() {
+    // The catalog answers well after the call stops waiting and well before
+    // the fetch's own budget of four seconds runs out.
+    let delay = Duration::from_millis(2000);
+    let catalog =
+        MockHttp::start(move |_| MockReply::json(200, mock_http::CATALOG_FIXTURE).delayed(delay));
+    let no_logins = NoSavedLogins::with_catalog(catalog);
+    let _timeout = no_logins.listing_timeout(Duration::from_millis(300));
+    let app = app(Arc::new(Registry::with_default_alias()));
+
+    let (status, value) = get_models(app.clone(), "/v1/models").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("public model catalog timed out"),
+        "{message}"
+    );
+
+    // The fetch leaves the flight map once it has stored the catalog. Wait
+    // for that rather than for a fixed time, which a loaded machine can
+    // outlast.
+    let url = no_logins.catalog.catalog_url();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while anthropic_catalog_flight_pending_for_tests(&url) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the catalog fetch never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (status, value) = get_models(app, "/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(row_ids(&value), CATALOG_IDS);
+    assert_eq!(no_logins.catalog.count(), 1);
+    assert_eq!(no_logins.logged("anthropic model catalog fetched").len(), 1);
+    assert!(
+        no_logins
+            .logged("anthropic model catalog fetch failed")
+            .is_empty()
+    );
+}
+
+/// A flight whose result is already in but that never left the flight map
+/// is not joined: the next call starts a fetch of its own in its place.
+#[tokio::test]
+async fn an_ended_catalog_flight_left_behind_is_replaced() {
+    let no_logins = NoSavedLogins::install();
+    let url = no_logins.catalog.catalog_url();
+    insert_ended_anthropic_catalog_flight_for_tests(&url);
+    assert!(anthropic_catalog_flight_pending_for_tests(&url));
+    let app = app(Arc::new(Registry::with_default_alias()));
+
+    let (status, value) = get_models(app, "/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(row_ids(&value), CATALOG_IDS);
+    assert_eq!(no_logins.catalog.count(), 1);
+    assert!(!anthropic_catalog_flight_pending_for_tests(&url));
+}
+
+/// A flight whose fetch task was dropped before it ran fails the calls that
+/// joined it with a logged `task` failure and leaves the flight map, so the
+/// next call fetches again.
+#[tokio::test]
+async fn an_unstarted_catalog_flight_fails_once_and_leaves() {
+    let no_logins = NoSavedLogins::install();
+    let url = no_logins.catalog.catalog_url();
+    insert_unstarted_anthropic_catalog_flight_for_tests(&url);
+    assert!(anthropic_catalog_flight_pending_for_tests(&url));
+    let app = app(Arc::new(Registry::with_default_alias()));
+
+    let (status, value) = get_models(app.clone(), "/v1/models").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("public model catalog fetch did not complete"),
+        "{message}"
+    );
+    assert_eq!(
+        no_logins.logged("anthropic model catalog fetch failed"),
+        [json!({"status": 0, "class": "task"})]
+    );
+    assert!(!anthropic_catalog_flight_pending_for_tests(&url));
+    assert_eq!(no_logins.catalog.count(), 0);
+
+    let (status, value) = get_models(app, "/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(row_ids(&value), CATALOG_IDS);
+    assert_eq!(no_logins.catalog.count(), 1);
+}
+
+/// Without a credential the catalog is the only source of Claude rows, so a
+/// catalog that cannot be read fails both routes. A failure is not cached.
+#[tokio::test]
+async fn models_fail_when_the_claude_catalog_is_unavailable() {
+    let refused = format!("{CLOSED_LOOPBACK}{}", mock_http::CATALOG_PATH);
+    let no_first_party = json!({
+        "version": 8,
+        "surfaces": {"cc": {"model_selector_config": [
+            {"models": [{"id": "claude-elsewhere", "offered_on": ["vertex"]}]}
+        ]}}
+    })
+    .to_string();
+    // Class, the catalog's answer (none: the port is closed), the logged
+    // status and the text the 502 message carries.
+    type CatalogDown = (&'static str, Option<(u16, String)>, u64, &'static str);
+    let cases: [CatalogDown; 4] = [
+        ("network", None, 0, "catalog unreachable"),
+        (
+            "status",
+            Some((500, r#"{"error":"down"}"#.to_string())),
+            500,
+            "answered 500",
+        ),
+        (
+            "body",
+            Some((200, "<html>".to_string())),
+            200,
+            "is not a catalog",
+        ),
+        ("empty", Some((200, no_first_party)), 200, "names no model"),
+    ];
+    for (class, reply, status, detail) in cases {
+        let no_logins = match reply {
+            Some((code, body)) => {
+                NoSavedLogins::with_catalog(MockHttp::start(move |_| MockReply::json(code, &*body)))
+            }
+            None => NoSavedLogins::with_catalog_url(refused.clone(), MockHttp::catalog()),
+        };
+        let app = app(Arc::new(Registry::with_default_alias()));
+        for uri in ["/v1/models", "/v1/models/claude-opus-5-5"] {
+            let (code, value) = get_models(app.clone(), uri).await;
+            assert_eq!(code, StatusCode::BAD_GATEWAY, "{class} {uri}: {value}");
+            assert_eq!(value["error"]["type"], "api_error");
+            let message = value["error"]["message"].as_str().unwrap();
+            assert!(
+                message.starts_with("anthropic model listing unavailable (unreachable): ")
+                    && message.contains(detail),
+                "{class}: {message}"
+            );
+        }
+        if class != "network" {
+            assert_eq!(no_logins.catalog.count(), 2, "{class}");
+        }
+        let warned = no_logins.logged("anthropic model catalog fetch failed");
+        assert_eq!(warned.len(), 2, "{class}: {warned:?}");
+        assert_eq!(warned[0]["class"], class);
+        assert_eq!(warned[0]["status"], json!(status));
+        assert!(!no_logins.log_text().contains("<html>"), "{class}");
+    }
+}
+
+/// A request that carries an API key gets Anthropic's own listing for that
+/// key: every page, each row as Anthropic wrote it. The relay keeps the key
+/// byte for byte, adds `anthropic-version` only when the client sent none,
+/// and passes the client's `lifecycle` pairs on as written.
+#[tokio::test]
+async fn an_api_key_lists_anthropic_rows_as_relayed() {
+    let no_logins = NoSavedLogins::install();
+    let upstream = relay_upstream();
+    let app = anthropic_listing_app(&upstream.base);
+    let (response, value) = get_models_response(
+        app.clone(),
+        "/v1/models?lifecycle[]=active&lifecycle[]=deprecated",
+        &[
+            ("x-api-key", TOY_API_KEY),
+            ("content-type", "application/json"),
+        ],
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK, "{value}");
+    let [a, b, c, _] = relayed_rows();
+    assert_eq!(value["data"], json!([a, b, c]));
+    assert_eq!(value["first_id"], "claude-relayed-a");
+    assert_eq!(value["last_id"], "claude-relayed-c");
+    assert_eq!(value["has_more"], json!(false));
+    assert_eq!(no_logins.catalog.count(), 0);
+
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    for (request, after_id) in requests.iter().zip([None, Some("claude-relayed-b")]) {
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path(), "/v1/models");
+        assert_eq!(request.header_values("x-api-key"), [TOY_API_KEY]);
+        assert!(request.header("authorization").is_none());
+        assert!(request.header("content-type").is_none());
+        assert_eq!(request.header_values("anthropic-version"), ["2023-06-01"]);
+        assert_eq!(request.query("limit").as_deref(), Some("1000"));
+        assert!(
+            request
+                .raw_query()
+                .contains("lifecycle[]=active&lifecycle[]=deprecated"),
+            "{}",
+            request.target
+        );
+        assert_eq!(request.query("after_id").as_deref(), after_id);
+    }
+
+    let (response, _) = get_models_response(
+        app,
+        "/v1/models",
+        &[
+            ("x-api-key", TOY_API_KEY),
+            ("anthropic-version", "2099-01-01"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let request = &upstream.requests()[2];
+    assert_eq!(request.header_values("anthropic-version"), ["2099-01-01"]);
+    assert!(
+        !request.raw_query().contains("lifecycle"),
+        "{}",
+        request.target
+    );
+}
+
+#[tokio::test]
+async fn a_bearer_token_and_beta_header_are_relayed_as_sent() {
+    let no_logins = NoSavedLogins::install();
+    let upstream = relay_upstream();
+    let app = anthropic_listing_app(&upstream.base);
+    let (response, value) = get_models_response(
+        app,
+        "/v1/models",
+        &[
+            ("authorization", "Bearer toy-oauth-token"),
+            ("anthropic-beta", "oauth-2025-04-20,toy-beta"),
+            ("anthropic-version", "2023-06-01"),
+        ],
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK, "{value}");
+    assert_eq!(
+        row_ids(&value),
+        ["claude-relayed-a", "claude-relayed-b", "claude-relayed-c"]
+    );
+    assert_eq!(no_logins.catalog.count(), 0);
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(
+            request.header_values("authorization"),
+            ["Bearer toy-oauth-token"]
+        );
+        assert_eq!(
+            request.header_values("anthropic-beta"),
+            ["oauth-2025-04-20,toy-beta"]
+        );
+        assert_eq!(request.header_values("anthropic-version"), ["2023-06-01"]);
+        assert!(request.header("x-api-key").is_none());
+    }
+}
+
+/// A relay that is refused, too slow or answers something other than a
+/// listing falls back to the catalog, with one warning that names neither
+/// the credential nor anything of the answer.
+#[tokio::test]
+async fn a_failed_relay_serves_the_catalog_and_logs_no_credential() {
+    // Only the slow relay runs on a shortened listing timeout, which also
+    // bounds the wait for the catalog after it, so the timeout leaves the
+    // catalog plenty and the relay answers long after it.
+    let timeout = Duration::from_millis(1500);
+    let cases: [(&str, u64, u16, &str, u64); 4] = [
+        (
+            "status",
+            401,
+            401,
+            r#"{"type":"error","error":{"type":"authentication_error","message":"secret-body-text"}}"#,
+            0,
+        ),
+        ("body", 200, 200, "secret-body-text", 0),
+        ("body", 200, 200, r#"{"rows":"secret-body-text"}"#, 0),
+        ("timeout", 0, 200, r#"{"data":[]}"#, 15_000),
+    ];
+    for (class, status, code, body, delay) in cases {
+        let no_logins = NoSavedLogins::install();
+        let _timeout = (class == "timeout").then(|| no_logins.listing_timeout(timeout));
+        let upstream = MockHttp::start(move |_| {
+            MockReply::json(code, body).delayed(Duration::from_millis(delay))
+        });
+        let app = anthropic_listing_app(&upstream.base);
+        let (response, value) = get_models_response(
+            app,
+            "/v1/models?lifecycle=active",
+            &[("x-api-key", TOY_API_KEY)],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK, "{class}: {value}");
+        assert_eq!(row_ids(&value), CATALOG_IDS, "{class}");
+        assert_eq!(upstream.count(), 1, "{class}");
+        assert_eq!(no_logins.catalog.count(), 1, "{class}");
+        let warned =
+            no_logins.logged("anthropic model listing relay failed; using the public catalog");
+        assert_eq!(warned.len(), 1, "{class}: {warned:?}");
+        assert_eq!(warned[0]["class"], class);
+        assert_eq!(warned[0]["status"], json!(status));
+        let log = no_logins.log_text();
+        for secret in [TOY_API_KEY, "secret-body-text", "lifecycle"] {
+            assert!(!log.contains(secret), "{class}: {secret} in {log}");
+        }
+    }
+}
+
+/// Relayed rows keep their own lifecycle and are filtered by it; by default
+/// a deprecated row is listed and a retired one is not. A cursor naming a row
+/// the filter drops is still valid.
+#[tokio::test]
+async fn relayed_rows_are_filtered_by_their_own_lifecycle() {
+    let _no_logins = NoSavedLogins::install();
+    let upstream = relay_upstream();
+    let app = anthropic_listing_app(&upstream.base);
+    let cases: [(&str, &[&str], bool); 9] = [
+        (
+            "/v1/models",
+            &["claude-relayed-a", "claude-relayed-b", "claude-relayed-c"],
+            false,
+        ),
+        (
+            "/v1/models?lifecycle=active",
+            &["claude-relayed-a", "claude-relayed-c"],
+            false,
+        ),
+        (
+            "/v1/models?lifecycle=deprecated",
+            &["claude-relayed-b"],
+            false,
+        ),
+        ("/v1/models?lifecycle=retired", &["claude-relayed-r"], false),
+        (
+            "/v1/models?lifecycle=active&after_id=claude-relayed-b",
+            &["claude-relayed-c"],
+            false,
+        ),
+        (
+            "/v1/models?lifecycle=active&before_id=claude-relayed-b",
+            &["claude-relayed-a"],
+            false,
+        ),
+        (
+            "/v1/models?lifecycle=active&limit=1",
+            &["claude-relayed-a"],
+            true,
+        ),
+        (
+            "/v1/models?lifecycle=active&after_id=claude-relayed-a&limit=1",
+            &["claude-relayed-c"],
+            false,
+        ),
+        (
+            "/v1/models?lifecycle=active&before_id=claude-relayed-r&limit=1",
+            &["claude-relayed-c"],
+            true,
+        ),
+    ];
+    for (uri, expected, has_more) in cases {
+        let (response, value) =
+            get_models_response(app.clone(), uri, &[("x-api-key", TOY_API_KEY)]).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}: {value}");
+        assert_eq!(row_ids(&value), expected, "{uri}");
+        assert_eq!(value["has_more"], json!(has_more), "{uri}");
+    }
+    let (response, value) = get_models_response(
+        app,
+        "/v1/models?lifecycle=active&after_id=claude-relayed-zz",
+        &[("x-api-key", TOY_API_KEY)],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{value}");
+}
+
+/// Retrieve relays the credential the same way and applies no lifecycle
+/// filter, so a retired relayed row is found.
+#[tokio::test]
+async fn retrieve_finds_a_relayed_row_with_a_credential() {
+    let no_logins = NoSavedLogins::install();
+    let upstream = relay_upstream();
+    let app = anthropic_listing_app(&upstream.base);
+    let (response, row) = get_models_response(
+        app.clone(),
+        "/v1/models/claude-relayed-r",
+        &[("x-api-key", TOY_API_KEY)],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "{row}");
+    assert_eq!(row, relayed_rows()[3]);
+    for request in upstream.requests() {
+        assert_eq!(request.header_values("x-api-key"), [TOY_API_KEY]);
+        assert!(
+            !request.raw_query().contains("lifecycle"),
+            "{}",
+            request.target
+        );
+    }
+    // Without a credential only the catalog answers, and it has no such id.
+    let (response, _) = get_models_response(app, "/v1/models/claude-relayed-r", &[]).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(no_logins.catalog.count(), 1);
+}
+
+/// Listings that arrive while a catalog fetch is failing wait for that fetch
+/// and all get its failure. The failure is not kept: the next listing
+/// fetches again.
+#[tokio::test]
+async fn concurrent_listings_share_one_failed_catalog_fetch() {
+    // A failure is not cached, so a listing that reached the catalog only
+    // after the fetch ended would fetch again. The fetch stays open long
+    // enough for a loaded machine to start all five, and well inside the
+    // listing timeout.
+    let catalog = MockHttp::start(|_| {
+        MockReply::json(503, r#"{"error":"down"}"#).delayed(Duration::from_millis(1500))
+    });
+    let no_logins = NoSavedLogins::with_catalog(catalog);
+    let app = app(Arc::new(Registry::with_default_alias()));
+    let answers =
+        futures_util::future::join_all((0..5).map(|_| get_models(app.clone(), "/v1/models"))).await;
+    for (status, value) in answers {
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("public model catalog answered 503"),
+            "{message}"
+        );
+    }
+    assert_eq!(no_logins.catalog.count(), 1);
+    assert_eq!(
+        no_logins.logged("anthropic model catalog fetch failed"),
+        [json!({"status": 503, "class": "status"})]
+    );
+
+    let (status, value) = get_models(app, "/v1/models").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+    assert_eq!(no_logins.catalog.count(), 2);
+}
+
+/// A listing that still says `has_more` after ten pages keeps those pages
+/// and logs that it stopped.
+#[tokio::test]
+async fn a_relay_stops_at_the_page_cap_and_says_so() {
+    let no_logins = NoSavedLogins::install();
+    let upstream = MockHttp::start(|request| {
+        let page = request.query("after_id").map_or(0, |id| {
+            id.trim_start_matches("claude-page-")
+                .parse::<usize>()
+                .unwrap()
+                + 1
+        });
+        let id = format!("claude-page-{page}");
+        let body = json!({
+            "data": [{"type": "model", "id": id}],
+            "first_id": id,
+            "has_more": true,
+            "last_id": id,
+        });
+        MockReply::json(200, body.to_string())
+    });
+    let app = anthropic_listing_app(&upstream.base);
+    let (response, value) =
+        get_models_response(app, "/v1/models", &[("x-api-key", TOY_API_KEY)]).await;
+
+    assert_eq!(response.status(), StatusCode::OK, "{value}");
+    let expected: Vec<String> = (0..10).map(|page| format!("claude-page-{page}")).collect();
+    assert_eq!(row_ids(&value), expected);
+    assert_eq!(upstream.count(), 10);
+    assert_eq!(no_logins.catalog.count(), 0);
+    assert_eq!(
+        no_logins.logged("anthropic model listing truncated"),
+        [json!({"pages": 10})]
+    );
+    assert!(
+        no_logins
+            .logged("anthropic model listing relay failed; using the public catalog")
+            .is_empty()
+    );
+}
+
+/// A page that says `has_more` without a cursor that moves on (none at all,
+/// or the one it was asked with) ends the listing with the rows read so far,
+/// and logs that it stopped.
+#[tokio::test]
+async fn a_relay_page_without_a_usable_cursor_ends_the_listing_and_says_so() {
+    let second_pages = [
+        json!({"data": [{"type": "model"}], "has_more": true}),
+        json!({"data": [], "has_more": true, "last_id": "claude-relayed-b"}),
+    ];
+    for second_page in second_pages {
+        let no_logins = NoSavedLogins::install();
+        let second = second_page.to_string();
+        let upstream = MockHttp::start(move |request| match request.query("after_id") {
+            None => {
+                let [a, b, ..] = relayed_rows();
+                let body = json!({"data": [a, b], "has_more": true, "last_id": "claude-relayed-b"});
+                MockReply::json(200, body.to_string())
+            }
+            Some(_) => MockReply::json(200, second.clone()),
+        });
+        let app = anthropic_listing_app(&upstream.base);
+        let (response, value) =
+            get_models_response(app, "/v1/models", &[("x-api-key", TOY_API_KEY)]).await;
+
+        assert_eq!(response.status(), StatusCode::OK, "{second_page}: {value}");
+        assert_eq!(
+            row_ids(&value),
+            ["claude-relayed-a", "claude-relayed-b"],
+            "{second_page}"
+        );
+        assert_eq!(upstream.count(), 2, "{second_page}");
+        assert_eq!(no_logins.catalog.count(), 0, "{second_page}");
+        assert_eq!(
+            no_logins.logged("anthropic model listing truncated"),
+            [json!({"pages": 2})],
+            "{second_page}"
+        );
+    }
+}
+
+/// A lifecycle string the proxy does not know counts as `active`, as a
+/// missing or non-string one does. The row keeps what Anthropic wrote.
+#[tokio::test]
+async fn an_unknown_lifecycle_counts_as_active() {
+    let _no_logins = NoSavedLogins::install();
+    let upstream = MockHttp::start(|_| {
+        let [template, ..] = relayed_rows();
+        let rows: Vec<Value> = [
+            ("claude-preview", json!("preview")),
+            ("claude-number", json!(3)),
+            ("claude-null", Value::Null),
+        ]
+        .into_iter()
+        .map(|(id, lifecycle)| {
+            let mut row = template.clone();
+            row["id"] = json!(id);
+            row["lifecycle"] = lifecycle;
+            row
+        })
+        .collect();
+        MockReply::json(200, json!({"data": rows, "has_more": false}).to_string())
+    });
+    let app = anthropic_listing_app(&upstream.base);
+    let all = ["claude-preview", "claude-number", "claude-null"];
+    let cases: [(&str, &[&str]); 4] = [
+        ("/v1/models", &all),
+        ("/v1/models?lifecycle=active", &all),
+        ("/v1/models?lifecycle=deprecated", &[]),
+        ("/v1/models?lifecycle=retired", &[]),
+    ];
+    for (uri, expected) in cases {
+        let (response, value) =
+            get_models_response(app.clone(), uri, &[("x-api-key", TOY_API_KEY)]).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}: {value}");
+        assert_eq!(row_ids(&value), expected, "{uri}");
+        if !expected.is_empty() {
+            assert_eq!(value["data"][0]["lifecycle"], "preview", "{uri}");
+        }
+    }
+}
+
+/// A relay page or a catalog longer than the body cap is a `body` failure,
+/// even when it is JSON that would otherwise be read: the relay falls back
+/// to the catalog, and a catalog that long fails the listing.
+#[tokio::test]
+async fn a_body_over_the_cap_is_a_body_failure() {
+    let padding = "x".repeat(MAX_BODY_BYTES + 1);
+
+    let no_logins = NoSavedLogins::install();
+    let page =
+        json!({"data": [relayed_rows()[0]], "has_more": false, "padding": padding}).to_string();
+    let upstream = MockHttp::start(move |_| MockReply::json(200, page.clone()));
+    let relay_app = anthropic_listing_app(&upstream.base);
+    let (response, value) =
+        get_models_response(relay_app, "/v1/models", &[("x-api-key", TOY_API_KEY)]).await;
+    assert_eq!(response.status(), StatusCode::OK, "{value}");
+    assert_eq!(row_ids(&value), CATALOG_IDS);
+    assert_eq!(
+        no_logins.logged("anthropic model listing relay failed; using the public catalog"),
+        [json!({"status": 200, "class": "body"})]
+    );
+    drop(no_logins);
+
+    let mut catalog: Value = serde_json::from_str(mock_http::CATALOG_FIXTURE).unwrap();
+    catalog["padding"] = json!(padding);
+    let catalog = catalog.to_string();
+    let no_logins = NoSavedLogins::with_catalog(MockHttp::start(move |_| {
+        MockReply::json(200, catalog.clone())
+    }));
+    let catalog_app = app(Arc::new(Registry::with_default_alias()));
+    let (status, value) = get_models(catalog_app, "/v1/models").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("public model catalog body is not a catalog"),
+        "{message}"
+    );
+    assert_eq!(
+        no_logins.logged("anthropic model catalog fetch failed"),
+        [json!({"status": 200, "class": "body"})]
+    );
+}
+
+/// A relay whose connection is refused falls back to the catalog, as any
+/// other relay failure does.
+#[tokio::test]
+async fn a_refused_relay_serves_the_catalog() {
+    let no_logins = NoSavedLogins::install();
+    let app = anthropic_listing_app(CLOSED_LOOPBACK);
+    let (response, value) =
+        get_models_response(app, "/v1/models", &[("x-api-key", TOY_API_KEY)]).await;
+
+    assert_eq!(response.status(), StatusCode::OK, "{value}");
+    assert_eq!(row_ids(&value), CATALOG_IDS);
+    assert_eq!(no_logins.catalog.count(), 1);
+    assert_eq!(
+        no_logins.logged("anthropic model listing relay failed; using the public catalog"),
+        [json!({"status": 0, "class": "network"})]
+    );
+    assert!(!no_logins.log_text().contains(TOY_API_KEY));
+}
+
+/// The body cap holds for a body that carries no `content-length`, chunked
+/// or ended by the connection closing, on the relay and on the catalog
+/// alike.
+#[tokio::test]
+async fn a_body_over_the_cap_without_a_length_is_a_body_failure() {
+    let padding = "x".repeat(MAX_BODY_BYTES + 1);
+    let page =
+        json!({"data": [relayed_rows()[0]], "has_more": false, "padding": padding}).to_string();
+    let mut catalog: Value = serde_json::from_str(mock_http::CATALOG_FIXTURE).unwrap();
+    catalog["padding"] = json!(padding);
+    let catalog = catalog.to_string();
+
+    for framing in [Framing::Chunked, Framing::Close] {
+        let no_logins = NoSavedLogins::install();
+        let relayed = page.clone();
+        let upstream =
+            MockHttp::start(move |_| MockReply::json(200, relayed.clone()).framed(framing));
+        let (response, value) = get_models_response(
+            anthropic_listing_app(&upstream.base),
+            "/v1/models",
+            &[("x-api-key", TOY_API_KEY)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{framing:?}: {value}");
+        assert_eq!(row_ids(&value), CATALOG_IDS, "{framing:?}");
+        assert_eq!(
+            no_logins.logged("anthropic model listing relay failed; using the public catalog"),
+            [json!({"status": 200, "class": "body"})],
+            "{framing:?}"
+        );
+        drop(no_logins);
+
+        let served = catalog.clone();
+        let no_logins = NoSavedLogins::with_catalog(MockHttp::start(move |_| {
+            MockReply::json(200, served.clone()).framed(framing)
+        }));
+        let catalog_app = app(Arc::new(Registry::with_default_alias()));
+        let (status, value) = get_models(catalog_app, "/v1/models").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{framing:?}: {value}");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("public model catalog body is not a catalog"),
+            "{framing:?}: {message}"
+        );
+        assert_eq!(
+            no_logins.logged("anthropic model catalog fetch failed"),
+            [json!({"status": 200, "class": "body"})],
+            "{framing:?}"
+        );
+    }
+}
+
+/// A catalog of exactly the cap is read, whatever its framing.
+#[tokio::test]
+async fn a_catalog_of_exactly_the_cap_is_read() {
+    let mut catalog: Value = serde_json::from_str(mock_http::CATALOG_FIXTURE).unwrap();
+    catalog["padding"] = json!("");
+    let unpadded = catalog.to_string().len();
+    catalog["padding"] = json!("x".repeat(MAX_BODY_BYTES - unpadded));
+    let catalog = catalog.to_string();
+    assert_eq!(catalog.len(), MAX_BODY_BYTES);
+
+    for framing in [Framing::Length, Framing::Chunked, Framing::Close] {
+        let served = catalog.clone();
+        let no_logins = NoSavedLogins::with_catalog(MockHttp::start(move |_| {
+            MockReply::json(200, served.clone()).framed(framing)
+        }));
+        let catalog_app = app(Arc::new(Registry::with_default_alias()));
+        let (status, value) = get_models(catalog_app, "/v1/models").await;
+        assert_eq!(status, StatusCode::OK, "{framing:?}: {value}");
+        assert_eq!(row_ids(&value), CATALOG_IDS, "{framing:?}");
+        assert!(
+            no_logins
+                .logged("anthropic model catalog fetch failed")
+                .is_empty(),
+            "{framing:?}"
+        );
+    }
+}
+
+/// The catalog fetch follows a redirect. The relay does not: a relay that
+/// answers with one is a failed relay, and the catalog answers instead.
+#[tokio::test]
+async fn the_catalog_follows_a_redirect_and_the_relay_does_not() {
+    const MOVED: &str = "/moved/catalog.json";
+    let catalog = MockHttp::start(|request| {
+        if request.path() == mock_http::CATALOG_PATH {
+            MockReply::redirect(MOVED)
+        } else {
+            MockReply::json(200, mock_http::CATALOG_FIXTURE)
+        }
+    });
+    let no_logins = NoSavedLogins::with_catalog(catalog);
+    let catalog_app = app(Arc::new(Registry::with_default_alias()));
+    let (status, value) = get_models(catalog_app, "/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(row_ids(&value), CATALOG_IDS);
+    let paths: Vec<String> = no_logins
+        .catalog
+        .requests()
+        .iter()
+        .map(|request| request.path().to_string())
+        .collect();
+    assert_eq!(paths, [mock_http::CATALOG_PATH, MOVED]);
+    drop(no_logins);
+
+    let no_logins = NoSavedLogins::install();
+    let upstream = MockHttp::start(|_| MockReply::redirect("/v1/models/elsewhere"));
+    let (response, value) = get_models_response(
+        anthropic_listing_app(&upstream.base),
+        "/v1/models",
+        &[("x-api-key", TOY_API_KEY)],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "{value}");
+    assert_eq!(row_ids(&value), CATALOG_IDS);
+    assert_eq!(upstream.count(), 1);
+    assert_eq!(no_logins.catalog.count(), 1);
+    assert_eq!(
+        no_logins.logged("anthropic model listing relay failed; using the public catalog"),
+        [json!({"status": 302, "class": "status"})]
+    );
+}
+
+/// A later page that fails fails the whole relay: the rows of the pages
+/// before it are dropped and the catalog answers instead.
+#[tokio::test]
+async fn a_failing_later_page_drops_the_relayed_rows() {
+    let no_logins = NoSavedLogins::install();
+    let upstream = MockHttp::start(|request| match request.query("after_id") {
+        None => {
+            let [a, b, ..] = relayed_rows();
+            let body = json!({"data": [a, b], "has_more": true, "last_id": "claude-relayed-b"});
+            MockReply::json(200, body.to_string())
+        }
+        Some(_) => MockReply::json(500, r#"{"type":"error"}"#),
+    });
+    let app = anthropic_listing_app(&upstream.base);
+    let (response, value) =
+        get_models_response(app, "/v1/models", &[("x-api-key", TOY_API_KEY)]).await;
+
+    assert_eq!(response.status(), StatusCode::OK, "{value}");
+    assert_eq!(row_ids(&value), CATALOG_IDS);
+    assert_eq!(upstream.count(), 2);
+    assert_eq!(no_logins.catalog.count(), 1);
+    assert_eq!(
+        no_logins.logged("anthropic model listing relay failed; using the public catalog"),
+        [json!({"status": 500, "class": "status"})]
+    );
+}
+
+/// The default registry with its Anthropic passthrough sending to `base`.
+fn default_registry_with_anthropic_at(base: &str) -> Arc<Registry> {
+    let _base_url = lock_anthropic_base_url();
+    let previous = std::env::var_os("CCP_ANTHROPIC_BASE_URL");
+    unsafe {
+        std::env::set_var("CCP_ANTHROPIC_BASE_URL", base);
+    }
+    let registry = Arc::new(Registry::with_default_alias());
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("CCP_ANTHROPIC_BASE_URL", value),
+            None => std::env::remove_var("CCP_ANTHROPIC_BASE_URL"),
+        }
+    }
+    registry
+}
+
+/// Neither a relayed nor a catalog listing feeds routing: Claude ids and
+/// aliases stay on the alias provider, Codex ids on Codex, and an id only
+/// the Anthropic listing names stays unroutable.
+#[tokio::test]
+async fn an_anthropic_listing_leaves_routing_as_it_was() {
+    let _no_logins = NoSavedLogins::install();
+    clear_listed_models_for_tests();
+    let upstream = MockHttp::start(|_| {
+        MockReply::json(
+            200,
+            json!({
+                "data": [
+                    {"type": "model", "id": "claude-relayed-a"},
+                    {"type": "model", "id": "zz-relayed-only"},
+                    {"type": "model", "id": "gpt-6-sol"}
+                ],
+                "has_more": false
+            })
+            .to_string(),
+        )
+    });
+    let registry = default_registry_with_anthropic_at(&upstream.base);
+    let ids = [
+        "claude-opus-5-5",
+        "claude-relayed-a",
+        "opus",
+        "sonnet",
+        "haiku",
+        "gpt-6-sol",
+        "zz-relayed-only",
+    ];
+    let routed = |registry: &Registry| {
+        ids.map(|id| {
+            registry
+                .provider_for_model(id, None)
+                .map(|provider| provider.name())
+        })
+    };
+    let before = routed(&registry);
+    assert_eq!(before[0], Some("anthropic"));
+    assert_eq!(before[5], Some("codex"));
+    assert_eq!(before[6], None);
+
+    let (response, value) = get_models_response(
+        app(registry.clone()),
+        "/v1/models",
+        &[("x-api-key", TOY_API_KEY)],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "{value}");
+    assert!(row_ids(&value).contains(&"zz-relayed-only"));
+    let (status, value) = get_models(app(registry.clone()), "/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(row_ids(&value), CATALOG_IDS);
+
+    assert_eq!(routed(&registry), before);
+    clear_listed_models_for_tests();
+}
 
 /// Pin the progress-label mode for the duration of a test: set or clear
 /// `CCP_AGENT_SUMMARY`, clear `CCP_AGENT_SUMMARY_MODEL` and
 /// `CCP_AUTO_REVIEW_MODEL`, and point `CCP_CONFIG_DIR` at an empty directory,
 /// so neither the environment nor a `config.json` on the machine picks the
 /// mode, the label model or the auto-review model. A test may set the cleared
-/// keys after installing; they are restored on drop. Tests that pin it run one
-/// at a time.
+/// keys after installing; they are restored on drop. The guard holds
+/// [`SHARED_STATE`], so it runs neither beside another test that pins it nor
+/// beside one that installs [`NoSavedLogins`], which sets `CCP_CONFIG_DIR`
+/// too.
 struct PinnedAgentSummary {
     previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _config_dir: tempfile::TempDir,
@@ -1956,9 +3763,7 @@ struct PinnedAgentSummary {
 
 impl PinnedAgentSummary {
     fn install(mode: Option<&str>) -> Self {
-        let lock = AGENT_SUMMARY_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = lock_shared_state();
         let config_dir = tempfile::TempDir::new().unwrap();
         let previous = [
             "CCP_AGENT_SUMMARY",
@@ -2339,11 +4144,19 @@ async fn the_permission_classifier_is_routed_even_when_it_opens_with_the_marker(
 }
 
 #[tokio::test]
-async fn models_endpoint_tolerates_unknown_query_params() {
-    let _no_logins = NoSavedLogins::install();
-    let app = app(Arc::new(Registry::with_default_alias()));
-    let (status, _) = get_models(app, "/v1/models?limit=1000&after_id=x").await;
-    assert_eq!(status, StatusCode::OK);
+async fn models_endpoint_ignores_unknown_query_params() {
+    let (_, plain) = get_models(five_model_app(), "/v1/models").await;
+    let (status, value) = get_models(
+        five_model_app(),
+        "/v1/models?beta=true&foo%5B%5D=bar&page=2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(
+        sorted_keys(&value),
+        ["data", "first_id", "has_more", "last_id"]
+    );
+    assert_eq!(value, plain);
 }
 
 /// The `request-id` header a response carries, or "" when it has none.
@@ -2594,10 +4407,29 @@ async fn an_upstream_request_id_is_kept_on_the_anthropic_route() {
 
 /// The Anthropic passthrough, sending to `address`.
 fn anthropic_provider(address: std::net::SocketAddr) -> Arc<dyn Provider> {
+    anthropic_provider_at(&format!("http://{address}"))
+}
+
+/// Held while a test points `CCP_ANTHROPIC_BASE_URL` at its own mock to
+/// build a provider, so two tests building at once cannot swap mocks or
+/// leave the other's URL behind. It is separate from [`SHARED_STATE`]
+/// because tests holding that build providers too, and it is only ever
+/// taken after it, never before.
+static ANTHROPIC_BASE_URL: Mutex<()> = Mutex::new(());
+
+fn lock_anthropic_base_url() -> MutexGuard<'static, ()> {
+    ANTHROPIC_BASE_URL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The Anthropic passthrough, sending to `base`.
+fn anthropic_provider_at(base: &str) -> Arc<dyn Provider> {
     // The provider reads its base URL once, when it is built.
+    let _base_url = lock_anthropic_base_url();
     let previous = std::env::var_os("CCP_ANTHROPIC_BASE_URL");
     unsafe {
-        std::env::set_var("CCP_ANTHROPIC_BASE_URL", format!("http://{address}"));
+        std::env::set_var("CCP_ANTHROPIC_BASE_URL", base);
     }
     let provider = Arc::new(claude_code_mux::providers::anthropic::AnthropicProvider::new())
         as Arc<dyn Provider>;

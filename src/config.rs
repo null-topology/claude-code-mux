@@ -563,6 +563,16 @@ pub fn anthropic_base_url() -> String {
     "https://api.anthropic.com".to_string()
 }
 
+/// Where the public Claude model catalog is fetched from when a `/v1/models`
+/// call carries no Anthropic credential. `CCP_ANTHROPIC_CATALOG_URL`
+/// overrides it; an empty value counts as unset.
+pub fn anthropic_catalog_url() -> String {
+    match std::env::var("CCP_ANTHROPIC_CATALOG_URL") {
+        Ok(raw) if !raw.trim().is_empty() => raw,
+        _ => crate::providers::anthropic::models::DEFAULT_CATALOG_URL.to_string(),
+    }
+}
+
 pub fn kimi_oauth_host() -> String {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_KIMI_OAUTH_HOST") {

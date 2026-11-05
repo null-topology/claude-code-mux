@@ -8,6 +8,8 @@
 //! api.anthropic.com and stream the response straight back. The proxy holds zero
 //! Anthropic credentials and never touches the cache-keyed request prefix.
 
+pub mod models;
+
 use std::task::Poll;
 
 use async_trait::async_trait;
@@ -24,7 +26,9 @@ use crate::monitor::{
     MonitorHandle, UsageReport, is_session_title_side_request, session_title_from_reply,
     usage_report_from_anthropic_body,
 };
-use crate::provider::{CliHandlers, ModelListing, Provider, RequestContext, ResponseOutcome};
+use crate::provider::{
+    CliHandlers, ListingRequest, ModelListing, Provider, RequestContext, ResponseOutcome,
+};
 use crate::providers::translate_shared::wrap_reasoning;
 use crate::registry::ANTHROPIC_STYLE_ALIASES;
 
@@ -212,7 +216,12 @@ fn is_stripped_response_header(name: &str) -> bool {
 }
 
 pub struct AnthropicProvider {
+    /// The passthrough client, which never follows a redirect. The relayed
+    /// model listing goes out on it too.
     client: reqwest::Client,
+    /// The public model catalog's own client: it never carries a client
+    /// header and follows redirects with reqwest's default bounded policy.
+    catalog_client: reqwest::Client,
     base_url: String,
 }
 
@@ -222,8 +231,12 @@ impl AnthropicProvider {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build anthropic passthrough client");
+        let catalog_client = reqwest::Client::builder()
+            .build()
+            .expect("failed to build anthropic model catalog client");
         Self {
             client,
+            catalog_client,
             base_url: crate::config::anthropic_base_url(),
         }
     }
@@ -557,15 +570,24 @@ impl Provider for AnthropicProvider {
         &ANTHROPIC_CLI
     }
 
-    /// The proxy holds no Anthropic credential, so it cannot ask what this
-    /// login may use, and Claude Code already lists its own models; repeating
-    /// them here only duplicated the picker. The provider is reported, its
-    /// rows are not.
-    async fn list_models(&self, _client_headers: Option<&axum::http::HeaderMap>) -> ModelListing {
-        ModelListing::client_side(
-            "anthropic",
-            "credentials are forwarded from the client; models are routed, not listed",
-        )
+    /// The Claude rows: Anthropic's own listing on the credential the client
+    /// request carries, else the public model catalog (see [`models`]).
+    async fn list_models(&self, client_headers: Option<&axum::http::HeaderMap>) -> ModelListing {
+        self.list_models_for(ListingRequest {
+            headers: client_headers,
+            lifecycle_pairs: &[],
+        })
+        .await
+    }
+
+    async fn list_models_for(&self, request: ListingRequest<'_>) -> ModelListing {
+        models::list(&self.client, &self.catalog_client, &self.base_url, request).await
+    }
+
+    /// The proxy holds no Anthropic login, yet the Claude rows are always
+    /// listed, and a listing that fails fails `/v1/models`.
+    fn listing_required(&self) -> bool {
+        true
     }
 
     async fn handle_messages(&self, _body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -1270,6 +1292,7 @@ data: {"type":"message_stop"}
 
         let provider = AnthropicProvider {
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            catalog_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             base_url: format!("http://{address}"),
         };
         // Key order, spacing and an escape that a reserialization would change.

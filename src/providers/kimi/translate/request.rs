@@ -167,6 +167,12 @@ pub fn translate_request(
     Ok(out)
 }
 
+/// The largest `max_tokens` a request for `model` (an id or alias) goes out
+/// with, or `None` when it is passed through (see `clamp_max_tokens`).
+pub fn max_tokens_cap(model: &str) -> Option<u32> {
+    (!is_k3(&resolve_model(model))).then_some(DEFAULT_MAX_TOKENS)
+}
+
 fn clamp_max_tokens(requested: Option<u32>, k3: bool) -> u32 {
     if k3 {
         // K3's context is 1M tokens. Kimi Code passes max_context_size as

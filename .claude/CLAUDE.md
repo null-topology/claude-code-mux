@@ -142,7 +142,8 @@ Request path:
    Other commands: `models [--full]`, `<provider> auth {login,device,status,logout}`,
    hidden `demo`.
 2. `src/server.rs`: axum router. Always `/healthz`, `/v1/messages`,
-   `/v1/messages/count_tokens`, `/v1/models`. Optional OpenAI-compatible
+   `/v1/messages/count_tokens`, `/v1/models`, `/v1/models/{model_id}`.
+   Optional OpenAI-compatible
    surfaces gated by `AppFeatures`: `/v1/responses` and `/v1/chat/completions`
    (`CCP_CODEX_RESPONSES_API`), `/v1/images/*` (`CCP_CODEX_IMAGES_API`),
    `/v1/audio/transcriptions` (`CCP_CODEX_TRANSCRIPTIONS_API`).
@@ -169,11 +170,48 @@ Request path:
    already set one (the passthrough relays Anthropic's); Claude Code records it
    as `requestId` in transcripts. The stamping lives in `dispatch_request`, not
    in `monitor_response_body`, so the OpenAI-compatible surfaces do not get it.
-   `handler_models` (`/v1/models`) calls `Provider::list_models` on every
-   registered provider (or the one named by `?provider=`), tags each row with
-   `provider`, and adds a top-level `providers[]` block with `auth`, `source`,
-   `status`, `detail`, `fetched_at` per provider. The filtered form fails with
-   502 when that provider cannot list; the aggregate form is always 200.
+   `handler_models` (`/v1/models`) answers Anthropic List Models: exactly
+   `data`, `first_id`, `has_more` and `last_id`, each row an Anthropic
+   `ModelInfo`. `collect_model_rows` takes every registered provider (or the
+   one named by `?provider=`, unknown name 400) and asks it only when
+   `listing_required()` holds (anthropic) or `has_credentials()` does, the
+   check running on tokio's blocking pool. A provider not asked adds
+   no rows; when it was named, the answer is 502 `api_error` `<name> model
+   listing unavailable (no saved login)`. Each asked provider gets
+   `list_models_for` with a `ListingRequest` (the client headers and the raw
+   `lifecycle` / `lifecycle[]` query pairs from `lifecycle_pairs`). Each
+   provider's check and listing are one future, and those run concurrently
+   (`join_all`), so a slow check delays only its own provider; the listings
+   are consumed in registry order
+   once all have finished: each goes to `record_listing` in that order, and a
+   listing that is not ok answers 502 `api_error` `<provider> model listing
+   unavailable (<status>): <detail>`, the first failure in that order
+   winning. `dedupe_model_rows` keeps one row per id (the
+   one of the provider routing picks when two list it, else the first);
+   Claude ids are listed like any other. The aggregate goes in
+   `list_provider_names` order, sorted by name, so anthropic's rows come
+   first. `ModelsQuery::parse` reads the raw query string, so every rejection
+   is an Anthropic JSON error: `limit` 1-1000 (absent means every row, not
+   Anthropic's 20), `after_id` and `before_id` never together (an empty value
+   counts as absent), `lifecycle` repeated, `lifecycle[]` or comma-separated
+   over `active|deprecated|retired`; other parameters are ignored.
+   `page_model_rows` resolves the exclusive cursors over every deduped row
+   (400 for a cursor that names no row), keeps the rows past the cursor whose
+   own `lifecycle` string `ModelsQuery::keeps` accepts (`model_row_lifecycle`:
+   absent, non-string or any string other than `active`, `deprecated` or
+   `retired` means `active`; without the parameter `active` and `deprecated`
+   pass), then
+   applies `limit`; `has_more` means kept rows remain in that direction.
+   `handler_model` (`/v1/models/{model_id}`) runs the same listing pass with
+   the client headers, no lifecycle pairs and no lifecycle filter, and the
+   same failure rule, and returns the row the list would show, or 404
+   `not_found_error` with `model: <id>`; an id containing `/` works literally
+   or as `%2F`. It is served by two routes, `/v1/models/` and the catch-all
+   `/v1/models/{*model_id}` (axum's catch-all matches no empty remainder),
+   and takes the path as `Result<Path<String>, PathRejection>`: an empty id or
+   one that does not percent-decode to UTF-8 answers that 404 with the path
+   as sent and runs no listing pass. Both handlers stamp a fresh `request-id`
+   through `with_request_id`, errors included.
 3. `src/registry.rs`: model to provider. `ANTHROPIC_STYLE_ALIASES` and any
    `claude-*` id go to the alias provider (`CCP_ALIAS_PROVIDER`, default
    anthropic); `cursor:` prefixes go to cursor; anything else must match a
@@ -190,9 +228,20 @@ Request path:
 4. `src/provider.rs`: the `Provider` trait, `RequestContext` (request id,
    session, traffic, monitor, and `Passthrough` with the raw bytes and headers
    for byte-exact relays), `ProviderError`, `CliHandlers`, and `ModelListing`
-   (what `list_models` returns; the default impl advertises `supported_models()`
-   as `source: bundled`, anthropic overrides to `auth: client` with no rows,
-   codex overrides to ask its backend).
+   (what `list_models` returns: `auth`, `source`, `status`, `detail`,
+   `fetched_at`, which the `models` command and the 502 messages read, and
+   the rows; a row the proxy builds comes from `model_info` or
+   `model_info_in_line`, which also sets `line`, the constructors of an
+   Anthropic `ModelInfo`, with `ModelCapabilities` writing the whole
+   capabilities tree; the default impl advertises `supported_models()` as
+   `source: bundled` with `capabilities: null` (`ModelListing::bundled`; kimi
+   uses `bundled_with_limits` for its `max_tokens` cap), anthropic overrides
+   to its relayed or catalog rows (`source: relayed` or `catalog`, `auth:
+   client`), codex overrides to ask its backend). `list_models_for` takes a
+   `ListingRequest` and defaults to `list_models(headers)`; anthropic
+   overrides it to pass the lifecycle pairs on. `listing_required` (default
+   false, true for anthropic) makes `/v1/models` ask a provider that holds
+   no saved login and fail when its listing is not ok.
 5. `src/providers/<name>/`: one directory per backend with the same shape:
    `auth/`, `client.rs`, `translate/` (`request.rs` Anthropic to native,
    `stream.rs` and `reducer.rs` native events to typed events,
@@ -204,6 +253,8 @@ Request path:
    - `anthropic/`: transparent reverse proxy to `api.anthropic.com`. Forwards
      the `Passthrough` bytes verbatim; the only rewrite is turning a
      signature-less `thinking` block into tagged text. Holds no credentials.
+     `models.rs` builds the Claude rows of `/v1/models` (see "Codex model
+     inventory").
    - `codex/`: by far the largest. Maps Anthropic Messages onto the OpenAI
      Responses API. A response that ended incomplete finishes with
      `stop_reason: max_tokens`, or `refusal` when its
@@ -830,15 +881,23 @@ compatibility contracts, not the user-facing name. Do not rename them:
 `/v1/models` and the `models` command do not read a compiled-in Codex list.
 `providers/codex/models.rs` calls `GET {api root}/models?client_version=X` on
 the Codex CLI's bearer (the completions URL with `/responses` replaced by
-`/models`), forwards the entries as the backend sent them, and remembers the
-slugs so routing and `assert_allowed_model` accept them; under the `inventory`
-lane policy `use_responses_lite` from the listing overrides the compiled-in
+`/models`), turns each entry into an Anthropic `ModelInfo` row
+(`UpstreamModel::to_listing_row`: `display_name` from the entry, else the
+slug; `max_input_tokens` from `max_context_window`, else `context_window`,
+else null; `max_tokens` null, as the translator sends no output cap;
+`capabilities` from `UpstreamModel::capabilities`, where a leaf is true only
+when the Codex translator carries that feature), keeps hidden entries, and
+remembers the slugs so
+routing and `assert_allowed_model` accept them. The other catalog fields stay
+in `UpstreamModel` for the proxy's own use and are not in the rows. Under the
+`inventory` lane policy `use_responses_lite` from the listing overrides the compiled-in
 lane table, while under the default `full` policy the proxy forces the full
 lane for every model and ignores that flag entirely
 (`uses_responses_lite_with_full_lane` in
-`providers/codex/translate/model_allowlist.rs`). Nothing is cached
-across calls or restarts, deliberately: a consumer that reads the listing as
-the truth about available models must see changes, not a stale fallback.
+`providers/codex/translate/model_allowlist.rs`). Nothing of the Codex
+listing is cached across calls or restarts, deliberately: a consumer that
+reads the listing as the truth about available models must see changes, not
+a stale fallback.
 
 The remembered listing also keeps, per slug, the default for the request's
 `service_tier` body field (`UpstreamModel::catalog_default_service_tier`):
@@ -880,17 +939,20 @@ Routing reads a process-wide catalog in `src/registry.rs` (`LISTED_MODELS`):
 per provider, the ids of its last successful listing from a backend
 (`source: upstream`), which replaces that provider's compiled-in list; a
 provider that has not listed yet routes on its compiled-in list, and bundled
-listings (kimi, grok, cursor today) are not recorded. `/v1/models` calls
-`list_models` on every provider regardless; being listed automatically, at
-start and on a miss, also needs `has_credentials`, which defaults to false,
-so a provider gains that by implementing both. Ownership never depends on
+listings (kimi, grok, cursor today) are not recorded, nor are anthropic's
+(`source: relayed` or `catalog`): `record_listing` records only `source:
+upstream`. Being listed by `/v1/models` and automatically, at start and on a
+miss, both need `has_credentials`, which defaults to false, so a provider
+gains them by implementing both (`/v1/models` also asks a provider whose
+`listing_required` holds). Ownership never depends on
 name order: an id a compiled-in list names stays with that provider, and its
 own listing only says whether it still serves it; an id only listings name
 goes to the provider whose current listing has named it the longest (the
 catalog numbers each recorded listing). The catalog is filled at three
 points, all through `record_listing`:
 
-- every `/v1/models` call (`handler_models`);
+- every `/v1/models` and `/v1/models/{model_id}` call, for the providers it
+  asks (`collect_model_rows`);
 - `serve` start: `main.rs` spawns `Registry::refresh_listings` beside the
   server, so binding never waits and a failed listing is only logged;
 - a routing miss: a `/v1/messages` or `count_tokens` request for an id that is
@@ -917,7 +979,8 @@ compiled-in list keeps routing. It is logged as a warning, `model listing
 named no models; routing keeps the previous one`. Every recorded listing is
 logged at info as `model listing recorded` with `provider`, `models`,
 `previous_models` (null for the first), `added` and `removed`, and no model
-bodies. `/v1/models` still reports such an empty answer as it came.
+bodies. `/v1/models` still takes such an answer as a successful listing: that
+provider adds no rows and no error.
 
 Hosted web search sits outside the policy: a request carrying the hosted
 `web_search_20250305` tool is forced onto the full lane, and there a non-forced
@@ -945,16 +1008,85 @@ a model there is optional; when done, keep `src/registry.rs` and
 `src/providers/codex/translate/model_allowlist.rs` in sync and update the
 `assert_allowed_model` test.
 
-`/v1/models` deliberately emits no Anthropic rows: the proxy holds no
-Anthropic credential, and Claude Code lists its own models. The anthropic
-entry in `providers[]` says so (`auth: client`). No id in `data[]` may contain
-`claude` or `anthropic`, because Claude Code's gateway discovery keeps such
-ids as picker rows.
+The Claude rows of `/v1/models` come from `providers/anthropic/models.rs`
+on every call (`listing_required`), though the proxy holds no Anthropic
+credential; anthropic's `has_credentials()` stays false, so `serve` start and
+a routing miss never fetch anything for it. A client request with a
+non-empty `x-api-key` or `authorization` header is relayed to
+`{CCP_ANTHROPIC_BASE_URL}/v1/models?limit=1000` with the client's headers,
+filtered by `is_stripped_request_header` like the messages relay and without
+`content-type`, plus `anthropic-version: 2023-06-01` only when absent, with
+the client's `lifecycle` pairs appended as spelled and `after_id=<last_id>`
+followed while `has_more` holds, at most `RELAY_MAX_PAGES` (10) pages. When
+the tenth page still says `has_more`, or a page says it with no cursor that
+differs from the one just sent (`last_id`, else the last row's id), the relay
+keeps the rows so far and logs the warn `anthropic model listing truncated`
+with `pages`. Because the `lifecycle` pairs go to Anthropic as spelled,
+cursors on the relayed path resolve over the rows Anthropic returned for that
+filter, and a credentialed `/v1/models/{model_id}` (no pairs) sees the rows
+Anthropic lists by default. Every page must be a 2xx with a `data` array; the
+rows then come untouched (those without a string `id` skipped), `source:
+relayed`. Anything else on any page (a non-2xx, a 3xx included since the
+relay uses the passthrough client with `redirect::Policy::none()`, a network
+error, a timeout, a body without `data`, a body over `MAX_BODY_BYTES`) drops
+the rows of earlier pages, logs the warn `anthropic model listing relay
+failed; using the public catalog` and falls back to the catalog. Without a
+credential, the rows come from `config::anthropic_catalog_url()`:
+`CCP_ANTHROPIC_CATALOG_URL` (env only, blank means unset), else
+`DEFAULT_CATALOG_URL`
+(`https://downloads.claude.ai/model-catalog/v1/catalog.json`), fetched with a
+plain GET and no client header on `AnthropicProvider::catalog_client`, a
+client of its own that never carries client headers and follows redirects
+with reqwest's default bounded policy. Relay pages and the catalog body are
+read in chunks up to `MAX_BODY_BYTES` (4 MiB); more is a failure of class
+`body` (`read_capped`). `catalog_rows` reads
+`surfaces.cc.model_selector_config[*].models[*]`, keeps a model whose
+`offered_on` is absent or an array naming `first_party` (a `null`, an empty
+array or any other value drops it) and the first occurrence of an id, and
+maps `name` to `display_name` (else the id),
+`runtime.max_input_tokens` and `max_output_tokens` to `max_input_tokens` and
+`max_tokens`, and `runtime.family` to `line` when it is one of `MODEL_LINES`,
+with `capabilities: null` and `source: catalog`; a catalog that yields no row
+is a failure. `CATALOG_CACHE` keeps the parsed rows per URL for
+`CATALOG_TTL` (10 min) from a successful fetch. `CATALOG_FLIGHTS` makes the
+fetch single-flight per URL: the first caller spawns the fetch as a task and
+registers its shared result; every caller that arrives while it is in flight
+awaits that same result, a failure included. The entry leaves the map when
+the task ends (`LeaveFlight`, matched by flight id), so a failure is never
+cached: a request after the flight ended starts a new fetch, and there is no
+stale fallback. A task dropped before its first poll (a runtime shutting
+down) never creates `LeaveFlight`, so two more rules keep such an entry from
+staying: a caller never joins a flight whose shared result is already in
+(`Shared::peek`) and starts a new one in its place, and a `JoinError` from
+the task removes the entry of that flight id and logs the failure warn with
+class `task`. With no successful relay the listing is
+`unavailable("anthropic", "unreachable", ...)`, and `/v1/models` and every
+`/v1/models/{model_id}` answer 502. `LISTING_TIMEOUT` (4 s) bounds the whole
+relay, each caller's wait for the catalog, whether it started the fetch
+or joined one, and, separately, the fetch itself, which therefore runs on
+and stores its result when every caller stopped waiting.
+`set_anthropic_listing_timeout_for_tests` shortens the relay and the waits,
+not the fetch's own budget. The info `anthropic model catalog fetched` carries the
+catalog's `version` and the `models` count; the two failure warns carry
+`status` (0 when none) and `class` (`status`, `timeout`, `network`, `body`,
+`empty`, and `task` on the catalog warn), the truncation warn carries
+`pages`. None logs a header, a body or
+the query. The catalog's signature is not
+verified; routing never reads these rows. Tests point
+`CCP_ANTHROPIC_CATALOG_URL` at a loopback mock and use
+`clear_anthropic_catalog_cache_for_tests`,
+`expire_anthropic_catalog_cache_for_tests`,
+`set_anthropic_listing_timeout_for_tests` and the flight-map hooks
+`insert_ended_anthropic_catalog_flight_for_tests`,
+`insert_unstarted_anthropic_catalog_flight_for_tests` and
+`anthropic_catalog_flight_pending_for_tests`. The `models` command calls
+`list_models(None)` on every provider without the login gate, so it prints
+the catalog ids as `[public catalog, not verified]`, or `anthropic:
+unavailable (...)`.
 
 ## How Codex models get into Claude Code's picker
 
-Verified against Claude Code 2.1.266 by reading the binary and by live runs;
-the FABLE variable below on 2.1.269:
+Applies to Claude Code 2.1.266; the FABLE variable below to 2.1.269:
 
 - `modelPicker` in user settings (`options[]` of `model`, `label`,
   `description`, `behavesAs`) is the supported way. Rows use bare ids, need no
@@ -963,16 +1095,20 @@ the FABLE variable below on 2.1.269:
   `/v1/models`) runs only with `ANTHROPIC_AUTH_TOKEN`, `apiKeyHelper`, or an
   API key, keeps only ids matching `/(claude|anthropic)/i`, and any of those
   credentials makes Claude Code drop the `RateLimitEvent` for every route and
-  disable claude.ai connectors. Do not build on it.
+  disable claude.ai connectors. Do not build on it. `/v1/models` lists Claude
+  rows, so a client that turns it on gets those as picker rows and none of
+  the Codex rows; the discovery request carries the configured credential,
+  so the rows are Anthropic's relayed listing, or the catalog's when the
+  relay fails.
 - The bootstrap call that carries Anthropic's own extra picker rows goes
   straight to `api.anthropic.com`, never through `ANTHROPIC_BASE_URL`.
 - Env-only alternatives exist but are narrower: `ANTHROPIC_DEFAULT_*_MODEL`
   remaps a built-in row (with `..._MODEL_DESCRIPTION` for its subtitle), and
   `ANTHROPIC_CUSTOM_MODEL_OPTION` (+ `_NAME`, `_DESCRIPTION`) adds one row.
   The slot variables are `ANTHROPIC_DEFAULT_OPUS_MODEL`, `..._SONNET_MODEL`,
-  `..._HAIKU_MODEL` and `..._FABLE_MODEL`; the fable one was read from a
-  2.1.269 binary and the CLI ships new builds quickly, so check the version in
-  use before relying on it.
+  `..._HAIKU_MODEL` and `..._FABLE_MODEL`; the fable one is known from
+  2.1.269, and the CLI ships new builds quickly, so check the version in use
+  before relying on it.
 
 Those four variables give a whole-picker recipe — haiku to `gpt-6-luna`,
 sonnet to `gpt-5.6-terra`, opus to `gpt-6-sol`, fable to `gpt-6-astra`. It is

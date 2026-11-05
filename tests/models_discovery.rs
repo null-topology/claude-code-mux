@@ -7,6 +7,7 @@ use axum::response::Response;
 use axum::routing::get;
 use claude_code_mux::config::clear_config_file_cache_for_tests;
 use claude_code_mux::logging::log_file;
+use claude_code_mux::providers::anthropic::models::clear_anthropic_catalog_cache_for_tests;
 use claude_code_mux::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_mux::providers::codex::models::{
     clear_discovered_models_for_tests, is_discovered_model,
@@ -23,6 +24,11 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use tower::util::ServiceExt;
+
+#[path = "support/mock_http.rs"]
+mod mock_http;
+
+use mock_http::MockHttp;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -206,6 +212,11 @@ async fn spawn_codex_upstream_with_delay(
 
 async fn get_models(uri: &str) -> (StatusCode, Value) {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    // Every listing also asks for the Claude rows: a loopback catalog serves
+    // them, so they never come from the public one.
+    let catalog = MockHttp::catalog();
+    let _catalog_env = EnvGuard::set("CCP_ANTHROPIC_CATALOG_URL", catalog.catalog_url());
+    clear_anthropic_catalog_cache_for_tests();
     let response = app(Arc::new(Registry::with_default_alias()))
         .oneshot(
             Request::builder()
@@ -259,13 +270,99 @@ async fn post_through(
         .unwrap()
 }
 
-fn provider_entry<'a>(value: &'a Value, name: &str) -> &'a Value {
-    value["providers"]
+/// The keys of an Anthropic `ModelInfo` row, sorted.
+const MODEL_INFO_KEYS: [&str; 11] = [
+    "capabilities",
+    "created_at",
+    "deprecated_at",
+    "display_name",
+    "id",
+    "lifecycle",
+    "line",
+    "max_input_tokens",
+    "max_tokens",
+    "retires_at",
+    "type",
+];
+
+fn sorted_keys(value: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .unwrap_or_else(|| panic!("not an object: {value}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+fn row_ids(value: &Value) -> Vec<&str> {
+    value["data"]
         .as_array()
-        .unwrap()
+        .unwrap_or_else(|| panic!("no data in {value}"))
         .iter()
-        .find(|entry| entry["provider"] == name)
-        .unwrap_or_else(|| panic!("provider {name} missing from {value}"))
+        .map(|row| row["id"].as_str().unwrap())
+        .collect()
+}
+
+/// Every dot-joined path to a boolean in a capabilities object, sorted; any
+/// other leaf fails the test.
+fn capability_paths(value: &Value) -> Vec<String> {
+    fn walk(value: &Value, prefix: &str, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    walk(child, &path, out);
+                }
+            }
+            Value::Bool(_) => out.push(prefix.to_string()),
+            other => panic!("{prefix} holds {other}, not a flag"),
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, "", &mut out);
+    out.sort_unstable();
+    out
+}
+
+/// The capabilities tree of the Anthropic Models API, as boolean paths.
+fn anthropic_capability_paths() -> Vec<String> {
+    let mut paths: Vec<String> = [
+        "batch.supported",
+        "citations.supported",
+        "code_execution.supported",
+        "context_management.supported",
+        "context_management.clear_thinking_20251015.supported",
+        "context_management.clear_tool_uses_20250919.supported",
+        "context_management.compact_20260112.supported",
+        "effort.supported",
+        "effort.low.supported",
+        "effort.medium.supported",
+        "effort.high.supported",
+        "effort.xhigh.supported",
+        "effort.max.supported",
+        "image_input.supported",
+        "pdf_input.supported",
+        "server_tools.supported",
+        "server_tools.code_execution.supported",
+        "server_tools.web_search.supported",
+        "structured_outputs.supported",
+        "thinking.supported",
+        "thinking.types.adaptive.supported",
+        "thinking.types.between_tools.supported",
+        "thinking.types.disabled.supported",
+        "thinking.types.enabled.supported",
+    ]
+    .iter()
+    .map(|path| path.to_string())
+    .collect();
+    paths.sort_unstable();
+    paths
 }
 
 fn upstream_inventory() -> Value {
@@ -300,7 +397,8 @@ fn upstream_inventory() -> Value {
                 "slug": "codex-auto-review",
                 "visibility": "hide",
                 "supported_in_api": true,
-                "use_responses_lite": true
+                "use_responses_lite": true,
+                "context_window": 500000
             }
         ]
     })
@@ -427,41 +525,61 @@ async fn models_endpoint_lists_codex_from_the_backend_and_routes_what_it_listed(
     let (status, value) = get_models("/v1/models?provider=codex").await;
     assert_eq!(status, StatusCode::OK, "{value}");
 
-    // The rows are the backend's answer, one `provider` tag each, hidden
-    // models and unknown fields passed through as the backend sent them.
+    // The rows are the backend's answer in its order, the hidden model
+    // included, each an Anthropic `ModelInfo` with nothing of the catalog
+    // entry beyond it.
+    assert_eq!(
+        sorted_keys(&value),
+        ["data", "first_id", "has_more", "last_id"]
+    );
     let data = value["data"].as_array().unwrap();
-    let ids: Vec<&str> = data.iter().map(|row| row["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, vec!["gpt-7-test", "gpt-5.5", "codex-auto-review"]);
+    assert_eq!(
+        row_ids(&value),
+        ["gpt-7-test", "gpt-5.5", "codex-auto-review"]
+    );
     for row in data {
+        assert_eq!(sorted_keys(row), MODEL_INFO_KEYS, "{row}");
         assert_eq!(row["type"], "model");
-        assert_eq!(row["object"], "model");
-        assert_eq!(row["provider"], "codex");
+        assert_eq!(row["created_at"], "1970-01-01T00:00:00Z");
+        assert_eq!(row["lifecycle"], "active");
+        for key in ["deprecated_at", "line", "retires_at", "max_tokens"] {
+            assert!(row[key].is_null(), "{key} in {row}");
+        }
+        assert_eq!(
+            capability_paths(&row["capabilities"]),
+            anthropic_capability_paths(),
+            "{row}"
+        );
     }
     assert_eq!(data[0]["display_name"], "Test 7");
-    assert_eq!(
-        data[0]["description"],
-        "Newest model, unknown to this build"
-    );
-    assert_eq!(data[0]["visibility"], "list");
-    assert_eq!(data[0]["use_responses_lite"], true);
-    assert_eq!(data[0]["context_window"], 272000);
-    assert_eq!(data[0]["supported_reasoning_levels"][1]["effort"], "high");
-    assert_eq!(data[0]["input_modalities"][1], "image");
-    assert!(data[0].get("model_messages").is_none());
     assert_eq!(data[2]["display_name"], "codex-auto-review");
-    assert_eq!(data[2]["visibility"], "hide");
+    // `max_context_window`, else `context_window`, else unknown.
+    assert_eq!(data[0]["max_input_tokens"], 872000);
+    assert!(data[1]["max_input_tokens"].is_null());
+    assert_eq!(data[2]["max_input_tokens"], 500000);
+
+    // Effort levels and image input follow the catalog entry.
+    let caps = &data[0]["capabilities"];
+    assert_eq!(caps["effort"]["supported"], true);
+    assert_eq!(caps["effort"]["low"]["supported"], true);
+    assert_eq!(caps["effort"]["medium"]["supported"], false);
+    assert_eq!(caps["effort"]["high"]["supported"], true);
+    assert_eq!(caps["image_input"]["supported"], true);
+    assert_eq!(caps["thinking"]["supported"], true);
+    assert_eq!(caps["pdf_input"]["supported"], false);
+    let bare = &data[1]["capabilities"];
+    assert_eq!(bare["effort"]["supported"], false);
+    assert_eq!(bare["thinking"]["supported"], false);
+    assert_eq!(bare["image_input"]["supported"], false);
+
     assert_eq!(value["has_more"], json!(false));
     assert_eq!(value["first_id"], "gpt-7-test");
     assert_eq!(value["last_id"], "codex-auto-review");
 
-    let providers = value["providers"].as_array().unwrap();
-    assert_eq!(providers.len(), 1, "filter narrows the provider block too");
-    let codex = provider_entry(&value, "codex");
-    assert_eq!(codex["auth"], "proxy");
-    assert_eq!(codex["source"], "upstream");
-    assert_eq!(codex["status"], "ok");
-    assert!(codex["detail"].is_null());
-    assert!(codex["fetched_at"].as_str().unwrap().contains('T'));
+    // Retrieving one id answers the same row; a dotted id is a plain id.
+    let (status, row) = get_models("/v1/models/gpt-5.5").await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    assert_eq!(row, data[1]);
 
     // The backend saw the proxy's own login and the required client version.
     let seen = captured.lock().unwrap();
@@ -520,26 +638,18 @@ async fn models_endpoint_reports_codex_unauthorized_on_403_without_rows() {
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
 
-    // The aggregate answer stays 200 so Claude Code's discovery never fails
-    // because one backend refused; the refusal is in the provider block.
-    let (status, value) = get_models("/v1/models?limit=1000").await;
-    assert_eq!(status, StatusCode::OK);
-    let codex = provider_entry(&value, "codex");
-    assert_eq!(codex["status"], "unauthorized");
-    assert_eq!(codex["source"], "none");
-    assert!(
-        codex["detail"]
-            .as_str()
-            .unwrap()
-            .contains("account not entitled")
-    );
-    assert!(
-        !value["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["provider"] == "codex")
-    );
+    // Codex holds a login, so its refusal fails the aggregate answer and the
+    // retrieve route alike rather than leaving its models out unnoticed.
+    for uri in ["/v1/models", "/v1/models/kimi-for-coding"] {
+        let (status, value) = get_models(uri).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{uri}: {value}");
+        assert_eq!(value["error"]["type"], "api_error", "{uri}");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("codex model listing unavailable (unauthorized)"),
+            "{uri}: {message}"
+        );
+    }
 
     // Asked for codex alone, the answer is a hard failure, not an empty list.
     let (status, value) = get_models("/v1/models?provider=codex").await;
@@ -577,19 +687,13 @@ async fn models_endpoint_reports_codex_unreachable_on_5xx_and_malformed_bodies()
     let (upstream, _captured) =
         spawn_codex_upstream(StatusCode::OK, json!({"unexpected": "shape"})).await;
     let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
-    let (status, value) = get_models("/v1/models").await;
-    assert_eq!(status, StatusCode::OK);
-    let codex = provider_entry(&value, "codex");
     // A body without `models` is an empty inventory, not an error: the
-    // backend answered and listed nothing.
-    assert_eq!(codex["status"], "ok");
-    assert_eq!(codex["source"], "upstream");
+    // backend answered and listed nothing, so the aggregate answer holds.
+    let (status, value) = get_models("/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
     assert!(
-        !value["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["provider"] == "codex")
+        !row_ids(&value).iter().any(|id| id.starts_with("gpt-")),
+        "{value}"
     );
     drop(_base_url_env);
 
@@ -651,8 +755,7 @@ async fn codex_lane_on_the_wire_follows_the_policy_then_the_backend_flag() {
     //    compiled-in one, now decides.
     let (status, value) = get_models("/v1/models?provider=codex").await;
     assert_eq!(status, StatusCode::OK, "{value}");
-    assert_eq!(value["data"][0]["id"], LANE_MODEL);
-    assert_eq!(value["data"][0]["use_responses_lite"], false);
+    assert_eq!(row_ids(&value), [LANE_MODEL]);
 
     clear_all_continuations_for_tests();
     assert_answered(post_messages(LANE_MODEL).await, "listed as full").await;
@@ -673,7 +776,7 @@ async fn codex_lane_on_the_wire_follows_the_policy_then_the_backend_flag() {
     let base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
     let (status, value) = get_models("/v1/models?provider=codex").await;
     assert_eq!(status, StatusCode::OK, "{value}");
-    assert_eq!(value["data"][0]["use_responses_lite"], true);
+    assert_eq!(row_ids(&value), [LANE_MODEL]);
 
     clear_all_continuations_for_tests();
     assert_answered(post_messages(LANE_MODEL).await, "listed as lite").await;
@@ -823,6 +926,40 @@ async fn a_model_only_the_backend_lists_routes_on_its_first_request() {
         2,
         "count_tokens refreshes the same way"
     );
+}
+
+/// A single `GET /v1/models/{model_id}`, with no list call before it, records
+/// the listing it read, so another model of that listing routes to codex.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_model_retrieve_alone_records_the_codex_listing() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let (upstream, captured) = spawn_codex_upstream(StatusCode::OK, upstream_inventory()).await;
+    let _env = routing_env(&config, &upstream);
+    let registry = Registry::with_default_alias();
+    assert!(
+        registry.provider_for_model("gpt-7-test", None).is_none(),
+        "nothing lists gpt-7-test yet"
+    );
+
+    let (status, row) = get_models("/v1/models/gpt-5.5").await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    assert_eq!(row["id"], "gpt-5.5");
+    assert_eq!(listings(&captured), 1);
+    assert_eq!(
+        registry
+            .provider_for_model("gpt-7-test", None)
+            .map(|provider| provider.name()),
+        Some("codex")
+    );
+
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    clear_all_continuations_for_tests();
 }
 
 /// A header named in `CCP_CODEX_FORWARD_HEADERS` goes from the client request
@@ -1065,6 +1202,59 @@ async fn an_empty_listing_keeps_routing_and_every_recorded_listing_is_logged() {
     }
 }
 
+/// The aggregate listing asks Codex only with a saved Codex login: without
+/// one there are only Claude rows and the backend is never asked; with the
+/// toy `auth.json` the backend's rows sit beside the Claude rows.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn models_list_includes_codex_rows_only_with_a_saved_codex_login() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    let config = TempDir::new().unwrap();
+    let (upstream, captured) = spawn_codex_upstream(StatusCode::OK, upstream_inventory()).await;
+    let _home_env = EnvGuard::set("HOME", config.path());
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path().join("config"));
+    let _state_env = EnvGuard::set("XDG_STATE_HOME", config.path().join("state"));
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _version_env = EnvGuard::set("CCP_CODEX_CLIENT_VERSION", "9.9.9");
+    let claude_ids = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
+
+    let missing_auth = EnvGuard::set(
+        "CCP_CODEX_AUTH_FILE",
+        config.path().join("missing-auth.json"),
+    );
+    let (status, value) = get_models("/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(row_ids(&value), claude_ids);
+    assert_eq!(listings(&captured), 0);
+    // The login check kept Codex out, not a listing that failed to load the
+    // missing auth file.
+    assert!(
+        logged("codex model listing unavailable").is_empty(),
+        "{:?}",
+        logged("codex model listing unavailable")
+    );
+    drop(missing_auth);
+
+    let _codex_auth = write_codex_auth(config.path());
+    let (status, value) = get_models("/v1/models").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let (claude, codex): (Vec<&str>, Vec<&str>) = row_ids(&value)
+        .into_iter()
+        .partition(|id| id.starts_with("claude-"));
+    assert_eq!(claude, claude_ids, "{value}");
+    assert_eq!(
+        codex,
+        ["gpt-7-test", "gpt-5.5", "codex-auto-review"],
+        "{value}"
+    );
+    assert_eq!(listings(&captured), 1);
+
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+}
+
 /// Stops the proxy process when the test ends, whether it passed or not.
 struct ChildGuard(std::process::Child);
 
@@ -1107,6 +1297,10 @@ async fn serve_lists_models_at_start_so_the_first_request_needs_no_refresh() {
         .env("CCP_CODEX_CLIENT_VERSION", "9.9.9")
         .env("CCP_CODEX_IMAGES_BASE_URL", closed)
         .env("CCP_ANTHROPIC_BASE_URL", closed)
+        .env(
+            "CCP_ANTHROPIC_CATALOG_URL",
+            format!("{closed}/model-catalog/v1/catalog.json"),
+        )
         .env("CCP_KIMI_BASE_URL", closed)
         .env("CCP_KIMI_OAUTH_HOST", closed)
         .env("CCP_GROK_BASE_URL", closed)
@@ -1308,11 +1502,15 @@ async fn catalog_default_service_tier_follows_the_model_on_the_wire() {
 
     let (status, value) = get_models("/v1/models?provider=codex").await;
     assert_eq!(status, StatusCode::OK, "{value}");
-    let rows = value["data"].as_array().unwrap();
-    let row = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap();
-    assert_eq!(row("gpt-6-sol")["default_service_tier"], "priority");
-    assert_eq!(row("gpt-6-sol")["service_tiers"][0]["id"], "priority");
-    assert!(row("gpt-6-luna").get("default_service_tier").is_none());
+    // The catalog tier stays inside the proxy: the rows are plain `ModelInfo`.
+    let ids = row_ids(&value);
+    assert!(
+        ids.contains(&"gpt-6-sol") && ids.contains(&"gpt-6-luna"),
+        "{value}"
+    );
+    for row in value["data"].as_array().unwrap() {
+        assert_eq!(sorted_keys(row), MODEL_INFO_KEYS, "{row}");
+    }
 
     assert_routed(
         post_body(message_body("gpt-6-sol"), "tier-2").await,
