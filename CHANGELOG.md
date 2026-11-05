@@ -1,4 +1,4 @@
-## Unreleased
+## v0.17.0 (2026-11-05)
 
 - Breaking: `GET /v1/models` now answers in the Anthropic List Models shape
   and carries nothing else. The body has exactly `data`, `first_id`,
