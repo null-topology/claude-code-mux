@@ -1,29 +1,39 @@
 ## Unreleased
 
 - Codex token refresh no longer writes over a login it did not start from.
-  The proxy now takes the Codex CLI's `auth.lock` next to `auth.json` while
-  it rereads and writes the file, and writes only when the file still holds
-  the refresh token the refresh was made from. If you log in again, log out
-  or delete `auth.json` while a refresh is in flight, the proxy drops its
-  refreshed tokens, leaves the file as you left it, and uses the stored token
-  when it is still valid; otherwise the request fails and asks you to run
-  `codex login`. A file the proxy cannot read as JSON is left untouched
-  instead of being replaced. The writeback changes only the token fields and
-  `last_refresh`, and stores a returned `id_token` in the same raw form the
-  Codex CLI uses. If another process holds `auth.lock` for more than 5
-  seconds, the refresh counts as a temporary failure.
-- A refresh that fails for a temporary reason (network error, timeout, 429,
-  5xx, the lock timeout above) in the last five minutes before the token
-  expires no longer fails the request: the proxy logs one
+  The proxy now takes `auth.lock` in the directory of `auth.json` while it
+  rereads and writes the file, waiting as long as another process holds it,
+  and writes only when the file still holds the access token and refresh
+  token the refresh was made from. If you log in again, log out or delete
+  `auth.json` while a refresh is in flight, the proxy drops its refreshed
+  tokens, leaves the file as you left it, and uses the stored token while it
+  is still valid; otherwise the request fails and asks you to run
+  `codex login`. A file the proxy cannot read, that is not JSON, or that has
+  no `tokens` object is left untouched and the refresh fails instead of
+  replacing it. The writeback changes only the token fields and
+  `last_refresh`, and stores a returned `id_token` only when the Codex CLI
+  can read its claims. If the new tokens cannot be written, the proxy logs
+  one `codex_token_writeback_failed` warning, serves the new token and leaves
+  the file as it was.
+- `auth.lock` is the Codex CLI's own lock only when `CCP_CODEX_AUTH_FILE` is
+  unset or names `$CODEX_HOME/auth.json`; point it at that file. A symlinked
+  `auth.json` is now updated at its target, so the link stays a link.
+- A refresh that fails in the last five minutes before the token expires no
+  longer fails the request, whatever the reason: the proxy logs one
   `codex_token_refresh_failed_using_stored_token` warning on the `codex`
   logger, with the failure class and HTTP status only, and keeps using the
-  stored token. A rejected refresh (401, 403, any other 4xx, a malformed
-  response) still fails, and the forced refresh after the backend rejected a
-  token never falls back. A token response without `refresh_token` is
-  accepted and keeps the stored one.
-- Errors from a failed Codex token refresh no longer include the token
-  endpoint's response body. They name the HTTP status, and for 401 and 403
-  ask you to run `codex login`.
+  stored token. The forced refresh after the backend rejected a token never
+  falls back. A token response without `refresh_token`, with an `id_token`
+  or `refresh_token` that is not a string, or with an `expires_in` that is
+  zero or not a number is accepted; the expiry then comes from the access
+  token, else one hour.
+- A Codex token refresh that fails for a temporary reason (the token
+  endpoint unreachable, a timeout, 429, 5xx) now answers 503 `api_error`
+  with `Codex token refresh is temporarily unavailable` instead of 401, a
+  status a client may retry; the forced refresh of a buffered request still
+  answers 401. Other refresh failures
+  still answer 401, without the token endpoint's response body; they name
+  the HTTP status, and for 401 and 403 ask you to run `codex login`.
 
 ## v0.17.0 (2026-11-05)
 

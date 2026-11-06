@@ -10,7 +10,7 @@ use crate::retry::should_retry_status;
 use crate::traffic::TrafficCapture;
 
 use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIGINATOR};
-use super::auth::manager::CodexAuthManager;
+use super::auth::manager::{CodexAuthManager, TransientRefreshError};
 use super::auth::token_store::{DefaultCodexAuthStore, StoredAuth, file_store};
 pub use super::events::{CodexErrorClass, CodexLimitWindow, CodexUsageLimit};
 use super::search::{SearchRequest, SearchResponse};
@@ -880,15 +880,7 @@ impl CodexHttpClient {
             .auth_manager
             .get_auth()
             .await
-            .map_err(|error| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(error.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                class: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+            .map_err(|error| auth_error(error, "Auth error"))?;
         let mut refresh_attempted = false;
 
         loop {
@@ -987,15 +979,7 @@ impl CodexHttpClient {
             .auth_manager
             .get_auth()
             .await
-            .map_err(|error| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(error.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                class: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+            .map_err(|error| auth_error(error, "Auth error"))?;
         let mut refresh_attempted = false;
 
         loop {
@@ -1075,15 +1059,7 @@ impl CodexHttpClient {
             .auth_manager
             .get_auth()
             .await
-            .map_err(|err| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(err.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                class: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+            .map_err(|err| auth_error(err, "Auth error"))?;
         let mut refresh_attempted = false;
 
         loop {
@@ -1180,15 +1156,11 @@ impl CodexHttpClient {
         body: &SearchRequest,
         ctx: &RequestContext,
     ) -> Result<SearchResponse, CodexError> {
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            class: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|e| auth_error(e, "Auth error"))?;
         let body_json = serde_json::to_string(body).map_err(|e| CodexError {
             status: 500,
             message: "Failed to serialize search request".to_string(),
@@ -1231,15 +1203,11 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            class: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|e| auth_error(e, "Auth error"))?;
         let body_json = serde_json::to_string(body).map_err(|e| CodexError {
             status: 500,
             message: "Failed to serialize request".to_string(),
@@ -1637,15 +1605,11 @@ impl CodexHttpClient {
     ) -> Result<OwnerAwareCodexResponse, CodexError> {
         use crate::config::CodexTransport;
 
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            class: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|e| auth_error(e, "Auth error"))?;
 
         let initial_pool_owner = websocket_pool_owner(continuation).cloned();
         if should_reset_websocket_pool(continuation)
@@ -1918,15 +1882,11 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
-        let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            class: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|e| auth_error(e, "Auth error"))?;
 
         let turn_id = continuation.and_then(super::continuation::ContinuationReservation::turn_id);
         if should_reset_websocket_pool(continuation)
@@ -2768,10 +2728,31 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
 }
 
 fn auth_refresh_error(err: anyhow::Error) -> CodexError {
+    auth_error(err, "Unauthorized")
+}
+
+/// What the client is told when the Codex token refresh failed for a reason
+/// that may pass: the token endpoint was unreachable or answered 429 or 5xx.
+pub(crate) const TOKEN_REFRESH_UNAVAILABLE: &str = "Codex token refresh is temporarily unavailable";
+
+/// Maps a failure to obtain a Codex token. A transient refresh failure answers
+/// 503 with a fixed message, which the client may retry; any other failure
+/// answers 401 with its own text, which asks for a login.
+fn auth_error(err: anyhow::Error, message: &str) -> CodexError {
+    let transient = err.downcast_ref::<TransientRefreshError>().is_some();
+    let (status, message, detail) = if transient {
+        (
+            503,
+            TOKEN_REFRESH_UNAVAILABLE.to_string(),
+            TOKEN_REFRESH_UNAVAILABLE.to_string(),
+        )
+    } else {
+        (401, message.to_string(), err.to_string())
+    };
     CodexError {
-        status: 401,
-        message: "Unauthorized".to_string(),
-        detail: Some(err.to_string()),
+        status,
+        message,
+        detail: Some(detail),
         retry_after: None,
         usage_limit: None,
         class: None,
