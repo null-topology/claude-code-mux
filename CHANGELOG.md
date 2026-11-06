@@ -65,6 +65,27 @@
   without the token endpoint's response body; an error status from the
   token endpoint is named in the message, and 401 and 403 ask you to run
   `codex login`.
+- `proxy.log` now keeps at most five rotated files. Past 20 MiB the log is
+  still renamed to `proxy.<millis>` in the state dir, and that rotation now
+  deletes every `proxy.<millis>` file there except the five newest. Before,
+  rotated files were never removed. There is no setting to keep more: copy a
+  rotated log somewhere else if you want to keep it.
+- Fix: a log field longer than 4000 bytes with a multibyte character across
+  the 4000-byte mark no longer panics while being shortened. Such fields
+  include upstream error messages, error bodies and the model id of an
+  unknown-model warning. The panic dropped the client's connection, and a
+  retry hit the same panic. The field
+  is now cut at the last whole character, and the `…[N more]` suffix counts
+  the bytes left out.
+- Fix: an environment variable whose value is not valid Unicode no longer
+  makes the proxy panic when it reads its configuration. Such a variable now
+  counts as unset. If it is `PORT` or a `CCP_*` variable, its setting comes
+  from `config.json` or the default, and the startup `config summary` warns
+  with the variable's name (never its value). Set the variable to a valid
+  value to use it again.
+- Fix: in a terminal too small for the help (`?`) or setup (`b`) popup, the
+  monitor no longer exits with a panic. The popup is now cut to the window.
+  Normal sizes look the same as before.
 
 ## v0.17.0 (2026-11-05)
 

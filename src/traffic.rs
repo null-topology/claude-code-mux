@@ -31,7 +31,7 @@ pub struct TrafficCaptureOptions {
 }
 
 pub fn traffic_capture_enabled() -> bool {
-    traffic_capture_enabled_for_env(&std::env::vars().collect())
+    traffic_capture_enabled_for_env(&crate::config::env_vars())
 }
 
 pub fn traffic_capture_enabled_for_env(env: &std::collections::HashMap<String, String>) -> bool {

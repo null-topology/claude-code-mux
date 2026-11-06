@@ -288,11 +288,18 @@ Request path:
    affinity), `request_identity.rs` (Claude Code session and agent headers),
    `retry.rs` (backoff on 429 and 5xx), `monitor.rs` + `tui.rs`, `traffic.rs`
    (`CCP_TRAFFIC_LOG=1` writes full captures under the state dir),
-   `logging.rs` (JSONL `proxy.log`, redacts known keys), `paths.rs` (config
+   `logging.rs` (JSONL `proxy.log`, redacts known keys, cuts a string field
+   over 4000 bytes on a character boundary unless verbose; past
+   `MAX_LOG_BYTES` (20 MiB) the log is renamed to `proxy.<millis>` and every
+   rotated file of it but the `MAX_ROTATED_LOGS` (5) newest is deleted),
+   `paths.rs` (config
    dir `~/.config/claude-code-proxy`, state dir
    `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy`, `CCP_CONFIG_DIR`
    overrides only the config dir), `config.rs` (precedence: `CCP_*` env, then
-   `config.json` in the config dir, then default). `read_file_config` keeps
+   `config.json` in the config dir, then default; the environment is read
+   through `env_vars`, where a variable whose name or value is not valid
+   Unicode reads as unset, and a `PORT` or `CCP_*` one with such a value is a
+   `config summary` warning that names it). `read_file_config` keeps
    the parsed file per path in a process-wide cache for `CONFIG_FILE_TTL`
    (30 s), a missing file (`NotFound`) included as `None`, so an edit lands
    within 30 s. Any other read error and a file that does not parse are not
