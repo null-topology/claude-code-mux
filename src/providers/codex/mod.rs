@@ -996,10 +996,7 @@ async fn live_stream_response_once(
                                     || error.get("type").and_then(|value| value.as_str())
                                         == Some("overloaded_error")
                             });
-                            if payload.get("type").and_then(|value| value.as_str())
-                                == Some("codex.rate_limits")
-                                || lower_message.contains("rate limit")
-                            {
+                            if lower_message.contains("rate limit") {
                                 429
                             } else if overloaded || lower_message.contains("overloaded") {
                                 529

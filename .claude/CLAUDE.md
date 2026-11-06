@@ -884,15 +884,22 @@ those paths. It carries no error object, so its reset and claim come from its
 own windows (`rate_limits::limiting_window`): a window is named only when
 exactly one window the event carries is at or past 100% and every window it
 carries is readable (`window_state`); otherwise none is, with no reset, no claim and
-nothing recorded. The snapshot itself is still taken as the newest reading
+nothing recorded. The snapshot itself still updates the held reading
 (`rate_limits::observe_event`) on the live HTTP stream and the buffered paths
 (`observe_rate_limits_in_body`), as on the live WebSocket start, before the
 limit is answered. Every spent-window answer (`usage_limit_response`), when
 the limit names a window and a reset, records that window as spent until its
-reset (`rate_limits::observe_usage_limit`, through the pure `mark_spent`): a
-reset already past is ignored, and a held window whose reset is later is kept.
+reset (`rate_limits::observe_usage_limit`, through the pure `mark_spent`).
+Every reading, healthy or refusing, and every spent window are merged window
+by window (`merge_snapshot`, `merge_window`), never swapped in whole: an
+incoming window whose reset has passed is ignored, a held window whose reset
+is more than `SAME_WINDOW_TOLERANCE_SECONDS` (60 s) after the incoming one is
+kept, and within that tolerance the incoming one replaces it as the same
+window, so a reset derived from a countdown a second or two off still marks
+it spent. A window the incoming reading does not carry, or carries unusable,
+keeps the held one, which `latest` drops once its reset passes.
 Healthy responses can then carry `unified-status: allowed` beside a
-utilization of 1.0 until the next reading replaces it. A
+utilization of 1.0 until the next reading of that window replaces it. A
 spent window after output started, as an error event or as that snapshot,
 ends the stream with an SSE `error` of type `rate_limit_error` and the same
 message, and records the window the same way; the status line has already
@@ -922,9 +929,16 @@ Other failures are classified by their error code first (`error_class` in
 JSON, else the SSE events a buffered WebSocket relay builds under the status
 its `error` event named), on the live WebSocket and HTTP starts, the WebSocket
 handshake and the buffered paths. The buffered class lookup runs before the
-status-only arms, and a 401 whose body or error names a class is answered as
-that class without a token refresh (`should_refresh_after_unauthorized`). The
-code decides over the status and the message heuristics:
+status-only arms. A 401's body or `error` event is read before any token
+refresh, on the live and buffered HTTP and WebSocket paths and `post_search`:
+a spent window (`usage_limit_reached` or a terminal snapshot) is answered
+first, then a known class, both with one upstream attempt and no refresh; only
+a 401 that names neither refreshes the token once
+(`should_refresh_after_unauthorized`, `unauthorized_needs_refresh`, and
+`unauthorized_event_needs_refresh` for a live WebSocket event). A terminal
+snapshot also closes the live WebSocket retry window
+(`event_closes_live_retry_window`), so no later 401 of that request refreshes.
+The code decides over the status and the message heuristics:
 
 - quota (`insufficient_quota`, `credit_balance_exhausted`,
   `organization_spend_limit_exceeded`, `project_spend_limit_exceeded`,
@@ -960,9 +974,10 @@ gives the value: `error.retry_after`, `error.retry_after_seconds`, the event's
 `Retry-After`), then the error's own `headers` the same way, which is where
 `response.failed` carries them (`codex-rs/codex-api/src/sse/responses_error.rs`
 at rust-v0.162.0-alpha.17). Any of them wins over the message's delay. A
-classified error body and a rejected upgrade's body are read the same way
-(`retry_advice`, `retry_after_from_body`), with the response's `Retry-After`
-header as the fallback. That
+Codex error body, classified or not, and a rejected upgrade's body are read
+the same way (`retry_advice`, `retry_after_from_body`; `response_retry_after`
+on the live and buffered HTTP paths), with the response's normalised
+`Retry-After` header as the fallback. That
 value, a rejected upgrade's `Retry-After` header and a refused CONNECT
 tunnel's are normalised when they are read, so an unclassified 429 or 5xx
 passes them on in that form too. `CodexError.class` carries the class to `map_codex_error_to_response`

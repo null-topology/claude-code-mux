@@ -3,9 +3,9 @@
 //! Codex reports how much of each subscription window is spent inside the
 //! stream, as a `codex.rate_limits` event, while Anthropic clients expect that
 //! state in response headers — which are already on the wire by the time the
-//! event arrives. So the newest snapshot is kept here and rides the next
-//! response: a quota gauge a few seconds stale, which is what a gauge fed by
-//! the previous turn's telemetry would be anyway.
+//! event arrives. So the newest reading of each window is kept here and rides
+//! the next response: a quota gauge a few seconds stale, which is what a gauge
+//! fed by the previous turn's telemetry would be anyway.
 //!
 //! Without this the only quota signal a client ever sees is the refusal, and a
 //! limit reached with no warning beforehand is exactly the case where nobody
@@ -188,8 +188,46 @@ pub(crate) fn observe_event(payload: &Value) {
         return;
     };
     if let Ok(mut latest) = cell().lock() {
-        *latest = Some(snapshot);
+        *latest = merge_snapshot(latest.take(), snapshot, now());
     }
+}
+
+/// Two readings of a window whose resets are at most this many seconds apart
+/// name the same window: a reset worked out from a countdown can land a second
+/// or two off the one stated.
+const SAME_WINDOW_TOLERANCE_SECONDS: u64 = 60;
+
+/// `held` with each window of `incoming` taken in its place
+/// (`merge_window`). A window the incoming reading does not give keeps the
+/// one held, which `latest` leaves out once its reset passes.
+fn merge_snapshot(held: Option<Snapshot>, incoming: Snapshot, now: u64) -> Option<Snapshot> {
+    let held = held.unwrap_or_default();
+    let merged = Snapshot {
+        five_hour: merge_window(held.five_hour, incoming.five_hour, now),
+        seven_day: merge_window(held.seven_day, incoming.seven_day, now),
+    };
+    (merged != Snapshot::default()).then_some(merged)
+}
+
+/// The reading to hold for one window once `incoming` arrives. An incoming
+/// window whose reset has passed, or one that resets more than
+/// `SAME_WINDOW_TOLERANCE_SECONDS` before the held one, belongs to a window
+/// that has since rolled over and leaves the held reading as it was.
+fn merge_window(
+    held: Option<WindowState>,
+    incoming: Option<WindowState>,
+    now: u64,
+) -> Option<WindowState> {
+    let Some(incoming) = incoming.filter(|state| state.resets_at > now) else {
+        return held;
+    };
+    let held_is_newer = held.is_some_and(|held| {
+        held.resets_at
+            > incoming
+                .resets_at
+                .saturating_add(SAME_WINDOW_TOLERANCE_SECONDS)
+    });
+    if held_is_newer { held } else { Some(incoming) }
 }
 
 /// The most recent snapshot, with any window that has since rolled over left
@@ -274,9 +312,9 @@ pub(crate) fn observe_usage_limit(limit: &super::events::CodexUsageLimit) {
 }
 
 /// `snapshot` with `window` used up until `resets_at`. A reset that has
-/// passed, or one earlier than the reading already held for that window,
-/// belongs to a window that has since rolled over, and leaves the snapshot as
-/// it was.
+/// passed, or one more than `SAME_WINDOW_TOLERANCE_SECONDS` earlier than the
+/// reading already held for that window, belongs to a window that has since
+/// rolled over, and leaves the snapshot as it was (`merge_window`).
 fn mark_spent(
     snapshot: Option<Snapshot>,
     window: super::events::CodexLimitWindow,
@@ -291,12 +329,11 @@ fn mark_spent(
         super::events::CodexLimitWindow::FiveHour => &mut snapshot.five_hour,
         super::events::CodexLimitWindow::SevenDay => &mut snapshot.seven_day,
     };
-    if !held.is_some_and(|state| state.resets_at > resets_at) {
-        *held = Some(WindowState {
-            utilization: 1.0,
-            resets_at,
-        });
-    }
+    let spent = WindowState {
+        utilization: 1.0,
+        resets_at,
+    };
+    *held = merge_window(*held, Some(spent), now);
     Some(snapshot)
 }
 
@@ -703,6 +740,156 @@ mod tests {
         let same =
             mark_spent(fresh, CodexLimitWindow::FiveHour, 1788879437, now).expect("snapshot");
         assert_eq!(same.five_hour.expect("five hour").utilization, 1.0);
+    }
+
+    /// `event` with each window resetting at the moment given, with no
+    /// countdown beside it.
+    fn event_resetting(
+        primary_percent: f64,
+        primary_reset: u64,
+        secondary_percent: f64,
+        secondary_reset: u64,
+    ) -> Value {
+        let mut payload = event(primary_percent, secondary_percent);
+        for (slot, reset) in [("primary", primary_reset), ("secondary", secondary_reset)] {
+            let window = payload["rate_limits"][slot]
+                .as_object_mut()
+                .expect("window");
+            window.remove("reset_after_seconds");
+            window.insert("reset_at".to_string(), reset.into());
+        }
+        payload
+    }
+
+    /// The same reading turned into a snapshot that refuses the request.
+    fn refusing(mut payload: Value) -> Value {
+        payload["rate_limits"]["allowed"] = false.into();
+        payload["rate_limits"]["limit_reached"] = true.into();
+        assert!(super::super::events::is_terminal_rate_limit_event(&payload));
+        payload
+    }
+
+    /// What a live stream records for a snapshot: the reading, then the
+    /// spent window the refusal names.
+    fn observe_refusing_snapshot(payload: &Value) {
+        observe_event(payload);
+        if let Some(limit) = super::super::events::usage_limit_from_event_with_headers(payload, &[])
+        {
+            observe_usage_limit(&limit);
+        }
+    }
+
+    fn latest_headers() -> std::collections::HashMap<&'static str, String> {
+        latest().expect("snapshot").headers().into_iter().collect()
+    }
+
+    #[test]
+    fn a_late_refusing_snapshot_leaves_a_newer_window_alone() {
+        let _snapshot = lock_for_tests();
+        clear_for_tests();
+        let now = now();
+        let newer = now + 10_000;
+        let older = newer - SAME_WINDOW_TOLERANCE_SECONDS - 1;
+        let weekly = now + 500_000;
+        observe_event(&event_resetting(3.0, newer, 16.0, weekly));
+
+        let late = refusing(event_resetting(100.0, older, 16.0, weekly));
+        let limit = super::super::events::usage_limit_from_event_with_headers(&late, &[])
+            .expect("the refusal names its window");
+        assert_eq!(limit.resets_at, Some(older));
+        observe_refusing_snapshot(&late);
+
+        let headers = latest_headers();
+        clear_for_tests();
+        assert_eq!(
+            headers.get("anthropic-ratelimit-unified-5h-reset"),
+            Some(&newer.to_string())
+        );
+        assert_eq!(
+            headers.get("anthropic-ratelimit-unified-5h-utilization"),
+            Some(&"0.0300".to_string())
+        );
+    }
+
+    #[test]
+    fn an_expired_refusing_snapshot_changes_nothing() {
+        let _snapshot = lock_for_tests();
+        clear_for_tests();
+        let now = now();
+        observe_event(&event_resetting(3.0, now + 10_000, 16.0, now + 500_000));
+        let before = latest();
+        assert!(before.is_some());
+
+        observe_refusing_snapshot(&refusing(event_resetting(100.0, now - 10, 100.0, now - 5)));
+
+        let after = latest();
+        clear_for_tests();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn a_reading_within_the_tolerance_names_the_same_window() {
+        use super::super::events::CodexLimitWindow;
+
+        let now = 1_788_000_000;
+        // The five hour window held resets at 1788879437.
+        let held = snapshot_from_event(&event(42.0, 16.0));
+
+        // A limit whose reset is a second before the held one still marks
+        // that window spent, and so does one at the edge of the tolerance.
+        for resets_at in [1788879436, 1788879437 - SAME_WINDOW_TOLERANCE_SECONDS] {
+            let marked = mark_spent(held.clone(), CodexLimitWindow::FiveHour, resets_at, now)
+                .expect("snapshot");
+            assert_eq!(
+                marked.five_hour,
+                Some(WindowState {
+                    utilization: 1.0,
+                    resets_at
+                })
+            );
+        }
+        // One second past the tolerance it names a window that came before.
+        assert_eq!(
+            mark_spent(
+                held.clone(),
+                CodexLimitWindow::FiveHour,
+                1788879437 - SAME_WINDOW_TOLERANCE_SECONDS - 1,
+                now
+            ),
+            held
+        );
+
+        // The same rule for a reading: inside the tolerance it replaces the
+        // held window, past it the held window stays, and a window the
+        // reading does not give keeps the one held.
+        let held = held.expect("snapshot");
+        let close = snapshot_from_event(&event_resetting(50.0, 1788879436, 20.0, 1789466238))
+            .expect("snapshot");
+        assert_eq!(
+            merge_snapshot(Some(held.clone()), close.clone(), now),
+            Some(close)
+        );
+        let stale = snapshot_from_event(&event_resetting(
+            100.0,
+            1788879437 - SAME_WINDOW_TOLERANCE_SECONDS - 1,
+            16.0,
+            1789466238,
+        ))
+        .expect("snapshot");
+        assert_eq!(
+            merge_snapshot(Some(held.clone()), stale, now),
+            Some(held.clone())
+        );
+        let weekly_only = Snapshot {
+            five_hour: None,
+            seven_day: Some(WindowState {
+                utilization: 0.5,
+                resets_at: 1789466238,
+            }),
+        };
+        let merged = merge_snapshot(Some(held.clone()), weekly_only, now).expect("snapshot");
+        assert_eq!(merged.five_hour, held.five_hour);
+        assert_eq!(merged.seven_day.expect("weekly").utilization, 0.5);
     }
 
     #[test]

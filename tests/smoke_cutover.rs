@@ -3128,6 +3128,74 @@ async fn smoke_codex_http_error_body_names_the_delay_without_a_header() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
+async fn smoke_codex_unclassified_429_sends_one_retry_after_on_both_http_paths() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    // The header alone is normalised; a delay the body names wins over it.
+    let cases = [
+        (json!({"error": {"message": "Too many requests."}}), "2"),
+        (
+            json!({"error": {"message": "Too many requests.", "retry_after": 4}}),
+            "4",
+        ),
+    ];
+    for (error_body, retry_after) in cases {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let mock = axum::Router::new().fallback({
+            let attempts = attempts.clone();
+            let error_body = error_body.to_string();
+            move || {
+                let attempts = attempts.clone();
+                let error_body = error_body.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    http::Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header("content-type", "application/json")
+                        .header("retry-after", "1.5")
+                        .body(Body::from(error_body))
+                        .unwrap()
+                }
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, mock).await.ok();
+        });
+        let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+
+        for stream in [true, false] {
+            let mut request = streamed_request();
+            request["stream"] = json!(stream);
+            let response = call_messages_body(request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "stream {stream}, {error_body}"
+            );
+            assert_eq!(
+                response.headers()[http::header::RETRY_AFTER],
+                retry_after,
+                "stream {stream}, {error_body}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "rate_limit_error");
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "{error_body}");
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
 async fn smoke_codex_http_reports_transient_rate_limit_with_reset_clock() {
     assert_codex_http_presemantic_failure_is_reported(codex_usage_limit_sse("rate_limit_exceeded"))
         .await;
