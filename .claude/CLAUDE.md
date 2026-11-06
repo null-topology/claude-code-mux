@@ -782,8 +782,11 @@ byte-exact.
   their own refresh token and writes over the file's pair; once the file
   holds anything else, a missing file included, they are dropped. They are
   written again at most once per `WRITEBACK_RETRY_INTERVAL` (30 s), due or
-  not and before any backoff applies (`retry_write_back`); between retries
-  `get_auth` serves them without the single-flight guard or `auth.lock`. A
+  not and before any backoff applies (`retry_write_back`). Between retries
+  `get_auth` serves them without the single-flight guard or `auth.lock` while
+  they are not due; once they are due it takes the single-flight guard for
+  the exchange or the backoff check, and no `auth.lock` while that refresh
+  backs off. A
   retry that fails for an I/O reason keeps them for another interval and
   logs nothing, one that finds another login drops them, and one that finds
   a document it cannot use (unreadable, not JSON, no `tokens` object) drops
@@ -807,8 +810,10 @@ byte-exact.
   while the stored token, read again under the lock, is unexpired keeps using
   it with one `codex_token_refresh_failed_using_stored_token` warning carrying
   only `class` and `status`, decided in the spawned task so that a dropped
-  caller still logs it once; the forced refresh after an upstream 401 never
-  does. `PROACTIVE_REFRESH_FAILURES` remembers the last failed proactive
+  caller still logs it once. The two failures outside that task, a file the
+  unlocked reload before it cannot read and a task that did not finish
+  (`refresh_task_answer`), fall back the same way in the caller. The forced
+  refresh after an upstream 401 never does. `PROACTIVE_REFRESH_FAILURES` remembers the last failed proactive
   refresh per store path and access token: the proactive path then serves
   the unexpired stored token without an exchange for
   `TRANSIENT_REFRESH_BACKOFF` (60 s) after a transient failure, and after
