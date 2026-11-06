@@ -2787,7 +2787,12 @@ fn codex_status_error(response: CodexResponse) -> CodexError {
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
         .map(|(_, value)| value.clone());
+    let class = super::events::error_class_from_body(&response.body);
     let message = codex_status_error_message(&response.body).unwrap_or_else(|| {
+        if class == Some(super::events::CodexErrorClass::ModelNotFound) {
+            // The code names a missing model that came with no message.
+            return "model_not_found".to_string();
+        }
         format!(
             "Upstream Codex request failed with status {}",
             response.status
@@ -2799,7 +2804,7 @@ fn codex_status_error(response: CodexResponse) -> CodexError {
         detail: Some(message),
         retry_after,
         usage_limit,
-        class: super::events::error_class_from_body(&response.body),
+        class,
         origin: match response.transport {
             ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
             ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,

@@ -2485,18 +2485,279 @@ async fn smoke_codex_http_reports_overload_after_control_events() {
     .await;
 }
 
+/// A `codex.rate_limits` event that ends the request: no usable credits, the
+/// five hour window spent and the weekly one not. Both reset in the past, so
+/// the reading reaches no other test's headers.
+fn codex_terminal_snapshot_event() -> Value {
+    json!({
+        "type": "codex.rate_limits",
+        "credits": {"has_credits": false, "unlimited": false},
+        "rate_limits": {
+            "allowed": false,
+            "limit_reached": true,
+            "primary": {
+                "used_percent": 100.0,
+                "window_minutes": 300,
+                "reset_after_seconds": 0,
+                "reset_at": 1788879437u64
+            },
+            "secondary": {
+                "used_percent": 40.0,
+                "window_minutes": 10080,
+                "reset_after_seconds": 0,
+                "reset_at": 1789466238u64
+            }
+        }
+    })
+}
+
+fn codex_sse(events: &[Value]) -> Vec<u8> {
+    events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// The start of a response that has already produced text.
+fn codex_text_events(id: &str, text: &str) -> Vec<Value> {
+    vec![
+        json!({"type": "response.created", "response": {"id": id}}),
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "message", "id": format!("msg_{id}")}
+        }),
+        json!({"type": "response.output_text.delta", "output_index": 0, "delta": text}),
+    ]
+}
+
+fn codex_completion_events(id: &str) -> Vec<Value> {
+    vec![
+        json!({"type": "response.output_item.done", "output_index": 0, "item": {"type": "message"}}),
+        json!({
+            "type": "response.completed",
+            "response": {"id": id, "status": "completed", "usage": {"input_tokens": 5, "output_tokens": 2}}
+        }),
+    ]
+}
+
+fn streamed_request() -> Value {
+    json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    })
+}
+
+/// The `error` event of a streamed body, which must end within two seconds.
+async fn stream_error_event(response: Response) -> (Value, String) {
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        Duration::from_secs(2),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("failed stream must terminate")
+    .unwrap();
+    let text = String::from_utf8_lossy(&body).into_owned();
+    let error = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .find(|event| event["type"] == "error")
+        .unwrap_or_else(|| panic!("no error event in {text}"));
+    (error, text)
+}
+
+async fn assert_terminal_snapshot_response(response: Response) {
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()["x-should-retry"], "false");
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-unified-status"],
+        "rejected"
+    );
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-unified-reset"],
+        "1788879437"
+    );
+    assert_eq!(
+        response.headers()["anthropic-ratelimit-unified-representative-claim"],
+        "five_hour"
+    );
+    assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["message"], "Usage limit reached");
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn smoke_codex_http_reports_rate_limit_after_control_events() {
-    assert_codex_http_presemantic_failure_is_reported(
-        concat!(
-            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_limited\"}}\n\n",
-            "data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"limit_reached\":true,\"primary\":{\"reset_after_seconds\":0}}}\n\n"
-        )
-        .as_bytes()
-        .to_vec(),
-    )
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            codex_sse(&[
+                json!({"type": "response.created", "response": {"id": "resp_limited"}}),
+                codex_terminal_snapshot_event(),
+            ])
+        }
+    })
     .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages_body(streamed_request()).await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_terminal_snapshot_response(response).await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_terminal_rate_limit_snapshot_fast_fails_buffered_request() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            codex_sse(&[codex_terminal_snapshot_event()])
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+    let response = call_messages("gpt-5.5").await;
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_terminal_snapshot_response(response).await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_usage_limit_after_output_is_a_rate_limit_error() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    // A window that reopens in an hour, so the next response still shows it.
+    let resets_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let mut limit = codex_usage_limit_event("usage_limit_reached");
+    limit["error"]["resets_at"] = json!(resets_at);
+    limit["error"]["resets_in_seconds"] = json!(3600);
+    limit["headers"]["X-Codex-Primary-Reset-After-Seconds"] = json!("3600");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let mut events = Vec::new();
+            if attempt == 2 {
+                // A reading that has rolled over replaces the spent window, so
+                // it reaches no other test.
+                events.push(json!({
+                    "type": "codex.rate_limits",
+                    "rate_limits": {
+                        "limit_reached": false,
+                        "primary": {"used_percent": 1.0, "window_minutes": 300, "reset_at": 1u64}
+                    }
+                }));
+            }
+            events.extend(codex_text_events("resp_partial", "partial output"));
+            if attempt == 0 {
+                events.push(limit.clone());
+            } else {
+                events.extend(codex_completion_events("resp_partial"));
+            }
+            codex_sse(&events)
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    let (error, text) = stream_error_event(call_messages_body(streamed_request()).await).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "stream body: {text}");
+    assert!(text.contains("partial output"), "stream body: {text}");
+    assert_eq!(error["error"]["type"], "rate_limit_error", "{text}");
+    assert_eq!(
+        error["error"]["message"], "The usage limit has been reached",
+        "{text}"
+    );
+
+    // The next response carries the window as spent until it reopens.
+    let next = call_messages_body(streamed_request()).await;
+    assert_eq!(next.status(), StatusCode::OK);
+    assert_eq!(
+        next.headers()["anthropic-ratelimit-unified-5h-utilization"],
+        "1.0000"
+    );
+    assert_eq!(
+        next.headers()["anthropic-ratelimit-unified-5h-reset"],
+        resets_at.to_string()
+    );
+    let _ = axum::body::to_bytes(next.into_body(), usize::MAX).await;
+
+    let cleanup = call_messages_body(streamed_request()).await;
+    let _ = axum::body::to_bytes(cleanup.into_body(), usize::MAX).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_terminal_snapshot_after_output_is_a_rate_limit_error() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_http_upstream({
+        let attempts = attempts.clone();
+        move |_body: Value| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let mut events = codex_text_events("resp_partial", "partial output");
+            events.push(codex_terminal_snapshot_event());
+            codex_sse(&events)
+        }
+    })
+    .await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    let (error, text) = stream_error_event(call_messages_body(streamed_request()).await).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "stream body: {text}");
+    assert_eq!(error["error"]["type"], "rate_limit_error", "{text}");
+    assert_eq!(error["error"]["message"], "Usage limit reached", "{text}");
 }
 
 #[allow(clippy::await_holding_lock)]

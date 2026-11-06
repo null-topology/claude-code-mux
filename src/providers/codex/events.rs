@@ -41,6 +41,8 @@ pub enum CodexErrorClass {
     Throttled,
     /// The backend is overloaded; the same request can succeed later.
     Overloaded,
+    /// The backend does not serve the model the request named.
+    ModelNotFound,
 }
 
 impl CodexErrorClass {
@@ -52,6 +54,7 @@ impl CodexErrorClass {
             Self::Rejected => 400,
             Self::ContextOverflow => 413,
             Self::Overloaded => 529,
+            Self::ModelNotFound => 404,
         }
     }
 
@@ -63,6 +66,7 @@ impl CodexErrorClass {
             Self::Rejected => "invalid_request_error",
             Self::ContextOverflow => "request_too_large",
             Self::Overloaded => "overloaded_error",
+            Self::ModelNotFound => "not_found_error",
         }
     }
 
@@ -73,7 +77,8 @@ impl CodexErrorClass {
             Self::QuotaExceeded
             | Self::UsageNotIncluded
             | Self::Rejected
-            | Self::ContextOverflow => CodexFailureKind::Permanent,
+            | Self::ContextOverflow
+            | Self::ModelNotFound => CodexFailureKind::Permanent,
         }
     }
 }
@@ -86,8 +91,8 @@ const QUOTA_ERROR_CODES: [&str; 5] = [
     "organization_usage_limit_exceeded",
 ];
 
-/// The class an error object's `code` (or, for quota and plan errors, its
-/// `type`) names. A spent subscription window keeps its own handling, so an
+/// The class an error object's `code` (or, for quota, plan, capacity and
+/// missing model errors, its `type`) names. A spent subscription window keeps its own handling, so an
 /// error typed `usage_limit_reached` has no class whatever its code says.
 pub(crate) fn error_class(error: &Value) -> Option<CodexErrorClass> {
     let code = error.get("code").and_then(Value::as_str);
@@ -107,10 +112,17 @@ pub(crate) fn error_class(error: &Value) -> Option<CodexErrorClass> {
         Some("invalid_prompt" | "cyber_policy" | "bio_policy" | "misalignment_policy_violation")
     ) {
         Some(CodexErrorClass::Rejected)
-    } else if code == Some("server_is_overloaded") {
+    } else if code == Some("server_is_overloaded") || names("policy_capacity_unavailable") {
+        // The CLI waits out both with the server's own retry delay
+        // (codex-rs/protocol/src/error.rs at rust-v0.166.0).
         Some(CodexErrorClass::Overloaded)
     } else if matches!(code, Some("rate_limit_exceeded" | "slow_down")) {
         Some(CodexErrorClass::Throttled)
+    } else if names("model_not_found") {
+        // The CLI reads it with no status or a 400, 403 or 404
+        // (codex-rs/codex-api/src/error.rs at rust-v0.166.0); here, as for
+        // the other codes, the code decides over any status.
+        Some(CodexErrorClass::ModelNotFound)
     } else {
         None
     }
@@ -224,11 +236,22 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
                 .and_then(Value::as_u64)
         })
         .and_then(|status| u16::try_from(status).ok());
-    let message = error
+    let class = error.and_then(error_class);
+    let native = error
         .and_then(|value| value.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or("Upstream error")
-        .to_string();
+        .and_then(Value::as_str);
+    let message = match native {
+        // A missing model is named by its code when it comes with no message,
+        // as the Codex CLI names it.
+        _ if class == Some(CodexErrorClass::ModelNotFound)
+            && native.is_none_or(|text| text.trim().is_empty()) =>
+        {
+            "model_not_found"
+        }
+        Some(text) => text,
+        None => "Upstream error",
+    }
+    .to_string();
     let code = error
         .and_then(|value| value.get("code"))
         .and_then(Value::as_str);
@@ -236,7 +259,6 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         .and_then(|value| value.get("type"))
         .and_then(Value::as_str);
     let lower = message.to_ascii_lowercase();
-    let class = error.and_then(error_class);
 
     let kind = if let Some(class) = class {
         class.kind()
@@ -335,11 +357,12 @@ pub struct CodexUsageLimit {
 /// Recognise the `usage_limit_reached` error Codex emits when a subscription
 /// window is spent. Upstream puts the clock both in the error body
 /// (`resets_at`, `resets_in_seconds`) and in `X-Codex-*` headers mirrored into
-/// the event payload.
+/// the event payload. A `codex.rate_limits` event that ends the request
+/// (`is_terminal_rate_limit_event`) is a spent window too.
 pub(crate) fn usage_limit_from_event(payload: &Value) -> Option<CodexUsageLimit> {
     if !matches!(
         payload.get("type").and_then(Value::as_str),
-        Some("response.failed" | "response.error" | "error")
+        Some("response.failed" | "response.error" | "error" | "codex.rate_limits")
     ) {
         return None;
     }
@@ -355,7 +378,7 @@ pub(crate) fn usage_limit_from_event_with_headers(
 ) -> Option<CodexUsageLimit> {
     if !matches!(
         payload.get("type").and_then(Value::as_str),
-        Some("response.failed" | "response.error" | "error")
+        Some("response.failed" | "response.error" | "error" | "codex.rate_limits")
     ) {
         return None;
     }
@@ -383,10 +406,11 @@ pub(crate) fn usage_limit_from_response(
 }
 
 fn is_usage_limit_payload(payload: &Value) -> bool {
-    event_error(payload)
-        .and_then(|error| error.get("type"))
-        .and_then(Value::as_str)
-        == Some("usage_limit_reached")
+    is_terminal_rate_limit_event(payload)
+        || event_error(payload)
+            .and_then(|error| error.get("type"))
+            .and_then(Value::as_str)
+            == Some("usage_limit_reached")
 }
 
 fn usage_limit_from_payload(payload: &Value) -> Option<CodexUsageLimit> {
@@ -397,6 +421,9 @@ fn usage_limit_from_payload_with_headers(
     payload: &Value,
     response_headers: &[(String, String)],
 ) -> Option<CodexUsageLimit> {
+    if payload.get("type").and_then(Value::as_str) == Some("codex.rate_limits") {
+        return is_terminal_rate_limit_event(payload).then(|| usage_limit_from_snapshot(payload));
+    }
     let error = event_error(payload)?;
     if error.get("type").and_then(Value::as_str) != Some("usage_limit_reached") {
         return None;
@@ -432,6 +459,21 @@ fn usage_limit_from_payload_with_headers(
         resets_at,
         window,
     })
+}
+
+/// A terminal `codex.rate_limits` event carries no error object, so its clock
+/// and window come from the windows it reports (`rate_limits::limiting_window`).
+/// When the window that ran out cannot be told, neither a clock nor a claim is
+/// named, as for a limit error whose clock matches no window.
+fn usage_limit_from_snapshot(payload: &Value) -> CodexUsageLimit {
+    let limiting = payload
+        .get("rate_limits")
+        .and_then(super::rate_limits::limiting_window);
+    CodexUsageLimit {
+        message: "Usage limit reached".to_string(),
+        resets_at: limiting.map(|(_, resets_at)| resets_at),
+        window: limiting.and_then(|(minutes, _)| super::rate_limits::claimable_window(minutes)),
+    }
 }
 
 /// Codex sends the clock for both windows on every limit error, so the one that
@@ -1113,6 +1155,18 @@ mod tests {
                 529,
                 true,
             ),
+            (
+                "policy_capacity_unavailable",
+                CodexErrorClass::Overloaded,
+                529,
+                true,
+            ),
+            (
+                "model_not_found",
+                CodexErrorClass::ModelNotFound,
+                404,
+                false,
+            ),
         ];
         for (code, class, status, retryable) in cases {
             let error = serde_json::json!({"code": code, "message": "toy message"});
@@ -1135,6 +1189,8 @@ mod tests {
         for (error_type, class) in [
             ("insufficient_quota", CodexErrorClass::QuotaExceeded),
             ("usage_not_included", CodexErrorClass::UsageNotIncluded),
+            ("policy_capacity_unavailable", CodexErrorClass::Overloaded),
+            ("model_not_found", CodexErrorClass::ModelNotFound),
         ] {
             let failure = classify_event_failure(&serde_json::json!({
                 "type": "error",
@@ -1143,7 +1199,8 @@ mod tests {
             .unwrap();
             assert_eq!(failure.class, Some(class), "{error_type}");
         }
-        // Only quota and plan errors are read from the type.
+        // Only quota, plan, capacity and missing model errors are read from
+        // the type.
         let failure = classify_event_failure(&serde_json::json!({
             "type": "error",
             "error": {"type": "invalid_prompt", "message": "toy message"}
@@ -1176,6 +1233,179 @@ mod tests {
         assert_eq!(rejected.class, Some(CodexErrorClass::Rejected));
         assert_eq!(rejected.kind, CodexFailureKind::Permanent);
         assert_eq!(rejected.status, 400);
+    }
+
+    #[test]
+    fn capacity_is_an_overload_with_the_delay_its_payload_names() {
+        let cases = [
+            serde_json::json!({
+                "type": "error",
+                "error": {"code": "policy_capacity_unavailable", "message": "toy message"}
+            }),
+            serde_json::json!({
+                "type": "error",
+                "status": 503,
+                "error": {"code": "policy_capacity_unavailable", "message": "toy message"}
+            }),
+        ];
+        for payload in cases {
+            let failure = classify_event_failure(&payload).unwrap();
+            assert_eq!(
+                failure.class,
+                Some(CodexErrorClass::Overloaded),
+                "{payload}"
+            );
+            assert_eq!(failure.kind, CodexFailureKind::Overloaded, "{payload}");
+            assert_eq!(failure.status, 529, "{payload}");
+            assert_eq!(failure.message, "toy message", "{payload}");
+            assert_eq!(failure.retry_after, None, "{payload}");
+        }
+
+        let delayed = classify_event_failure(&serde_json::json!({
+            "type": "response.failed",
+            "response": {"error": {
+                "type": "policy_capacity_unavailable",
+                "message": "toy message",
+                "retry_after": 1.5
+            }}
+        }))
+        .unwrap();
+        assert_eq!(delayed.class, Some(CodexErrorClass::Overloaded));
+        assert_eq!(delayed.retry_after.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn a_missing_model_is_not_found_whatever_its_status() {
+        let statusless = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "error": {"code": "model_not_found", "message": "toy message"}
+        }))
+        .unwrap();
+        assert_eq!(statusless.class, Some(CodexErrorClass::ModelNotFound));
+        assert_eq!(statusless.explicit_status, None);
+        assert_eq!(statusless.status, 404);
+        assert_eq!(statusless.message, "toy message");
+        assert!(!statusless.retryable());
+
+        let bad_request = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "status": 400,
+            "error": {"code": "model_not_found", "message": "toy message"}
+        }))
+        .unwrap();
+        assert_eq!(bad_request.class, Some(CodexErrorClass::ModelNotFound));
+        assert_eq!(bad_request.explicit_status, Some(400));
+        assert_eq!(bad_request.status, 404);
+
+        // With no message, or an empty one, the code names it.
+        for error in [
+            serde_json::json!({"code": "model_not_found"}),
+            serde_json::json!({"code": "model_not_found", "message": " "}),
+        ] {
+            let failure =
+                classify_event_failure(&serde_json::json!({"type": "error", "error": error}))
+                    .unwrap();
+            assert_eq!(failure.message, "model_not_found", "{error}");
+        }
+        assert_eq!(
+            error_class_from_body(br#"{"error":{"type":"model_not_found"}}"#),
+            Some(CodexErrorClass::ModelNotFound)
+        );
+        // A spent window keeps precedence.
+        let spent_window = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "error": {"type": "usage_limit_reached", "code": "model_not_found"}
+        }))
+        .unwrap();
+        assert_eq!(spent_window.class, None);
+    }
+
+    /// A `codex.rate_limits` event that ends the request, with the five hour
+    /// window spent and the weekly one not.
+    fn terminal_snapshot(credits: Value) -> Value {
+        serde_json::json!({
+            "type": "codex.rate_limits",
+            "credits": credits,
+            "rate_limits": {
+                "allowed": false,
+                "limit_reached": true,
+                "primary": {
+                    "used_percent": 100.0,
+                    "window_minutes": 300,
+                    "reset_after_seconds": 9569,
+                    "reset_at": 1788879437u64
+                },
+                "secondary": {
+                    "used_percent": 40.0,
+                    "window_minutes": 10080,
+                    "reset_after_seconds": 596369,
+                    "reset_at": 1789466238u64
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_terminal_rate_limit_snapshot_is_a_spent_window() {
+        let snapshot =
+            terminal_snapshot(serde_json::json!({"has_credits": false, "unlimited": false}));
+        let expected = CodexUsageLimit {
+            message: "Usage limit reached".to_string(),
+            resets_at: Some(1788879437),
+            window: Some(CodexLimitWindow::FiveHour),
+        };
+        assert_eq!(usage_limit_from_event(&snapshot), Some(expected.clone()));
+        assert_eq!(
+            usage_limit_from_event_with_headers(&snapshot, &[]),
+            Some(expected.clone())
+        );
+        let body = format!("data: {snapshot}\n\n");
+        assert_eq!(
+            usage_limit_from_response(body.as_bytes(), &[]),
+            Some(expected)
+        );
+
+        // Credits that still pay keep the stream going, so there is no limit.
+        let credited =
+            terminal_snapshot(serde_json::json!({"has_credits": true, "unlimited": false}));
+        assert_eq!(usage_limit_from_event(&credited), None);
+        let body = format!("data: {credited}\n\n");
+        assert_eq!(usage_limit_from_response(body.as_bytes(), &[]), None);
+        assert_eq!(
+            usage_limit_from_event(&serde_json::json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {"limit_reached": false}
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn a_terminal_snapshot_names_a_window_only_when_one_can_be_told() {
+        // Both windows spent: which one refused cannot be told.
+        let mut both = terminal_snapshot(Value::Null);
+        both["rate_limits"]["secondary"]["used_percent"] = serde_json::json!(100.0);
+        let limit = usage_limit_from_event(&both).unwrap();
+        assert_eq!((limit.resets_at, limit.window), (None, None));
+
+        // The only window reported is the one, spent or not.
+        let mut weekly_only = terminal_snapshot(Value::Null);
+        weekly_only["rate_limits"]
+            .as_object_mut()
+            .unwrap()
+            .remove("primary");
+        let limit = usage_limit_from_event(&weekly_only).unwrap();
+        assert_eq!(limit.resets_at, Some(1789466238));
+        assert_eq!(limit.window, Some(CodexLimitWindow::SevenDay));
+
+        // No windows at all still ends the request, with nothing to name.
+        let bare = serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {"limit_reached": true}
+        });
+        let limit = usage_limit_from_event(&bare).unwrap();
+        assert_eq!(limit.message, "Usage limit reached");
+        assert_eq!((limit.resets_at, limit.window), (None, None));
     }
 
     #[test]
