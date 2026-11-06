@@ -388,6 +388,22 @@ pub struct CodexUsageLimit {
     pub message: String,
     pub resets_at: Option<u64>,
     pub window: Option<CodexLimitWindow>,
+    /// The ChatGPT account of the request the limit refused, which the quota
+    /// gauge records the spent window under (`rate_limits::observe_usage_limit`).
+    /// Set by whoever knows the request (`for_account`); `None` until then.
+    pub account: Option<String>,
+    /// False for a terminal `codex.rate_limits` snapshot that reads a metered
+    /// limit other than `codex` (`rate_limits::reads_codex_limit`): it still
+    /// refuses the request, but its windows are not the ones the gauge shows.
+    pub feeds_gauge: bool,
+}
+
+impl CodexUsageLimit {
+    /// The limit, as refusing a request of `account`.
+    pub(crate) fn for_account(mut self, account: Option<&str>) -> Self {
+        self.account = account.map(str::to_owned);
+        self
+    }
 }
 
 /// Recognise the `usage_limit_reached` error Codex emits when a subscription
@@ -443,10 +459,11 @@ pub(crate) fn usage_limit_from_response(
 }
 
 /// Hand every `codex.rate_limits` event of a buffered body to the quota gauge
-/// (`rate_limits::observe_event`), in body order.
-pub(crate) fn observe_rate_limits_in_body(body: &[u8]) {
+/// (`rate_limits::observe_event`), in body order, for the ChatGPT account of
+/// the request the body answered.
+pub(crate) fn observe_rate_limits_in_body(account: Option<&str>, body: &[u8]) {
     for payload in response_payloads(body) {
-        super::rate_limits::observe_event(&payload);
+        super::rate_limits::observe_event(account, &payload);
     }
 }
 
@@ -507,6 +524,8 @@ fn usage_limit_from_payload_with_headers(
             .to_string(),
         resets_at,
         window,
+        account: None,
+        feeds_gauge: true,
     })
 }
 
@@ -522,6 +541,8 @@ fn usage_limit_from_snapshot(payload: &Value) -> CodexUsageLimit {
         message: "Usage limit reached".to_string(),
         resets_at: limiting.map(|(_, resets_at)| resets_at),
         window: limiting.and_then(|(minutes, _)| super::rate_limits::claimable_window(minutes)),
+        account: None,
+        feeds_gauge: super::rate_limits::reads_codex_limit(payload),
     }
 }
 
@@ -1430,6 +1451,8 @@ mod tests {
             message: "Usage limit reached".to_string(),
             resets_at: Some(1788879437),
             window: Some(CodexLimitWindow::FiveHour),
+            account: None,
+            feeds_gauge: true,
         };
         assert_eq!(usage_limit_from_event(&snapshot), Some(expected.clone()));
         assert_eq!(

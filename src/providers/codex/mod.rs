@@ -838,7 +838,7 @@ async fn live_stream_response(
         let upstream_events = match transport {
             config::CodexTransport::Http => {
                 client
-                    .stream_codex_http_events_for_owner(&request_body, &ctx)
+                    .stream_codex_http_events_for_owner(&request_body, &ctx, false)
                     .await
             }
             config::CodexTransport::WebSocket => client
@@ -869,6 +869,7 @@ async fn live_stream_response(
             }
         };
 
+        let account_id = upstream_events.account_reader();
         match live_stream_response_once(
             upstream_events,
             response_headers,
@@ -883,7 +884,7 @@ async fn live_stream_response(
         {
             LiveStreamStart::Response(response) => {
                 cleanup.disarm();
-                return with_rate_limit_headers(response);
+                return with_rate_limit_headers(response, account_id().as_deref());
             }
             LiveStreamStart::Retry {
                 error,
@@ -959,7 +960,7 @@ async fn live_stream_response_once(
             }
             generation_started = true;
         }
-        rate_limits::observe_event(&payload);
+        rate_limits::observe_event(upstream_events.account_id().as_deref(), &payload);
         turn_state::observe_event(&ctx.req_id, &payload);
         append_upstream_sse_payload(&mut upstream_sse_body, &payload);
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, None)
@@ -977,6 +978,7 @@ async fn live_stream_response_once(
                         &request_continuation,
                         compaction.attempt,
                     );
+                    let limit = limit.for_account(upstream_events.account_id().as_deref());
                     return LiveStreamStart::Response(usage_limit_response(&limit));
                 }
                 let failure = events::classify_event_failure(&payload);
@@ -1203,6 +1205,9 @@ fn remaining_live_stream_response(
     let outcome = live_stream_outcome(&translator);
     let response_outcome = outcome.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    // Output has started, so the request is not sent again under another
+    // account; the gauge keys this stream's readings by the one it went with.
+    let account_id = upstream_events.account_id();
     tokio::spawn(async move {
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
             abort_request_state(
@@ -1248,7 +1253,7 @@ fn remaining_live_stream_response(
             };
             match item {
                 Ok(payload) => {
-                    rate_limits::observe_event(&payload);
+                    rate_limits::observe_event(account_id.as_deref(), &payload);
                     turn_state::observe_event(&ctx.req_id, &payload);
                     append_upstream_sse_payload(&mut upstream_sse_body, &payload);
                     let (chunk, terminal) = match translate_live_stream_payload(
@@ -1269,7 +1274,8 @@ fn remaining_live_stream_response(
                             let limit = events::usage_limit_from_event_with_headers(
                                 &payload,
                                 &response_headers,
-                            );
+                            )
+                            .map(|limit| limit.for_account(account_id.as_deref()));
                             if let Some(limit) = limit.as_ref() {
                                 rate_limits::observe_usage_limit(limit);
                             }
@@ -1563,15 +1569,17 @@ fn update_continuation_from_upstream(
 /// carries the exact state of the window that refused it, which is better than
 /// a snapshot taken a turn earlier. So is one that tells the client not to
 /// retry: a spent credit balance is not a window, and a snapshot saying the
-/// window is allowed would contradict the refusal.
-fn with_rate_limit_headers(mut response: Response) -> Response {
+/// window is allowed would contradict the refusal. The snapshot is the one
+/// held for `account`, the ChatGPT account the request went out with; one
+/// held for another account says nothing about this request.
+fn with_rate_limit_headers(mut response: Response, account: Option<&str>) -> Response {
     let headers = response.headers();
     if headers.contains_key("anthropic-ratelimit-unified-status")
         || headers.contains_key("x-should-retry")
     {
         return response;
     }
-    let Some(snapshot) = rate_limits::latest() else {
+    let Some(snapshot) = rate_limits::latest(account) else {
         return response;
     };
 
@@ -1936,19 +1944,27 @@ mod tests {
     fn a_refusal_keeps_the_state_of_the_window_that_refused_it() {
         let _rate_limits = rate_limits::lock_for_tests();
         // The snapshot from an earlier turn says the allowance was fine.
-        rate_limits::observe_event(&serde_json::json!({
-            "type": "codex.rate_limits",
-            "rate_limits": {
-                "primary": {"used_percent": 5.0, "window_minutes": 300, "resets_at": 1u64},
-                "secondary": {"used_percent": 5.0, "window_minutes": 10080, "resets_at": 2u64}
-            }
-        }));
+        rate_limits::observe_event(
+            None,
+            &serde_json::json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {
+                    "primary": {"used_percent": 5.0, "window_minutes": 300, "resets_at": 1u64},
+                    "secondary": {"used_percent": 5.0, "window_minutes": 10080, "resets_at": 2u64}
+                }
+            }),
+        );
 
-        let refusal = with_rate_limit_headers(usage_limit_response(&events::CodexUsageLimit {
-            message: "The usage limit has been reached".to_string(),
-            resets_at: Some(1788879437),
-            window: Some(events::CodexLimitWindow::FiveHour),
-        }));
+        let refusal = with_rate_limit_headers(
+            usage_limit_response(&events::CodexUsageLimit {
+                message: "The usage limit has been reached".to_string(),
+                resets_at: Some(1788879437),
+                window: Some(events::CodexLimitWindow::FiveHour),
+                account: None,
+                feeds_gauge: true,
+            }),
+            None,
+        );
 
         let headers = refusal.headers();
         assert_eq!(
@@ -2150,19 +2166,24 @@ mod tests {
     async fn spent_credits_stop_the_retry_loop_without_naming_a_window() {
         let _rate_limits = rate_limits::lock_for_tests();
         // An earlier turn left a quota snapshot behind.
-        rate_limits::observe_event(&serde_json::json!({
-            "type": "codex.rate_limits",
-            "rate_limits": {
-                "primary": {"used_percent": 5.0, "window_minutes": 300, "resets_at": 1u64}
-            }
-        }));
-        let response =
-            with_rate_limit_headers(map_codex_error_to_response(&classified_codex_error(
+        rate_limits::observe_event(
+            None,
+            &serde_json::json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {
+                    "primary": {"used_percent": 5.0, "window_minutes": 300, "resets_at": 1u64}
+                }
+            }),
+        );
+        let response = with_rate_limit_headers(
+            map_codex_error_to_response(&classified_codex_error(
                 events::CodexErrorClass::QuotaExceeded,
                 429,
                 "You exceeded your current quota, please check your plan and billing details.",
                 Some("30"),
-            )));
+            )),
+            None,
+        );
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         let headers = response.headers();

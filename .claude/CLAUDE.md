@@ -279,7 +279,7 @@ Request path:
      clobber each other; `compaction.rs` does server-side compaction;
      `events.rs` classifies stream failures and recognises the
      `usage_limit_reached` error; `rate_limits.rs` keeps the newest
-     `codex.rate_limits` reading and publishes it as
+     `codex.rate_limits` reading of one ChatGPT account and publishes it as
      `anthropic-ratelimit-unified-*` headers (see below). Auth reads the Codex
      CLI's `~/.codex/auth.json` (`CCP_CODEX_AUTH_FILE` overrides the path).
    - `kimi/`, `grok/`: Chat Completions / Responses translators with their own
@@ -781,11 +781,28 @@ carries is readable (`window_state`); otherwise none is, with no reset, no claim
 nothing recorded. The snapshot itself still updates the held reading
 (`rate_limits::observe_event`) on the live HTTP stream and the buffered paths
 (`observe_rate_limits_in_body`), as on the live WebSocket start, before the
-limit is answered. Every spent-window answer (`usage_limit_response`), when
-the limit names a window and a reset, records that window as spent until its
-reset (`rate_limits::observe_usage_limit`, through the pure `mark_spent`).
-Every reading, healthy or refusing, and every spent window are merged window
-by window (`merge_snapshot`, `merge_window`), never swapped in whole: an
+limit is answered, and so does every window of an error body:
+`codex_status_error` (a failed live HTTP start, the search call, the buffered
+fallthrough) and `handshake_rejection_error` (a rejected upgrade) observe the
+whole body before reducing it to a spent window. Every spent-window answer
+(`usage_limit_response`), when the limit names a window and a reset, records
+that window as spent until its reset (`rate_limits::observe_usage_limit`,
+through the pure `mark_spent`).
+The reading is held for one ChatGPT account (`Held` in `rate_limits.rs`):
+each reading and spent window carries the request's account id (the login's
+`account_id`; on the live paths `CodexWebSocketEventStream::account_id`, on a
+rejected upgrade the request's `ChatGPT-Account-Id` header), one under
+another account replaces the held reading whole, and `with_rate_limit_headers`
+publishes it only for a request under the same account. A reading whose
+`metered_limit_name`, else `limit_name`, names a limit other than `codex`
+updates nothing, and its refusal marks no window (`reads_codex_limit`,
+`CodexUsageLimit::feeds_gauge`); one naming neither reads `codex`, as the
+Codex CLI files it (`codex-rs/codex-api/src/rate_limits.rs:124-167` at
+rust-v0.166.0). `is_terminal_rate_limit_event` does not read the name, so
+such a refusal is still answered as a spent window.
+Under one account, every reading, healthy or refusing, and every spent window
+are merged window by window (`merge_snapshot`, `merge_window`), never swapped
+in whole: an
 incoming window whose reset has passed is ignored, a held window whose reset
 is more than `SAME_WINDOW_TOLERANCE_SECONDS` (60 s) after the incoming one is
 kept, and within that tolerance the incoming one replaces it as the same
@@ -826,10 +843,15 @@ handshake and the buffered paths. The buffered class lookup runs before the
 status-only arms. A 401's body or `error` event is read before any token
 refresh, on the live and buffered HTTP and WebSocket paths and `post_search`:
 a spent window (`usage_limit_reached` or a terminal snapshot) is answered
-first, then a known class, both with one upstream attempt and no refresh; only
-a 401 that names neither refreshes the token once
-(`should_refresh_after_unauthorized`, `unauthorized_needs_refresh`, and
-`unauthorized_event_needs_refresh` for a live WebSocket event). A terminal
+first, then a known class, both with no refresh and one upstream attempt per
+transport: under `auto` a refused upgrade still falls back to HTTP, which
+reads its own answer. Only a 401 that names neither refreshes the token, at
+most once per client request (`should_refresh_after_unauthorized`,
+`unauthorized_needs_refresh`, and `unauthorized_event_needs_refresh` for a
+live WebSocket event): the buffered loop keeps one flag across both
+transports, and the live WebSocket task marks its refresh on the stream
+(`used_auth_refresh`), which the live `auto` fallback hands to the HTTP
+attempt (`auth_refresh_spent`). A terminal
 snapshot also closes the live WebSocket retry window
 (`event_closes_live_retry_window`), so no later 401 of that request refreshes.
 The code decides over the status and the message heuristics:

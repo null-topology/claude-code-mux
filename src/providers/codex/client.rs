@@ -449,6 +449,7 @@ struct HttpEventStreamState {
     resp: reqwest::Response,
     response_headers: Vec<(String, String)>,
     started_at: Instant,
+    account_id: Option<String>,
 }
 
 impl HttpSseDecoder {
@@ -1203,7 +1204,7 @@ impl CodexHttpClient {
         loop {
             let response = self.attempt_post_search(&auth, &body_json, ctx).await?;
             if !(200..300).contains(&response.status) {
-                let error = codex_status_error(response);
+                let error = codex_status_error(response, auth.account_id.as_deref());
                 if !auth_refresh_attempted && unauthorized_needs_refresh(&error) {
                     auth_refresh_attempted = true;
                     auth = self
@@ -1232,18 +1233,29 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
-        self.stream_codex_http_events_with_headers(body, ctx)
+        self.stream_codex_http_events_with_headers(body, ctx, false)
             .await
-            .map(|(receiver, _)| receiver)
+            .map(|(receiver, _, _)| receiver)
     }
 
     /// The live HTTP stream together with its response headers, which hold
-    /// the `X-Codex-*` quota clocks an event may leave out.
+    /// the `X-Codex-*` quota clocks an event may leave out, and the ChatGPT
+    /// account the request went out with. `auth_refresh_spent` says the
+    /// client request already refreshed the token (a WebSocket attempt that
+    /// fell back), so a 401 here is answered without a second refresh.
     async fn stream_codex_http_events_with_headers(
         self: &Arc<Self>,
         body: &ResponsesRequest,
         ctx: &RequestContext,
-    ) -> Result<(CodexHttpEventReceiver, Vec<(String, String)>), CodexError> {
+        auth_refresh_spent: bool,
+    ) -> Result<
+        (
+            CodexHttpEventReceiver,
+            Vec<(String, String)>,
+            Option<String>,
+        ),
+        CodexError,
+    > {
         let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
@@ -1262,7 +1274,7 @@ impl CodexHttpClient {
             class: None,
             origin: CodexErrorOrigin::Http,
         })?;
-        let mut auth_refresh_attempted = false;
+        let mut auth_refresh_attempted = auth_refresh_spent;
         let use_responses_lite = body.client_metadata.is_some();
         let (resp, response_headers, started_at) = self
             .start_http_event_attempt(
@@ -1276,15 +1288,17 @@ impl CodexHttpClient {
             .await?;
 
         let headers = response_headers.clone();
+        let account_id = auth.account_id.clone();
         let receiver = self.spawn_http_event_stream(
             HttpEventStreamState {
                 resp,
                 response_headers,
                 started_at,
+                account_id: account_id.clone(),
             },
             ctx.clone(),
         );
-        Ok((receiver, headers))
+        Ok((receiver, headers, account_id))
     }
 
     /// The live HTTP stream and its response headers; see
@@ -1293,6 +1307,7 @@ impl CodexHttpClient {
         self: &Arc<Self>,
         body: &ResponsesRequest,
         ctx: &RequestContext,
+        auth_refresh_spent: bool,
     ) -> Result<
         (
             super::websocket::CodexWebSocketEventStream,
@@ -1300,10 +1315,11 @@ impl CodexHttpClient {
         ),
         CodexError,
     > {
-        let (receiver, headers) = self
-            .stream_codex_http_events_with_headers(body, ctx)
+        let (receiver, headers, account_id) = self
+            .stream_codex_http_events_with_headers(body, ctx, auth_refresh_spent)
             .await?;
-        let (stream, _) = super::websocket::CodexWebSocketEventStream::pending(receiver);
+        let (stream, publisher) = super::websocket::CodexWebSocketEventStream::pending(receiver);
+        publisher.publish_account(account_id.as_deref());
         Ok((stream, headers))
     }
 
@@ -1325,7 +1341,7 @@ impl CodexHttpClient {
                 // The body is read first: a 401 that names a spent window or a
                 // known class is answered as such, not refreshed.
                 let response = self.collect_http_response(resp, started_at, ctx).await?;
-                let mut error = codex_status_error(response);
+                let mut error = codex_status_error(response, auth.account_id.as_deref());
                 error.origin = CodexErrorOrigin::Http;
                 if !*auth_refresh_attempted && unauthorized_needs_refresh(&error) {
                     *auth_refresh_attempted = true;
@@ -1387,7 +1403,10 @@ impl CodexHttpClient {
         match websocket.recv().await {
             Some(Err(err)) if should_fallback_to_http(&err) => {
                 log_websocket_fallback_to_http(ctx, &err);
-                self.stream_codex_http_events_for_owner(body, ctx).await
+                // One refresh per client request: when the WebSocket attempt
+                // already refreshed the token, the HTTP one does not again.
+                self.stream_codex_http_events_for_owner(body, ctx, websocket.used_auth_refresh())
+                    .await
             }
             Some(item) => {
                 let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -1420,6 +1439,7 @@ impl CodexHttpClient {
             mut resp,
             response_headers,
             started_at,
+            account_id,
         } = state;
         let body_idle_timeout_ms = self.body_idle_timeout_ms;
         let req_id = ctx.req_id.clone();
@@ -1598,10 +1618,10 @@ impl CodexHttpClient {
                                 // The terminal snapshot is never forwarded, so
                                 // the gauge reads its windows here, before the
                                 // limit marks the one it names.
-                                super::rate_limits::observe_event(&payload);
+                                super::rate_limits::observe_event(account_id.as_deref(), &payload);
                                 let _ = tx
                                     .send(Err(codex_usage_limit_error(
-                                        limit,
+                                        limit.for_account(account_id.as_deref()),
                                         CodexErrorOrigin::Http,
                                     )))
                                     .await;
@@ -1833,8 +1853,9 @@ impl CodexHttpClient {
                 };
                 // The gauge reads the body's windows before the limit marks
                 // the one it names, as on a live stream.
-                super::events::observe_rate_limits_in_body(&response.body);
-                return Err(codex_usage_limit_error(limit, origin));
+                let account = auth.account_id.as_deref();
+                super::events::observe_rate_limits_in_body(account, &response.body);
+                return Err(codex_usage_limit_error(limit.for_account(account), origin));
             }
 
             if should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport) {
@@ -1889,7 +1910,10 @@ impl CodexHttpClient {
                         )
                         .is_some() =>
                 {
-                    return Err(codex_status_error(response.into_response()));
+                    return Err(codex_status_error(
+                        response.into_response(),
+                        auth.account_id.as_deref(),
+                    ));
                 }
                 Ok(response) if response.status == 401 => {
                     let detail = String::from_utf8_lossy(&response.body).to_string();
@@ -1929,7 +1953,10 @@ impl CodexHttpClient {
                     });
                 }
                 Ok(response) if !(200..300).contains(&response.status) => {
-                    return Err(codex_status_error(response.into_response()));
+                    return Err(codex_status_error(
+                        response.into_response(),
+                        auth.account_id.as_deref(),
+                    ));
                 }
                 Ok(response) => return Ok(response),
                 Err(err)
@@ -1985,6 +2012,7 @@ impl CodexHttpClient {
         let continuation = continuation.cloned();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let (rx, socket_id_publisher) = super::websocket::CodexWebSocketEventStream::pending(rx);
+        socket_id_publisher.publish_account(auth.account_id.as_deref());
         tokio::spawn(async move {
             client
                 .coordinate_live_websocket_events(
@@ -2020,6 +2048,7 @@ impl CodexHttpClient {
 
         'attempt: loop {
             socket_id_publisher.publish(None);
+            socket_id_publisher.publish_account(auth.account_id.as_deref());
             let ws_headers = match build_codex_headers(
                 &auth,
                 &ctx,
@@ -2073,6 +2102,7 @@ impl CodexHttpClient {
                             && !forwarded_any =>
                     {
                         auth_refresh_attempted = true;
+                        socket_id_publisher.mark_auth_refresh();
                         invalidate_live_continuation_pool(continuation.as_ref());
                         let refresh = self.auth_manager.force_refresh(&auth.access);
                         auth = match refresh.await {
@@ -2160,6 +2190,7 @@ impl CodexHttpClient {
                 };
                 if unauthorized && !auth_refresh_attempted && !forwarded_any {
                     auth_refresh_attempted = true;
+                    socket_id_publisher.mark_auth_refresh();
                     invalidate_live_continuation_pool(continuation.as_ref());
                     let refresh = self.auth_manager.force_refresh(&auth.access);
                     auth = match refresh.await {
@@ -2838,9 +2869,13 @@ fn response_retry_after(body: &[u8], headers: &[(String, String)]) -> Option<Str
     })
 }
 
-fn codex_status_error(response: CodexResponse) -> CodexError {
-    let usage_limit =
-        super::events::usage_limit_from_response(&response.body, &response.headers).map(Box::new);
+/// A non-success answer of the request sent for `account`. Every
+/// `codex.rate_limits` event its body holds reaches the quota gauge whole
+/// before the body is reduced to a spent window.
+fn codex_status_error(response: CodexResponse, account: Option<&str>) -> CodexError {
+    super::events::observe_rate_limits_in_body(account, &response.body);
+    let usage_limit = super::events::usage_limit_from_response(&response.body, &response.headers)
+        .map(|limit| Box::new(limit.for_account(account)));
     let retry_after = response_retry_after(&response.body, &response.headers);
     let class = super::events::error_class_from_body(&response.body, response.status);
     let message = codex_status_error_message(&response.body).unwrap_or_else(|| {
@@ -4906,13 +4941,16 @@ mod tests {
 
     #[test]
     fn status_error_preserves_buffered_websocket_event_message() {
-        let error = codex_status_error(CodexResponse {
-            body: b"data: {\"type\":\"error\",\"error\":{\"status\":400,\"message\":\"bad request\"}}\n\n"
-                .to_vec(),
-            status: 400,
-            headers: Vec::new(),
-            transport: ActualTransport::WebSocket,
-        });
+        let error = codex_status_error(
+            CodexResponse {
+                body: b"data: {\"type\":\"error\",\"error\":{\"status\":400,\"message\":\"bad request\"}}\n\n"
+                    .to_vec(),
+                status: 400,
+                headers: Vec::new(),
+                transport: ActualTransport::WebSocket,
+            },
+            None,
+        );
 
         assert_eq!(error.status, 400);
         assert_eq!(error.detail.as_deref(), Some("bad request"));
@@ -5634,6 +5672,15 @@ mod tests {
         }
     }
 
+    /// A rotated login with no refresh token: the first refresh picks it up,
+    /// and a second one fails as an `Auth` error without leaving loopback.
+    fn last_rotation_test_auth() -> StoredAuth {
+        StoredAuth {
+            refresh: String::new(),
+            ..rotated_test_auth()
+        }
+    }
+
     /// A refresh sends the request again, so the attempts tell whether one ran.
     fn expected_unauthorized_attempts(refreshes: bool) -> usize {
         if refreshes { 2 } else { 1 }
@@ -5667,12 +5714,40 @@ mod tests {
         error: &'static str,
         attempts: Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        serve_unauthorized_http_rotating_to(listener, client, error, attempts, rotated_test_auth())
+            .await;
+    }
+
+    /// Same, rotating to a login that a second refresh cannot renew.
+    async fn serve_unauthorized_http_last_rotation(
+        listener: TcpListener,
+        client: Arc<CodexHttpClient>,
+        error: &'static str,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        serve_unauthorized_http_rotating_to(
+            listener,
+            client,
+            error,
+            attempts,
+            last_rotation_test_auth(),
+        )
+        .await;
+    }
+
+    async fn serve_unauthorized_http_rotating_to(
+        listener: TcpListener,
+        client: Arc<CodexHttpClient>,
+        error: &'static str,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        rotated: StoredAuth,
+    ) {
         let body = format!(r#"{{"error":{error}}}"#);
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
             let _request = read_http_request(&mut stream).await;
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            client.auth_manager().set_test_auth(rotated_test_auth());
+            client.auth_manager().set_test_auth(rotated.clone());
             let head = format!(
                 "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
@@ -5769,29 +5844,35 @@ mod tests {
         }
     }
 
+    fn search_test_request() -> super::super::search::SearchRequest {
+        super::super::search::SearchRequest {
+            id: "session".to_string(),
+            model: "gpt-5.6-luna".to_string(),
+            reasoning: None,
+            input: None,
+            commands: super::super::search::SearchCommands {
+                search_query: vec![super::super::search::SearchQuery {
+                    q: "find Codex".to_string(),
+                }],
+            },
+            settings: super::super::search::SearchSettings {
+                filters: None,
+                allowed_callers: vec!["direct"],
+                external_web_access: true,
+            },
+            max_output_tokens: 2_500,
+        }
+    }
+
     #[tokio::test]
     async fn a_401_naming_a_spent_window_or_a_class_is_answered_on_the_search_call() {
         for (error, refreshes) in UNAUTHORIZED_ERRORS {
             let (client, server, attempts) =
                 unauthorized_test_server(serve_unauthorized_http, error).await;
-            let request = super::super::search::SearchRequest {
-                id: "session".to_string(),
-                model: "gpt-5.6-luna".to_string(),
-                reasoning: None,
-                input: None,
-                commands: super::super::search::SearchCommands {
-                    search_query: vec![super::super::search::SearchQuery {
-                        q: "find Codex".to_string(),
-                    }],
-                },
-                settings: super::super::search::SearchSettings {
-                    filters: None,
-                    allowed_callers: vec!["direct"],
-                    external_web_access: true,
-                },
-                max_output_tokens: 2_500,
-            };
-            let err = match client.post_search(&request, &http_test_context()).await {
+            let err = match client
+                .post_search(&search_test_request(), &http_test_context())
+                .await
+            {
                 Err(err) => err,
                 Ok(_) => panic!("a 401 must not answer the search"),
             };
@@ -5897,6 +5978,213 @@ mod tests {
                 refreshes,
                 "{error}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_401_event_naming_a_spent_window_or_a_class_is_answered_on_the_buffered_websocket() {
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        for (error, refreshes) in UNAUTHORIZED_ERRORS {
+            let (client, server, attempts) =
+                unauthorized_test_server(serve_unauthorized_websocket_event, error).await;
+            let err = match client
+                .post_codex_with_transport(
+                    &buffered_test_request(),
+                    &http_test_context(),
+                    None,
+                    crate::config::CodexTransport::WebSocket,
+                )
+                .await
+            {
+                Err(err) => err,
+                Ok(_) => panic!("a 401 event must not succeed"),
+            };
+            assert_unauthorized_answer(&err, error, refreshes);
+            assert_eq!(
+                unauthorized_attempts(server, &attempts),
+                expected_unauthorized_attempts(refreshes),
+                "{error}"
+            );
+        }
+    }
+
+    /// Under `auto` a refused upgrade falls back to HTTP, which reads its own
+    /// answer, and a plain 401 on both is refreshed once per client request:
+    /// the HTTP attempt does not refresh again after the WebSocket did. A
+    /// second refresh would fail here as an `Auth` error.
+    #[tokio::test]
+    async fn a_401_on_the_live_auto_fallback_refreshes_at_most_once() {
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        for (error, refreshes) in UNAUTHORIZED_ERRORS {
+            let (client, server, attempts) =
+                unauthorized_test_server(serve_unauthorized_http_last_rotation, error).await;
+            let err = match client
+                .stream_codex_auto_events_for_owner(
+                    &buffered_test_request(),
+                    &http_test_context(),
+                    None,
+                )
+                .await
+            {
+                Err(err) => err,
+                Ok(_) => panic!("a 401 must not start a stream"),
+            };
+            assert_unauthorized_answer(&err, error, refreshes);
+            assert_eq!(err.origin, CodexErrorOrigin::Http, "{error}");
+            // The upgrade, the upgrade again after the refresh, then HTTP;
+            // with no refresh, the upgrade and HTTP.
+            assert_eq!(
+                unauthorized_attempts(server, &attempts),
+                if refreshes { 3 } else { 2 },
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_401_on_the_buffered_auto_fallback_refreshes_at_most_once() {
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        for (error, refreshes) in UNAUTHORIZED_ERRORS {
+            let (client, server, attempts) =
+                unauthorized_test_server(serve_unauthorized_http_last_rotation, error).await;
+            let err = match client
+                .post_codex_with_transport(
+                    &buffered_test_request(),
+                    &http_test_context(),
+                    None,
+                    crate::config::CodexTransport::Auto,
+                )
+                .await
+            {
+                Err(err) => err,
+                Ok(_) => panic!("a 401 must not succeed"),
+            };
+            assert_unauthorized_answer(&err, error, refreshes);
+            assert_ne!(err.origin, CodexErrorOrigin::Auth, "{error}");
+            // The upgrade and HTTP, and both again after the one refresh.
+            assert_eq!(
+                unauthorized_attempts(server, &attempts),
+                if refreshes { 4 } else { 2 },
+                "{error}"
+            );
+        }
+    }
+
+    /// A Codex answer that reads both windows spent, each resetting ahead,
+    /// so the refusal names neither window.
+    fn spent_snapshot_body() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {
+                "allowed": false,
+                "limit_reached": true,
+                "primary": {"used_percent": 100.0, "window_minutes": 300, "reset_at": now + 10_000},
+                "secondary": {"used_percent": 100.0, "window_minutes": 10080, "reset_at": now + 500_000}
+            }
+        })
+        .to_string()
+    }
+
+    /// Answers every request, a WebSocket upgrade included, with a 429
+    /// holding `body`.
+    async fn serve_rate_limited(listener: TcpListener, body: String) {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut stream).await;
+            let head = format!(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body.as_bytes()).await.unwrap();
+        }
+    }
+
+    /// The utilisations a healthy response with no telemetry of its own is
+    /// given for a request under `account`.
+    fn published_utilizations(account: Option<&str>) -> [Option<String>; 2] {
+        let response = super::super::with_rate_limit_headers(
+            axum::response::IntoResponse::into_response(axum::http::StatusCode::OK),
+            account,
+        );
+        [
+            "anthropic-ratelimit-unified-5h-utilization",
+            "anthropic-ratelimit-unified-7d-utilization",
+        ]
+        .map(|name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        })
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_error_answer_feeds_every_window_it_reads_to_the_gauge() {
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        let _rate_limits = super::super::rate_limits::lock_for_tests();
+        for path in ["live http", "search", "upgrade"] {
+            super::super::rate_limits::clear_for_tests();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = Arc::new(authenticated_http_test_client(format!(
+                "http://{addr}/responses"
+            )));
+            let server = tokio::spawn(serve_rate_limited(listener, spent_snapshot_body()));
+            let err = match path {
+                "live http" => client
+                    .stream_codex_http_events(&buffered_test_request(), &http_test_context())
+                    .await
+                    .err(),
+                "search" => client
+                    .post_search(&search_test_request(), &http_test_context())
+                    .await
+                    .err(),
+                _ => match client
+                    .stream_codex_websocket_events_for_owner(
+                        &buffered_test_request(),
+                        &http_test_context(),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .recv()
+                    .await
+                {
+                    Some(Err(err)) => Some(err),
+                    _ => None,
+                },
+            }
+            .expect(path);
+            server.abort();
+            let published = published_utilizations(Some("acct"));
+            let unkeyed = published_utilizations(None);
+            super::super::rate_limits::clear_for_tests();
+
+            // Both windows are spent, so the refusal still names neither.
+            assert!(
+                err.usage_limit
+                    .as_ref()
+                    .is_some_and(|limit| limit.window.is_none()),
+                "{path}: {err:?}"
+            );
+            assert_eq!(
+                published,
+                [Some("1.0000".to_string()), Some("1.0000".to_string())],
+                "{path}"
+            );
+            // The reading is held for the login's account only.
+            assert_eq!(unkeyed, [None, None], "{path}");
         }
     }
 
