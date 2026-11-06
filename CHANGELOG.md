@@ -16,11 +16,17 @@
   included, the proxy logs one `codex_token_writeback_failed` warning, serves
   the new token and leaves the file as it was. It keeps those tokens in
   memory and uses them while the file still holds the login they replaced:
-  later requests write them again until a write succeeds, refresh them from
-  their own refresh token when they are due, and drop them once the file
-  holds anything else. A restart forgets them. A refresh also finishes, and
-  its tokens are written, when the request that started it is cancelled;
-  requests waiting for it use its result.
+  they are written again at most every 30 seconds until a write succeeds,
+  also while a failed refresh is waiting to be tried again, they are
+  refreshed from their own refresh token when they are due, and they are
+  dropped once the file holds anything else. A file that by then cannot be
+  read, is not JSON or has no `tokens` object drops them too, and the request
+  fails as it would without them. If the token endpoint refuses their
+  refresh token, they stay in use until their access token expires. A
+  restart forgets them. A refresh also finishes, and its tokens are written,
+  when the request that started it is cancelled; requests waiting for it use
+  its result, and a refresh that falls back to the stored token logs its
+  warning once either way.
 - `auth.lock` is the Codex CLI's own lock only when `CCP_CODEX_AUTH_FILE` is
   unset or names `$CODEX_HOME/auth.json`; point it at that file. A symlinked
   `auth.json` is now updated at its target, so the link stays a link; a link
@@ -38,7 +44,8 @@
   `expires_in` that is not a positive integer counts as absent; the expiry
   is the access token's `exp`, else `expires_in`, else one hour.
 - A Codex token refresh that fails for a temporary reason (the token
-  endpoint unreachable, a timeout, 429, 5xx) now answers 503 `api_error`
+  endpoint unreachable, a timeout, 429, 5xx, a refresh that did not finish)
+  now answers 503 `api_error`
   with `Codex token refresh is temporarily unavailable` instead of 401, a
   status a client may retry, the forced refresh after a 401 included. The
   Codex model listing reports such a failure as unreachable rather than as

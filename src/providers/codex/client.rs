@@ -3201,33 +3201,61 @@ mod tests {
         client
     }
 
+    /// How long a one-shot mock server waits for its request, and a test for it.
+    const MOCK_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// A mock server task, aborted when the test leaves it, however it leaves.
+    struct MockServer(tokio::task::JoinHandle<()>);
+
+    impl MockServer {
+        /// Answer one request with `response`. Accepting and reading give up after
+        /// `MOCK_DEADLINE`.
+        async fn answer_once(response: String) -> (std::net::SocketAddr, Self) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = tokio::time::timeout(MOCK_DEADLINE, listener.accept())
+                    .await
+                    .expect("mock server: no request arrived")
+                    .unwrap();
+                tokio::time::timeout(MOCK_DEADLINE, read_http_request(&mut stream))
+                    .await
+                    .expect("mock server: the request did not finish arriving");
+                let _ = tokio::time::timeout(MOCK_DEADLINE, stream.write_all(response.as_bytes()))
+                    .await;
+            });
+            (addr, Self(task))
+        }
+
+        /// Wait for the server to have answered, failing the test with its panic.
+        async fn join(mut self) {
+            tokio::time::timeout(MOCK_DEADLINE, &mut self.0)
+                .await
+                .expect("mock server did not finish")
+                .unwrap();
+        }
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     /// The client's answer to a buffered request the backend rejects with 401, when
     /// the token endpoint answers the forced refresh with `refresh_status`.
     async fn forced_refresh_answer(refresh_status: &'static str) -> axum::response::Response {
-        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let backend_addr = backend.local_addr().unwrap();
-        let backend_server = tokio::spawn(async move {
-            let (mut stream, _) = backend.accept().await.unwrap();
-            read_http_request(&mut stream).await;
-            stream
-                .write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                )
-                .await
-                .unwrap();
-        });
-        let token = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let token_addr = token.local_addr().unwrap();
-        let token_server = tokio::spawn(async move {
-            let (mut stream, _) = token.accept().await.unwrap();
-            read_http_request(&mut stream).await;
-            let body = r#"{"error":"invalid_grant"}"#;
-            let response = format!(
-                "HTTP/1.1 {refresh_status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
+        let (backend_addr, backend_server) = MockServer::answer_once(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                .to_string(),
+        )
+        .await;
+        let body = r#"{"error":"invalid_grant"}"#;
+        let (token_addr, token_server) = MockServer::answer_once(format!(
+            "HTTP/1.1 {refresh_status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
 
         let dir = tempfile::tempdir().unwrap();
         let manager = CodexAuthManager::new_with_token_endpoint(
@@ -3247,20 +3275,22 @@ mod tests {
             manager,
             format!("http://{backend_addr}/responses"),
         );
-        let error = match client
-            .post_codex_with_transport(
-                &buffered_test_request(),
-                &http_test_context(),
-                None,
-                crate::config::CodexTransport::Http,
-            )
+        let (body, context) = (buffered_test_request(), http_test_context());
+        let request = client.post_codex_with_transport(
+            &body,
+            &context,
+            None,
+            crate::config::CodexTransport::Http,
+        );
+        let error = match tokio::time::timeout(MOCK_DEADLINE, request)
             .await
+            .expect("the request did not finish")
         {
             Ok(_) => panic!("a failed forced refresh must fail the request"),
             Err(error) => error,
         };
-        backend_server.await.unwrap();
-        token_server.await.unwrap();
+        backend_server.join().await;
+        token_server.join().await;
         super::super::map_codex_error_to_response(&error)
     }
 

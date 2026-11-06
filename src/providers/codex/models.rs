@@ -799,4 +799,117 @@ mod tests {
             );
         }
     }
+
+    /// How long a one-shot mock server waits for its request, and a test for it.
+    const MOCK_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// A mock server task, aborted when the test leaves it, however it leaves.
+    struct MockServer(tokio::task::JoinHandle<()>);
+
+    impl MockServer {
+        /// Answer one request with `status` and a JSON `body`. Accepting and reading
+        /// give up after `MOCK_DEADLINE`.
+        async fn answer_once(status: &'static str, body: &'static str) -> (String, Self) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = tokio::time::timeout(MOCK_DEADLINE, listener.accept())
+                    .await
+                    .expect("mock server: no request arrived")
+                    .unwrap();
+                let read = async {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert!(read > 0, "request ended before its body was complete");
+                        request.extend_from_slice(&chunk[..read]);
+                        let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            return;
+                        }
+                    }
+                };
+                tokio::time::timeout(MOCK_DEADLINE, read)
+                    .await
+                    .expect("mock server: the request did not finish arriving");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tokio::time::timeout(MOCK_DEADLINE, stream.write_all(response.as_bytes()))
+                    .await;
+            });
+            (format!("http://{addr}"), Self(task))
+        }
+
+        /// Wait for the server to have answered, failing the test with its panic.
+        async fn join(mut self) {
+            tokio::time::timeout(MOCK_DEADLINE, &mut self.0)
+                .await
+                .expect("mock server did not finish")
+                .unwrap();
+        }
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    /// The listing rejected with 401 forces a token refresh: one the endpoint cannot
+    /// serve right now leaves the listing unreachable, one it refuses unauthorized.
+    #[tokio::test]
+    async fn a_forced_refresh_after_a_401_maps_its_failure() {
+        use super::super::auth::token_store::{CodexCliAuthStore, CodexTokenStore};
+        for (refresh_status, unreachable) in [
+            ("503 Service Unavailable", true),
+            ("400 Bad Request", false),
+        ] {
+            let (backend, backend_server) = MockServer::answer_once("401 Unauthorized", "{}").await;
+            let (token, token_server) =
+                MockServer::answer_once(refresh_status, r#"{"error":"invalid_grant"}"#).await;
+            let dir = tempfile::tempdir().unwrap();
+            let manager = CodexAuthManager::new_with_token_endpoint(
+                CodexTokenStore::codex_cli(CodexCliAuthStore::new(dir.path().join("auth.json"))),
+                format!("{token}/oauth/token"),
+            );
+            manager.set_test_auth(StoredAuth {
+                access: "access-test".to_string(),
+                refresh: "refresh-test".to_string(),
+                expires: u64::MAX,
+                account_id: Some("acct".to_string()),
+            });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let base_url = format!("{backend}/responses");
+            let listing = fetch_models(&client, &manager, &base_url, None);
+            let error = tokio::time::timeout(MOCK_DEADLINE, listing)
+                .await
+                .expect("the listing did not finish")
+                .unwrap_err();
+            backend_server.join().await;
+            token_server.join().await;
+            assert_eq!(
+                matches!(error, ModelsError::Unreachable(_)),
+                unreachable,
+                "{refresh_status}: {error:?}"
+            );
+            assert_eq!(
+                matches!(error, ModelsError::Unauthorized(_)),
+                !unreachable,
+                "{refresh_status}: {error:?}"
+            );
+        }
+    }
 }
