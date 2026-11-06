@@ -1983,7 +1983,9 @@ impl CodexHttpClient {
         let ctx = ctx.clone();
         let continuation = continuation.cloned();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let (rx, socket_id_publisher) = super::websocket::CodexWebSocketEventStream::pending(rx);
+        let (mut rx, socket_id_publisher) =
+            super::websocket::CodexWebSocketEventStream::pending(rx);
+        rx.mark_rate_limits_observed();
         socket_id_publisher.publish_account(auth.account_id.as_deref());
         tokio::spawn(async move {
             client
@@ -2222,6 +2224,12 @@ impl CodexHttpClient {
                 }
                 let terminal = item.as_ref().is_err()
                     || item.as_ref().is_ok_and(super::websocket::is_terminal_event);
+                // A refresh can move the stream to another account before the
+                // reader takes this item off the queue, so the reading is
+                // recorded here, for the account of the attempt that read it.
+                if let Ok(payload) = &item {
+                    super::rate_limits::observe_event(auth.account_id.as_deref(), payload);
+                }
                 if tx.send(item).await.is_err() {
                     if let Some(reservation) = continuation.as_ref() {
                         super::websocket::invalidate_codex_websocket_pool_socket(
@@ -6244,6 +6252,11 @@ mod tests {
                 Err(err) => err,
                 Ok(_) => panic!("a 401 must not start a stream"),
             };
+            assert_eq!(
+                client.auth_manager().forced_refreshes_for_tests(),
+                usize::from(refreshes),
+                "{error}"
+            );
             assert_unauthorized_answer(&err, error, refreshes);
             assert_eq!(err.origin, CodexErrorOrigin::Http, "{error}");
             // The upgrade, the upgrade again after the refresh, then HTTP;

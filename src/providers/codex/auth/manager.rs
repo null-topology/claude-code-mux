@@ -168,6 +168,8 @@ pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
     pub store: Arc<CodexTokenStore<S>>,
     #[cfg(test)]
     test_auth: Arc<Mutex<Option<StoredAuth>>>,
+    #[cfg(test)]
+    forced_refreshes: std::sync::atomic::AtomicUsize,
     refresh_lock: Arc<AsyncMutex<()>>,
     refresh_client: reqwest::Client,
     token_endpoint: String,
@@ -186,6 +188,8 @@ impl<S: AuthStorage<StoredAuth> + 'static> CodexAuthManager<S> {
             store: Arc::new(store),
             #[cfg(test)]
             test_auth: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            forced_refreshes: std::sync::atomic::AtomicUsize::new(0),
             refresh_lock: CODEX_REFRESH_LOCK.clone(),
             refresh_client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
@@ -202,6 +206,8 @@ impl<S: AuthStorage<StoredAuth> + 'static> CodexAuthManager<S> {
             store: self.store.clone(),
             #[cfg(test)]
             test_auth: self.test_auth.clone(),
+            #[cfg(test)]
+            forced_refreshes: std::sync::atomic::AtomicUsize::new(0),
             refresh_lock: self.refresh_lock.clone(),
             refresh_client: self.refresh_client.clone(),
             token_endpoint: self.token_endpoint.clone(),
@@ -230,6 +236,9 @@ impl<S: AuthStorage<StoredAuth> + 'static> CodexAuthManager<S> {
     }
 
     pub async fn force_refresh(&self, rejected_access: &str) -> Result<StoredAuth, anyhow::Error> {
+        #[cfg(test)]
+        self.forced_refreshes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.refresh(true, Some(rejected_access)).await
     }
 
@@ -761,6 +770,14 @@ impl<S: AuthStorage<StoredAuth> + 'static> CodexAuthManager<S> {
         if let Some(signal) = signal {
             let _ = signal.send(());
         }
+    }
+
+    /// How many token refreshes this manager was asked for after a rejected
+    /// login, the ones that failed included.
+    #[cfg(test)]
+    pub fn forced_refreshes_for_tests(&self) -> usize {
+        self.forced_refreshes
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 

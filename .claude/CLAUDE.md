@@ -897,7 +897,12 @@ through the pure `mark_spent`).
 The reading is held for one ChatGPT account (`Held` in `rate_limits.rs`):
 each reading and spent window carries the request's account id (the login's
 `account_id`; on the live paths `CodexWebSocketEventStream::account_id`, on a
-rejected upgrade the request's `ChatGPT-Account-Id` header), one under
+rejected upgrade the request's `ChatGPT-Account-Id` header). A live WebSocket
+reading is recorded by `coordinate_live_websocket_events` under the account
+of the attempt that read it before it is queued, and the reader skips it
+(`rate_limits_observed`), because a 401 refresh can move the stream to
+another login while the reading waits in the queue; the response headers
+still follow the stream's final account. A reading or spent window under
 another account replaces the held reading whole, and `with_rate_limit_headers`
 publishes it only for a request under the same account. A reading whose
 `metered_limit_name`, else `limit_name`, names a limit other than `codex`
