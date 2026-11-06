@@ -147,16 +147,20 @@ fn rotate_file(path: &Path) -> io::Result<()> {
         .unwrap_or_default()
         .as_millis();
     let rotated = path.with_extension(format!("{ts}"));
-    fs::rename(path, rotated)?;
-    prune_rotated_logs(path, MAX_ROTATED_LOGS);
+    fs::rename(path, &rotated)?;
+    prune_rotated_logs(path, &rotated, MAX_ROTATED_LOGS);
     Ok(())
 }
 
-/// Delete all but the `keep` newest rotated files of the log at `path`.
-/// [`rotate_file`] names them `<stem>.<millis>` beside the log, so only a file
-/// whose name is the log's stem, a dot and digits counts, ordered by that
-/// number. A failed listing or delete is ignored: pruning never fails logging.
-fn prune_rotated_logs(path: &Path, keep: usize) {
+/// Keep `keep` rotated files of the log at `path`: `just_rotated`, the file
+/// [`rotate_file`] has just created, and the `keep - 1` newest of the others,
+/// deleting the rest. Rotated files are named `<stem>.<millis>` beside the
+/// log, so only a file whose name is the log's stem, a dot and digits counts,
+/// ordered by that number. `just_rotated` is never a candidate, so a clock
+/// that went back (or a zero timestamp) cannot make the newest log the one
+/// deleted. A failed listing or delete is ignored: pruning never fails
+/// logging.
+fn prune_rotated_logs(path: &Path, just_rotated: &Path, keep: usize) {
     let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else {
         return;
     };
@@ -167,6 +171,7 @@ fn prune_rotated_logs(path: &Path, keep: usize) {
     let mut rotated: Vec<(u128, PathBuf)> = entries
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter(|entry| entry.path() != just_rotated)
         .filter_map(|entry| {
             let name = entry.file_name();
             let stamp = name.to_str()?.strip_prefix(&prefix)?;
@@ -177,7 +182,7 @@ fn prune_rotated_logs(path: &Path, keep: usize) {
         })
         .collect();
     rotated.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-    for (_, old) in rotated.into_iter().skip(keep) {
+    for (_, old) in rotated.into_iter().skip(keep.saturating_sub(1)) {
         let _ = fs::remove_file(old);
     }
 }
@@ -213,6 +218,17 @@ pub fn redact_value(value: Value) -> Value {
     redact_with_depth(value, 0)
 }
 
+/// `s` cut to at most 4000 bytes, followed by `…[N more]` with N the bytes
+/// left out; a shorter string is kept whole. The cut falls on a character
+/// boundary, since slicing inside a multibyte character panics.
+fn shorten_for_log(s: String) -> String {
+    if s.len() <= 4000 {
+        return s;
+    }
+    let kept = s.floor_char_boundary(4000);
+    format!("{}…[{} more]", &s[..kept], s.len() - kept)
+}
+
 fn redact_with_depth(value: Value, depth: u8) -> Value {
     if depth > 6 {
         return Value::String("[depth-limit]".into());
@@ -222,13 +238,8 @@ fn redact_with_depth(value: Value, depth: u8) -> Value {
         Value::String(s) => {
             if config::log_verbose() {
                 Value::String(s)
-            } else if s.len() > 4000 {
-                // Cut on a character boundary: slicing inside a multibyte
-                // character panics.
-                let kept = s.floor_char_boundary(4000);
-                Value::String(format!("{}…[{} more]", &s[..kept], s.len() - kept))
             } else {
-                Value::String(s)
+                Value::String(shorten_for_log(s))
             }
         }
         Value::Array(values) => Value::Array(
@@ -312,17 +323,42 @@ mod tests {
     #[test]
     fn long_strings_are_cut_on_a_character_boundary() {
         // `é` takes bytes 3999 and 4000, so a cut at byte 4000 would split it.
+        // The helper takes no verbose flag, so a test elsewhere that turns on
+        // verbose logging process-wide cannot change this result.
         let text = format!("{}é{}", "a".repeat(3999), "b".repeat(100));
-        let redacted = redact_value(serde_json::json!({ "message": text }));
+        let shortened = shorten_for_log(text.clone());
 
         let expected = format!("{}…[{} more]", "a".repeat(3999), text.len() - 3999);
-        assert_eq!(redacted["message"], Value::String(expected));
-        assert!(
-            redacted["message"]
-                .as_str()
-                .unwrap()
-                .ends_with("…[102 more]")
-        );
+        assert_eq!(shortened, expected);
+        assert!(shortened.ends_with("…[102 more]"));
+
+        let whole = "é".repeat(2000);
+        assert_eq!(shorten_for_log(whole.clone()), whole);
+    }
+
+    #[test]
+    fn pruning_keeps_the_just_rotated_log_whatever_its_number() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("proxy.log");
+        // A clock at the epoch named the new rotation `proxy.0`, below every
+        // earlier one.
+        let just_rotated = dir.path().join("proxy.0");
+        fs::write(&just_rotated, "newest\n").unwrap();
+        let stamps = [10_u64, 20, 30, 40, 50, 60];
+        for stamp in stamps {
+            fs::write(dir.path().join(format!("proxy.{stamp}")), "old\n").unwrap();
+        }
+
+        prune_rotated_logs(&log, &just_rotated, MAX_ROTATED_LOGS);
+
+        assert_eq!(fs::read_to_string(&just_rotated).unwrap(), "newest\n");
+        let exists = |stamp: u64| dir.path().join(format!("proxy.{stamp}")).exists();
+        for stamp in [30, 40, 50, 60] {
+            assert!(exists(stamp), "kept proxy.{stamp}");
+        }
+        for stamp in [10, 20] {
+            assert!(!exists(stamp), "deleted proxy.{stamp}");
+        }
     }
 
     #[test]

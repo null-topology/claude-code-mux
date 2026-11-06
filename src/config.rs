@@ -142,20 +142,40 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
 /// one stray entry anywhere in the environment would stop every config read;
 /// here it reads as unset and the next source of the setting applies.
 /// [`config_override_summary`] reports the proxy's own variables left out this
-/// way.
+/// way. Variables that hold a path are not read here but with `var_os`, so a
+/// path that is not valid Unicode still applies (see [`paths::PATH_ENV_VARS`]
+/// and [`OS_PATH_ENV_VARS`]).
 pub(crate) fn env_vars() -> HashMap<String, String> {
     std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .collect()
 }
 
+/// The proxy's own path variables read with `var_os` outside
+/// [`paths::PATH_ENV_VARS`]: the Codex CLI credential file override that
+/// `codex_auth_file` reads. Their value applies even when it is not valid
+/// Unicode.
+const OS_PATH_ENV_VARS: [&str; 1] = ["CCP_CODEX_AUTH_FILE"];
+
 /// The proxy's own variables (`PORT` and every `CCP_*` name) whose value is not
-/// valid Unicode, sorted by name.
+/// valid Unicode and is therefore ignored, sorted by name. A path variable is
+/// never one of them: it applies as it is.
 fn non_unicode_env_names() -> Vec<String> {
-    let mut names: Vec<String> = std::env::vars_os()
+    non_unicode_names_in(std::env::vars_os())
+}
+
+fn non_unicode_names_in(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<String> {
+    let mut names: Vec<String> = vars
+        .into_iter()
         .filter(|(_, value)| value.to_str().is_none())
         .filter_map(|(key, _)| key.into_string().ok())
         .filter(|key| key == "PORT" || key.starts_with("CCP_"))
+        .filter(|key| {
+            !paths::PATH_ENV_VARS.contains(&key.as_str())
+                && !OS_PATH_ENV_VARS.contains(&key.as_str())
+        })
         .collect();
     names.sort();
     names
@@ -215,9 +235,7 @@ pub fn clear_config_file_cache_for_tests() {
 }
 
 pub fn load_config() -> LoadedConfig {
-    let env = paths::DirResolverEnv::default();
-    let config_dir = paths::resolve_config_dir(&env);
-    load_config_from_env(&env.env, config_dir)
+    load_config_from_env(&env_vars(), paths::config_dir())
 }
 
 pub fn load_config_for_env(env: &HashMap<String, String>) -> LoadedConfig {
@@ -226,12 +244,7 @@ pub fn load_config_for_env(env: &HashMap<String, String>) -> LoadedConfig {
         .or_else(|| env.get("USERPROFILE"))
         .cloned()
         .unwrap_or_else(|| "/".to_string());
-    let resolver_env = paths::DirResolverEnv {
-        platform: std::env::consts::OS.to_string(),
-        env: env.clone(),
-        home,
-    };
-    let config_dir = paths::resolve_config_dir(&resolver_env);
+    let config_dir = paths::resolve_config_dir_for_env(std::env::consts::OS, &home, env);
     load_config_from_env(env, config_dir)
 }
 
@@ -1303,6 +1316,7 @@ mod tests {
         "CCP_CODEX_TRANSPORT",
         "CCP_LOG_VERBOSE",
         "CCP_LOG_STDERR",
+        "CCP_TRAFFIC_LOG",
         "CCP_CODEX_REASONING_SUMMARY",
         "CCP_CODEX_SERVER_COMPACTION",
         "CCP_CODEX_FULL_LANE",
@@ -1488,6 +1502,57 @@ mod tests {
                 .iter()
                 .all(|line| !line.text.contains("caf") && !line.text.contains("MUX_TEST"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_path_variables_apply_and_are_not_reported() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        clear_config_file_cache_for_tests();
+        // Only resolved, never created: some filesystems refuse such names.
+        let root = tempfile::TempDir::new().unwrap();
+        let config_dir = root.path().join(OsStr::from_bytes(b"config-\xff"));
+        let state_home = root.path().join(OsStr::from_bytes(b"state-\xff"));
+        let _config_dir = EnvGuard::set("CCP_CONFIG_DIR", &config_dir);
+        let _state_home = EnvGuard::set("XDG_STATE_HOME", &state_home);
+
+        assert_eq!(paths::config_dir(), config_dir);
+        assert_eq!(paths::state_dir(), state_home.join("claude-code-proxy"));
+        assert_eq!(
+            paths::log_file(),
+            state_home.join("claude-code-proxy").join("proxy.log")
+        );
+        let cfg = load_config();
+        assert_eq!(cfg.config_dir, config_dir);
+        let summary = config_override_summary(&cfg);
+        assert!(summary.iter().all(|line| !line.ignored), "{summary:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn not_unicode_warning_leaves_out_path_variables() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let vars = [
+            "CCP_CONFIG_DIR",
+            "CCP_CODEX_AUTH_FILE",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "CCP_CODEX_TRANSPORT",
+            "PORT",
+        ]
+        .map(|name| {
+            (
+                OsString::from(name),
+                OsString::from_vec(b"caf\xe9".to_vec()),
+            )
+        });
+        assert_eq!(non_unicode_names_in(vars), ["CCP_CODEX_TRANSPORT", "PORT"]);
     }
 
     #[test]

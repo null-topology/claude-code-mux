@@ -290,16 +290,23 @@ Request path:
    (`CCP_TRAFFIC_LOG=1` writes full captures under the state dir),
    `logging.rs` (JSONL `proxy.log`, redacts known keys, cuts a string field
    over 4000 bytes on a character boundary unless verbose; past
-   `MAX_LOG_BYTES` (20 MiB) the log is renamed to `proxy.<millis>` and every
-   rotated file of it but the `MAX_ROTATED_LOGS` (5) newest is deleted),
-   `paths.rs` (config
+   `MAX_LOG_BYTES` (20 MiB) the log is renamed to `proxy.<millis>`, and that
+   file and the `MAX_ROTATED_LOGS - 1` (4) newest other rotated files of it
+   are kept, the rest deleted), `paths.rs` (config
    dir `~/.config/claude-code-proxy`, state dir
    `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy`, `CCP_CONFIG_DIR`
-   overrides only the config dir), `config.rs` (precedence: `CCP_*` env, then
-   `config.json` in the config dir, then default; the environment is read
-   through `env_vars`, where a variable whose name or value is not valid
+   overrides only the config dir; the variables in `PATH_ENV_VARS` and
+   `HOME` / `USERPROFILE` are read with `var_os`, so a path that is not valid
+   UTF-8 applies as set), `config.rs` (precedence: `CCP_*` env, then
+   `config.json` in the config dir, then default; settings read as text come
+   from `env_vars`, where a variable whose name or value is not valid
    Unicode reads as unset, and a `PORT` or `CCP_*` one with such a value is a
-   `config summary` warning that names it). `read_file_config` keeps
+   `config summary` warning that names it, except the path variables read
+   with `var_os`, `paths::PATH_ENV_VARS` and `OS_PATH_ENV_VARS`
+   (`CCP_CODEX_AUTH_FILE`); the Codex client's `ProxyEnvironment::from_env`
+   skips an `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` or `NO_PROXY` spelling,
+   either case, that is not valid Unicode, so the other spelling or none
+   applies). `read_file_config` keeps
    the parsed file per path in a process-wide cache for `CONFIG_FILE_TTL`
    (30 s), a missing file (`NotFound`) included as `None`, so an edit lands
    within 30 s. Any other read error and a file that does not parse are not
