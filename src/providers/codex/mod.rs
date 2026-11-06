@@ -973,8 +973,8 @@ async fn live_stream_response_once(
                     );
                     return LiveStreamStart::Response(usage_limit_response(&limit));
                 }
-                let class =
-                    events::classify_event_failure(&payload).and_then(|failure| failure.class);
+                let failure = events::classify_event_failure(&payload);
+                let class = failure.as_ref().and_then(|failure| failure.class);
                 if retryable_live_start_payload(&payload, &message) {
                     let lower_message = message.to_ascii_lowercase();
                     let status = class
@@ -1020,8 +1020,14 @@ async fn live_stream_response_once(
                     compaction.attempt,
                 );
                 if let Some(class) = class {
+                    // The classifier's message, as the buffered paths answer
+                    // with, so a code that stands in for a missing message
+                    // does so here too.
+                    let native = failure
+                        .as_ref()
+                        .map_or(message.as_str(), |failure| failure.message.as_str());
                     return LiveStreamStart::Response(classified_error_response(
-                        class, &message, None,
+                        class, native, None,
                     ));
                 }
                 return LiveStreamStart::Response(map_codex_failure_to_response(&message));
@@ -1252,14 +1258,24 @@ fn remaining_live_stream_response(
                                 &request_continuation,
                                 compaction.attempt,
                             );
-                            let error_type = events::classify_event_failure(&payload)
-                                .and_then(|failure| failure.class)
-                                .map_or("api_error", events::CodexErrorClass::error_type);
-                            let chunk = translator.error_chunk(
-                                client_error_text(&message, error_type),
-                                error_type,
-                                ctx.traffic.as_deref(),
-                            );
+                            // A spent window after output started is still a
+                            // rate limit, told the way the status line would
+                            // have told it, and the gauge learns of it.
+                            let limit = events::usage_limit_from_event(&payload);
+                            if let Some(limit) = limit.as_ref() {
+                                rate_limits::observe_usage_limit(limit);
+                            }
+                            let (error_type, text) = match limit.as_ref() {
+                                Some(limit) => ("rate_limit_error", limit.message.as_str()),
+                                None => {
+                                    let error_type = events::classify_event_failure(&payload)
+                                        .and_then(|failure| failure.class)
+                                        .map_or("api_error", events::CodexErrorClass::error_type);
+                                    (error_type, client_error_text(&message, error_type))
+                                }
+                            };
+                            let chunk =
+                                translator.error_chunk(text, error_type, ctx.traffic.as_deref());
                             // The status left with the first chunk, so the
                             // failure travels beside the body instead.
                             outcome.fail(message);
@@ -1562,7 +1578,11 @@ fn with_rate_limit_headers(mut response: Response) -> Response {
 /// `Retry-After` is deliberately absent: clients sleep for its full value, and
 /// here that is hours. `x-should-retry: false` stops the retry loop instead,
 /// which is the honest signal — a spent window does not reopen on a backoff.
+///
+/// The window the limit names is recorded as spent until its reset
+/// (`rate_limits::observe_usage_limit`), so later responses carry it.
 fn usage_limit_response(limit: &events::CodexUsageLimit) -> Response {
+    rate_limits::observe_usage_limit(limit);
     let mut headers = HeaderMap::new();
     headers.insert(
         HeaderName::from_static("x-should-retry"),
@@ -1693,10 +1713,13 @@ fn classified_error_response(
     retry_after: Option<&str>,
 ) -> Response {
     let error_type = class.error_type();
-    let native = if native.trim().is_empty() {
-        generic_error_text(error_type)
-    } else {
+    let native = if !native.trim().is_empty() {
         native
+    } else if class == events::CodexErrorClass::ModelNotFound {
+        // As the Codex CLI does, the code stands in for an empty message.
+        "model_not_found"
+    } else {
+        generic_error_text(error_type)
     };
     if class == events::CodexErrorClass::ContextOverflow {
         return context_overflow_response(native);
@@ -1723,7 +1746,8 @@ fn classified_error_response(
         events::CodexErrorClass::Overloaded => retry_after.map(events::normalize_retry_after),
         events::CodexErrorClass::UsageNotIncluded
         | events::CodexErrorClass::Rejected
-        | events::CodexErrorClass::ContextOverflow => None,
+        | events::CodexErrorClass::ContextOverflow
+        | events::CodexErrorClass::ModelNotFound => None,
     };
     match retry_after {
         Some(retry_after) => ([(http::header::RETRY_AFTER, retry_after)], response).into_response(),
@@ -1779,6 +1803,7 @@ fn generic_error_text(error_type: &str) -> &'static str {
         "invalid_request_error" => "Invalid request",
         "permission_error" => "Permission denied",
         "request_too_large" => "Request too large",
+        "not_found_error" => "Not found",
         _ => "Internal server error",
     }
 }
@@ -1995,6 +2020,12 @@ mod tests {
                 StatusCode::from_u16(529).unwrap(),
                 "overloaded_error",
             ),
+            (
+                events::CodexErrorClass::ModelNotFound,
+                400,
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+            ),
         ];
         for (class, backend_status, status, error_type) in cases {
             let response = map_codex_error_to_response(&classified_codex_error(
@@ -2008,6 +2039,102 @@ mod tests {
             assert_eq!(body["error"]["type"], error_type, "{class:?}");
             assert_eq!(body["error"]["message"], "toy backend message", "{class:?}");
         }
+    }
+
+    /// What a client gets for a failure event that reached it before any
+    /// output, through the same classification the buffered paths use.
+    fn response_to_failure_event(payload: serde_json::Value) -> Response {
+        let failure = events::classify_event_failure(&payload).expect("a failure event");
+        map_codex_error_to_response(&client::CodexError {
+            status: failure.status,
+            message: failure.message.clone(),
+            detail: Some(failure.message),
+            retry_after: failure.retry_after,
+            usage_limit: None,
+            class: failure.class,
+            origin: client::CodexErrorOrigin::BufferedHttp,
+        })
+    }
+
+    #[tokio::test]
+    async fn no_capacity_is_an_overload_with_only_the_delay_it_names() {
+        let cases = [
+            (serde_json::json!({}), None),
+            (serde_json::json!({"status": 503}), None),
+            (serde_json::json!({"retry_after": 1.5}), Some("2")),
+            (
+                serde_json::json!({"status": 503, "retry_after": 7}),
+                Some("7"),
+            ),
+        ];
+        for (extra, retry_after) in cases {
+            let mut payload = serde_json::json!({
+                "type": "error",
+                "error": {"code": "policy_capacity_unavailable", "message": "toy capacity message"}
+            });
+            if let Some(status) = extra.get("status") {
+                payload["status"] = status.clone();
+            }
+            if let Some(delay) = extra.get("retry_after") {
+                payload["error"]["retry_after"] = delay.clone();
+            }
+            let response = response_to_failure_event(payload);
+            assert_eq!(response.status().as_u16(), 529, "{extra}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                retry_after,
+                "{extra}"
+            );
+            let body = error_body(response).await;
+            assert_eq!(body["error"]["type"], "overloaded_error", "{extra}");
+            assert_eq!(body["error"]["message"], "toy capacity message", "{extra}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_model_is_answered_as_not_found() {
+        let cases = [
+            (
+                serde_json::json!({"type": "error", "error": {
+                    "code": "model_not_found", "message": "toy model message"
+                }}),
+                "toy model message",
+            ),
+            (
+                serde_json::json!({"type": "error", "status": 400, "error": {
+                    "code": "model_not_found", "message": "toy model message"
+                }}),
+                "toy model message",
+            ),
+            (
+                serde_json::json!({"type": "response.failed", "response": {"error": {
+                    "type": "model_not_found"
+                }}}),
+                "model_not_found",
+            ),
+        ];
+        for (payload, message) in cases {
+            let response = response_to_failure_event(payload.clone());
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{payload}");
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+            let body = error_body(response).await;
+            assert_eq!(body["error"]["type"], "not_found_error", "{payload}");
+            assert_eq!(body["error"]["message"], message, "{payload}");
+        }
+        // An empty message from any other source is named by the code too.
+        let response = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::ModelNotFound,
+            404,
+            "",
+            None,
+        ));
+        assert_eq!(
+            error_body(response).await["error"]["message"],
+            "model_not_found"
+        );
     }
 
     #[tokio::test]
@@ -3272,42 +3399,88 @@ mod tests {
     async fn retryable_live_failure_aborts_request_state_after_one_attempt() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
-        let status = run_live_failure_case(
+        let response = run_live_failure_case(
             "live-retryable-failure-cleanup",
             serde_json::json!({
+                "type": "error",
+                "error": {"code": "rate_limit_exceeded", "message": "Please slow down."}
+            }),
+            1,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key("x-should-retry"));
+    }
+
+    #[tokio::test]
+    async fn terminal_rate_limit_snapshot_fails_a_live_start_as_a_spent_window() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let response = run_live_failure_case(
+            "live-terminal-snapshot-cleanup",
+            serde_json::json!({
                 "type": "codex.rate_limits",
+                "credits": {"has_credits": false, "unlimited": false},
                 "rate_limits": {
                     "allowed": false,
                     "limit_reached": true,
-                    "primary": {"reset_after_seconds": 0}
+                    "primary": {
+                        "used_percent": 100.0,
+                        "window_minutes": 300,
+                        "reset_after_seconds": 9569,
+                        "reset_at": 1788879437u64
+                    },
+                    "secondary": {
+                        "used_percent": 40.0,
+                        "window_minutes": 10080,
+                        "reset_after_seconds": 596369,
+                        "reset_at": 1789466238u64
+                    }
                 }
             }),
             1,
         )
-        .await
-        .status();
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["x-should-retry"], "false");
+        assert_eq!(
+            response.headers()["anthropic-ratelimit-unified-status"],
+            "rejected"
+        );
+        assert_eq!(
+            response.headers()["anthropic-ratelimit-unified-reset"],
+            "1788879437"
+        );
+        assert_eq!(
+            response.headers()["anthropic-ratelimit-unified-representative-claim"],
+            "five_hour"
+        );
+        assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["message"], "Usage limit reached");
     }
 
     #[tokio::test]
     async fn excessive_retry_after_aborts_live_request_state() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
-        let status = run_live_failure_case(
+        let response = run_live_failure_case(
             "live-excessive-retry-after-cleanup",
             serde_json::json!({
-                "type": "codex.rate_limits",
-                "rate_limits": {
-                    "allowed": false,
-                    "limit_reached": true,
-                    "primary": {"reset_after_seconds": 31}
+                "type": "error",
+                "error": {
+                    "code": "rate_limit_exceeded",
+                    "message": "Please slow down.",
+                    "retry_after": 31
                 }
             }),
             1,
         )
-        .await
-        .status();
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "31");
     }
 
     #[tokio::test]

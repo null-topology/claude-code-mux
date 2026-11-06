@@ -869,6 +869,18 @@ relative reset still gets its window from the `X-Codex-*` headers; a header
 inside the event payload wins over the HTTP one. Only the explicit
 `usage_limit_reached` type is
 terminal; a transient 429 that happens to carry a reset clock stays retryable.
+A `codex.rate_limits` event reporting `limit_reached` with no usable credits
+(`is_terminal_rate_limit_event`: neither `credits.has_credits` nor
+`credits.unlimited` true) is answered as a spent window too, on every one of
+those paths. It carries no error object, so its reset and claim come from its
+own windows (`rate_limits::limiting_window`): the one window at or past 100%,
+else the only window reported; two spent windows, or two that are not, name
+neither. Every spent-window answer (`usage_limit_response`) records the window
+it names as spent until its reset (`rate_limits::observe_usage_limit`). A
+spent window after output started, as an error event or as that snapshot,
+ends the stream with an SSE `error` of type `rate_limit_error` and the same
+message, and records the window the same way; the status line has already
+left, so it carries no headers.
 The representative claim is published only for a window duration that
 `claimable_window` in `rate_limits.rs` recognises (around 300 minutes for the
 five hour window, around 10080 for the weekly one; Codex has reported 299),
@@ -878,6 +890,10 @@ because clients sleep for its full value, which here is hours. Healthy
 readings become `-5h-utilization` / `-5h-reset` / `-7d-*`, and a window past
 its threshold (`CCP_CODEX_QUOTA_WARN_AT`, defaults 0.9 session / 0.75 weekly)
 adds `-surpassed-threshold`; readings whose reset time has passed are dropped.
+A reading drops a window, not the whole reading, when its `window_minutes`,
+`used_percent`, reset moment or countdown is not a finite, non-negative number
+in range (numeric strings are still read), and a countdown is added to the
+clock with saturating arithmetic (`window_state`).
 
 Other failures are classified by their error code first (`error_class` in
 `events.rs`, `CodexErrorClass`), in event payloads (`error`,
@@ -899,8 +915,13 @@ code decides over the status and the message heuristics:
   context window message path (`context_overflow_response`), native text kept;
 - `slow_down`, `rate_limit_exceeded`: 429 with `Retry-After` from the payload,
   else from the message's `try again in N s|ms|seconds`;
-- `server_is_overloaded`: 529 `overloaded_error`, with `Retry-After` only when
-  the payload carries one.
+- `server_is_overloaded`, and `policy_capacity_unavailable` as code or type:
+  529 `overloaded_error`, native text kept, with `Retry-After` only when the
+  payload carries one;
+- `model_not_found` (code or type), whatever status came with it or none:
+  404 `not_found_error` with the native text, else `model_not_found`.
+
+`usage_limit_reached` keeps precedence over every class.
 
 A classified `Retry-After` is normalised (`normalize_retry_after`): a number
 is rounded up to whole seconds, at least 1; anything else (an HTTP date)
