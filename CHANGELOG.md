@@ -2,8 +2,9 @@
 
 - `proxy.log` now keeps at most five rotated files. Past 20 MiB the log is
   still renamed to `proxy.<millis>` in the state dir, and that rotation now
-  deletes every `proxy.<millis>` file there except the five newest. Before,
-  rotated files were never removed. There is no setting to keep more: copy a
+  deletes every `proxy.<millis>` file there except the one it just created
+  and the four newest others, so the log just rotated is kept even after the
+  system clock went back. Before, rotated files were never removed. There is no setting to keep more: copy a
   rotated log somewhere else if you want to keep it.
 - Fix: a log field longer than 4000 bytes with a multibyte character across
   the 4000-byte mark no longer panics while being shortened. Such fields
@@ -13,11 +14,21 @@
   is now cut at the last whole character, and the `…[N more]` suffix counts
   the bytes left out.
 - Fix: an environment variable whose value is not valid Unicode no longer
-  makes the proxy panic when it reads its configuration. Such a variable now
-  counts as unset. If it is `PORT` or a `CCP_*` variable, its setting comes
-  from `config.json` or the default, and the startup `config summary` warns
-  with the variable's name (never its value). Set the variable to a valid
-  value to use it again.
+  makes the proxy panic, at startup or when it reads its configuration.
+  - A setting read as text counts as unset with such a value. For `PORT` and
+    the `CCP_*` variables other than the path ones below, the setting comes
+    from `config.json` or the default, and the startup `config summary`
+    warns with the variable's name (never its value). Set the variable to a
+    valid value to use it again.
+  - Variables that hold a path keep a path that is not valid UTF-8 and apply
+    as set: `CCP_CONFIG_DIR`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `APPDATA`,
+    `LOCALAPPDATA`, `HOME` and `USERPROFILE` for the config and state
+    directories, and `CCP_CODEX_AUTH_FILE` and `CODEX_HOME` for the Codex CLI
+    login file. The `config summary` never names them.
+  - `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` with such a value
+    count as unset for the Codex backend, with no warning, in either spelling.
+    When the uppercase one is not valid Unicode, a valid lowercase one
+    applies.
 - Fix: in a terminal too small for the help (`?`) or setup (`b`) popup, the
   monitor no longer exits with a panic. The popup is now cut to the window.
   Normal sizes look the same as before.

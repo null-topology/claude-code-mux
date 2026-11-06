@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -599,7 +600,16 @@ struct ProxyEnvironment {
 
 impl ProxyEnvironment {
     fn from_env() -> Self {
-        if std::env::var_os("REQUEST_METHOD").is_some() {
+        Self::from_lookup(|name| std::env::var_os(name))
+    }
+
+    /// The proxy settings from the variables `var` returns. For each setting
+    /// the uppercase spelling is consulted before the lowercase one, and a
+    /// spelling whose value is not valid Unicode counts as unset, so the other
+    /// one applies; such a value cannot name a proxy, and taking it for an
+    /// invalid URL would panic while the client is built at startup.
+    fn from_lookup(var: impl Fn(&str) -> Option<OsString>) -> Self {
+        if var("REQUEST_METHOD").is_some() {
             return Self {
                 http_proxy: None,
                 https_proxy: None,
@@ -609,15 +619,13 @@ impl ProxyEnvironment {
             };
         }
 
-        let no_proxy_value = std::env::var("NO_PROXY")
-            .or_else(|_| std::env::var("no_proxy"))
-            .ok();
+        let no_proxy_value = unicode_env_value(&var, "NO_PROXY", "no_proxy");
         Self {
-            http_proxy: proxy_env_value("HTTP_PROXY", "http_proxy")
+            http_proxy: proxy_env_value(&var, "HTTP_PROXY", "http_proxy")
                 .unwrap_or_else(|name| panic!("invalid {name} proxy URL")),
-            https_proxy: proxy_env_value("HTTPS_PROXY", "https_proxy")
+            https_proxy: proxy_env_value(&var, "HTTPS_PROXY", "https_proxy")
                 .unwrap_or_else(|name| panic!("invalid {name} proxy URL")),
-            all_proxy: proxy_env_value("ALL_PROXY", "all_proxy")
+            all_proxy: proxy_env_value(&var, "ALL_PROXY", "all_proxy")
                 .unwrap_or_else(|name| panic!("invalid {name} proxy URL")),
             no_proxy: no_proxy_value
                 .as_deref()
@@ -687,14 +695,26 @@ fn codex_http_client(proxy_environment: &ProxyEnvironment) -> reqwest::Client {
         .expect("failed to create HTTP client")
 }
 
+/// The value of `uppercase`, else of `lowercase`, skipping a spelling that is
+/// unset or not valid Unicode.
+fn unicode_env_value(
+    var: &impl Fn(&str) -> Option<OsString>,
+    uppercase: &str,
+    lowercase: &str,
+) -> Option<String> {
+    [uppercase, lowercase]
+        .into_iter()
+        .find_map(|name| var(name)?.into_string().ok())
+}
+
 fn proxy_env_value(
+    var: &impl Fn(&str) -> Option<OsString>,
     uppercase: &'static str,
     lowercase: &'static str,
 ) -> Result<Option<String>, &'static str> {
-    let Some(raw) = std::env::var_os(uppercase).or_else(|| std::env::var_os(lowercase)) else {
+    let Some(raw) = unicode_env_value(var, uppercase, lowercase) else {
         return Ok(None);
     };
-    let raw = raw.into_string().map_err(|_| uppercase)?;
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(None);
@@ -3675,6 +3695,83 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.bytes().await.unwrap(), b"{}".as_slice());
         server.await.unwrap();
+    }
+
+    /// A lookup over a fixed set of variables, so these tests leave the
+    /// process environment, which other tests build clients from, untouched.
+    fn env_lookup(vars: Vec<(&'static str, OsString)>) -> impl Fn(&str) -> Option<OsString> {
+        let vars: std::collections::HashMap<&str, OsString> = vars.into_iter().collect();
+        move |name| vars.get(name).cloned()
+    }
+
+    #[cfg(unix)]
+    fn not_unicode() -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(b"127.0.0.1:\xff".to_vec())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_proxy_variables_count_as_unset() {
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ] {
+            let proxies = ProxyEnvironment::from_lookup(env_lookup(vec![(name, not_unicode())]));
+            assert_eq!(proxies.http_proxy, None, "{name}");
+            assert_eq!(proxies.https_proxy, None, "{name}");
+            assert_eq!(proxies.all_proxy, None, "{name}");
+            assert_eq!(proxies.no_proxy_value, None, "{name}");
+            assert!(proxies.no_proxy.is_none(), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_uppercase_proxy_variable_yields_to_the_lowercase_one() {
+        let proxies = ProxyEnvironment::from_lookup(env_lookup(vec![
+            ("HTTP_PROXY", not_unicode()),
+            ("http_proxy", "127.0.0.1:3128".into()),
+            ("HTTPS_PROXY", not_unicode()),
+            ("https_proxy", "http://127.0.0.1:3129".into()),
+            ("ALL_PROXY", not_unicode()),
+            ("all_proxy", "socks5h://127.0.0.1:1080".into()),
+            ("NO_PROXY", not_unicode()),
+            ("no_proxy", "localhost".into()),
+        ]));
+        assert_eq!(proxies.http_proxy, normalize_proxy_url("127.0.0.1:3128"));
+        assert_eq!(
+            proxies.https_proxy,
+            normalize_proxy_url("http://127.0.0.1:3129")
+        );
+        assert_eq!(
+            proxies.all_proxy,
+            normalize_proxy_url("socks5h://127.0.0.1:1080")
+        );
+        assert!(proxies.http_proxy.is_some() && proxies.all_proxy.is_some());
+        assert_eq!(proxies.no_proxy_value.as_deref(), Some("localhost"));
+        assert!(proxies.no_proxy.is_some());
+    }
+
+    #[test]
+    fn unicode_proxy_variables_keep_their_precedence() {
+        // The uppercase spelling wins, and an empty one still means no proxy
+        // rather than falling through to the lowercase spelling.
+        let proxies = ProxyEnvironment::from_lookup(env_lookup(vec![
+            ("HTTP_PROXY", "127.0.0.1:3128".into()),
+            ("http_proxy", "127.0.0.1:3130".into()),
+            ("HTTPS_PROXY", "".into()),
+            ("https_proxy", "127.0.0.1:3131".into()),
+        ]));
+        assert_eq!(proxies.http_proxy, normalize_proxy_url("127.0.0.1:3128"));
+        assert_eq!(proxies.https_proxy, None);
+        assert_eq!(proxies.all_proxy, None);
     }
 
     #[tokio::test]
