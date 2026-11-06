@@ -749,7 +749,9 @@ byte-exact.
   and write only. That is the Codex CLI's own lock only when the path is
   `$CODEX_HOME/auth.json`, so `CCP_CODEX_AUTH_FILE` must name that file. A
   symlinked `auth.json` is resolved under the lock, and the temp file and the
-  rename go to the target's directory, so the link stays a link. It writes
+  rename go to the target's directory, so the link stays a link; a link whose
+  target is missing is a changed login to `save_refreshed` and refused by the
+  whole-login `save`, and stays a link either way. It writes
   only into a file that still holds the access token and the refresh token it
   refreshed from (and the same `account_id` when both are known). It changes
   only `tokens.access_token`, `tokens.refresh_token` and `tokens.id_token` when
@@ -768,23 +770,44 @@ byte-exact.
     drops the refreshed tokens, and the request uses the stored token while
     it is unexpired and, on the forced refresh, differs from the rejected
     token (`usable_after_login_change`);
-  - a write that fails once the file was read (encode, temp file, write,
-    rename) or a lock that cannot be taken logs one
-    `codex_token_writeback_failed` warning and serves the refreshed token,
-    leaving the file unchanged.
+  - a write that fails for an I/O reason (`WritebackError::Io`: `auth.lock`
+    that cannot be opened or locked, encode, temp file, write, rename) logs
+    one `codex_token_writeback_failed` warning with no fields and serves the
+    refreshed token, leaving the file unchanged.
+  Tokens whose write failed that way stay in `UNWRITTEN_REFRESHES` in
+  `manager.rs`, in memory only and never logged, keyed by the store path and
+  matched on the access and refresh token they replaced. While the file
+  still holds that pair, `load` and `load_locked` serve them, `get_auth`
+  writes them again (`write_back` with `fresh` false, which logs nothing),
+  and a due refresh exchanges their own refresh token and writes over the
+  file's pair; once the file holds anything else, a missing file included,
+  they are dropped. The exchange and the writeback run in a `tokio::spawn`ed
+  task that owns the single-flight guard (`lock_owned`), so a caller dropped
+  mid-request neither frees the lock early nor loses the tokens; no `std`
+  mutex is held across an await. A writeback that finds a changed login
+  reads the store again with `load_locked`. `load_locked` itself falls back
+  to a plain read when `auth.lock` cannot be taken, as the Codex CLI's own
+  read takes no lock (`codex-rs/login/src/auth/storage.rs` at rust-v0.166.0)
+  and a read-only home must keep working.
   The same rule for another login covers a stored token that changed before
   the request went out and the re-read under `auth.lock` after the token
   endpoint answered 401 or 403. A proactive refresh that fails for any reason
   while the stored token, read again under the lock, is unexpired keeps using
   it with one `codex_token_refresh_failed_using_stored_token` warning carrying
   only `class` and `status`; the forced refresh after an upstream 401 never
-  does. A transient failure (the endpoint unreachable, a timeout, 429, 5xx,
-  `TransientRefreshError`) answers the client 503 `api_error` with the fixed
-  message `Codex token refresh is temporarily unavailable` (`auth_error` in
-  `client.rs`, at every `get_auth` site and in `auth_refresh_error`); any
-  other failure answers 401. The forced refresh inside
-  `post_codex_with_transport` still answers 401 for every failure. No refresh
-  error carries the token endpoint's response body.
+  does. `PROACTIVE_REFRESH_FAILURES` remembers the last failed proactive
+  refresh per store path and access token: the proactive path then serves
+  the unexpired stored token without an exchange for
+  `TRANSIENT_REFRESH_BACKOFF` (60 s) after a transient failure, and after
+  any other failure until the access token changes; the forced path neither
+  reads nor writes it. A transient failure (the endpoint unreachable, a
+  timeout, 429, 5xx, `TransientRefreshError`) answers the client 503
+  `api_error` with the fixed message `Codex token refresh is temporarily
+  unavailable` (`auth_error` at every `get_auth` site in `client.rs`,
+  `auth_refresh_error` at every `force_refresh` site there); any other
+  failure answers 401. The model listing maps the same split to
+  `ModelsError::Unreachable` and `Unauthorized` (`auth_models_error` in
+  `models.rs`). No refresh error carries the token endpoint's response body.
 
 ## Codex rate limits
 

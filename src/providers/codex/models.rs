@@ -23,7 +23,7 @@ use crate::config;
 use crate::provider::{ModelCapabilities, model_info};
 
 use super::auth::constants::{CODEX_CLIENT_VERSION, ORIGINATOR};
-use super::auth::manager::CodexAuthManager;
+use super::auth::manager::{CodexAuthManager, TransientRefreshError};
 use super::auth::token_store::{StoredAuth, codex_auth_file};
 use super::client::forward_client_headers;
 use super::translate::model_allowlist::full_lane_web_search_model;
@@ -340,11 +340,21 @@ fn build_request(
     Ok(request)
 }
 
+/// A failure to obtain a Codex token: a refresh that may pass is `Unreachable`,
+/// anything else `Unauthorized`.
+fn auth_models_error(error: anyhow::Error) -> ModelsError {
+    if error.downcast_ref::<TransientRefreshError>().is_some() {
+        ModelsError::Unreachable(error.to_string())
+    } else {
+        ModelsError::Unauthorized(error.to_string())
+    }
+}
+
 /// Ask the backend which models this login may use. A 401 triggers one token
 /// refresh and one retry, mirroring the completions path. The result of a
 /// successful call that names at least one model is remembered for routing
 /// (see [`is_discovered_model`]).
-pub async fn fetch_models<S: AuthStorage<StoredAuth>>(
+pub async fn fetch_models<S: AuthStorage<StoredAuth> + 'static>(
     client: &reqwest::Client,
     auth_manager: &CodexAuthManager<S>,
     base_url: &str,
@@ -355,10 +365,7 @@ pub async fn fetch_models<S: AuthStorage<StoredAuth>>(
         models_endpoint(base_url),
         client_version()
     );
-    let mut auth = auth_manager
-        .get_auth()
-        .await
-        .map_err(|error| ModelsError::Unauthorized(error.to_string()))?;
+    let mut auth = auth_manager.get_auth().await.map_err(auth_models_error)?;
     let mut refresh_attempted = false;
     loop {
         let request = build_request(client, &url, &auth, client_headers)
@@ -377,7 +384,7 @@ pub async fn fetch_models<S: AuthStorage<StoredAuth>>(
             auth = auth_manager
                 .force_refresh(&auth.access)
                 .await
-                .map_err(|error| ModelsError::Unauthorized(error.to_string()))?;
+                .map_err(auth_models_error)?;
             continue;
         }
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -756,5 +763,40 @@ mod tests {
         let snippet = body_snippet(long.as_bytes());
         assert!(snippet.ends_with('…'));
         assert!(snippet.len() <= 204);
+    }
+
+    /// A token refresh that may pass leaves the listing unreachable; a login that
+    /// needs `codex login` again leaves it unauthorized.
+    #[tokio::test]
+    async fn a_token_refresh_outage_is_unreachable_and_a_dead_login_unauthorized() {
+        use super::super::auth::token_store::{CodexCliAuthStore, CodexTokenStore};
+        // Nothing listens on port 1, so the refresh cannot reach the endpoint; without
+        // a refresh token only a new login helps.
+        for (refresh, unreachable) in [("refresh-test", true), ("", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let manager = CodexAuthManager::new_with_token_endpoint(
+                CodexTokenStore::codex_cli(CodexCliAuthStore::new(dir.path().join("auth.json"))),
+                "http://127.0.0.1:1/oauth/token".to_string(),
+            );
+            manager.set_test_auth(StoredAuth {
+                access: "expired".to_string(),
+                refresh: refresh.to_string(),
+                expires: 0,
+                account_id: Some("acct".to_string()),
+            });
+            let error = fetch_models(
+                &reqwest::Client::new(),
+                &manager,
+                "http://127.0.0.1:1/responses",
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                matches!(error, ModelsError::Unreachable(_)),
+                unreachable,
+                "refresh token {refresh:?}: {error:?}"
+            );
+        }
     }
 }

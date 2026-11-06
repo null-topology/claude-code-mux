@@ -1,9 +1,7 @@
-use std::sync::Arc;
-use std::sync::LazyLock;
-#[cfg(test)]
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex as AsyncMutex;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use super::constants::{CLIENT_ID, ISSUER, REFRESH_MARGIN_MS};
 use super::jwt::{
@@ -15,6 +13,58 @@ use crate::logging::create_logger;
 
 static CODEX_REFRESH_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
     LazyLock::new(|| Arc::new(AsyncMutex::new(())));
+
+/// Tokens a refresh obtained but could not write back, per store path. They stand in
+/// for the login they replaced (`refreshed_access` and `refreshed_from`) while the
+/// store still holds it, and are dropped once it holds anything else. They live in
+/// memory only and are never logged.
+static UNWRITTEN_REFRESHES: LazyLock<Mutex<HashMap<String, RefreshedTokens>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The last failed proactive refresh, per store path.
+static PROACTIVE_REFRESH_FAILURES: LazyLock<Mutex<HashMap<String, RefreshFailure>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How long the proactive refresh is not tried again after a transient failure.
+const TRANSIENT_REFRESH_BACKOFF: Duration = Duration::from_secs(60);
+
+struct RefreshFailure {
+    access: String,
+    at: Instant,
+    transient: bool,
+}
+
+fn unwritten_refreshes() -> MutexGuard<'static, HashMap<String, RefreshedTokens>> {
+    UNWRITTEN_REFRESHES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn proactive_refresh_failures() -> MutexGuard<'static, HashMap<String, RefreshFailure>> {
+    PROACTIVE_REFRESH_FAILURES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What the store holds, and what requests use in its place.
+struct Loaded {
+    /// The store's own reading.
+    stored: StoredAuth,
+    /// `stored`, or the tokens of a refresh that could not write them back.
+    auth: StoredAuth,
+    /// Those tokens, when `auth` comes from them.
+    unwritten: Option<RefreshedTokens>,
+}
+
+impl Loaded {
+    fn stored(stored: StoredAuth) -> Self {
+        Self {
+            auth: stored.clone(),
+            stored,
+            unwritten: None,
+        }
+    }
+}
 
 const NO_CREDENTIALS: &str =
     "No Codex credentials. Log in with the Codex CLI (`codex login`) to create ~/.codex/auth.json";
@@ -94,7 +144,7 @@ fn same_credentials(a: &StoredAuth, b: &StoredAuth) -> bool {
 }
 
 pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
-    pub store: CodexTokenStore<S>,
+    pub store: Arc<CodexTokenStore<S>>,
     #[cfg(test)]
     test_auth: Arc<Mutex<Option<StoredAuth>>>,
     refresh_lock: Arc<AsyncMutex<()>>,
@@ -102,7 +152,7 @@ pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
     token_endpoint: String,
 }
 
-impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
+impl<S: AuthStorage<StoredAuth> + 'static> CodexAuthManager<S> {
     pub fn new(store: CodexTokenStore<S>) -> Self {
         Self::new_with_token_endpoint(store, format!("{ISSUER}/oauth/token"))
     }
@@ -112,7 +162,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         token_endpoint: String,
     ) -> Self {
         Self {
-            store,
+            store: Arc::new(store),
             #[cfg(test)]
             test_auth: Arc::new(Mutex::new(None)),
             refresh_lock: CODEX_REFRESH_LOCK.clone(),
@@ -125,6 +175,18 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         }
     }
 
+    /// A handle on the same store, lock and endpoint, for the task a refresh runs in.
+    fn shared(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            #[cfg(test)]
+            test_auth: self.test_auth.clone(),
+            refresh_lock: self.refresh_lock.clone(),
+            refresh_client: self.refresh_client.clone(),
+            token_endpoint: self.token_endpoint.clone(),
+        }
+    }
+
     fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -133,12 +195,13 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
     }
 
     pub async fn get_auth(&self) -> Result<StoredAuth, anyhow::Error> {
-        let stored = self
-            .load_auth()?
+        let loaded = self
+            .load()?
             .ok_or_else(|| anyhow::anyhow!(NO_CREDENTIALS))?;
 
-        if stored.expires > Self::now_ms() + REFRESH_MARGIN_MS {
-            return Ok(stored);
+        // Tokens that could not be written back are written again first.
+        if loaded.unwritten.is_none() && loaded.auth.expires > Self::now_ms() + REFRESH_MARGIN_MS {
+            return Ok(loaded.auth);
         }
 
         match self.refresh(false, None).await {
@@ -147,7 +210,11 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
                 // A proactive refresh that failed in any way keeps using the stored
                 // token while it is still valid. The store is read again under
                 // `auth.lock`; a file that cannot be read keeps the refresh error.
-                match self.load_auth_locked().await {
+                match self
+                    .load_locked()
+                    .await
+                    .map(|loaded| loaded.map(|l| l.auth))
+                {
                     Ok(Some(stored)) if stored.expires > Self::now_ms() => {
                         let (class, status) = refresh_failure_fields(&err);
                         let fields = serde_json::Map::from_iter([
@@ -170,7 +237,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         self.refresh(true, Some(rejected_access)).await
     }
 
-    fn load_auth(&self) -> Result<Option<StoredAuth>, anyhow::Error> {
+    fn load(&self) -> Result<Option<Loaded>, anyhow::Error> {
         #[cfg(test)]
         if let Some(auth) = self
             .test_auth
@@ -178,15 +245,15 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .clone()
         {
-            return Ok(Some(auth));
+            return Ok(Some(Loaded::stored(auth)));
         }
 
-        self.store.load_auth()
+        Ok(self.with_unwritten(self.store.load_auth()?))
     }
 
-    /// `load_auth`, with the file read under the Codex CLI's `auth.lock` so a write in
+    /// `load`, with the file read under the Codex CLI's `auth.lock` so a write in
     /// progress is seen whole.
-    async fn load_auth_locked(&self) -> Result<Option<StoredAuth>, anyhow::Error> {
+    async fn load_locked(&self) -> Result<Option<Loaded>, anyhow::Error> {
         #[cfg(test)]
         if let Some(auth) = self
             .test_auth
@@ -194,10 +261,80 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .clone()
         {
-            return Ok(Some(auth));
+            return Ok(Some(Loaded::stored(auth)));
         }
 
-        self.store.load_auth_locked().await
+        let stored = self.store.load_auth_locked().await?;
+        Ok(self.with_unwritten(stored))
+    }
+
+    /// The store's reading, with the tokens of a refresh that could not write them
+    /// back in place of the login they replaced while the store still holds it. Once
+    /// it holds anything else, a missing file included, those tokens are dropped.
+    fn with_unwritten(&self, stored: Option<StoredAuth>) -> Option<Loaded> {
+        let mut slots = unwritten_refreshes();
+        let path = self.store.auth_path();
+        let Some(unwritten) = slots.get(&path) else {
+            return stored.map(Loaded::stored);
+        };
+        match stored {
+            Some(stored)
+                if stored.access == unwritten.refreshed_access
+                    && stored.refresh == unwritten.refreshed_from =>
+            {
+                let unwritten = unwritten.clone();
+                Some(Loaded {
+                    auth: unwritten.clone().into_stored(stored.account_id.clone()),
+                    stored,
+                    unwritten: Some(unwritten),
+                })
+            }
+            stored => {
+                slots.remove(&path);
+                stored.map(Loaded::stored)
+            }
+        }
+    }
+
+    fn keep_unwritten(&self, refreshed: RefreshedTokens) {
+        unwritten_refreshes().insert(self.store.auth_path(), refreshed);
+    }
+
+    fn forget_unwritten(&self) {
+        unwritten_refreshes().remove(&self.store.auth_path());
+    }
+
+    /// Whether the proactive refresh of `current` failed recently enough to serve it
+    /// as it is: within `TRANSIENT_REFRESH_BACKOFF` of a transient failure, and after
+    /// any other failure until the access token changes. Only an unexpired token is
+    /// served this way.
+    fn proactive_refresh_backing_off(&self, current: &StoredAuth) -> bool {
+        current.expires > Self::now_ms()
+            && proactive_refresh_failures()
+                .get(&self.store.auth_path())
+                .is_some_and(|failure| {
+                    failure.access == current.access
+                        && (!failure.transient || failure.at.elapsed() < TRANSIENT_REFRESH_BACKOFF)
+                })
+    }
+
+    fn note_proactive_refresh(&self, access: &str, result: &Result<StoredAuth, anyhow::Error>) {
+        let mut failures = proactive_refresh_failures();
+        match result {
+            Ok(_) => {
+                failures.remove(&self.store.auth_path());
+            }
+            Err(err) => {
+                failures.insert(
+                    self.store.auth_path(),
+                    RefreshFailure {
+                        access: access.to_string(),
+                        at: Instant::now(),
+                        transient: err.downcast_ref::<TransientRefreshError>().is_some(),
+                    },
+                );
+            }
+        }
     }
 
     async fn refresh(
@@ -205,34 +342,60 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         force: bool,
         rejected_access: Option<&str>,
     ) -> Result<StoredAuth, anyhow::Error> {
-        let _refresh_guard = self.refresh_lock.lock().await;
+        let refresh_guard = self.refresh_lock.clone().lock_owned().await;
 
         // Reload from durable storage after acquiring the single-flight lock.
         // Another request may have rotated and persisted the token while this
         // caller was waiting.
-        let current = self
-            .load_auth()?
+        let loaded = self
+            .load()?
             .ok_or_else(|| anyhow::anyhow!("Not authenticated"))?;
+        let current = &loaded.auth;
 
-        if !force && current.expires > Self::now_ms() + REFRESH_MARGIN_MS {
-            return Ok(current);
+        let due = force || current.expires <= Self::now_ms() + REFRESH_MARGIN_MS;
+        if !due && loaded.unwritten.is_none() {
+            return Ok(loaded.auth);
         }
         if rejected_access.is_some_and(|access| current.access != access) {
             // Another writer replaced the rejected token while this caller waited.
-            return Self::usable_after_login_change(Some(current), rejected_access);
+            return Self::usable_after_login_change(Some(loaded.auth), rejected_access);
+        }
+        if due && !force && self.proactive_refresh_backing_off(current) {
+            return Ok(loaded.auth);
         }
 
-        self.refresh_now(&current, rejected_access).await
+        // The exchange and the writeback run in a task that owns the single-flight
+        // lock: a caller that goes away mid-request neither frees the lock early nor
+        // loses tokens the endpoint already issued.
+        let worker = self.shared();
+        let rejected_access = rejected_access.map(str::to_string);
+        let task = tokio::spawn(async move {
+            let _refresh_guard: OwnedMutexGuard<()> = refresh_guard;
+            if !due && let Some(unwritten) = loaded.unwritten {
+                return worker.write_back(unwritten, None, false).await;
+            }
+            let result = worker
+                .refresh_now(&loaded, rejected_access.as_deref())
+                .await;
+            if !force {
+                worker.note_proactive_refresh(&loaded.auth.access, &result);
+            }
+            result
+        });
+        task.await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("Codex token refresh did not finish")))
     }
 
-    /// Exchange the stored refresh token and write the result back to the login it
-    /// came from. No error text carries the token endpoint's response body: it is
-    /// controlled by the identity provider and may echo credential material.
+    /// Exchange the refresh token in use (the stored one, or that of tokens not yet
+    /// written back) and write the result back to the login the store holds. No error
+    /// text carries the token endpoint's response body: it is controlled by the
+    /// identity provider and may echo credential material.
     async fn refresh_now(
         &self,
-        current: &StoredAuth,
+        loaded: &Loaded,
         rejected_access: Option<&str>,
     ) -> Result<StoredAuth, anyhow::Error> {
+        let (stored, current) = (&loaded.stored, &loaded.auth);
         if current.refresh.is_empty() {
             anyhow::bail!("No refresh token stored; re-authenticate");
         }
@@ -264,10 +427,12 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             // flight. The file is read again under `auth.lock`, so a write in
             // progress is seen whole.
             if let Some(latest) = self.store.load_auth_locked().await?
-                && !same_credentials(&latest, current)
+                && !same_credentials(&latest, stored)
             {
+                self.forget_unwritten();
                 return Self::usable_after_login_change(Some(latest), rejected_access);
             }
+            self.forget_unwritten();
             self.store.clear_auth()?;
             return Err(PermanentRefreshError::error(
                 "rejected",
@@ -310,35 +475,67 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         })?;
         validate_token_response(&tokens)
             .map_err(|err| PermanentRefreshError::error("response", status, err.to_string()))?;
+        // Tokens not yet written back fill in what the answer leaves out, as the
+        // stored ones would.
+        let unwritten = loaded.unwritten.as_ref();
         let refreshed = RefreshedTokens {
-            refreshed_access: current.access.clone(),
-            refreshed_from: current.refresh.clone(),
-            expected_account_id: current.account_id.clone(),
+            refreshed_access: stored.access.clone(),
+            refreshed_from: stored.refresh.clone(),
+            expected_account_id: stored.account_id.clone(),
             account_id: extract_account_id(&tokens).or_else(|| current.account_id.clone()),
-            refresh_token: tokens.new_refresh_token().map(str::to_string),
+            refresh_token: tokens
+                .new_refresh_token()
+                .map(str::to_string)
+                .or_else(|| unwritten.map(|_| current.refresh.clone())),
             // An id token the Codex CLI could not decode is not written; the stored one
             // stays.
             id_token: tokens
                 .new_id_token()
                 .filter(|token| is_codex_cli_readable_jwt(token))
-                .map(str::to_string),
+                .map(str::to_string)
+                .or_else(|| unwritten.and_then(|tokens| tokens.id_token.clone())),
             expires: tokens.expires_at_ms(Self::now_ms()),
             access_token: tokens.access_token,
         };
+        self.write_back(refreshed, rejected_access, true).await
+    }
+
+    /// Write refreshed tokens back to the login they came from. Tokens that cannot be
+    /// written for an I/O reason, `auth.lock` included, are what the request uses and
+    /// are kept in memory for the next request, which writes them again; `fresh` says
+    /// they come from an exchange just made rather than from such a retry.
+    async fn write_back(
+        &self,
+        refreshed: RefreshedTokens,
+        rejected_access: Option<&str>,
+        fresh: bool,
+    ) -> Result<StoredAuth, anyhow::Error> {
         // What the request uses when the refresh is valid but cannot be written.
-        let unwritten = refreshed.clone().into_stored(current.account_id.clone());
-        match self.store.save_refreshed(refreshed).await {
-            Ok(next) => Ok(next),
+        let unwritten = refreshed
+            .clone()
+            .into_stored(refreshed.expected_account_id.clone());
+        match self.store.save_refreshed(refreshed.clone()).await {
+            Ok(next) => {
+                self.forget_unwritten();
+                Ok(next)
+            }
             Err(WritebackError::LoginChanged) => {
-                Self::usable_after_login_change(self.load_auth()?, rejected_access)
+                self.forget_unwritten();
+                let latest = self.load_locked().await?.map(|loaded| loaded.auth);
+                Self::usable_after_login_change(latest, rejected_access)
             }
             Err(WritebackError::Io(_)) => {
                 // The refresh is spent and its tokens are valid, so the request uses
                 // them; the file keeps what it held. The error names a path, so the
                 // warning carries no detail.
-                create_logger("codex").warn("codex_token_writeback_failed", None);
+                if fresh {
+                    create_logger("codex").warn("codex_token_writeback_failed", None);
+                }
+                self.keep_unwritten(refreshed);
                 Ok(unwritten)
             }
+            // A retry keeps the tokens it could not write as an I/O failure does.
+            Err(WritebackError::Unusable(_)) if !fresh => Ok(unwritten),
             Err(WritebackError::Unusable(err)) => Err(err),
         }
     }
@@ -386,6 +583,12 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         if let Ok(mut guard) = self.test_auth.lock() {
             *guard = Some(auth);
         }
+    }
+
+    /// Whether tokens a refresh could not write back are kept for this store.
+    #[cfg(test)]
+    fn holds_unwritten_refresh(&self) -> bool {
+        unwritten_refreshes().contains_key(&self.store.auth_path())
     }
 }
 
@@ -922,7 +1125,11 @@ mod tests {
         let path = auth_file(&dir, &in_window, "refresh-old");
         let before = std::fs::read(&path).unwrap();
 
+        // Each case on a store of its own: a failed proactive refresh of a token is not
+        // tried again at once.
         for status in ["503 Service Unavailable", "429 Too Many Requests"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = auth_file(&dir, &in_window, "refresh-old");
             let (endpoint, server) = token_endpoint(status, MARKER.to_string(), || {});
             let auth = file_manager(&path, endpoint).get_auth().await.unwrap();
             server.join().unwrap();
@@ -931,7 +1138,9 @@ mod tests {
         }
 
         // An unreachable token endpoint is transient as well.
-        let auth = file_manager(&path, "http://127.0.0.1:1/oauth/token".into())
+        let unreachable_dir = tempfile::TempDir::new().unwrap();
+        let unreachable_path = auth_file(&unreachable_dir, &in_window, "refresh-old");
+        let auth = file_manager(&unreachable_path, "http://127.0.0.1:1/oauth/token".into())
             .get_auth()
             .await
             .unwrap();
@@ -1113,6 +1322,7 @@ mod tests {
     #[tokio::test]
     async fn a_refresh_that_cannot_be_written_serves_the_new_token() {
         use std::os::unix::fs::PermissionsExt;
+        let _log = LOG_LOCK.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
         let path = auth_file(&dir, &jwt_expiring_in(-60), "refresh-old");
         drop(lock_auth_dir(dir.path()));
@@ -1166,5 +1376,391 @@ mod tests {
         assert_eq!(doc["tokens"]["access_token"], json!(new_access));
         assert_eq!(doc["tokens"]["refresh_token"], "refresh-old");
         assert_eq!(doc["tokens"]["id_token"], "old.id.tok");
+    }
+
+    /// Held by every test that points the proxy log at a directory of its own and by
+    /// every test that logs a writeback failure, whose warning has no field to tell
+    /// the tests apart by.
+    static LOG_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+
+    /// The proxy log in a directory of its own while it lives.
+    struct CapturedLog {
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _dir: tempfile::TempDir,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CapturedLog {
+        async fn start() -> Self {
+            let lock = LOG_LOCK.lock().await;
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut previous = Vec::new();
+            for key in ["XDG_STATE_HOME", "LOCALAPPDATA"] {
+                previous.push((key, std::env::var_os(key)));
+                unsafe {
+                    std::env::set_var(key, dir.path());
+                }
+            }
+            Self {
+                previous,
+                _dir: dir,
+                _lock: lock,
+            }
+        }
+
+        /// The logged events with this message, oldest first.
+        fn events(&self, msg: &str) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(crate::logging::log_file())
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|event| event["msg"] == msg)
+                .collect()
+        }
+    }
+
+    impl Drop for CapturedLog {
+        fn drop(&mut self) {
+            for (key, value) in self.previous.drain(..) {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A mock token endpoint that answers every request until it is dropped, with the
+    /// answers in order and the last one repeated, and keeps each request's body.
+    /// With `hold`, each answer waits for one message on it (ten seconds at most).
+    struct CountingEndpoint {
+        url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CountingEndpoint {
+        fn start(
+            answers: Vec<(&'static str, String)>,
+            hold: Option<std::sync::mpsc::Receiver<()>>,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}/oauth/token", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (seen, stopped) = (requests.clone(), stop.clone());
+            thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(err) => panic!("mock token endpoint: accept failed: {err}"),
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let body = read_request_body(&mut stream);
+                    let index = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(body);
+                        seen.len() - 1
+                    };
+                    if let Some(hold) = &hold {
+                        let _ = hold.recv_timeout(Duration::from_secs(10));
+                    }
+                    let (status, body) = &answers[index.min(answers.len() - 1)];
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    // A client that went away is not the endpoint's failure.
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            Self {
+                url,
+                requests,
+                stop,
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for CountingEndpoint {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn read_request_body(stream: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    return String::from_utf8_lossy(&request[end + 4..]).into_owned();
+                }
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    /// A directory nothing can be created in while this lives, with `auth.lock`
+    /// already there; `None` when permissions are not enforced for this user.
+    #[cfg(unix)]
+    struct ReadOnlyDir(PathBuf);
+
+    #[cfg(unix)]
+    impl ReadOnlyDir {
+        fn new(dir: &Path) -> Option<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            drop(lock_auth_dir(dir));
+            let read_only = Self(dir.to_path_buf());
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let probe = dir.join("probe");
+            if std::fs::write(&probe, b"").is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                return None;
+            }
+            Some(read_only)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReadOnlyDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unwritten_refresh_serves_later_requests_without_another_exchange() {
+        let log = CapturedLog::start().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let in_window = jwt_expiring_in(60);
+        let path = auth_file(&dir, &in_window, "refresh-old");
+        let before = std::fs::read(&path).unwrap();
+        let Some(_read_only) = ReadOnlyDir::new(dir.path()) else {
+            return;
+        };
+        let endpoint = CountingEndpoint::start(vec![("200 OK", rotated_body())], None);
+        let manager = file_manager(&path, endpoint.url.clone());
+
+        let first = manager.get_auth().await.unwrap();
+        // The second request writes again and fails again; another manager of the
+        // process sees the same tokens.
+        let second = manager.get_auth().await.unwrap();
+        let third = file_manager(&path, endpoint.url.clone())
+            .get_auth()
+            .await
+            .unwrap();
+        assert_eq!(endpoint.requests().len(), 1);
+        assert_ne!(first.access, in_window);
+        assert_eq!(first.refresh, "refresh-new");
+        assert_eq!(second, first);
+        assert_eq!(third, first);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(manager.holds_unwritten_refresh());
+
+        let warnings = log.events("codex_token_writeback_failed");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].get("fields").is_none(), "{}", warnings[0]);
+        let line = warnings[0].to_string();
+        for secret in [
+            first.access.as_str(),
+            in_window.as_str(),
+            "refresh-new",
+            "refresh-old",
+            "acct_file",
+            dir.path().to_str().unwrap(),
+        ] {
+            assert!(!line.contains(secret), "{line}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_later_successful_write_drops_the_unwritten_refresh() {
+        let _log = LOG_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = auth_file(&dir, &jwt_expiring_in(60), "refresh-old");
+        let Some(read_only) = ReadOnlyDir::new(dir.path()) else {
+            return;
+        };
+        let endpoint = CountingEndpoint::start(vec![("200 OK", rotated_body())], None);
+        let manager = file_manager(&path, endpoint.url.clone());
+        let unwritten = manager.get_auth().await.unwrap();
+        assert!(manager.holds_unwritten_refresh());
+
+        drop(read_only);
+        let written = manager.get_auth().await.unwrap();
+        assert_eq!(written, unwritten);
+        assert_eq!(endpoint.requests().len(), 1);
+        assert!(!manager.holds_unwritten_refresh());
+        let doc = read_doc(&path);
+        assert_eq!(doc["tokens"]["access_token"], json!(unwritten.access));
+        assert_eq!(doc["tokens"]["refresh_token"], "refresh-new");
+        assert_eq!(doc["tokens"]["account_id"], "acct_file");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_changed_file_drops_the_unwritten_refresh() {
+        let _log = LOG_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = auth_file(&dir, &jwt_expiring_in(60), "refresh-old");
+        let Some(read_only) = ReadOnlyDir::new(dir.path()) else {
+            return;
+        };
+        let endpoint = CountingEndpoint::start(vec![("200 OK", rotated_body())], None);
+        let manager = file_manager(&path, endpoint.url.clone());
+        manager.get_auth().await.unwrap();
+        assert!(manager.holds_unwritten_refresh());
+
+        drop(read_only);
+        let relogin = jwt_expiring_in(7200);
+        write_doc(&path, &auth_doc(&relogin, "refresh-relogin"));
+        let auth = manager.get_auth().await.unwrap();
+        assert_eq!(auth.access, relogin);
+        assert_eq!(auth.refresh, "refresh-relogin");
+        assert!(!manager.holds_unwritten_refresh());
+        assert_eq!(endpoint.requests().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unwritten_refresh_that_is_due_exchanges_its_own_refresh_token() {
+        let _log = LOG_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = auth_file(&dir, &jwt_expiring_in(60), "refresh-old");
+        let Some(read_only) = ReadOnlyDir::new(dir.path()) else {
+            return;
+        };
+        // The first answer is itself inside the refresh margin.
+        let short = json!({
+            "access_token": jwt_expiring_in(120),
+            "refresh_token": "refresh-mid",
+            "id_token": NEW_ID_TOKEN
+        })
+        .to_string();
+        let endpoint =
+            CountingEndpoint::start(vec![("200 OK", short), ("200 OK", rotated_body())], None);
+        let manager = file_manager(&path, endpoint.url.clone());
+        assert_eq!(manager.get_auth().await.unwrap().refresh, "refresh-mid");
+
+        drop(read_only);
+        let auth = manager.get_auth().await.unwrap();
+        let requests = endpoint.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].contains("refresh_token=refresh-old"),
+            "{}",
+            requests[0]
+        );
+        assert!(
+            requests[1].contains("refresh_token=refresh-mid"),
+            "{}",
+            requests[1]
+        );
+        assert_eq!(auth.refresh, "refresh-new");
+        assert!(!manager.holds_unwritten_refresh());
+        let doc = read_doc(&path);
+        assert_eq!(doc["tokens"]["access_token"], json!(auth.access));
+        assert_eq!(doc["tokens"]["refresh_token"], "refresh-new");
+        // The id token of the unwritten refresh is written with the next one.
+        assert_eq!(doc["tokens"]["id_token"], NEW_ID_TOKEN);
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_goes_away_neither_frees_the_lock_nor_loses_the_tokens() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = auth_file(&dir, &jwt_expiring_in(-60), "refresh-old");
+        let (release, hold) = std::sync::mpsc::channel();
+        let endpoint = CountingEndpoint::start(vec![("200 OK", rotated_body())], Some(hold));
+        let manager = file_manager(&path, endpoint.url.clone());
+
+        // The first caller goes away once its request reached the endpoint, which
+        // holds the answer.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        tokio::select! {
+            _ = manager.get_auth() => panic!("the first caller finished while its answer was held"),
+            () = async {
+                while endpoint.requests().is_empty() {
+                    assert!(Instant::now() < deadline, "no token request arrived");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            } => {}
+        }
+
+        // A second caller queues behind the exchange still in flight.
+        let (second, ()) = tokio::join!(manager.get_auth(), async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            release.send(()).unwrap();
+        });
+        let second = second.unwrap();
+        assert_eq!(endpoint.requests().len(), 1);
+        assert_eq!(second.refresh, "refresh-new");
+        let doc = read_doc(&path);
+        assert_eq!(doc["tokens"]["access_token"], json!(second.access));
+        assert_eq!(doc["tokens"]["refresh_token"], "refresh-new");
+    }
+
+    #[tokio::test]
+    async fn a_failed_proactive_refresh_is_not_tried_again_at_once() {
+        let log = CapturedLog::start().await;
+        for status in ["504 Gateway Timeout", "400 Bad Request"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let in_window = jwt_expiring_in(60);
+            let path = auth_file(&dir, &in_window, "refresh-old");
+            let endpoint = CountingEndpoint::start(vec![(status, MARKER.to_string())], None);
+            let manager = file_manager(&path, endpoint.url.clone());
+
+            for _ in 0..2 {
+                assert_eq!(
+                    manager.get_auth().await.unwrap().access,
+                    in_window,
+                    "{status}"
+                );
+            }
+            assert_eq!(endpoint.requests().len(), 1, "{status}");
+            // The forced refresh after an upstream 401 still asks the endpoint.
+            assert!(manager.force_refresh(&in_window).await.is_err(), "{status}");
+            assert_eq!(endpoint.requests().len(), 2, "{status}");
+        }
+
+        let warnings: Vec<_> = log
+            .events("codex_token_refresh_failed_using_stored_token")
+            .into_iter()
+            .filter(|event| event["fields"]["status"] == 504)
+            .collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let fields = warnings[0]["fields"].as_object().unwrap();
+        let mut keys: Vec<_> = fields.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["class", "status"]);
+        assert_eq!(fields["class"], "status");
     }
 }

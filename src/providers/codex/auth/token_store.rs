@@ -410,10 +410,21 @@ impl AuthStorage<StoredAuth> for CodexCliAuthStore {
         // `save_refreshed` instead, which writes only over the login it refreshed.
         let _lock = self.lock().map_err(anyhow::Error::new)?;
         // A symlinked file is replaced at its target; a missing one is created at the
-        // configured path.
+        // configured path. A link whose target is missing is refused and left as it
+        // is, as `save_refreshed` treats it as a changed login.
         let target = match self.target() {
             Ok(target) => target,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => self.path.clone(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(&self.path)
+                    .is_ok_and(|meta| meta.file_type().is_symlink())
+                {
+                    anyhow::bail!(
+                        "{} is a link to a file that does not exist",
+                        self.path.display()
+                    );
+                }
+                self.path.clone()
+            }
             Err(err) => anyhow::bail!("failed to resolve {}: {err}", self.path.display()),
         };
         // Re-read so fields the proxy does not own survive the write. A file that
@@ -993,6 +1004,30 @@ mod tests {
             .save_refreshed(refreshed_from("refresh-abc"))
             .unwrap_err();
         assert!(matches!(err, WritebackError::LoginChanged), "{err:?}");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(dir_entries(root.path()), ["auth.json", "auth.lock"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_whole_login_save_refuses_a_symlink_to_no_file_and_leaves_it() {
+        let root = tempfile::TempDir::new().unwrap();
+        let link = root.path().join("auth.json");
+        std::os::unix::fs::symlink("missing/auth.json", &link).unwrap();
+        let store = CodexCliAuthStore::new(link.clone());
+
+        let saved = store.save(StoredAuth {
+            access: ACCESS_JWT_2100.to_string(),
+            refresh: "refresh-abc".to_string(),
+            expires: u64::MAX,
+            account_id: Some("acct_file".to_string()),
+        });
+        assert!(saved.is_err());
         assert!(
             std::fs::symlink_metadata(&link)
                 .unwrap()

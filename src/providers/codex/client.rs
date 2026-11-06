@@ -1758,17 +1758,7 @@ impl CodexHttpClient {
                             full_context_continuation(active_continuation.as_ref());
                         continue;
                     }
-                    Err(e) => {
-                        return Err(CodexError {
-                            status: 401,
-                            message: "Unauthorized".to_string(),
-                            detail: Some(e.to_string()),
-                            retry_after: None,
-                            usage_limit: None,
-                            class: None,
-                            origin: CodexErrorOrigin::Http,
-                        });
-                    }
+                    Err(e) => return Err(auth_refresh_error(e)),
                 }
             }
 
@@ -3209,6 +3199,93 @@ mod tests {
         let client = http_test_client(base_url, 100);
         client.auth_manager().set_test_auth(http_test_auth());
         client
+    }
+
+    /// The client's answer to a buffered request the backend rejects with 401, when
+    /// the token endpoint answers the forced refresh with `refresh_status`.
+    async fn forced_refresh_answer(refresh_status: &'static str) -> axum::response::Response {
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let backend_server = tokio::spawn(async move {
+            let (mut stream, _) = backend.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let token = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_addr = token.local_addr().unwrap();
+        let token_server = tokio::spawn(async move {
+            let (mut stream, _) = token.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            let body = r#"{"error":"invalid_grant"}"#;
+            let response = format!(
+                "HTTP/1.1 {refresh_status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = CodexAuthManager::new_with_token_endpoint(
+            super::super::auth::token_store::CodexTokenStore::codex_cli(
+                super::super::auth::token_store::CodexCliAuthStore::new(
+                    dir.path().join("auth.json"),
+                ),
+            ),
+            format!("http://{token_addr}/oauth/token"),
+        );
+        manager.set_test_auth(StoredAuth {
+            refresh: "refresh-test".into(),
+            ..http_test_auth()
+        });
+        let client = CodexHttpClient::new_with_client(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            manager,
+            format!("http://{backend_addr}/responses"),
+        );
+        let error = match client
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+        {
+            Ok(_) => panic!("a failed forced refresh must fail the request"),
+            Err(error) => error,
+        };
+        backend_server.await.unwrap();
+        token_server.await.unwrap();
+        super::super::map_codex_error_to_response(&error)
+    }
+
+    async fn error_body(response: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_forced_refresh_outage_after_a_401_answers_503() {
+        let response = forced_refresh_answer("503 Service Unavailable").await;
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], TOKEN_REFRESH_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_forced_refresh_the_endpoint_refuses_after_a_401_answers_401() {
+        let response = forced_refresh_answer("400 Bad Request").await;
+        assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "authentication_error");
     }
 
     async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {

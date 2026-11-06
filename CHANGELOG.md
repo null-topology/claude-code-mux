@@ -12,26 +12,37 @@
   no `tokens` object is left untouched and the refresh fails instead of
   replacing it. The writeback changes only the token fields and
   `last_refresh`, and stores a returned `id_token` only when the Codex CLI
-  can read its claims. If the new tokens cannot be written, the proxy logs
-  one `codex_token_writeback_failed` warning, serves the new token and leaves
-  the file as it was.
+  can read its claims. If the new tokens cannot be written, `auth.lock`
+  included, the proxy logs one `codex_token_writeback_failed` warning, serves
+  the new token and leaves the file as it was. It keeps those tokens in
+  memory and uses them while the file still holds the login they replaced:
+  later requests write them again until a write succeeds, refresh them from
+  their own refresh token when they are due, and drop them once the file
+  holds anything else. A restart forgets them. A refresh also finishes, and
+  its tokens are written, when the request that started it is cancelled;
+  requests waiting for it use its result.
 - `auth.lock` is the Codex CLI's own lock only when `CCP_CODEX_AUTH_FILE` is
   unset or names `$CODEX_HOME/auth.json`; point it at that file. A symlinked
-  `auth.json` is now updated at its target, so the link stays a link.
+  `auth.json` is now updated at its target, so the link stays a link; a link
+  whose target is missing is left alone and never replaced by a file.
 - A refresh that fails in the last five minutes before the token expires no
   longer fails the request, whatever the reason: the proxy logs one
   `codex_token_refresh_failed_using_stored_token` warning on the `codex`
   logger, with the failure class and HTTP status only, and keeps using the
-  stored token. The forced refresh after the backend rejected a token never
-  falls back. A token response without `refresh_token`, with an `id_token`
-  or `refresh_token` that is not a string, or with an `expires_in` that is
-  zero or not a number is accepted; the expiry then comes from the access
-  token, else one hour.
+  stored token. That refresh is not tried again for 60 seconds after a
+  temporary failure, and after any other failure not until the stored access
+  token changes; the stored token is used meanwhile while it is valid. The
+  forced refresh after the backend rejected a token is always tried and
+  never falls back. A token response without `refresh_token`, or with an
+  `id_token` or `refresh_token` that is not a string, is accepted; an
+  `expires_in` that is not a positive integer counts as absent; the expiry
+  is the access token's `exp`, else `expires_in`, else one hour.
 - A Codex token refresh that fails for a temporary reason (the token
   endpoint unreachable, a timeout, 429, 5xx) now answers 503 `api_error`
   with `Codex token refresh is temporarily unavailable` instead of 401, a
-  status a client may retry; the forced refresh of a buffered request still
-  answers 401. Other refresh failures
+  status a client may retry, the forced refresh after a 401 included. The
+  Codex model listing reports such a failure as unreachable rather than as
+  a missing login. Other refresh failures
   still answer 401, without the token endpoint's response body; they name
   the HTTP status, and for 401 and 403 ask you to run `codex login`.
 
