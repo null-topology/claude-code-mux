@@ -146,10 +146,30 @@
 - A buffered WebSocket request whose `error` event carries a status is now
   answered by the event's error code as well, like an HTTP error body.
 - A Codex 401 whose body or `error` event reports a spent usage window or
-  names one of the known codes is now answered as that window or code, with
-  one upstream attempt and no token refresh, on the live and buffered HTTP
-  and WebSocket paths and the standalone search call. A plain 401 still
-  refreshes the token once and sends the request again, as before.
+  names one of the known codes is now answered as that window or code
+  without a token refresh, on the live and buffered HTTP and WebSocket paths
+  and the standalone search call. Each of them makes one upstream attempt,
+  except that under the default `auto` transport a rejected WebSocket
+  upgrade still falls back to HTTP, which reads its own answer. A plain 401
+  still refreshes the token and sends the request again, at most once per
+  client request: under `auto` a live request whose WebSocket attempt
+  already refreshed no longer refreshes a second time on the HTTP fallback.
+- A rejected WebSocket upgrade and a failed live HTTP start or search call
+  now update the held reading with every `codex.rate_limits` window their
+  error body carries before the body is turned into a spent window, as the
+  buffered paths already did. The refusal itself is answered as before: two
+  spent windows still name neither, but later responses now carry both in
+  their `anthropic-ratelimit-unified-5h-*` and `-7d-*` headers.
+- The held `codex.rate_limits` reading now belongs to the ChatGPT account of
+  the request it came with. A reading or spent window under another account
+  replaces it instead of merging into it, and a response to a request under
+  another account carries none of its `anthropic-ratelimit-unified-5h-*` or
+  `-7d-*` headers, so after switching Codex logins the previous account's
+  windows are no longer shown.
+- A `codex.rate_limits` reading that names a metered limit other than
+  `codex` in `metered_limit_name` or `limit_name` no longer updates the held
+  reading or records a spent window. A refusing reading of that kind is
+  still answered as a spent window.
 - The delay a Codex error body names (`retry_after`, `retry_after_seconds`
   or a `headers` object) is now sent as `Retry-After`, rounded up to whole
   seconds, before the response's own `Retry-After` header, which is rounded

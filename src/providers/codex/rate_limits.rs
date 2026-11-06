@@ -156,10 +156,34 @@ impl Snapshot {
     }
 }
 
-static LATEST: OnceLock<Mutex<Option<Snapshot>>> = OnceLock::new();
+/// The snapshot held, with the ChatGPT account of the requests whose readings
+/// built it. Windows belong to one account's allowance, so a reading for
+/// another account replaces them rather than merging into them, and a request
+/// for another account is told nothing from them.
+struct Held {
+    account: Option<String>,
+    snapshot: Snapshot,
+}
 
-fn cell() -> &'static Mutex<Option<Snapshot>> {
+static LATEST: OnceLock<Mutex<Option<Held>>> = OnceLock::new();
+
+fn cell() -> &'static Mutex<Option<Held>> {
     LATEST.get_or_init(|| Mutex::new(None))
+}
+
+/// The snapshot `held` keeps for `account`: none when it was built for
+/// another account.
+fn held_for(held: Option<Held>, account: Option<&str>) -> Option<Snapshot> {
+    held.filter(|held| held.account.as_deref() == account)
+        .map(|held| held.snapshot)
+}
+
+/// `snapshot`, held for `account`.
+fn hold(snapshot: Option<Snapshot>, account: Option<&str>) -> Option<Held> {
+    snapshot.map(|snapshot| Held {
+        account: account.map(str::to_owned),
+        snapshot,
+    })
 }
 
 /// Forget the snapshot, for a test that leaves a reading behind.
@@ -178,17 +202,40 @@ pub(crate) fn lock_for_tests() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Record the quota state carried by a `codex.rate_limits` event. Any other
-/// event is ignored, so this can be handed every frame off the stream.
-pub(crate) fn observe_event(payload: &Value) {
-    if payload.get("type").and_then(Value::as_str) != Some("codex.rate_limits") {
+/// Record the quota state carried by a `codex.rate_limits` event, for the
+/// ChatGPT account of the request it came with. Any other event is ignored,
+/// so this can be handed every frame off the stream, and so is one that reads
+/// a metered limit other than `codex` (`reads_codex_limit`).
+pub(crate) fn observe_event(account: Option<&str>, payload: &Value) {
+    if payload.get("type").and_then(Value::as_str) != Some("codex.rate_limits")
+        || !reads_codex_limit(payload)
+    {
         return;
     }
     let Some(snapshot) = snapshot_from_event(payload) else {
         return;
     };
     if let Ok(mut latest) = cell().lock() {
-        *latest = merge_snapshot(latest.take(), snapshot, now());
+        let held = held_for(latest.take(), account);
+        *latest = hold(merge_snapshot(held, snapshot, now()), account);
+    }
+}
+
+/// Whether a `codex.rate_limits` event reads the `codex` metered limit, the
+/// allowance the gauge stands for. The event names its limit in
+/// `metered_limit_name`, else `limit_name`, and one naming neither reads
+/// `codex`, as the Codex CLI files it
+/// (`codex-rs/codex-api/src/rate_limits.rs:124-167` at rust-v0.166.0, with
+/// the name trimmed, lowercased and `-` read as `_` at :270-272). A name that
+/// is not a string names no limit the gauge knows.
+pub(crate) fn reads_codex_limit(payload: &Value) -> bool {
+    let named = ["metered_limit_name", "limit_name"]
+        .into_iter()
+        .find_map(|key| payload.get(key).filter(|value| !value.is_null()));
+    match named {
+        None => true,
+        Some(Value::String(name)) => name.trim().to_ascii_lowercase().replace('-', "_") == "codex",
+        Some(_) => false,
     }
 }
 
@@ -237,9 +284,15 @@ fn merge_window(
 /// turn right after a window reopens would otherwise carry the spent figure
 /// from before the reset — and announce an allowance as nearly gone at the
 /// moment it came back. A window whose reset time has passed says nothing about
-/// the one now running.
-pub(crate) fn latest() -> Option<Snapshot> {
-    let snapshot = cell().lock().ok().and_then(|latest| latest.clone())?;
+/// the one now running. A snapshot held for another account than `account`
+/// gives nothing.
+pub(crate) fn latest(account: Option<&str>) -> Option<Snapshot> {
+    let snapshot = cell().lock().ok().and_then(|latest| {
+        latest
+            .as_ref()
+            .filter(|held| held.account.as_deref() == account)
+            .map(|held| held.snapshot.clone())
+    })?;
     still_running(snapshot, now())
 }
 
@@ -300,14 +353,19 @@ pub(crate) fn limiting_window(limits: &Value) -> Option<(u64, u64)> {
 }
 
 /// Record the window a spent allowance names as used up until the reset the
-/// limit reports, keeping the other window's last reading. A limit that names
-/// no window or no reset cannot be placed and changes nothing.
+/// limit gives, keeping the other window's last reading when it was held for
+/// the limit's account. A limit that names no window or no reset cannot be
+/// placed and changes nothing, and neither does one from a snapshot of a
+/// metered limit other than `codex` (`CodexUsageLimit::feeds_gauge`).
 pub(crate) fn observe_usage_limit(limit: &super::events::CodexUsageLimit) {
-    let (Some(window), Some(resets_at)) = (limit.window, limit.resets_at) else {
+    let (Some(window), Some(resets_at), true) = (limit.window, limit.resets_at, limit.feeds_gauge)
+    else {
         return;
     };
+    let account = limit.account.as_deref();
     if let Ok(mut latest) = cell().lock() {
-        *latest = mark_spent(latest.take(), window, resets_at, now());
+        let held = held_for(latest.take(), account);
+        *latest = hold(mark_spent(held, window, resets_at, now()), account);
     }
 }
 
@@ -772,7 +830,7 @@ mod tests {
     /// What a live stream records for a snapshot: the reading, then the
     /// spent window the refusal names.
     fn observe_refusing_snapshot(payload: &Value) {
-        observe_event(payload);
+        observe_event(None, payload);
         if let Some(limit) = super::super::events::usage_limit_from_event_with_headers(payload, &[])
         {
             observe_usage_limit(&limit);
@@ -780,7 +838,13 @@ mod tests {
     }
 
     fn latest_headers() -> std::collections::HashMap<&'static str, String> {
-        latest().expect("snapshot").headers().into_iter().collect()
+        headers_for(None).expect("snapshot")
+    }
+
+    fn headers_for(
+        account: Option<&str>,
+    ) -> Option<std::collections::HashMap<&'static str, String>> {
+        latest(account).map(|snapshot| snapshot.headers().into_iter().collect())
     }
 
     #[test]
@@ -791,7 +855,7 @@ mod tests {
         let newer = now + 10_000;
         let older = newer - SAME_WINDOW_TOLERANCE_SECONDS - 1;
         let weekly = now + 500_000;
-        observe_event(&event_resetting(3.0, newer, 16.0, weekly));
+        observe_event(None, &event_resetting(3.0, newer, 16.0, weekly));
 
         let late = refusing(event_resetting(100.0, older, 16.0, weekly));
         let limit = super::super::events::usage_limit_from_event_with_headers(&late, &[])
@@ -816,13 +880,16 @@ mod tests {
         let _snapshot = lock_for_tests();
         clear_for_tests();
         let now = now();
-        observe_event(&event_resetting(3.0, now + 10_000, 16.0, now + 500_000));
-        let before = latest();
+        observe_event(
+            None,
+            &event_resetting(3.0, now + 10_000, 16.0, now + 500_000),
+        );
+        let before = latest(None);
         assert!(before.is_some());
 
         observe_refusing_snapshot(&refusing(event_resetting(100.0, now - 10, 100.0, now - 5)));
 
-        let after = latest();
+        let after = latest(None);
         clear_for_tests();
         assert_eq!(after, before);
     }
@@ -895,7 +962,134 @@ mod tests {
     #[test]
     fn ignores_frames_that_are_not_quota_telemetry() {
         let _snapshot = lock_for_tests();
-        observe_event(&serde_json::json!({"type": "response.completed"}));
+        observe_event(None, &serde_json::json!({"type": "response.completed"}));
         assert!(snapshot_from_event(&serde_json::json!({"type": "codex.rate_limits"})).is_none());
+    }
+
+    #[test]
+    fn windows_are_held_for_the_account_that_read_them() {
+        let _snapshot = lock_for_tests();
+        clear_for_tests();
+        let now = now();
+        let later = now + 10_000;
+        let earlier = later - SAME_WINDOW_TOLERANCE_SECONDS - 1;
+        let weekly = now + 500_000;
+        observe_event(Some("acct-a"), &event_resetting(30.0, later, 40.0, weekly));
+
+        // A request for another account, or for none, is told nothing from
+        // the windows another account's requests read.
+        let for_b_before = headers_for(Some("acct-b"));
+        let for_none = headers_for(None);
+        let for_a = headers_for(Some("acct-a")).expect("account a");
+
+        // Under the same account this reading would be stale and leave the
+        // held five hour window alone; under another account it replaces
+        // the snapshot whole.
+        observe_event(
+            Some("acct-b"),
+            &event_resetting(70.0, earlier, 80.0, weekly),
+        );
+        let for_b = headers_for(Some("acct-b")).expect("account b");
+        let for_a_after = headers_for(Some("acct-a"));
+
+        // A spent window named under another account does not mark the
+        // windows held; it starts that account's snapshot in their place.
+        observe_usage_limit(&super::super::events::CodexUsageLimit {
+            message: "The usage limit has been reached".to_string(),
+            resets_at: Some(earlier),
+            window: Some(super::super::events::CodexLimitWindow::FiveHour),
+            account: Some("acct-a".to_string()),
+            feeds_gauge: true,
+        });
+        let for_b_after_limit = headers_for(Some("acct-b"));
+        let for_a_after_limit = headers_for(Some("acct-a")).expect("account a");
+        clear_for_tests();
+
+        assert_eq!(for_b_before, None);
+        assert_eq!(for_none, None);
+        assert_eq!(
+            for_a.get("anthropic-ratelimit-unified-5h-reset"),
+            Some(&later.to_string())
+        );
+        assert_eq!(
+            for_b.get("anthropic-ratelimit-unified-5h-reset"),
+            Some(&earlier.to_string())
+        );
+        assert_eq!(
+            for_b.get("anthropic-ratelimit-unified-5h-utilization"),
+            Some(&"0.7000".to_string())
+        );
+        assert_eq!(
+            for_b.get("anthropic-ratelimit-unified-7d-utilization"),
+            Some(&"0.8000".to_string())
+        );
+        assert_eq!(for_a_after, None);
+        assert_eq!(for_b_after_limit, None);
+        assert_eq!(
+            for_a_after_limit.get("anthropic-ratelimit-unified-5h-utilization"),
+            Some(&"1.0000".to_string())
+        );
+        assert_eq!(
+            for_a_after_limit.get("anthropic-ratelimit-unified-7d-utilization"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_default_metered_limit_feeds_the_gauge() {
+        let _snapshot = lock_for_tests();
+        clear_for_tests();
+        let now = now();
+        let reset = now + 10_000;
+        let weekly = now + 500_000;
+        observe_event(None, &event_resetting(3.0, reset, 16.0, weekly));
+        let before = latest(None);
+        assert!(before.is_some());
+
+        let mut held_after = Vec::new();
+        for (key, name) in [
+            ("metered_limit_name", "codex_other"),
+            ("limit_name", "codex_other"),
+        ] {
+            let mut foreign = event_resetting(100.0, reset, 16.0, weekly);
+            foreign[key] = name.into();
+            observe_event(None, &foreign);
+            held_after.push(latest(None));
+            // A refusal for another limit is still terminal, but its spent
+            // window is not this gauge's.
+            let foreign = refusing(foreign);
+            let limit = super::super::events::usage_limit_from_event_with_headers(&foreign, &[])
+                .expect("the refusal names its window");
+            assert!(!limit.feeds_gauge);
+            observe_refusing_snapshot(&foreign);
+            held_after.push(latest(None));
+        }
+
+        // The default limit under its own name, spelled as the CLI
+        // normalises it, still counts; `metered_limit_name` wins over
+        // `limit_name`.
+        let mut named = event_resetting(50.0, reset, 60.0, weekly);
+        named["metered_limit_name"] = " Codex ".into();
+        named["limit_name"] = "codex_other".into();
+        observe_event(None, &named);
+        let named_headers = latest_headers();
+        clear_for_tests();
+
+        for after in held_after {
+            assert_eq!(after, before);
+        }
+        assert_eq!(
+            named_headers.get("anthropic-ratelimit-unified-5h-utilization"),
+            Some(&"0.5000".to_string())
+        );
+        assert!(reads_codex_limit(
+            &serde_json::json!({"limit_name": "codex"})
+        ));
+        assert!(reads_codex_limit(
+            &serde_json::json!({"metered_limit_name": null})
+        ));
+        assert!(!reads_codex_limit(
+            &serde_json::json!({"metered_limit_name": 7})
+        ));
     }
 }

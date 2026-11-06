@@ -74,6 +74,8 @@ pub(crate) struct CodexWebSocketEventStream {
     socket_id: Arc<AtomicU64>,
     full_context_retry: Arc<AtomicBool>,
     provider_retry_handoff: Arc<AtomicBool>,
+    auth_refresh: Arc<AtomicBool>,
+    account_id: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -81,6 +83,8 @@ pub(crate) struct CodexWebSocketSocketIdPublisher {
     socket_id: Arc<AtomicU64>,
     full_context_retry: Arc<AtomicBool>,
     provider_retry_handoff: Arc<AtomicBool>,
+    auth_refresh: Arc<AtomicBool>,
+    account_id: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl CodexWebSocketEventStream {
@@ -90,19 +94,49 @@ impl CodexWebSocketEventStream {
         let socket_id = Arc::new(AtomicU64::new(0));
         let full_context_retry = Arc::new(AtomicBool::new(false));
         let provider_retry_handoff = Arc::new(AtomicBool::new(false));
+        let auth_refresh = Arc::new(AtomicBool::new(false));
+        let account_id = Arc::new(std::sync::Mutex::new(None));
         (
             Self {
                 receiver,
                 socket_id: socket_id.clone(),
                 full_context_retry: full_context_retry.clone(),
                 provider_retry_handoff: provider_retry_handoff.clone(),
+                auth_refresh: auth_refresh.clone(),
+                account_id: account_id.clone(),
             },
             CodexWebSocketSocketIdPublisher {
                 socket_id,
                 full_context_retry,
                 provider_retry_handoff,
+                auth_refresh,
+                account_id,
             },
         )
+    }
+
+    /// Whether the task behind the stream already refreshed the token for
+    /// this request, so a fallback that follows does not refresh it again.
+    pub(crate) fn used_auth_refresh(&self) -> bool {
+        self.auth_refresh.load(Ordering::Acquire)
+    }
+
+    /// The ChatGPT account the stream's request was last sent with, which
+    /// the quota gauge keys its readings by.
+    pub(crate) fn account_id(&self) -> Option<String> {
+        self.account_reader()()
+    }
+
+    /// Reads the stream's account after the stream itself has been handed
+    /// on, for a response built once the stream has started.
+    pub(crate) fn account_reader(&self) -> impl Fn() -> Option<String> + use<> {
+        let account_id = self.account_id.clone();
+        move || {
+            account_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
     }
 
     pub(crate) async fn recv(&mut self) -> Option<Result<serde_json::Value, CodexError>> {
@@ -144,6 +178,17 @@ impl CodexWebSocketSocketIdPublisher {
 
     pub(super) fn mark_full_context_retry(&self) {
         self.full_context_retry.store(true, Ordering::Release);
+    }
+
+    pub(super) fn mark_auth_refresh(&self) {
+        self.auth_refresh.store(true, Ordering::Release);
+    }
+
+    pub(super) fn publish_account(&self, account_id: Option<&str>) {
+        *self
+            .account_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = account_id.map(str::to_owned);
     }
 
     pub(super) fn is_provider_retry_handoff(&self) -> bool {
@@ -1300,12 +1345,27 @@ fn handshake_error_detail(body: Option<&[u8]>) -> String {
     sanitized[..end].to_string()
 }
 
+/// The ChatGPT account an upgrade request is sent with (`build_codex_headers`).
+fn request_account_id(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("chatgpt-account-id")
+        .and_then(|value| value.to_str().ok())
+}
+
 /// A rejected upgrade, built the same way on the direct and the tunneled path.
 /// `body` is what was read of the rejection's body, `None` for a 407, which is
 /// never read. A `Retry-After` header is normalised the way a classified one
 /// is (`normalize_retry_after`); whether it reaches the client is up to the
 /// error mapping, which never sends it for a spent usage window or a quota.
-fn handshake_rejection_error(status: u16, headers: &HeaderMap, body: Option<&[u8]>) -> CodexError {
+/// Every `codex.rate_limits` event the body holds reaches the quota gauge
+/// whole, under `account`, the ChatGPT account the upgrade was sent with,
+/// before the body is reduced to a spent window.
+fn handshake_rejection_error(
+    status: u16,
+    headers: &HeaderMap,
+    body: Option<&[u8]>,
+    account: Option<&str>,
+) -> CodexError {
     let header_retry_after = || {
         headers
             .get(http::header::RETRY_AFTER)
@@ -1333,10 +1393,12 @@ fn handshake_rejection_error(status: u16, headers: &HeaderMap, body: Option<&[u8
                 }
                 detail => detail,
             };
+            super::events::observe_rate_limits_in_body(account, body);
             (
                 detail,
                 class,
-                super::events::usage_limit_from_response(body, &header_pairs).map(Box::new),
+                super::events::usage_limit_from_response(body, &header_pairs)
+                    .map(|limit| Box::new(limit.for_account(account))),
                 // The delay the body names wins over the header, as on the
                 // other paths.
                 super::events::retry_after_from_body(body).or_else(header_retry_after),
@@ -1824,14 +1886,22 @@ fn websocket_destination(url: &str) -> Result<(String, String), CodexError> {
 /// body bytes arrived with its head, which may be all of a short body, part of
 /// it or nothing; they are read the way the direct path reads its body, and a
 /// 407 is not read at all.
-fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> CodexError {
+fn tungstenite_handshake_error(
+    error: tokio_tungstenite::tungstenite::Error,
+    account: Option<&str>,
+) -> CodexError {
     if let tokio_tungstenite::tungstenite::Error::Http(response) = error {
         let body = response
             .body()
             .as_deref()
             .filter(|_| response.status() != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
             .map(|body| &body[..body.len().min(MAX_HANDSHAKE_ERROR_BODY_BYTES)]);
-        return handshake_rejection_error(response.status().as_u16(), response.headers(), body);
+        return handshake_rejection_error(
+            response.status().as_u16(),
+            response.headers(),
+            body,
+            account,
+        );
     }
     CodexError {
         status: 0,
@@ -1891,7 +1961,7 @@ async fn connect_via_http_proxy_tunnel(
         .map_err(ConnectAttemptError::Origin)?;
     let (websocket, response) = tokio_tungstenite::client_async(request, stream)
         .await
-        .map_err(tungstenite_handshake_error)
+        .map_err(|error| tungstenite_handshake_error(error, request_account_id(headers)))
         .map_err(ConnectAttemptError::Origin)?;
     validate_websocket_upgrade(
         response.version(),
@@ -1937,13 +2007,18 @@ async fn connect_via_http_upgrade(
     let response = request.send().await.map_err(reqwest_handshake_error)?;
     if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
         let status = response.status().as_u16();
-        let headers = response.headers().clone();
+        let response_headers = response.headers().clone();
         let body = if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16() {
             None
         } else {
             Some(bounded_handshake_error_body(response).await)
         };
-        return Err(handshake_rejection_error(status, &headers, body.as_deref()));
+        return Err(handshake_rejection_error(
+            status,
+            &response_headers,
+            body.as_deref(),
+            request_account_id(headers),
+        ));
     }
 
     validate_websocket_upgrade(
@@ -3918,7 +3993,7 @@ mod tests {
         .unwrap();
         let err = match tokio_tungstenite::client_async(request, client_io).await {
             Ok(_) => panic!("expected the tunneled upgrade to be rejected"),
-            Err(error) => tungstenite_handshake_error(error),
+            Err(error) => tungstenite_handshake_error(error, None),
         };
 
         assert_eq!(err.status, 403);
@@ -3937,8 +4012,10 @@ mod tests {
             .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
             .body(Some(body.as_bytes().to_vec()))
             .unwrap();
-        let err =
-            tungstenite_handshake_error(tokio_tungstenite::tungstenite::Error::Http(rejected));
+        let err = tungstenite_handshake_error(
+            tokio_tungstenite::tungstenite::Error::Http(rejected),
+            None,
+        );
         assert_eq!(err.status, 407);
         assert_eq!(err.class, None);
         assert_eq!(err.detail.as_deref(), Some(GENERIC_HANDSHAKE_ERROR_DETAIL));
@@ -4046,7 +4123,7 @@ mod tests {
         .unwrap();
         match tokio_tungstenite::client_async(request, client_io).await {
             Ok(_) => panic!("expected the tunneled upgrade to be rejected"),
-            Err(error) => tungstenite_handshake_error(error),
+            Err(error) => tungstenite_handshake_error(error, None),
         }
     }
 
@@ -4716,7 +4793,7 @@ mod tests {
             serde_json::json!({"code": "model_not_found", "message": "  \t "}),
         ] {
             let body = serde_json::to_vec(&serde_json::json!({ "error": error })).unwrap();
-            let err = handshake_rejection_error(404, &HeaderMap::new(), Some(&body));
+            let err = handshake_rejection_error(404, &HeaderMap::new(), Some(&body), None);
             assert_eq!(
                 err.class,
                 Some(super::super::events::CodexErrorClass::ModelNotFound)
@@ -4731,7 +4808,7 @@ mod tests {
             "error": {"code": "policy_capacity_unavailable", "message": "busy", "retry_after": 2.5}
         }))
         .unwrap();
-        let err = handshake_rejection_error(503, &HeaderMap::new(), Some(&body));
+        let err = handshake_rejection_error(503, &HeaderMap::new(), Some(&body), None);
         assert_eq!(
             err.class,
             Some(super::super::events::CodexErrorClass::Overloaded)
@@ -4740,13 +4817,13 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert(http::header::RETRY_AFTER, "9".parse().unwrap());
-        let err = handshake_rejection_error(503, &headers, Some(&body));
+        let err = handshake_rejection_error(503, &headers, Some(&body), None);
         assert_eq!(err.retry_after.as_deref(), Some("3"));
         let without_delay = serde_json::to_vec(&serde_json::json!({
             "error": {"code": "policy_capacity_unavailable", "message": "busy"}
         }))
         .unwrap();
-        let err = handshake_rejection_error(503, &headers, Some(&without_delay));
+        let err = handshake_rejection_error(503, &headers, Some(&without_delay), None);
         assert_eq!(err.retry_after.as_deref(), Some("9"));
     }
 }
