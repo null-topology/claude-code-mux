@@ -73,6 +73,11 @@ pub(crate) fn clear_session_compaction(session_id: &str) {
     compaction::clear_compaction(session_id);
 }
 
+/// Forget the newest Codex quota reading, for a test that leaves one behind.
+pub fn clear_codex_rate_limits_for_tests() {
+    rate_limits::clear_for_tests();
+}
+
 pub struct CodexProvider {
     client: Arc<CodexHttpClient>,
 }
@@ -828,28 +833,25 @@ async fn live_stream_response(
     let mut continuation = Some(continuation);
 
     loop {
+        // The stream, and the HTTP response headers when it is an HTTP one:
+        // they hold the quota clocks a spent window's event may leave out.
         let upstream_events = match transport {
             config::CodexTransport::Http => {
                 client
                     .stream_codex_http_events_for_owner(&request_body, &ctx)
                     .await
             }
-            config::CodexTransport::WebSocket => {
-                client
-                    .stream_codex_websocket_events_for_owner(
-                        &request_body,
-                        &ctx,
-                        continuation.as_ref(),
-                    )
-                    .await
-            }
+            config::CodexTransport::WebSocket => client
+                .stream_codex_websocket_events_for_owner(&request_body, &ctx, continuation.as_ref())
+                .await
+                .map(|events| (events, Vec::new())),
             config::CodexTransport::Auto => {
                 client
                     .stream_codex_auto_events_for_owner(&request_body, &ctx, continuation.as_ref())
                     .await
             }
         };
-        let upstream_events = match upstream_events {
+        let (upstream_events, response_headers) = match upstream_events {
             Ok(events) => events,
             // The continuation is the proxy's own state, so a request the
             // backend no longer remembers is resent once with full context.
@@ -869,6 +871,7 @@ async fn live_stream_response(
 
         match live_stream_response_once(
             upstream_events,
+            response_headers,
             message_id.clone(),
             &model,
             ctx.clone(),
@@ -915,6 +918,7 @@ fn provider_retry(
 #[allow(clippy::too_many_arguments)]
 async fn live_stream_response_once(
     mut upstream_events: websocket::CodexWebSocketEventStream,
+    response_headers: Vec<(String, String)>,
     message_id: String,
     model: &str,
     ctx: RequestContext,
@@ -962,10 +966,12 @@ async fn live_stream_response_once(
         {
             Ok(result) => result,
             Err(message) => {
-                // A spent subscription window reopens hours from now, so the
-                // retry budget can only burn the request down to the same 429.
-                // Report it once, with the reset clock upstream supplied.
-                if let Some(limit) = events::usage_limit_from_event(&payload) {
+                // A spent subscription window reopens hours from now: answer
+                // it once, with the reset clock upstream supplied, and never
+                // as something to retry.
+                if let Some(limit) =
+                    events::usage_limit_from_event_with_headers(&payload, &response_headers)
+                {
                     abort_request_state(
                         ctx.session_id.as_deref(),
                         &request_continuation,
@@ -1055,6 +1061,7 @@ async fn live_stream_response_once(
             }
             return LiveStreamStart::Response(remaining_live_stream_response(
                 upstream_events,
+                response_headers,
                 translator,
                 pending_chunk,
                 ctx,
@@ -1187,6 +1194,7 @@ fn empty_live_stream_response(outcome: ResponseOutcome) -> Response {
 #[allow(clippy::too_many_arguments)]
 fn remaining_live_stream_response(
     mut upstream_events: websocket::CodexWebSocketEventStream,
+    response_headers: Vec<(String, String)>,
     mut translator: LiveStreamTranslator,
     first_chunk: Vec<u8>,
     ctx: RequestContext,
@@ -1261,17 +1269,26 @@ fn remaining_live_stream_response(
                             // A spent window after output started is still a
                             // rate limit, told the way the status line would
                             // have told it, and the gauge learns of it.
-                            let limit = events::usage_limit_from_event(&payload);
+                            let limit = events::usage_limit_from_event_with_headers(
+                                &payload,
+                                &response_headers,
+                            );
                             if let Some(limit) = limit.as_ref() {
                                 rate_limits::observe_usage_limit(limit);
                             }
-                            let (error_type, text) = match limit.as_ref() {
-                                Some(limit) => ("rate_limit_error", limit.message.as_str()),
-                                None => {
-                                    let error_type = events::classify_event_failure(&payload)
-                                        .and_then(|failure| failure.class)
-                                        .map_or("api_error", events::CodexErrorClass::error_type);
-                                    (error_type, client_error_text(&message, error_type))
+                            // A classified failure is told in the classifier's
+                            // words, which name a missing model that came with
+                            // no message by its code.
+                            let classified = events::classify_event_failure(&payload)
+                                .and_then(|failure| Some((failure.class?, failure.message)));
+                            let (error_type, text) = match (limit.as_ref(), classified.as_ref()) {
+                                (Some(limit), _) => ("rate_limit_error", limit.message.as_str()),
+                                (None, Some((class, native))) => {
+                                    let error_type = class.error_type();
+                                    (error_type, client_error_text(native, error_type))
+                                }
+                                (None, None) => {
+                                    ("api_error", client_error_text(&message, "api_error"))
                                 }
                             };
                             let chunk =
@@ -1920,6 +1937,7 @@ mod tests {
 
     #[test]
     fn a_refusal_keeps_the_state_of_the_window_that_refused_it() {
+        let _rate_limits = rate_limits::lock_for_tests();
         // The snapshot from an earlier turn says the allowance was fine.
         rate_limits::observe_event(&serde_json::json!({
             "type": "codex.rate_limits",
@@ -2130,8 +2148,10 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn spent_credits_stop_the_retry_loop_without_naming_a_window() {
+        let _rate_limits = rate_limits::lock_for_tests();
         // An earlier turn left a quota snapshot behind.
         rate_limits::observe_event(&serde_json::json!({
             "type": "codex.rate_limits",
@@ -2730,6 +2750,7 @@ mod tests {
         let continuation = ContinuationReservation::for_owner_turn(None, None);
         let response = match live_stream_response_once(
             rx,
+            Vec::new(),
             "msg_test".to_string(),
             "claude-opus-4-8",
             ctx,
@@ -2965,7 +2986,8 @@ mod tests {
 
     #[test]
     fn live_start_payload_retry_detection_covers_rate_limit_and_overload() {
-        assert!(retryable_live_start_payload(
+        // A terminal snapshot is a spent window, answered once and never retried.
+        assert!(!retryable_live_start_payload(
             &serde_json::json!({
                 "type": "codex.rate_limits",
                 "rate_limits": {"limit_reached": true}
@@ -3045,10 +3067,12 @@ mod tests {
         response
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn usage_limit_fast_fails_websocket_and_aborts_request_state() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
         let response = run_live_failure_case(
             "live-usage-limit-cleanup",
             serde_json::json!({
@@ -3150,10 +3174,12 @@ mod tests {
         assert_eq!(body["error"]["type"], "rate_limit_error");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn failed_live_attempt_is_reported_without_backoff() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
         let session_id = "live-retry-backoff-cleanup";
         let owner = ConversationIdentity::Main(session_id.to_string());
         continuation::clear_continuation_for_owner(Some(&owner));
@@ -3351,10 +3377,12 @@ mod tests {
         assert!(!response.headers().contains_key("x-should-retry"));
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn terminal_rate_limit_snapshot_fails_a_live_start_as_a_spent_window() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
         let response = run_live_failure_case(
             "live-terminal-snapshot-cleanup",
             serde_json::json!({

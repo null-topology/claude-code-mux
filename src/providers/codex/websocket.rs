@@ -1306,11 +1306,13 @@ fn handshake_error_detail(body: Option<&[u8]>) -> String {
 /// is (`normalize_retry_after`); whether it reaches the client is up to the
 /// error mapping, which never sends it for a spent usage window or a quota.
 fn handshake_rejection_error(status: u16, headers: &HeaderMap, body: Option<&[u8]>) -> CodexError {
-    let retry_after = headers
-        .get(http::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .map(super::events::normalize_retry_after);
-    let (detail, class, usage_limit) = match body {
+    let header_retry_after = || {
+        headers
+            .get(http::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(super::events::normalize_retry_after)
+    };
+    let (detail, class, usage_limit, retry_after) = match body {
         Some(body) => {
             let header_pairs: Vec<(String, String)> = headers
                 .iter()
@@ -1318,13 +1320,34 @@ fn handshake_rejection_error(status: u16, headers: &HeaderMap, body: Option<&[u8
                     Some((name.to_string(), value.to_str().ok()?.to_string()))
                 })
                 .collect();
+            let class = super::events::error_class_from_body(body, status);
+            let detail = match handshake_error_detail(Some(body)) {
+                // A missing model with no message is named by its code, as
+                // on the stream.
+                detail
+                    if class == Some(super::events::CodexErrorClass::ModelNotFound)
+                        && (detail.trim().is_empty()
+                            || detail == GENERIC_HANDSHAKE_ERROR_DETAIL) =>
+                {
+                    "model_not_found".to_string()
+                }
+                detail => detail,
+            };
             (
-                handshake_error_detail(Some(body)),
-                super::events::error_class_from_body(body),
+                detail,
+                class,
                 super::events::usage_limit_from_response(body, &header_pairs).map(Box::new),
+                // The delay the body names wins over the header, as on the
+                // other paths.
+                super::events::retry_after_from_body(body).or_else(header_retry_after),
             )
         }
-        None => (GENERIC_HANDSHAKE_ERROR_DETAIL.to_string(), None, None),
+        None => (
+            GENERIC_HANDSHAKE_ERROR_DETAIL.to_string(),
+            None,
+            None,
+            header_retry_after(),
+        ),
     };
     CodexError {
         status,
@@ -2207,8 +2230,11 @@ where
                     last_response_event_at = Instant::now();
                 }
 
-                // Check for terminal events
-                if is_terminal_event(&parsed) {
+                // Check for terminal events. A `codex.rate_limits` event that
+                // ends the request is one too, so the spent window is answered.
+                if is_terminal_event(&parsed)
+                    || super::events::is_terminal_rate_limit_event(&parsed)
+                {
                     terminal_event = Some(WsEvent {
                         event_type: parsed
                             .get("type")
@@ -4681,5 +4707,46 @@ mod tests {
                 GENERIC_HANDSHAKE_ERROR_DETAIL
             );
         }
+    }
+
+    #[test]
+    fn a_rejected_upgrade_for_a_missing_model_without_a_message_names_the_code() {
+        for error in [
+            serde_json::json!({"code": "model_not_found"}),
+            serde_json::json!({"code": "model_not_found", "message": "  \t "}),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({ "error": error })).unwrap();
+            let err = handshake_rejection_error(404, &HeaderMap::new(), Some(&body));
+            assert_eq!(
+                err.class,
+                Some(super::super::events::CodexErrorClass::ModelNotFound)
+            );
+            assert_eq!(err.detail.as_deref(), Some("model_not_found"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_upgrade_reads_the_delay_its_body_names_before_the_header() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "error": {"code": "policy_capacity_unavailable", "message": "busy", "retry_after": 2.5}
+        }))
+        .unwrap();
+        let err = handshake_rejection_error(503, &HeaderMap::new(), Some(&body));
+        assert_eq!(
+            err.class,
+            Some(super::super::events::CodexErrorClass::Overloaded)
+        );
+        assert_eq!(err.retry_after.as_deref(), Some("3"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, "9".parse().unwrap());
+        let err = handshake_rejection_error(503, &headers, Some(&body));
+        assert_eq!(err.retry_after.as_deref(), Some("3"));
+        let without_delay = serde_json::to_vec(&serde_json::json!({
+            "error": {"code": "policy_capacity_unavailable", "message": "busy"}
+        }))
+        .unwrap();
+        let err = handshake_rejection_error(503, &headers, Some(&without_delay));
+        assert_eq!(err.retry_after.as_deref(), Some("9"));
     }
 }

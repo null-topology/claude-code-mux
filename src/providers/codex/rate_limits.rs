@@ -162,6 +162,22 @@ fn cell() -> &'static Mutex<Option<Snapshot>> {
     LATEST.get_or_init(|| Mutex::new(None))
 }
 
+/// Forget the snapshot, for a test that leaves a reading behind.
+pub(crate) fn clear_for_tests() {
+    if let Ok(mut latest) = cell().lock() {
+        *latest = None;
+    }
+}
+
+/// Taken by every unit test that writes or reads the snapshot, so a reading
+/// one test leaves never reaches another test's assertions.
+#[cfg(test)]
+pub(crate) fn lock_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Record the quota state carried by a `codex.rate_limits` event. Any other
 /// event is ignored, so this can be handed every frame off the stream.
 pub(crate) fn observe_event(payload: &Value) {
@@ -224,21 +240,25 @@ fn snapshot_from_event(payload: &Value) -> Option<Snapshot> {
 
 /// The window `rate_limits` of a `codex.rate_limits` event names as the one
 /// that refused the request, as its length in minutes and its reset moment:
-/// the one window reported at or past its allowance, else the only window
-/// reported. `None` when that cannot be told: two spent windows, or several
-/// windows none of which is spent.
+/// the one window the event gives at or past its allowance. `None` when that
+/// cannot be told: no spent window, two of them, or a given window whose
+/// numbers are unusable, since that one may be the window that ran out. A
+/// slot that is absent or `null` gives no window.
 pub(crate) fn limiting_window(limits: &Value) -> Option<(u64, u64)> {
-    let windows: Vec<(u64, WindowState)> = ["primary", "secondary"]
-        .into_iter()
-        .filter_map(|slot| limits.get(slot).and_then(window_state))
-        .collect();
-    let mut spent = windows.iter().filter(|(_, state)| state.surpassed(1.0));
-    let (minutes, state) = match (spent.next(), spent.next()) {
-        (Some(window), None) => window,
-        (None, None) if windows.len() == 1 => &windows[0],
-        _ => return None,
-    };
-    Some((*minutes, state.resets_at))
+    let mut spent = None;
+    for slot in ["primary", "secondary"] {
+        let Some(window) = limits.get(slot).filter(|window| !window.is_null()) else {
+            continue;
+        };
+        let (minutes, state) = window_state(window)?;
+        if state.surpassed(1.0) {
+            if spent.is_some() {
+                return None;
+            }
+            spent = Some((minutes, state.resets_at));
+        }
+    }
+    spent
 }
 
 /// Record the window a spent allowance names as used up until the reset the
@@ -248,24 +268,43 @@ pub(crate) fn observe_usage_limit(limit: &super::events::CodexUsageLimit) {
     let (Some(window), Some(resets_at)) = (limit.window, limit.resets_at) else {
         return;
     };
-    let spent = Some(WindowState {
-        utilization: 1.0,
-        resets_at,
-    });
     if let Ok(mut latest) = cell().lock() {
-        let mut snapshot = latest.clone().unwrap_or_default();
-        match window {
-            super::events::CodexLimitWindow::FiveHour => snapshot.five_hour = spent,
-            super::events::CodexLimitWindow::SevenDay => snapshot.seven_day = spent,
-        }
-        *latest = Some(snapshot);
+        *latest = mark_spent(latest.take(), window, resets_at, now());
     }
+}
+
+/// `snapshot` with `window` used up until `resets_at`. A reset that has
+/// passed, or one earlier than the reading already held for that window,
+/// belongs to a window that has since rolled over, and leaves the snapshot as
+/// it was.
+fn mark_spent(
+    snapshot: Option<Snapshot>,
+    window: super::events::CodexLimitWindow,
+    resets_at: u64,
+    now: u64,
+) -> Option<Snapshot> {
+    if resets_at <= now {
+        return snapshot;
+    }
+    let mut snapshot = snapshot.unwrap_or_default();
+    let held = match window {
+        super::events::CodexLimitWindow::FiveHour => &mut snapshot.five_hour,
+        super::events::CodexLimitWindow::SevenDay => &mut snapshot.seven_day,
+    };
+    if !held.is_some_and(|state| state.resets_at > resets_at) {
+        *held = Some(WindowState {
+            utilization: 1.0,
+            resets_at,
+        });
+    }
+    Some(snapshot)
 }
 
 /// One window of a `codex.rate_limits` event. A window whose length, spent
 /// percentage, reset moment or countdown is not a finite, non-negative number
 /// in range is left out rather than guessed, and the event's other window still
-/// counts.
+/// counts. That holds for a reset field the window carries even when another
+/// one is usable: the window then contradicts itself.
 fn window_state(window: &Value) -> Option<(u64, WindowState)> {
     let minutes = whole(number(window.get("window_minutes"))?)?;
     let used_percent =
@@ -273,13 +312,13 @@ fn window_state(window: &Value) -> Option<(u64, WindowState)> {
     // The stream names the moment `reset_at`; the same window reserialised into
     // a session log calls it `resets_at`. Both spellings are read so a payload
     // from either side parses.
-    let resets_at = match first(window, &["reset_at", "resets_at"]) {
-        Some(at) => whole(at)?,
-        // Some payloads count down instead of naming the moment.
-        None => now().saturating_add(whole(first(
-            window,
-            &["reset_after_seconds", "resets_in_seconds"],
-        )?)?),
+    let moment = carried(window, &["reset_at", "resets_at"])?;
+    // Some payloads count down instead of naming the moment.
+    let countdown = carried(window, &["reset_after_seconds", "resets_in_seconds"])?;
+    let resets_at = match (moment, countdown) {
+        (Some(at), _) => at,
+        (None, Some(after)) => now().saturating_add(after),
+        (None, None) => return None,
     };
 
     Some((
@@ -297,8 +336,19 @@ fn whole(value: f64) -> Option<u64> {
     (value.is_finite() && value >= 0.0 && value < u64::MAX as f64).then_some(value as u64)
 }
 
-fn first(window: &Value, names: &[&str]) -> Option<f64> {
-    names.iter().find_map(|name| number(window.get(*name)))
+/// The first of `names` the window carries, as a whole count: `Some(None)`
+/// when it carries none of them (absent or `null`), `None` when one it carries
+/// is not a usable count.
+fn carried(window: &Value, names: &[&str]) -> Option<Option<u64>> {
+    let mut first = None;
+    for name in names {
+        let value = window.get(*name).filter(|value| !value.is_null());
+        if value.is_some() {
+            let count = whole(number(value)?)?;
+            first.get_or_insert(count);
+        }
+    }
+    Some(first)
 }
 
 fn number(value: Option<&Value>) -> Option<f64> {
@@ -516,6 +566,30 @@ mod tests {
             assert_eq!(snapshot.five_hour, None, "{countdown}");
             assert!(snapshot.seven_day.is_some(), "{countdown}");
         }
+
+        // A reset field the window carries counts even beside a usable one.
+        let contradictions = [
+            ("reset_at", serde_json::json!("soon")),
+            ("reset_at", serde_json::json!(true)),
+            ("reset_after_seconds", serde_json::json!("NaN")),
+            ("reset_after_seconds", serde_json::json!(-5)),
+            ("reset_after_seconds", serde_json::json!("soon")),
+            ("resets_in_seconds", serde_json::json!("inf")),
+        ];
+        for (field, value) in contradictions {
+            let mut payload = event(42.0, 16.0);
+            payload["rate_limits"]["primary"][field] = value.clone();
+            let snapshot = snapshot_from_event(&payload).expect("the weekly window survives");
+            assert_eq!(snapshot.five_hour, None, "{field}: {value}");
+            assert!(snapshot.seven_day.is_some(), "{field}: {value}");
+        }
+
+        // An absent or `null` field is not an unusable one.
+        let mut payload = event(42.0, 16.0);
+        payload["rate_limits"]["primary"]["reset_after_seconds"] = Value::Null;
+        payload["rate_limits"]["primary"]["resets_at"] = Value::Null;
+        let snapshot = snapshot_from_event(&payload).expect("snapshot");
+        assert_eq!(snapshot.five_hour.expect("five hour").resets_at, 1788879437);
     }
 
     #[test]
@@ -535,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn the_limiting_window_is_the_spent_one_or_the_only_one() {
+    fn the_limiting_window_is_the_one_spent_window() {
         let mut spent = event(100.0, 40.0);
         assert_eq!(
             limiting_window(&spent["rate_limits"]),
@@ -550,50 +624,90 @@ mod tests {
         // Two spent windows, or two that are not: no telling which refused.
         assert_eq!(limiting_window(&event(100.0, 100.0)["rate_limits"]), None);
         assert_eq!(limiting_window(&event(40.0, 40.0)["rate_limits"]), None);
-        // A spent window whose numbers are unusable does not count.
+
+        // A lone window names itself only when it is spent; a `null` slot
+        // gives no window.
+        let mut lone = event(40.0, 0.0);
+        lone["rate_limits"]["secondary"] = Value::Null;
+        assert_eq!(limiting_window(&lone["rate_limits"]), None);
+        lone["rate_limits"]["primary"]["used_percent"] = serde_json::json!(100.0);
+        assert_eq!(
+            limiting_window(&lone["rate_limits"]),
+            Some((300, 1788879437))
+        );
+
+        // An unusable window may be the one that ran out, so nothing is named,
+        // whether it reads as spent or the other one does.
         let mut broken = event(100.0, 40.0);
         broken["rate_limits"]["primary"]["reset_at"] = serde_json::json!("NaN");
-        assert_eq!(
-            limiting_window(&broken["rate_limits"]),
-            Some((10080, 1789466238))
-        );
+        assert_eq!(limiting_window(&broken["rate_limits"]), None);
+        let mut broken = event(100.0, 40.0);
+        broken["rate_limits"]["secondary"]["used_percent"] = serde_json::json!("NaN");
+        assert_eq!(limiting_window(&broken["rate_limits"]), None);
     }
 
     #[test]
     fn a_spent_allowance_marks_its_window_used_up() {
-        use super::super::events::{CodexLimitWindow, CodexUsageLimit};
+        use super::super::events::CodexLimitWindow;
 
-        // Resets in the past, so `latest()` never hands this to another test.
-        observe_event(&event(42.0, 16.0));
-        observe_usage_limit(&CodexUsageLimit {
-            message: "toy".to_string(),
-            resets_at: Some(1788879999),
-            window: Some(CodexLimitWindow::FiveHour),
-        });
-        let snapshot = cell().lock().unwrap().clone().expect("snapshot");
+        let now = 1_788_000_000;
+        let held = snapshot_from_event(&event(42.0, 16.0));
+        let marked = mark_spent(held.clone(), CodexLimitWindow::FiveHour, 1788879999, now)
+            .expect("snapshot");
         assert_eq!(
-            snapshot.five_hour,
+            marked.five_hour,
             Some(WindowState {
                 utilization: 1.0,
                 resets_at: 1788879999
             })
         );
         assert_eq!(
-            snapshot.seven_day.expect("weekly reading kept").utilization,
+            marked.seven_day.expect("weekly reading kept").utilization,
             0.16
         );
 
-        // A limit that cannot be placed changes nothing.
-        observe_usage_limit(&CodexUsageLimit {
-            message: "toy".to_string(),
-            resets_at: None,
-            window: Some(CodexLimitWindow::SevenDay),
-        });
-        assert_eq!(cell().lock().unwrap().clone(), Some(snapshot));
+        // With no reading held, the spent window is the whole snapshot.
+        let alone =
+            mark_spent(None, CodexLimitWindow::SevenDay, 1789466238, now).expect("snapshot");
+        assert_eq!(alone.five_hour, None);
+        assert_eq!(alone.seven_day.expect("weekly").utilization, 1.0);
+    }
+
+    #[test]
+    fn a_stale_allowance_leaves_a_newer_reading_alone() {
+        use super::super::events::CodexLimitWindow;
+
+        // A fresh reading of windows that reset later, then a limit for the
+        // five hour window that came before them.
+        let fresh = snapshot_from_event(&event(3.0, 16.0));
+        let now = 1_788_000_000;
+        assert_eq!(
+            mark_spent(fresh.clone(), CodexLimitWindow::FiveHour, 1788800000, now),
+            fresh
+        );
+        // A reset that has already passed names no window still running.
+        assert_eq!(
+            mark_spent(
+                fresh.clone(),
+                CodexLimitWindow::FiveHour,
+                1788879999,
+                1788879999
+            ),
+            fresh
+        );
+        assert_eq!(
+            mark_spent(None, CodexLimitWindow::SevenDay, 1789466238, 1789466239),
+            None
+        );
+        // The same reset as the reading held still marks it spent.
+        let same =
+            mark_spent(fresh, CodexLimitWindow::FiveHour, 1788879437, now).expect("snapshot");
+        assert_eq!(same.five_hour.expect("five hour").utilization, 1.0);
     }
 
     #[test]
     fn ignores_frames_that_are_not_quota_telemetry() {
+        let _snapshot = lock_for_tests();
         observe_event(&serde_json::json!({"type": "response.completed"}));
         assert!(snapshot_from_event(&serde_json::json!({"type": "codex.rate_limits"})).is_none());
     }

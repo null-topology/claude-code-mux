@@ -5,29 +5,45 @@
   `usage_limit_reached` error already was, on the live WebSocket and HTTP
   streams and the buffered paths: 429 `rate_limit_error` with
   `x-should-retry: false`, `anthropic-ratelimit-unified-status: rejected`,
-  and `-reset` and `-representative-claim` when the event's windows tell
-  which one ran out. It no longer sends `Retry-After`, which used to carry
+  and `-reset` and `-representative-claim` only when exactly one of the
+  windows it carries is spent and every one it carries is readable; two
+  spent windows name neither. It no longer sends `Retry-After`, which used to carry
   the window's whole countdown (hours on a weekly window) for a client to
   sleep through before retrying; `x-should-retry: false` tells it not to
   retry instead. A snapshot that still has credits keeps streaming as before.
 - A spent window after the answer started streaming, as a
   `usage_limit_reached` error or as that snapshot, now ends the stream with
   an SSE `error` of type `rate_limit_error` instead of `api_error`.
-- Every spent-window answer now records the window it names as spent until
-  its reset, so later responses carry it in their
-  `anthropic-ratelimit-unified-5h-*` or `-7d-*` headers.
+- Every spent-window answer that names a window and a reset still ahead now
+  records that window as spent until then, unless the reading held already
+  resets it later, and a refusing snapshot is kept as the newest reading, so
+  later responses carry it in their `anthropic-ratelimit-unified-5h-*` or
+  `-7d-*` headers. Until the next reading those responses can say
+  `unified-status: allowed` beside a utilization of 1.0. A spent window
+  that arrives after output on the HTTP transport takes its window from the
+  response's `X-Codex-*` headers when the event names none.
 - Codex `policy_capacity_unavailable` errors (as code or type) are answered
   like `server_is_overloaded`: 529 `overloaded_error` with the native
   message, and `Retry-After` only when the error carries a delay. They used
   to be 502 `api_error`, a server failure.
-- Codex `model_not_found` errors (as code or type), with or without a status,
-  are answered 404 `not_found_error` with the native message, or
-  `model_not_found` when there is none, instead of 502 `api_error` or a
-  status-based answer.
+- Codex `model_not_found` errors (as code or type) that come with no status
+  or with 400, 403 or 404 are answered 404 `not_found_error` with the native
+  message, or `model_not_found` when it is empty or missing, instead of
+  502 `api_error` or a status-based answer. With any other status they keep
+  their previous answer.
+- A buffered WebSocket request whose `error` event carries a status is now
+  answered by the event's error code as well, like an HTTP error body, and
+  a 401 whose body names one of the known codes is answered as that code
+  without a token refresh.
+- The delay a classified Codex error body names (`retry_after`,
+  `retry_after_seconds` or a `headers` object) is now sent as `Retry-After`,
+  rounded up to whole seconds, before the response's own `Retry-After`
+  header, on HTTP responses and rejected WebSocket upgrades alike.
 - A `codex.rate_limits` reading with a non-finite, negative or out-of-range
   window length, percentage, reset time or countdown now drops only that
-  window; the other window is still published. A huge countdown no longer
-  wraps the reset time.
+  window; the other window is still published. A reset time or countdown
+  that is present but unusable drops its window even when the other one is
+  usable. A huge countdown no longer wraps the reset time.
 
 ## v0.17.0 (2026-11-05)
 

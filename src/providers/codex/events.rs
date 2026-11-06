@@ -119,19 +119,60 @@ pub(crate) fn error_class(error: &Value) -> Option<CodexErrorClass> {
     } else if matches!(code, Some("rate_limit_exceeded" | "slow_down")) {
         Some(CodexErrorClass::Throttled)
     } else if names("model_not_found") {
-        // The CLI reads it with no status or a 400, 403 or 404
-        // (codex-rs/codex-api/src/error.rs at rust-v0.166.0); here, as for
-        // the other codes, the code decides over any status.
+        // Only with a status the CLI accepts for it (`class_with_status`).
         Some(CodexErrorClass::ModelNotFound)
     } else {
         None
     }
 }
 
-/// The class a JSON error body `{"error": {...}}` names.
-pub(crate) fn error_class_from_body(body: &[u8]) -> Option<CodexErrorClass> {
-    let value = serde_json::from_slice::<Value>(body).ok()?;
-    error_class(value.get("error")?)
+/// `class` as it stands beside `status`. A missing model is one only with no
+/// status or a 400, 403 or 404, as the Codex CLI reads it
+/// (`codex-rs/codex-api/src/error.rs:83-94` at rust-v0.166.0); under any other
+/// status the failure keeps the handling that status gives it.
+fn class_with_status(
+    class: Option<CodexErrorClass>,
+    status: Option<u16>,
+) -> Option<CodexErrorClass> {
+    match (class, status) {
+        (Some(CodexErrorClass::ModelNotFound), Some(status))
+            if !matches!(status, 400 | 403 | 404) =>
+        {
+            None
+        }
+        _ => class,
+    }
+}
+
+/// The class an error body names that came with HTTP `status`: a JSON body
+/// `{"error": {...}}`, else the first event of an SSE body that names one,
+/// read with that event's own status as a stream event is
+/// (`classify_event_failure`).
+pub(crate) fn error_class_from_body(body: &[u8], status: u16) -> Option<CodexErrorClass> {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(value) => class_with_status(error_class(value.get("error")?), Some(status)),
+        Err(_) => sse_payloads(body).find_map(|payload| classify_event_failure(&payload)?.class),
+    }
+}
+
+/// The retry advice an error body gives, read the way a stream event's is
+/// (`retry_advice`): a JSON body's own fields, else the first event of an SSE
+/// body that names one. Normalised (`normalize_retry_after`).
+pub(crate) fn retry_after_from_body(body: &[u8]) -> Option<String> {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(value) => {
+            retry_advice(&value, event_error(&value)).map(|value| normalize_retry_after(&value))
+        }
+        Err(_) => {
+            sse_payloads(body).find_map(|payload| classify_event_failure(&payload)?.retry_after)
+        }
+    }
+}
+
+fn sse_payloads(body: &[u8]) -> impl Iterator<Item = Value> {
+    crate::anthropic::sse::parse_sse_events(body)
+        .into_iter()
+        .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok())
 }
 
 /// The delay a throttling message asks for, as in "Please try again in
@@ -210,20 +251,10 @@ pub(crate) fn event_error(payload: &Value) -> Option<&Value> {
 }
 
 pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailure> {
+    // A `codex.rate_limits` event is no failure here: one that ends the
+    // request is a spent window, which the usage limit readers answer once and
+    // never as something to retry.
     let event_type = payload.get("type").and_then(Value::as_str)?;
-    if event_type == "codex.rate_limits" {
-        if !is_terminal_rate_limit_event(payload) {
-            return None;
-        }
-        return Some(CodexEventFailure {
-            kind: CodexFailureKind::RateLimit,
-            explicit_status: Some(429),
-            status: 429,
-            message: "rate limit reached".to_string(),
-            retry_after: scalar_string(payload.pointer("/rate_limits/primary/reset_after_seconds")),
-            class: None,
-        });
-    }
     if !matches!(event_type, "response.failed" | "response.error" | "error") {
         return None;
     }
@@ -236,7 +267,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
                 .and_then(Value::as_u64)
         })
         .and_then(|status| u16::try_from(status).ok());
-    let class = error.and_then(error_class);
+    let class = class_with_status(error.and_then(error_class), explicit_status);
     let native = error
         .and_then(|value| value.get("message"))
         .and_then(Value::as_str);
@@ -293,7 +324,24 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
             CodexFailureKind::Permanent => 500,
         })
     });
-    let retry_after = error
+    // Normalised once here, so a failure without a class passes whole seconds
+    // as well; normalising a whole number again keeps it.
+    let retry_after = retry_advice(payload, error).map(|value| normalize_retry_after(&value));
+
+    Some(CodexEventFailure {
+        kind,
+        explicit_status,
+        status,
+        message,
+        retry_after,
+        class,
+    })
+}
+
+/// The retry delay a failure payload names, as it came: `error` is the
+/// payload's error object (`event_error`).
+fn retry_advice(payload: &Value, error: Option<&Value>) -> Option<String> {
+    error
         .and_then(|value| value.get("retry_after"))
         .and_then(scalar_string_value)
         .or_else(|| {
@@ -314,18 +362,6 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
                     .or_else(|| scalar_string(value.pointer("/headers/Retry-After")))
             })
         })
-        // Normalised once here, so a failure without a class passes whole
-        // seconds as well; normalising a whole number again keeps it.
-        .map(|value| normalize_retry_after(&value));
-
-    Some(CodexEventFailure {
-        kind,
-        explicit_status,
-        status,
-        message,
-        retry_after,
-        class,
-    })
 }
 
 /// Which known upstream quota window ran out.
@@ -359,19 +395,15 @@ pub struct CodexUsageLimit {
 /// (`resets_at`, `resets_in_seconds`) and in `X-Codex-*` headers mirrored into
 /// the event payload. A `codex.rate_limits` event that ends the request
 /// (`is_terminal_rate_limit_event`) is a spent window too.
+#[cfg(test)]
 pub(crate) fn usage_limit_from_event(payload: &Value) -> Option<CodexUsageLimit> {
-    if !matches!(
-        payload.get("type").and_then(Value::as_str),
-        Some("response.failed" | "response.error" | "error" | "codex.rate_limits")
-    ) {
-        return None;
-    }
-    usage_limit_from_payload(payload)
+    usage_limit_from_event_with_headers(payload, &[])
 }
 
-/// Read a quota exhaustion event from a live HTTP stream. Codex may send the
-/// clock only in the stream's response headers, so those are consulted for any
-/// `X-Codex-*` value the event payload does not carry.
+/// Read a quota exhaustion event from a live stream. Codex may send the clock
+/// only in the stream's HTTP response headers, so those are consulted for any
+/// `X-Codex-*` value the event payload does not carry; a WebSocket stream has
+/// none to give.
 pub(crate) fn usage_limit_from_event_with_headers(
     payload: &Value,
     headers: &[(String, String)],
@@ -392,17 +424,38 @@ pub(crate) fn usage_limit_from_response(
     body: &[u8],
     headers: &[(String, String)],
 ) -> Option<CodexUsageLimit> {
-    let direct = serde_json::from_slice::<Value>(body).ok().into_iter();
-    let events = crate::anthropic::sse::parse_sse_events(body)
-        .into_iter()
-        .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok());
-    direct.chain(events).find_map(|payload| {
+    let payloads: Vec<Value> = response_payloads(body).collect();
+    // An explicit `usage_limit_reached` error names its own clock, so it is
+    // read before a terminal snapshot whose windows may not tell which one ran
+    // out, wherever each sits in the body.
+    let limit_error = |payload: &&Value| {
+        payload.get("type").and_then(Value::as_str) != Some("codex.rate_limits")
+            && is_usage_limit_payload(payload)
+    };
+    let snapshot = |payload: &&Value| is_terminal_rate_limit_event(payload);
+    let explicit = payloads.iter().filter(limit_error);
+    let terminal = payloads.iter().filter(snapshot);
+    explicit.chain(terminal).find_map(|payload| {
         // Only an actual quota event consults the headers; they are not copied
         // into every parsed event.
-        is_usage_limit_payload(&payload)
-            .then(|| usage_limit_from_payload_with_headers(&payload, headers))
-            .flatten()
+        usage_limit_from_payload_with_headers(payload, headers)
     })
+}
+
+/// Hand every `codex.rate_limits` event of a buffered body to the quota gauge
+/// (`rate_limits::observe_event`), in body order.
+pub(crate) fn observe_rate_limits_in_body(body: &[u8]) {
+    for payload in response_payloads(body) {
+        super::rate_limits::observe_event(&payload);
+    }
+}
+
+/// A JSON body as one payload, or the events of an SSE body.
+fn response_payloads(body: &[u8]) -> impl Iterator<Item = Value> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .into_iter()
+        .chain(sse_payloads(body))
 }
 
 fn is_usage_limit_payload(payload: &Value) -> bool {
@@ -411,10 +464,6 @@ fn is_usage_limit_payload(payload: &Value) -> bool {
             .and_then(|error| error.get("type"))
             .and_then(Value::as_str)
             == Some("usage_limit_reached")
-}
-
-fn usage_limit_from_payload(payload: &Value) -> Option<CodexUsageLimit> {
-    usage_limit_from_payload_with_headers(payload, &[])
 }
 
 fn usage_limit_from_payload_with_headers(
@@ -937,13 +986,14 @@ mod tests {
 
     #[test]
     fn classifies_retryable_failure_kinds() {
-        let rate = classify_event_failure(&serde_json::json!({
+        // A snapshot that ends the request is a spent window, answered by the
+        // usage limit readers, never a failure to retry after its countdown.
+        let spent = serde_json::json!({
             "type": "codex.rate_limits",
             "rate_limits": {"limit_reached": true, "primary": {"reset_after_seconds": 1.5}}
-        }))
-        .unwrap();
-        assert_eq!(rate.kind, CodexFailureKind::RateLimit);
-        assert_eq!(rate.retry_after.as_deref(), Some("1.5"));
+        });
+        assert!(is_terminal_rate_limit_event(&spent));
+        assert!(classify_event_failure(&spent).is_none());
 
         let overload = classify_event_failure(&serde_json::json!({
             "type": "response.failed",
@@ -1275,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_model_is_not_found_whatever_its_status() {
+    fn a_missing_model_is_not_found_under_the_statuses_the_cli_accepts() {
         let statusless = classify_event_failure(&serde_json::json!({
             "type": "error",
             "error": {"code": "model_not_found", "message": "toy message"}
@@ -1297,6 +1347,33 @@ mod tests {
         assert_eq!(bad_request.explicit_status, Some(400));
         assert_eq!(bad_request.status, 404);
 
+        // Any other status keeps the handling that status gives.
+        for (status, retryable) in [(500, true), (429, true), (401, false)] {
+            let other = classify_event_failure(&serde_json::json!({
+                "type": "error",
+                "status": status,
+                "error": {"code": "model_not_found", "message": "toy message"}
+            }))
+            .unwrap();
+            assert_eq!(other.class, None, "{status}");
+            assert_eq!(other.status, status, "{status}");
+            assert_eq!(other.retryable(), retryable, "{status}");
+        }
+        for status in [400, 403, 404] {
+            assert_eq!(
+                error_class_from_body(br#"{"error":{"code":"model_not_found"}}"#, status),
+                Some(CodexErrorClass::ModelNotFound),
+                "{status}"
+            );
+        }
+        for status in [401, 429, 500, 503] {
+            assert_eq!(
+                error_class_from_body(br#"{"error":{"code":"model_not_found"}}"#, status),
+                None,
+                "{status}"
+            );
+        }
+
         // With no message, or an empty one, the code names it.
         for error in [
             serde_json::json!({"code": "model_not_found"}),
@@ -1308,7 +1385,7 @@ mod tests {
             assert_eq!(failure.message, "model_not_found", "{error}");
         }
         assert_eq!(
-            error_class_from_body(br#"{"error":{"type":"model_not_found"}}"#),
+            error_class_from_body(br#"{"error":{"type":"model_not_found"}}"#, 404),
             Some(CodexErrorClass::ModelNotFound)
         );
         // A spent window keeps precedence.
@@ -1388,15 +1465,24 @@ mod tests {
         let limit = usage_limit_from_event(&both).unwrap();
         assert_eq!((limit.resets_at, limit.window), (None, None));
 
-        // The only window reported is the one, spent or not.
+        // A lone window that is not spent names nothing; a spent one does.
         let mut weekly_only = terminal_snapshot(Value::Null);
         weekly_only["rate_limits"]
             .as_object_mut()
             .unwrap()
             .remove("primary");
         let limit = usage_limit_from_event(&weekly_only).unwrap();
+        assert_eq!((limit.resets_at, limit.window), (None, None));
+        weekly_only["rate_limits"]["secondary"]["used_percent"] = serde_json::json!(100.0);
+        let limit = usage_limit_from_event(&weekly_only).unwrap();
         assert_eq!(limit.resets_at, Some(1789466238));
         assert_eq!(limit.window, Some(CodexLimitWindow::SevenDay));
+
+        // A spent window beside one whose numbers are unusable names nothing.
+        let mut broken = terminal_snapshot(Value::Null);
+        broken["rate_limits"]["secondary"]["reset_at"] = serde_json::json!("soon");
+        let limit = usage_limit_from_event(&broken).unwrap();
+        assert_eq!((limit.resets_at, limit.window), (None, None));
 
         // No windows at all still ends the request, with nothing to name.
         let bare = serde_json::json!({
@@ -1405,6 +1491,34 @@ mod tests {
         });
         let limit = usage_limit_from_event(&bare).unwrap();
         assert_eq!(limit.message, "Usage limit reached");
+        assert_eq!((limit.resets_at, limit.window), (None, None));
+    }
+
+    #[test]
+    fn an_explicit_limit_error_is_read_before_a_terminal_snapshot() {
+        // The snapshot comes first and cannot tell which window ran out; the
+        // limit error after it can.
+        let mut both = terminal_snapshot(Value::Null);
+        both["rate_limits"]["secondary"]["used_percent"] = serde_json::json!(100.0);
+        let failed = serde_json::json!({
+            "type": "response.failed",
+            "response": {"error": spent_five_hour_window()["error"].clone()},
+            "headers": spent_five_hour_window()["headers"].clone()
+        });
+        for limit_event in [spent_five_hour_window(), failed] {
+            let body = format!("data: {both}\n\ndata: {limit_event}\n\n");
+            let limit = usage_limit_from_response(body.as_bytes(), &[]).expect("usage limit");
+            assert_eq!(limit.resets_at, Some(1788879437), "{limit_event}");
+            assert_eq!(
+                limit.window,
+                Some(CodexLimitWindow::FiveHour),
+                "{limit_event}"
+            );
+        }
+
+        // A snapshot alone still answers.
+        let body = format!("data: {both}\n\n");
+        let limit = usage_limit_from_response(body.as_bytes(), &[]).expect("usage limit");
         assert_eq!((limit.resets_at, limit.window), (None, None));
     }
 
@@ -1435,23 +1549,76 @@ mod tests {
     #[test]
     fn reads_the_class_of_a_json_error_body() {
         assert_eq!(
-            error_class_from_body(br#"{"error":{"code":"credit_balance_exhausted"}}"#),
+            error_class_from_body(br#"{"error":{"code":"credit_balance_exhausted"}}"#, 429),
             Some(CodexErrorClass::QuotaExceeded)
         );
         assert_eq!(
-            error_class_from_body(br#"{"error":{"type":"usage_not_included"}}"#),
+            error_class_from_body(br#"{"error":{"type":"usage_not_included"}}"#, 403),
             Some(CodexErrorClass::UsageNotIncluded)
         );
         assert_eq!(
-            error_class_from_body(br#"{"error":{"code":"server_is_overloaded"}}"#),
+            error_class_from_body(br#"{"error":{"code":"server_is_overloaded"}}"#, 503),
             Some(CodexErrorClass::Overloaded)
         );
         assert_eq!(
-            error_class_from_body(br#"{"error":{"code":"some_future_code"}}"#),
+            error_class_from_body(br#"{"error":{"code":"some_future_code"}}"#, 500),
             None
         );
-        assert_eq!(error_class_from_body(br#"{"detail":"toy"}"#), None);
-        assert_eq!(error_class_from_body(b"not json"), None);
+        assert_eq!(error_class_from_body(br#"{"detail":"toy"}"#, 500), None);
+        assert_eq!(error_class_from_body(b"not json", 500), None);
+    }
+
+    #[test]
+    fn reads_the_class_and_delay_of_an_sse_error_body() {
+        // A buffered WebSocket failure arrives as SSE under the status its
+        // event named; the event's own status decides, as on the stream.
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_toy\"}}\n\n",
+            "data: {\"type\":\"error\",\"status\":503,\"error\":{\"code\":\"policy_capacity_unavailable\",\"message\":\"toy\",\"retry_after\":2.5}}\n\n",
+        );
+        assert_eq!(
+            error_class_from_body(body.as_bytes(), 503),
+            Some(CodexErrorClass::Overloaded)
+        );
+        assert_eq!(retry_after_from_body(body.as_bytes()).as_deref(), Some("3"));
+
+        // A statusless missing model is one, whatever status the buffered
+        // response was given for it.
+        let statusless = b"data: {\"type\":\"error\",\"error\":{\"code\":\"model_not_found\"}}\n\n";
+        assert_eq!(
+            error_class_from_body(statusless, 500),
+            Some(CodexErrorClass::ModelNotFound)
+        );
+    }
+
+    #[test]
+    fn reads_the_delay_a_json_error_body_names() {
+        for (body, expected) in [
+            (r#"{"error":{"code":"toy","retry_after":2.5}}"#, Some("3")),
+            (
+                r#"{"error":{"code":"toy","retry_after_seconds":"4"}}"#,
+                Some("4"),
+            ),
+            (
+                r#"{"error":{"code":"toy"},"retry_after_seconds":0.2}"#,
+                Some("1"),
+            ),
+            (
+                r#"{"error":{"code":"toy"},"headers":{"retry-after":"7"}}"#,
+                Some("7"),
+            ),
+            (
+                r#"{"error":{"code":"toy","headers":{"Retry-After":"8"}}}"#,
+                Some("8"),
+            ),
+            (r#"{"error":{"code":"toy"}}"#, None),
+        ] {
+            assert_eq!(
+                retry_after_from_body(body.as_bytes()).as_deref(),
+                expected,
+                "{body}"
+            );
+        }
     }
 
     #[test]
