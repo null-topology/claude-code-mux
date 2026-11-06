@@ -742,7 +742,23 @@ byte-exact.
 - Codex credentials come only from the Codex CLI's `~/.codex/auth.json`. The
   proxy has no Codex login of its own and must never delete that file. Token
   refresh writes back to it so the Codex CLI keeps working (OpenAI rotates the
-  refresh token on use).
+  refresh token on use). The writeback (`CodexCliAuthStore::save_refreshed` in
+  `providers/codex/auth/token_store.rs`) holds the Codex CLI's `auth.lock` next
+  to `auth.json` (an exclusive `File::lock`, tried every 50 ms for up to 5 s,
+  never removed or truncated) across reload, compare and write only, and
+  writes only into a file that still holds the refresh token it refreshed
+  from (and the same `account_id` when both are known). It changes only
+  `tokens.access_token`, `tokens.refresh_token` and `tokens.id_token` when the
+  response carried them, `tokens.account_id` when it was absent, and
+  `last_refresh`, through a uuid temp file, `sync_all` and a rename. A missing
+  file, another login or a file it cannot read as a JSON object with a
+  `tokens` object is left as it is: the refreshed tokens are dropped and the
+  request uses the stored token while it is unexpired. A proactive refresh
+  that fails transiently (network, timeout, 429, 5xx, lock timeout) while the
+  token is still valid keeps using it with one
+  `codex_token_refresh_failed_using_stored_token` warning; the forced refresh
+  after an upstream 401 never does. No refresh error carries the token
+  endpoint's response body.
 
 ## Codex rate limits
 

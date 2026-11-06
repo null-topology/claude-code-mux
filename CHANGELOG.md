@@ -1,3 +1,30 @@
+## Unreleased
+
+- Codex token refresh no longer writes over a login it did not start from.
+  The proxy now takes the Codex CLI's `auth.lock` next to `auth.json` while
+  it rereads and writes the file, and writes only when the file still holds
+  the refresh token the refresh was made from. If you log in again, log out
+  or delete `auth.json` while a refresh is in flight, the proxy drops its
+  refreshed tokens, leaves the file as you left it, and uses the stored token
+  when it is still valid; otherwise the request fails and asks you to run
+  `codex login`. A file the proxy cannot read as JSON is left untouched
+  instead of being replaced. The writeback changes only the token fields and
+  `last_refresh`, and stores a returned `id_token` in the same raw form the
+  Codex CLI uses. If another process holds `auth.lock` for more than 5
+  seconds, the refresh counts as a temporary failure.
+- A refresh that fails for a temporary reason (network error, timeout, 429,
+  5xx, the lock timeout above) in the last five minutes before the token
+  expires no longer fails the request: the proxy logs one
+  `codex_token_refresh_failed_using_stored_token` warning on the `codex`
+  logger, with the failure class and HTTP status only, and keeps using the
+  stored token. A rejected refresh (401, 403, any other 4xx, a malformed
+  response) still fails, and the forced refresh after the backend rejected a
+  token never falls back. A token response without `refresh_token` is
+  accepted and keeps the stored one.
+- Errors from a failed Codex token refresh no longer include the token
+  endpoint's response body. They name the HTTP status, and for 401 and 403
+  ask you to run `codex login`.
+
 ## v0.17.0 (2026-11-05)
 
 - Breaking: `GET /v1/models` now answers in the Anthropic List Models shape
