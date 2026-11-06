@@ -4,6 +4,7 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
+use claude_code_mux::providers::codex::clear_codex_rate_limits_for_tests;
 use claude_code_mux::providers::codex::compaction::clear_all_compactions_for_tests;
 use claude_code_mux::providers::codex::continuation::clear_all_continuations_for_tests;
 use claude_code_mux::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
@@ -2511,6 +2512,31 @@ fn codex_terminal_snapshot_event() -> Value {
     })
 }
 
+/// Starts a test with no quota reading and forgets the one it leaves behind,
+/// even when an assertion fails first.
+struct RateLimitReadingGuard;
+
+impl RateLimitReadingGuard {
+    fn new() -> Self {
+        clear_codex_rate_limits_for_tests();
+        Self
+    }
+}
+
+impl Drop for RateLimitReadingGuard {
+    fn drop(&mut self) {
+        clear_codex_rate_limits_for_tests();
+    }
+}
+
+fn unix_seconds_from_now(seconds: u64) -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + seconds
+}
+
 fn codex_sse(events: &[Value]) -> Vec<u8> {
     events
         .iter()
@@ -2659,13 +2685,10 @@ async fn smoke_codex_http_usage_limit_after_output_is_a_rate_limit_error() {
     clear_all_continuations_for_tests();
     let config = TempDir::new().unwrap();
     let _codex_auth = write_codex_auth(config.path());
+    let _reading = RateLimitReadingGuard::new();
 
     // A window that reopens in an hour, so the next response still shows it.
-    let resets_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 3600;
+    let resets_at = unix_seconds_from_now(3600);
     let mut limit = codex_usage_limit_event("usage_limit_reached");
     limit["error"]["resets_at"] = json!(resets_at);
     limit["error"]["resets_in_seconds"] = json!(3600);
@@ -2676,19 +2699,7 @@ async fn smoke_codex_http_usage_limit_after_output_is_a_rate_limit_error() {
         let attempts = attempts.clone();
         move |_body: Value| {
             let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-            let mut events = Vec::new();
-            if attempt == 2 {
-                // A reading that has rolled over replaces the spent window, so
-                // it reaches no other test.
-                events.push(json!({
-                    "type": "codex.rate_limits",
-                    "rate_limits": {
-                        "limit_reached": false,
-                        "primary": {"used_percent": 1.0, "window_minutes": 300, "reset_at": 1u64}
-                    }
-                }));
-            }
-            events.extend(codex_text_events("resp_partial", "partial output"));
+            let mut events = codex_text_events("resp_partial", "partial output");
             if attempt == 0 {
                 events.push(limit.clone());
             } else {
@@ -2724,10 +2735,7 @@ async fn smoke_codex_http_usage_limit_after_output_is_a_rate_limit_error() {
         resets_at.to_string()
     );
     let _ = axum::body::to_bytes(next.into_body(), usize::MAX).await;
-
-    let cleanup = call_messages_body(streamed_request()).await;
-    let _ = axum::body::to_bytes(cleanup.into_body(), usize::MAX).await;
-    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -2758,6 +2766,364 @@ async fn smoke_codex_http_terminal_snapshot_after_output_is_a_rate_limit_error()
     assert_eq!(attempts.load(Ordering::SeqCst), 1, "stream body: {text}");
     assert_eq!(error["error"]["type"], "rate_limit_error", "{text}");
     assert_eq!(error["error"]["message"], "Usage limit reached", "{text}");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_two_spent_windows_name_no_claim_and_stay_spent() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    for stream in [true, false] {
+        let _reading = RateLimitReadingGuard::new();
+        let five_hour_reset = unix_seconds_from_now(3600);
+        let weekly_reset = unix_seconds_from_now(86_400);
+        let snapshot = json!({
+            "type": "codex.rate_limits",
+            "credits": {"has_credits": false, "unlimited": false},
+            "rate_limits": {
+                "allowed": false,
+                "limit_reached": true,
+                "primary": {"used_percent": 100.0, "window_minutes": 300, "reset_at": five_hour_reset},
+                "secondary": {"used_percent": 100.0, "window_minutes": 10080, "reset_at": weekly_reset}
+            }
+        });
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let upstream = spawn_http_upstream({
+            let attempts = attempts.clone();
+            move |_body: Value| {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    codex_sse(std::slice::from_ref(&snapshot))
+                } else {
+                    let mut events = codex_text_events("resp_after", "ok");
+                    events.extend(codex_completion_events("resp_after"));
+                    codex_sse(&events)
+                }
+            }
+        })
+        .await;
+        let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+        let mut request = streamed_request();
+        request["stream"] = json!(stream);
+
+        let refused = call_messages_body(request).await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "stream {stream}"
+        );
+        assert_eq!(refused.headers()["x-should-retry"], "false");
+        assert_eq!(
+            refused.headers()["anthropic-ratelimit-unified-status"],
+            "rejected"
+        );
+        assert!(
+            !refused
+                .headers()
+                .contains_key("anthropic-ratelimit-unified-representative-claim"),
+            "stream {stream}"
+        );
+        assert!(
+            !refused
+                .headers()
+                .contains_key("anthropic-ratelimit-unified-reset"),
+            "stream {stream}"
+        );
+        let _ = axum::body::to_bytes(refused.into_body(), usize::MAX).await;
+
+        // The refusal's own reading is kept, so both windows read as spent on
+        // the next live response, the one kind of answer that carries them.
+        let next = call_messages_body(streamed_request()).await;
+        assert_eq!(next.status(), StatusCode::OK, "stream {stream}");
+        let header = |name: String| {
+            next.headers()
+                .get(name.as_str())
+                .map(|value| value.to_str().unwrap().to_string())
+                .unwrap_or_else(|| panic!("stream {stream}: no {name} in {:?}", next.headers()))
+        };
+        for (window, reset) in [("5h", five_hour_reset), ("7d", weekly_reset)] {
+            assert_eq!(
+                header(format!("anthropic-ratelimit-unified-{window}-utilization")),
+                "1.0000"
+            );
+            assert_eq!(
+                header(format!("anthropic-ratelimit-unified-{window}-reset")),
+                reset.to_string()
+            );
+        }
+        let _ = axum::body::to_bytes(next.into_body(), usize::MAX).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "stream {stream}");
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_buffered_websocket_ending_on_a_terminal_snapshot_is_a_spent_window() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+    let _reading = RateLimitReadingGuard::new();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream =
+        spawn_websocket_failure_upstream(codex_terminal_snapshot_event(), attempts.clone()).await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let mut request = streamed_request();
+    request["stream"] = json!(false);
+    let response = tokio::time::timeout(Duration::from_secs(5), call_messages_body(request))
+        .await
+        .expect("a terminal snapshot must end a buffered request");
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_terminal_snapshot_response(response).await;
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_limit_after_output_takes_its_window_from_response_headers() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    let error =
+        json!({"type": "usage_limit_reached", "message": "The usage limit has been reached"});
+    let shapes = [
+        json!({"type": "error", "status_code": 429, "error": error.clone()}),
+        json!({
+            "type": "response.failed",
+            "response": {"id": "resp_partial", "status": "failed", "error": error}
+        }),
+    ];
+    for limit in shapes {
+        let _reading = RateLimitReadingGuard::new();
+        // Only the HTTP response headers name the window and its reset.
+        let resets_at = unix_seconds_from_now(3600);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let mock = axum::Router::new().fallback({
+            let attempts = attempts.clone();
+            let limit = limit.clone();
+            move || {
+                let attempts = attempts.clone();
+                let limit = limit.clone();
+                async move {
+                    let mut events = codex_text_events("resp_partial", "partial output");
+                    let mut response = http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream");
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        response = response
+                            .header("x-codex-primary-window-minutes", "300")
+                            .header("x-codex-primary-reset-at", resets_at.to_string());
+                        events.push(limit);
+                    } else {
+                        events.extend(codex_completion_events("resp_partial"));
+                    }
+                    response.body(Body::from(codex_sse(&events))).unwrap()
+                }
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, mock).await.ok();
+        });
+        let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+
+        let (error, text) = stream_error_event(call_messages_body(streamed_request()).await).await;
+        assert!(text.contains("partial output"), "stream body: {text}");
+        assert_eq!(error["error"]["type"], "rate_limit_error", "{text}");
+        assert_eq!(
+            error["error"]["message"], "The usage limit has been reached",
+            "{text}"
+        );
+
+        let next = call_messages_body(streamed_request()).await;
+        assert_eq!(next.status(), StatusCode::OK);
+        assert_eq!(
+            next.headers()["anthropic-ratelimit-unified-5h-utilization"],
+            "1.0000",
+            "{limit}"
+        );
+        assert_eq!(
+            next.headers()["anthropic-ratelimit-unified-5h-reset"],
+            resets_at.to_string(),
+            "{limit}"
+        );
+        let _ = axum::body::to_bytes(next.into_body(), usize::MAX).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_missing_model_after_output_names_the_code() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    let errors = [
+        json!({"code": "model_not_found"}),
+        json!({"code": "model_not_found", "message": "   "}),
+    ];
+    for failure in errors {
+        let upstream = spawn_http_upstream({
+            let failure = failure.clone();
+            move |_body: Value| {
+                let mut events = codex_text_events("resp_partial", "partial output");
+                events.push(json!({"type": "error", "error": failure.clone()}));
+                codex_sse(&events)
+            }
+        })
+        .await;
+        let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+
+        let (error, text) = stream_error_event(call_messages_body(streamed_request()).await).await;
+        assert_eq!(error["error"]["type"], "not_found_error", "{text}");
+        assert_eq!(error["error"]["message"], "model_not_found", "{text}");
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_buffered_websocket_error_with_a_status_is_answered_by_its_code() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+
+    let cases = [
+        (
+            json!({
+                "type": "error",
+                "status": 403,
+                "error": {"code": "model_not_found", "message": "The model is not available."}
+            }),
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "The model is not available.",
+            None,
+        ),
+        (
+            json!({
+                "type": "error",
+                "status": 503,
+                "error": {
+                    "code": "policy_capacity_unavailable",
+                    "message": "Capacity is unavailable.",
+                    "retry_after": 2.5
+                }
+            }),
+            StatusCode::from_u16(529).unwrap(),
+            "overloaded_error",
+            "Capacity is unavailable.",
+            Some("3"),
+        ),
+    ];
+    for (event, status, error_type, message, retry_after) in cases {
+        clear_codex_websocket_pool_for_tests();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let upstream = spawn_websocket_failure_upstream(event, attempts.clone()).await;
+        let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+        let mut request = streamed_request();
+        request["stream"] = json!(false);
+
+        let response = call_messages_body(request).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "{error_type}");
+        assert_eq!(response.status(), status, "{error_type}");
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .map(|value| value.to_str().unwrap()),
+            retry_after,
+            "{error_type}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], error_type);
+        assert_eq!(body["error"]["message"], message);
+    }
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_error_body_names_the_delay_without_a_header() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let mock = axum::Router::new().fallback({
+        let attempts = attempts.clone();
+        move || {
+            let attempts = attempts.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                http::Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "error": {
+                                "code": "policy_capacity_unavailable",
+                                "message": "Capacity is unavailable.",
+                                "retry_after": 2.5
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, mock).await.ok();
+    });
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "http");
+
+    for stream in [true, false] {
+        let mut request = streamed_request();
+        request["stream"] = json!(stream);
+        let response = call_messages_body(request).await;
+        assert_eq!(response.status().as_u16(), 529, "stream {stream}");
+        assert_eq!(
+            response.headers()[http::header::RETRY_AFTER],
+            "3",
+            "stream {stream}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "overloaded_error");
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
 #[allow(clippy::await_holding_lock)]

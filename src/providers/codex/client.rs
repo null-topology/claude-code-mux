@@ -1225,6 +1225,18 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
+        self.stream_codex_http_events_with_headers(body, ctx)
+            .await
+            .map(|(receiver, _)| receiver)
+    }
+
+    /// The live HTTP stream together with its response headers, which hold
+    /// the `X-Codex-*` quota clocks an event may leave out.
+    async fn stream_codex_http_events_with_headers(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+    ) -> Result<(CodexHttpEventReceiver, Vec<(String, String)>), CodexError> {
         let mut auth = self
             .auth_manager
             .get_auth()
@@ -1252,24 +1264,36 @@ impl CodexHttpClient {
             )
             .await?;
 
-        Ok(self.spawn_http_event_stream(
+        let headers = response_headers.clone();
+        let receiver = self.spawn_http_event_stream(
             HttpEventStreamState {
                 resp,
                 response_headers,
                 started_at,
             },
             ctx.clone(),
-        ))
+        );
+        Ok((receiver, headers))
     }
 
+    /// The live HTTP stream and its response headers; see
+    /// `stream_codex_http_events_with_headers`.
     pub(crate) async fn stream_codex_http_events_for_owner(
         self: &Arc<Self>,
         body: &ResponsesRequest,
         ctx: &RequestContext,
-    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
-        let receiver = self.stream_codex_http_events(body, ctx).await?;
+    ) -> Result<
+        (
+            super::websocket::CodexWebSocketEventStream,
+            Vec<(String, String)>,
+        ),
+        CodexError,
+    > {
+        let (receiver, headers) = self
+            .stream_codex_http_events_with_headers(body, ctx)
+            .await?;
         let (stream, _) = super::websocket::CodexWebSocketEventStream::pending(receiver);
-        Ok(stream)
+        Ok((stream, headers))
     }
 
     async fn start_http_event_attempt(
@@ -1328,15 +1352,23 @@ impl CodexHttpClient {
             continuation.map(super::continuation::ContinuationReservation::from_public_candidate);
         self.stream_codex_auto_events_for_owner(body, ctx, reservation.as_ref())
             .await
-            .map(super::websocket::CodexWebSocketEventStream::into_receiver)
+            .map(|(events, _)| events.into_receiver())
     }
 
+    /// The stream and, when it fell back to HTTP, that response's headers; a
+    /// WebSocket stream has none.
     pub(crate) async fn stream_codex_auto_events_for_owner(
         self: &Arc<Self>,
         body: &ResponsesRequest,
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
-    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+    ) -> Result<
+        (
+            super::websocket::CodexWebSocketEventStream,
+            Vec<(String, String)>,
+        ),
+        CodexError,
+    > {
         let mut websocket = self
             .stream_codex_websocket_events_for_owner(body, ctx, continuation)
             .await?;
@@ -1353,7 +1385,7 @@ impl CodexHttpClient {
                         forward_codex_events(receiver, tx).await;
                     }
                 });
-                Ok(websocket)
+                Ok((websocket, Vec::new()))
             }
             None => Err(CodexError {
                 status: 0,
@@ -1551,6 +1583,10 @@ impl CodexHttpClient {
                                 &response_headers,
                             ) {
                                 pending_events.clear();
+                                // The terminal snapshot is never forwarded, so
+                                // the gauge reads its windows here, before the
+                                // limit marks the one it names.
+                                super::rate_limits::observe_event(&payload);
                                 let _ = tx
                                     .send(Err(codex_usage_limit_error(
                                         limit,
@@ -1792,6 +1828,9 @@ impl CodexHttpClient {
                     ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
                     ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
                 };
+                // The gauge reads the body's windows before the limit marks
+                // the one it names, as on a live stream.
+                super::events::observe_rate_limits_in_body(&response.body);
                 return Err(codex_usage_limit_error(limit, origin));
             }
 
@@ -1811,6 +1850,20 @@ impl CodexHttpClient {
             }
 
             match result {
+                // An error code in the body says more than the status: read
+                // its class and its message rather than the raw body. A
+                // buffered WebSocket failure is an SSE body under the status
+                // its event named, and is read the same way.
+                Ok(response)
+                    if !(200..300).contains(&response.status)
+                        && super::events::error_class_from_body(
+                            &response.body,
+                            response.status,
+                        )
+                        .is_some() =>
+                {
+                    return Err(codex_status_error(response.into_response()));
+                }
                 Ok(response) if response.status == 401 => {
                     let detail = String::from_utf8_lossy(&response.body).to_string();
                     return Err(CodexError {
@@ -1822,14 +1875,6 @@ impl CodexHttpClient {
                         class: None,
                         origin: CodexErrorOrigin::Http,
                     });
-                }
-                // An error code in the body says more than the status: read
-                // its class and its message rather than the raw body.
-                Ok(response)
-                    if !(200..300).contains(&response.status)
-                        && super::events::error_class_from_body(&response.body).is_some() =>
-                {
-                    return Err(codex_status_error(response.into_response()));
                 }
                 Ok(response) if response.status == 403 => {
                     let detail = String::from_utf8_lossy(&response.body).to_string();
@@ -2776,12 +2821,16 @@ fn auth_error(err: anyhow::Error, message: &str) -> CodexError {
 fn codex_status_error(response: CodexResponse) -> CodexError {
     let usage_limit =
         super::events::usage_limit_from_response(&response.body, &response.headers).map(Box::new);
-    let retry_after = response
-        .headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
-        .map(|(_, value)| value.clone());
-    let class = super::events::error_class_from_body(&response.body);
+    // The delay the body names, as `classify_event_failure` reads it from an
+    // event, else the response's `Retry-After`.
+    let retry_after = super::events::retry_after_from_body(&response.body).or_else(|| {
+        response
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+            .map(|(_, value)| super::events::normalize_retry_after(value))
+    });
+    let class = super::events::error_class_from_body(&response.body, response.status);
     let message = codex_status_error_message(&response.body).unwrap_or_else(|| {
         if class == Some(super::events::CodexErrorClass::ModelNotFound) {
             // The code names a missing model that came with no message.
@@ -2878,10 +2927,16 @@ fn should_refresh_after_unauthorized(
     if auth_refresh_attempted {
         return false;
     }
+    // A 401 whose body names a known error class is answered as that class: a
+    // fresh token would not change it.
     match result {
-        Ok(response) => response.status == 401,
+        Ok(response) => {
+            response.status == 401
+                && super::events::error_class_from_body(&response.body, response.status).is_none()
+        }
         Err(err) => {
             err.status == 401
+                && err.class.is_none()
                 && (err.origin != CodexErrorOrigin::WebSocketHandshake
                     || transport == crate::config::CodexTransport::WebSocket)
         }
@@ -5678,6 +5733,73 @@ mod tests {
             crate::config::CodexTransport::Auto
         ));
         assert!(should_fallback_to_http(rejected_handshake_err));
+    }
+
+    #[tokio::test]
+    async fn a_401_naming_a_known_class_is_answered_without_a_token_refresh() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let server_client = client.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut stream).await;
+            // A refresh would pick up this login and send the request again.
+            server_client.auth_manager().set_test_auth(StoredAuth {
+                access: "rotated".into(),
+                refresh: "rotated-refresh".into(),
+                account_id: Some("acct-rotated".into()),
+                expires: u64::MAX,
+            });
+            let body = br#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota."}}"#;
+            let head = format!(
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let err = match client
+            .post_codex_with_transport(
+                &buffered_test_request(),
+                &http_test_context(),
+                None,
+                crate::config::CodexTransport::Http,
+            )
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("a quota failure must not succeed"),
+        };
+        assert_eq!(
+            err.class,
+            Some(super::super::events::CodexErrorClass::QuotaExceeded)
+        );
+        assert_eq!(err.message, "You exceeded your current quota.");
+        server.await.unwrap();
+
+        let classified = Err(CodexError {
+            status: 401,
+            message: "WebSocket upgrade rejected with status 401".to_string(),
+            detail: None,
+            retry_after: None,
+            usage_limit: None,
+            class: Some(super::super::events::CodexErrorClass::QuotaExceeded),
+            origin: CodexErrorOrigin::WebSocket,
+        });
+        assert!(!should_refresh_after_unauthorized(
+            &classified,
+            false,
+            crate::config::CodexTransport::Auto
+        ));
     }
 
     #[test]
