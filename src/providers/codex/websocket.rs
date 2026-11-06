@@ -76,6 +76,7 @@ pub(crate) struct CodexWebSocketEventStream {
     provider_retry_handoff: Arc<AtomicBool>,
     auth_refresh: Arc<AtomicBool>,
     account_id: Arc<std::sync::Mutex<Option<String>>>,
+    rate_limits_observed: bool,
 }
 
 #[derive(Clone)]
@@ -104,6 +105,7 @@ impl CodexWebSocketEventStream {
                 provider_retry_handoff: provider_retry_handoff.clone(),
                 auth_refresh: auth_refresh.clone(),
                 account_id: account_id.clone(),
+                rate_limits_observed: false,
             },
             CodexWebSocketSocketIdPublisher {
                 socket_id,
@@ -137,6 +139,17 @@ impl CodexWebSocketEventStream {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
         }
+    }
+
+    /// Whether the task behind the stream records each quota reading for the
+    /// account of the attempt that read it before queuing it, so the reader
+    /// does not record it again under the stream's current account.
+    pub(crate) fn rate_limits_observed(&self) -> bool {
+        self.rate_limits_observed
+    }
+
+    pub(super) fn mark_rate_limits_observed(&mut self) {
+        self.rate_limits_observed = true;
     }
 
     pub(crate) async fn recv(&mut self) -> Option<Result<serde_json::Value, CodexError>> {
@@ -4127,9 +4140,12 @@ mod tests {
         }
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_rejected_upgrade_answers_retry_after_by_the_class_rules() {
         let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = super::super::rate_limits::lock_for_tests();
+        super::super::rate_limits::clear_for_tests();
         let date = "Wed, 21 Oct 2026 07:28:00 GMT";
         let stop: &[(&str, &str)] = &[("x-should-retry", "false")];
         let spent: &[(&str, &str)] = &[
@@ -4211,11 +4227,15 @@ mod tests {
                 }
             }
         }
+        super::super::rate_limits::clear_for_tests();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_long_rejection_body_still_reports_a_spent_window() {
         let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = super::super::rate_limits::lock_for_tests();
+        super::super::rate_limits::clear_for_tests();
         let message = format!("The usage limit has been reached. {}", "x".repeat(2048));
         let body = serde_json::json!({"error": {
             "type": "usage_limit_reached",
@@ -4239,11 +4259,15 @@ mod tests {
             );
             assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
         }
+        super::super::rate_limits::clear_for_tests();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_rejected_upgrade_takes_the_spent_window_from_codex_headers() {
         let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = super::super::rate_limits::lock_for_tests();
+        super::super::rate_limits::clear_for_tests();
         let raw = raw_rejection(
             "429 Too Many Requests",
             &[
@@ -4272,6 +4296,7 @@ mod tests {
             );
             assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
         }
+        super::super::rate_limits::clear_for_tests();
     }
 
     #[test]

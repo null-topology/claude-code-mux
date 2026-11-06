@@ -960,7 +960,9 @@ async fn live_stream_response_once(
             }
             generation_started = true;
         }
-        rate_limits::observe_event(upstream_events.account_id().as_deref(), &payload);
+        if !upstream_events.rate_limits_observed() {
+            rate_limits::observe_event(upstream_events.account_id().as_deref(), &payload);
+        }
         turn_state::observe_event(&ctx.req_id, &payload);
         append_upstream_sse_payload(&mut upstream_sse_body, &payload);
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, None)
@@ -1208,6 +1210,7 @@ fn remaining_live_stream_response(
     // Output has started, so the request is not sent again under another
     // account; the gauge keys this stream's readings by the one it went with.
     let account_id = upstream_events.account_id();
+    let rate_limits_observed = upstream_events.rate_limits_observed();
     tokio::spawn(async move {
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
             abort_request_state(
@@ -1253,7 +1256,9 @@ fn remaining_live_stream_response(
             };
             match item {
                 Ok(payload) => {
-                    rate_limits::observe_event(account_id.as_deref(), &payload);
+                    if !rate_limits_observed {
+                        rate_limits::observe_event(account_id.as_deref(), &payload);
+                    }
                     turn_state::observe_event(&ctx.req_id, &payload);
                     append_upstream_sse_payload(&mut upstream_sse_body, &payload);
                     let (chunk, terminal) = match translate_live_stream_payload(
@@ -3348,6 +3353,172 @@ mod tests {
         ));
         server.await.unwrap();
         websocket::invalidate_codex_websocket_pool_owner(&owner);
+    }
+
+    /// A plain 401 on the live WebSocket refreshes the login, and the one it
+    /// reloads may belong to another account. A reading the first attempt
+    /// queued before the refresh stays with the account that read it, so the
+    /// response, sent with the reloaded account, publishes none of its windows.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_queued_reading_stays_with_the_account_that_read_it() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
+        rate_limits::clear_for_tests();
+        let session_id = "live-queued-reading-account";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let request = live_test_request("one");
+        let continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let login = |access: &str, account: &str| auth::token_store::StoredAuth {
+            access: access.to_string(),
+            refresh: String::new(),
+            expires: u64::MAX,
+            account_id: Some(account.to_string()),
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        client
+            .auth_manager()
+            .set_test_auth(login("token-a", "acct-a"));
+        let rotating_client = client.clone();
+        let rotated = login("token-b", "acct-b");
+        let (resent_tx, resent_rx) = tokio::sync::oneshot::channel();
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = next_live_websocket_request(&mut websocket).await;
+            emit_live_event(
+                &mut websocket,
+                &serde_json::json!({
+                    "type": "codex.rate_limits",
+                    "rate_limits": {
+                        "allowed": true,
+                        "limit_reached": false,
+                        "primary": {
+                            "used_percent": 40.0,
+                            "window_minutes": 300,
+                            "reset_at": now + 3_600
+                        },
+                        "secondary": {
+                            "used_percent": 20.0,
+                            "window_minutes": 10080,
+                            "reset_at": now + 86_400
+                        }
+                    }
+                }),
+            )
+            .await;
+            rotating_client.auth_manager().set_test_auth(rotated);
+            emit_live_event(
+                &mut websocket,
+                &serde_json::json!({
+                    "type": "error",
+                    "status": 401,
+                    "error": {"message": "Your token has expired."}
+                }),
+            )
+            .await;
+            drop(websocket);
+
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = next_live_websocket_request(&mut websocket).await;
+            resent_tx.send(()).unwrap();
+            answer_rx.await.unwrap();
+            emit_live_event(
+                &mut websocket,
+                &serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "message", "id": "msg-reloaded"}
+                }),
+            )
+            .await;
+            emit_live_event(
+                &mut websocket,
+                &serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "answer"
+                }),
+            )
+            .await;
+            while websocket.next().await.is_some() {}
+        });
+
+        let ctx = live_test_context(session_id);
+        let events = client
+            .stream_codex_websocket_events_for_owner(&request, &ctx, Some(&continuation))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), resent_rx)
+            .await
+            .expect("the request was not sent again after the refresh")
+            .unwrap();
+        // Nothing has read the queue yet: the first attempt's reading waits in
+        // it while the stream already stands for the reloaded account.
+        assert_eq!(events.account_id().as_deref(), Some("acct-b"));
+        answer_tx.send(()).unwrap();
+        let account_id = events.account_reader();
+        let start = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            live_stream_response_once(
+                events,
+                Vec::new(),
+                "message".to_string(),
+                &request.model,
+                ctx,
+                continuation.clone(),
+                request.clone(),
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+            ),
+        )
+        .await
+        .expect("the live response did not start");
+        let LiveStreamStart::Response(response) = start else {
+            panic!("the reloaded account's answer must start the response");
+        };
+        let response = with_rate_limit_headers(response, account_id().as_deref());
+
+        assert!(
+            response
+                .headers()
+                .keys()
+                .all(|name| !name.as_str().starts_with("anthropic-ratelimit-unified")),
+            "{:?}",
+            response.headers()
+        );
+        let held = rate_limits::latest(Some("acct-a")).expect("the reading keeps its account");
+        assert_eq!(
+            held.five_hour.map(|window| window.resets_at),
+            Some(now + 3_600)
+        );
+        assert_eq!(
+            held.seven_day.map(|window| window.resets_at),
+            Some(now + 86_400)
+        );
+        assert!(rate_limits::latest(Some("acct-b")).is_none());
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("dropping the response did not close the upstream socket")
+            .unwrap();
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        continuation::clear_continuation_for_owner(Some(&owner));
+        rate_limits::clear_for_tests();
     }
 
     #[tokio::test]
