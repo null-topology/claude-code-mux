@@ -15,13 +15,22 @@
   `usage_limit_reached` error or as that snapshot, now ends the stream with
   an SSE `error` of type `rate_limit_error` instead of `api_error`.
 - Every spent-window answer that names a window and a reset still ahead now
-  records that window as spent until then, unless the reading held already
-  resets it later, and a refusing snapshot is kept as the newest reading, so
-  later responses carry it in their `anthropic-ratelimit-unified-5h-*` or
-  `-7d-*` headers. Until the next reading those responses can say
-  `unified-status: allowed` beside a utilization of 1.0. A spent window
-  that arrives after output on the HTTP transport takes its window from the
-  response's `X-Codex-*` headers when the event names none.
+  records that window as spent until then, and a refusing snapshot updates
+  the held reading too, so later responses carry it in their
+  `anthropic-ratelimit-unified-5h-*` or `-7d-*` headers. Until the next
+  reading those responses can say `unified-status: allowed` beside a
+  utilization of 1.0. A spent window that arrives after output on the HTTP
+  transport takes its window from the response's `X-Codex-*` headers when
+  the event names none.
+- Every `codex.rate_limits` reading, healthy or refusing, and every spent
+  window now update the held reading one window at a time instead of
+  replacing it: a window whose reset has already passed is ignored, and a
+  held window that resets more than 60 seconds after the incoming one is
+  kept, so a reading that arrives late cannot take a newer window back.
+  Within 60 seconds the two count as the same window, so a spent window is
+  still recorded when its reset is a second or two off. A window a reading
+  does not carry keeps the one held until its reset passes; a reading with
+  only one window used to drop the other from the headers.
 - Codex `policy_capacity_unavailable` errors (as code or type) are answered
   like `server_is_overloaded`: 529 `overloaded_error` with the native
   message, and `Retry-After` only when the error carries a delay. They used
@@ -32,13 +41,18 @@
   502 `api_error` or a status-based answer. With any other status they keep
   their previous answer.
 - A buffered WebSocket request whose `error` event carries a status is now
-  answered by the event's error code as well, like an HTTP error body, and
-  a 401 whose body names one of the known codes is answered as that code
-  without a token refresh.
-- The delay a classified Codex error body names (`retry_after`,
-  `retry_after_seconds` or a `headers` object) is now sent as `Retry-After`,
-  rounded up to whole seconds, before the response's own `Retry-After`
-  header, on HTTP responses and rejected WebSocket upgrades alike.
+  answered by the event's error code as well, like an HTTP error body.
+- A Codex 401 whose body or `error` event reports a spent usage window or
+  names one of the known codes is now answered as that window or code, with
+  one upstream attempt and no token refresh, on the live and buffered HTTP
+  and WebSocket paths and the standalone search call. A plain 401 still
+  refreshes the token once and sends the request again, as before.
+- The delay a Codex error body names (`retry_after`, `retry_after_seconds`
+  or a `headers` object) is now sent as `Retry-After`, rounded up to whole
+  seconds, before the response's own `Retry-After` header, which is rounded
+  the same way, on live and buffered HTTP responses and rejected WebSocket
+  upgrades alike. A buffered 429 without a known code used to pass the
+  header on as it came and ignore the body's delay.
 - A `codex.rate_limits` reading with a non-finite, negative or out-of-range
   window length, percentage, reset time or countdown now drops only that
   window; the other window is still published. A reset time or countdown
