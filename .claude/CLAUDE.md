@@ -295,9 +295,9 @@ Request path:
    are kept, the rest deleted), `paths.rs` (config
    dir `~/.config/claude-code-proxy`, state dir
    `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy`, `CCP_CONFIG_DIR`
-   overrides only the config dir; the variables in `PATH_ENV_VARS` and
-   `HOME` / `USERPROFILE` are read with `var_os`, so a path that is not valid
-   UTF-8 applies as set), `config.rs` (precedence: `CCP_*` env, then
+   overrides only the config dir; `CCP_CONFIG_DIR`, `XDG_CONFIG_HOME`,
+   `XDG_STATE_HOME`, `HOME` / `USERPROFILE` are read with `var_os`: a
+   non-UTF-8 path applies as set), `config.rs` (precedence: `CCP_*` env, then
    `config.json` in the config dir, then default; settings read as text come
    from `env_vars`, where a variable whose name or value is not valid
    Unicode reads as unset, and a `PORT` or `CCP_*` one with such a value is a

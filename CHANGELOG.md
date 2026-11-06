@@ -4,8 +4,9 @@
   still renamed to `proxy.<millis>` in the state dir, and that rotation now
   deletes every `proxy.<millis>` file there except the one it just created
   and the four newest others, so the log just rotated is kept even after the
-  system clock went back. Before, rotated files were never removed. There is no setting to keep more: copy a
-  rotated log somewhere else if you want to keep it.
+  system clock went back. Before, rotated files were never removed. There is
+  no setting to keep more: copy a rotated log somewhere else if you want to
+  keep it.
 - Fix: a log field longer than 4000 bytes with a multibyte character across
   the 4000-byte mark no longer panics while being shortened. Such fields
   include upstream error messages, error bodies and the model id of an
@@ -21,10 +22,12 @@
     warns with the variable's name (never its value). Set the variable to a
     valid value to use it again.
   - Variables that hold a path keep a path that is not valid UTF-8 and apply
-    as set: `CCP_CONFIG_DIR`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `APPDATA`,
-    `LOCALAPPDATA`, `HOME` and `USERPROFILE` for the config and state
-    directories, and `CCP_CODEX_AUTH_FILE` and `CODEX_HOME` for the Codex CLI
-    login file. The `config summary` never names them.
+    as set: `CCP_CONFIG_DIR`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `HOME` and
+    `USERPROFILE` for the config and state directories, and
+    `CCP_CODEX_AUTH_FILE` and `CODEX_HOME` for the Codex CLI login file. The
+    `config summary` never names them. Stored Kimi, Grok and Cursor logins
+    under a config directory that is not valid UTF-8 still use a lossily
+    converted path.
   - `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` with such a value
     count as unset for the Codex backend, with no warning, in either spelling.
     When the uppercase one is not valid Unicode, a valid lowercase one
