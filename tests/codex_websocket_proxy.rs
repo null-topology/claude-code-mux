@@ -2,7 +2,9 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use claude_code_mux::logging::log_file;
 use claude_code_mux::providers::codex::continuation::clear_all_continuations_for_tests;
-use claude_code_mux::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
+use claude_code_mux::providers::codex::websocket::{
+    clear_codex_websocket_pool_for_tests, set_codex_websocket_request_write_timeout_for_tests,
+};
 use claude_code_mux::{registry::Registry, server::app};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
@@ -392,6 +394,56 @@ async fn spawn_closing_websocket_origin() -> (String, Arc<Mutex<Vec<String>>>) {
         }
     });
     (format!("http://{addr}/responses"), seen)
+}
+
+/// A Codex origin that completes the WebSocket upgrade and then never reads.
+/// Its small receive buffer keeps a large request frame from fitting in the
+/// socket buffers. Records `GET` for an upgrade and `HTTP` for anything else.
+async fn spawn_non_reading_websocket_origin() -> (String, Arc<Mutex<Vec<String>>>) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(16).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let task_seen = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let seen = task_seen.clone();
+            tokio::spawn(async move {
+                let mut first = [0_u8; 1];
+                if stream.peek(&mut first).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                if first[0] != b'G' {
+                    seen.lock().unwrap().push("HTTP".to_string());
+                    return;
+                }
+                seen.lock().unwrap().push("GET".to_string());
+                let Ok(_websocket) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    (format!("http://{addr}/responses"), seen)
+}
+
+/// Shortens the request write budget for one test and restores it on drop.
+struct RequestWriteTimeoutGuard;
+
+impl RequestWriteTimeoutGuard {
+    fn set(timeout: Duration) -> Self {
+        set_codex_websocket_request_write_timeout_for_tests(Some(timeout));
+        Self
+    }
+}
+
+impl Drop for RequestWriteTimeoutGuard {
+    fn drop(&mut self) {
+        set_codex_websocket_request_write_timeout_for_tests(None);
+    }
 }
 
 type SeenRequests = Arc<Mutex<Vec<(&'static str, Value)>>>;
@@ -802,6 +854,46 @@ async fn codex_default_transport_falls_back_to_http_only_before_sending() {
             !seen.iter().any(|event| event == "HTTP"),
             "stream {stream}: {seen:?}"
         );
+    }
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[tokio::test]
+async fn codex_default_transport_does_not_replay_a_timed_out_request_write_over_http() {
+    let _env = ENV_LOCK.lock().await;
+    let _retry_delay = ZeroRetryDelayGuard::new();
+    let _write_timeout = RequestWriteTimeoutGuard::set(Duration::from_millis(500));
+    let config_dir = TempDir::new().unwrap();
+    write_codex_auth(config_dir.path());
+    // Large enough that the request frame cannot fit in the socket buffers.
+    // The response wait keeps its full idle budget, longer than the outer
+    // timeout below, so only the write deadline can end the request in time.
+    let messages = json!([{"role": "user", "content": "word ".repeat(16 * 1024 * 1024 / 5)}]);
+
+    for stream in [false, true] {
+        clear_codex_websocket_pool_for_tests();
+        let (origin_url, seen) = spawn_non_reading_websocket_origin().await;
+        let state_dir = TempDir::new().unwrap();
+        let (status, body, logged) = {
+            let mut guards = clear_proxy_environment();
+            guards.extend(configure_codex(config_dir.path(), &origin_url));
+            guards.push(EnvGuard::unset("CCP_CODEX_TRANSPORT"));
+            guards.push(EnvGuard::set("XDG_STATE_HOME", state_dir.path()));
+            let (status, body) = tokio::time::timeout(
+                Duration::from_secs(60),
+                call_messages_with_history(
+                    "transport-default-stalled-write",
+                    stream,
+                    messages.clone(),
+                ),
+            )
+            .await
+            .expect("a request write the peer never reads must end within its budget");
+            (status, body, fallback_log_lines())
+        };
+        assert!(!status.is_success(), "stream {stream}: {body}");
+        assert_eq!(*seen.lock().unwrap(), ["GET"], "stream {stream}");
+        assert!(logged.is_empty(), "stream {stream}: {logged:?}");
     }
     clear_codex_websocket_pool_for_tests();
 }

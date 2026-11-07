@@ -3108,7 +3108,13 @@ fn unauthorized_event_needs_refresh(payload: &serde_json::Value) -> bool {
 fn should_fallback_to_http(err: &CodexError) -> bool {
     err.origin == CodexErrorOrigin::WebSocketHandshake
         && err.status != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
-        && err.detail.as_deref() != Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL)
+        && !matches!(
+            err.detail.as_deref(),
+            Some(
+                super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL
+                    | super::websocket::WEBSOCKET_WRITE_TIMEOUT_DETAIL
+            )
+        )
 }
 
 /// The longest `detail` a fallback log line carries, in characters.
@@ -3203,6 +3209,9 @@ fn event_closes_live_retry_window(payload: &serde_json::Value) -> bool {
         )
 }
 
+/// A write that ran out of time (`WEBSOCKET_WRITE_TIMEOUT_DETAIL`) is left
+/// out on purpose: part of the frame may already be on the socket, so the
+/// request is not sent again.
 pub(super) fn is_continuation_retry_error(err: &CodexError) -> bool {
     matches!(
         err.detail.as_deref(),
@@ -4616,6 +4625,245 @@ mod tests {
 
         super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
         super::super::continuation::abort_continuation_for_owner(&reserved);
+    }
+
+    /// A Codex origin that answers one WebSocket request with `resp_a`, then
+    /// the next Ping (the pooled-socket validation), and then stops reading.
+    /// Its small receive buffer keeps a large frame from fitting in the
+    /// socket buffers. Every later connection is recorded by its first bytes
+    /// and left unanswered.
+    async fn spawn_origin_that_stops_reading_after_one_turn() -> (
+        std::net::SocketAddr,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(16).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let later_connections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = later_connections.clone();
+        let task = tokio::spawn(async move {
+            let (first_socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(first_socket).await.unwrap();
+            next_websocket_json(&mut websocket).await;
+            send_completed_websocket_response(&mut websocket, "resp_a").await;
+            let answer_validation = async {
+                while let Some(Ok(message)) = websocket.next().await {
+                    if let tokio_tungstenite::tungstenite::Message::Ping(payload) = message {
+                        websocket
+                            .send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                }
+                futures_util::future::pending::<()>().await;
+            };
+            let record_later_connections = async {
+                let mut held = Vec::new();
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut head = [0_u8; 16];
+                    let read = stream.read(&mut head).await.unwrap_or(0);
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&head[..read]).into_owned());
+                    held.push(stream);
+                }
+            };
+            tokio::join!(answer_validation, record_later_connections);
+        });
+        (addr, later_connections, task)
+    }
+
+    fn assert_no_later_connection(later_connections: &std::sync::Mutex<Vec<String>>) {
+        let later = later_connections.lock().unwrap().clone();
+        assert!(
+            later.is_empty(),
+            "the timed-out request reached the origin again: {later:?}"
+        );
+    }
+
+    // Part of a timed-out frame may already be on the socket, so neither a
+    // full-context resend on a new socket nor an HTTP replay may follow.
+    #[tokio::test]
+    async fn buffered_request_write_timeout_is_neither_resent_nor_replayed_over_http() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Main("buffered-write-timeout-session".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let (addr, later_connections, origin) =
+            spawn_origin_that_stops_reading_after_one_turn().await;
+
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let context = http_test_context();
+        let first_request = buffered_request_with_texts(&["one"]);
+        let first_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &first_request,
+            true,
+        );
+        let first_response = client
+            .post_codex_with_transport(
+                &first_request,
+                &context,
+                Some(&first_candidate),
+                crate::config::CodexTransport::Auto,
+            )
+            .await
+            .unwrap();
+        super::super::update_continuation_from_upstream(
+            None,
+            &first_candidate,
+            None,
+            &first_request,
+            &first_response.body,
+            first_response.socket_id,
+            false,
+        );
+
+        let large_text = "x".repeat(16 * 1024 * 1024);
+        let second_request = buffered_request_with_texts(&["one", &large_text]);
+        let second_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &second_request,
+            true,
+        );
+        assert_eq!(
+            second_candidate.candidate().previous_response_id.as_deref(),
+            Some("resp_a")
+        );
+        let _write_timeout =
+            super::super::websocket::RequestWriteTimeoutOverride::set(Duration::from_millis(300));
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            client.post_codex_with_transport(
+                &second_request,
+                &context,
+                Some(&second_candidate),
+                crate::config::CodexTransport::Auto,
+            ),
+        )
+        .await
+        .expect("the request must end within its write budget");
+        let error = match result {
+            Ok(_) => panic!("expected the request write to time out"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(super::super::websocket::WEBSOCKET_WRITE_TIMEOUT_DETAIL)
+        );
+        assert_eq!(
+            error.message,
+            "WebSocket response start timeout after 300ms"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_no_later_connection(&later_connections);
+
+        origin.abort();
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        super::super::continuation::abort_continuation_for_owner(&second_candidate);
+    }
+
+    #[tokio::test]
+    async fn live_request_write_timeout_is_neither_resent_nor_replayed_over_http() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Main("live-write-timeout-session".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let (addr, later_connections, origin) =
+            spawn_origin_that_stops_reading_after_one_turn().await;
+
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let context = http_test_context();
+        let first_request = buffered_request_with_texts(&["one"]);
+        let first_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &first_request,
+            true,
+        );
+        let first_response = client
+            .post_codex_with_transport(
+                &first_request,
+                &context,
+                Some(&first_candidate),
+                crate::config::CodexTransport::Auto,
+            )
+            .await
+            .unwrap();
+        super::super::update_continuation_from_upstream(
+            None,
+            &first_candidate,
+            None,
+            &first_request,
+            &first_response.body,
+            first_response.socket_id,
+            false,
+        );
+
+        let large_text = "x".repeat(16 * 1024 * 1024);
+        let second_request = buffered_request_with_texts(&["one", &large_text]);
+        let second_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &second_request,
+            true,
+        );
+        assert_eq!(
+            second_candidate.candidate().previous_response_id.as_deref(),
+            Some("resp_a")
+        );
+        let _write_timeout =
+            super::super::websocket::RequestWriteTimeoutOverride::set(Duration::from_millis(300));
+        let error = tokio::time::timeout(Duration::from_secs(30), async {
+            match client
+                .stream_codex_auto_events_for_owner(
+                    &second_request,
+                    &context,
+                    Some(&second_candidate),
+                )
+                .await
+            {
+                Err(error) => error,
+                Ok((mut events, _)) => {
+                    let item = events.recv().await;
+                    assert!(!events.used_full_context_retry());
+                    match item {
+                        Some(Err(error)) => error,
+                        _ => panic!("expected the request write to time out"),
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the request must end within its write budget");
+
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(super::super::websocket::WEBSOCKET_WRITE_TIMEOUT_DETAIL)
+        );
+        assert_eq!(
+            error.message,
+            "WebSocket response start timeout after 300ms"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_no_later_connection(&later_connections);
+
+        origin.abort();
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        super::super::continuation::abort_continuation_for_owner(&second_candidate);
     }
 
     #[tokio::test]

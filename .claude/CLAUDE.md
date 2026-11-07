@@ -265,8 +265,15 @@ Request path:
      `websocket.rs`, falling back to HTTP only when the handshake failed
      before anything was sent (`should_fallback_to_http` in `client.rs`). A
      request already sent over the WebSocket is never replayed over HTTP, and
-     `websocket` never falls back. Each fallback, live and buffered, logs a
-     `codex_websocket_fallback_to_http` warning
+     `websocket` never falls back. WebSocket writes share the idle deadline
+     of their path: the request frame (`send_request_frame`) and Pong
+     replies that of the response wait, and the validation Ping that of the
+     pooled-socket validation. A timed-out request frame or Pong answers as
+     the response wait's own timeout (a request frame as a response that
+     never started) with `WEBSOCKET_WRITE_TIMEOUT_DETAIL`, which
+     `is_continuation_retry_error` and `should_fallback_to_http` leave out,
+     so it is neither resent nor replayed over HTTP. Each fallback, live and
+     buffered, logs a `codex_websocket_fallback_to_http` warning
      (`log_websocket_fallback_to_http`) with `reqId`, the handshake `status`
      (0 when none came), `class`, `usageLimit`, `retryAfter` and a `detail`
      holding the rejection text or connect error cut to 300 characters, never
