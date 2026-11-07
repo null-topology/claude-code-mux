@@ -62,17 +62,22 @@
   replaces it instead of merging into it, and a response to a request under
   another account carries none of its `anthropic-ratelimit-unified-5h-*` or
   `-7d-*` headers, so after switching Codex logins the previous account's
-  windows are no longer shown.
+  windows are no longer shown. A pooled WebSocket opened under another login
+  is no longer reused: the next request opens a new connection, and a
+  continuation that depended on the old socket is sent again with its full
+  context, as when a pooled socket is gone. A token of the same account
+  renewed before it expires keeps the socket.
 - A `codex.rate_limits` reading that names a metered limit other than
   `codex` in `metered_limit_name` or `limit_name` no longer updates the held
   reading or records a spent window. A refusing reading of that kind is
   still answered as a spent window.
-- The delay a Codex error body names (`retry_after`, `retry_after_seconds`
-  or a `headers` object) is now sent as `Retry-After`, rounded up to whole
-  seconds, before the response's own `Retry-After` header, which is rounded
-  the same way, on live and buffered HTTP responses and rejected WebSocket
-  upgrades alike. A buffered 429 without a known code used to pass the
-  header on as it came and ignore the body's delay.
+- On live and buffered HTTP responses and rejected WebSocket upgrades, a
+  delay the Codex error body names (`retry_after`, `retry_after_seconds` or
+  a `headers` object) now takes precedence over the response's own
+  `Retry-After` header. Whichever is used is sent as `Retry-After`: a number
+  of seconds rounded up to a whole second, at least 1, and an HTTP date
+  unchanged. A buffered 429 without a known code used to
+  pass the header on as it came and ignore the body's delay.
 - A `codex.rate_limits` reading with a non-finite, negative or out-of-range
   window length, percentage, reset time or countdown now drops only that
   window; the other window is still published. A reset time or countdown

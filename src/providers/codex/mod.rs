@@ -3521,6 +3521,356 @@ mod tests {
         rate_limits::clear_for_tests();
     }
 
+    fn test_login(access: &str, account: &str) -> auth::token_store::StoredAuth {
+        auth::token_store::StoredAuth {
+            access: access.to_string(),
+            refresh: String::new(),
+            expires: u64::MAX,
+            account_id: Some(account.to_string()),
+        }
+    }
+
+    /// What the mock backend of `second_turn_after_saving_login` saw: the
+    /// `ChatGPT-Account-Id` of each WebSocket handshake, and each request with
+    /// the index of the socket it came on.
+    struct SeenUpstream {
+        handshakes: Vec<Option<String>>,
+        requests: Vec<(usize, serde_json::Value)>,
+    }
+
+    /// Two turns of one conversation on the live WebSocket: the first under
+    /// `acct-a`, the second after `second_login` is saved. The mock backend
+    /// answers a request under the account of the socket it came on, with a
+    /// reading of that account's windows for `acct-a` and none for another.
+    /// Returns the second turn's response and what the backend saw.
+    // tungstenite's own callback type fixes the error response size.
+    #[allow(clippy::result_large_err)]
+    async fn second_turn_after_saving_login(
+        session_id: &str,
+        second_login: auth::token_store::StoredAuth,
+    ) -> (Response, SeenUpstream) {
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let reading = serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary": {
+                    "used_percent": 40.0,
+                    "window_minutes": 300,
+                    "reset_at": now + 3_600
+                },
+                "secondary": {
+                    "used_percent": 20.0,
+                    "window_minutes": 10080,
+                    "reset_at": now + 86_400
+                }
+            }
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (handshake_tx, mut handshake_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for socket_index in 0_usize.. {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut account: Option<String> = None;
+                let mut websocket = tokio_tungstenite::accept_hdr_async(
+                    socket,
+                    |request: &http::Request<()>, response| {
+                        account = request
+                            .headers()
+                            .get("chatgpt-account-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+                handshake_tx.send(account.clone()).unwrap();
+                let request_tx = request_tx.clone();
+                let reading = reading.clone();
+                tokio::spawn(async move {
+                    let mut answered = 0;
+                    while let Some(Ok(message)) = websocket.next().await {
+                        match message {
+                            Message::Ping(payload) => {
+                                let _ = websocket.send(Message::Pong(payload)).await;
+                            }
+                            Message::Text(text) => {
+                                let request: serde_json::Value =
+                                    serde_json::from_str(&text).unwrap();
+                                request_tx.send((socket_index, request)).unwrap();
+                                answered += 1;
+                                if account.as_deref() == Some("acct-a") {
+                                    emit_live_event(&mut websocket, &reading).await;
+                                }
+                                emit_live_event(
+                                    &mut websocket,
+                                    &serde_json::json!({
+                                        "type": "response.completed",
+                                        "response": {
+                                            "id": format!("resp-{socket_index}-{answered}"),
+                                            "status": "completed",
+                                            "output": []
+                                        }
+                                    }),
+                                )
+                                .await;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        client
+            .auth_manager()
+            .set_test_auth(test_login("token-a", "acct-a"));
+        let compaction = LiveStreamCompaction {
+            compact_boundary: false,
+            attempt: None,
+        };
+        let first = live_test_request("one");
+        let first_turn = continuation_candidate_for_owner(Some(&owner), &first, true);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            live_stream_response(
+                client.clone(),
+                "message".to_string(),
+                &first.model,
+                live_test_context(session_id),
+                first.clone(),
+                first_turn,
+                compaction,
+                config::CodexTransport::WebSocket,
+            ),
+        )
+        .await
+        .expect("the first turn did not finish");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        client.auth_manager().set_test_auth(second_login);
+        let mut second = live_test_request("one");
+        second.input.extend(live_test_request("two").input);
+        let second_turn = continuation_candidate_for_owner(Some(&owner), &second, true);
+        // The second turn only appends, so its continuation names the first response.
+        assert_eq!(
+            second_turn.candidate().previous_response_id.as_deref(),
+            Some("resp-0-1")
+        );
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            live_stream_response(
+                client,
+                "message".to_string(),
+                &second.model,
+                live_test_context(session_id),
+                second.clone(),
+                second_turn,
+                compaction,
+                config::CodexTransport::WebSocket,
+            ),
+        )
+        .await
+        .expect("the second turn did not finish");
+        server.abort();
+
+        let mut seen = SeenUpstream {
+            handshakes: Vec::new(),
+            requests: Vec::new(),
+        };
+        while let Ok(account) = handshake_rx.try_recv() {
+            seen.handshakes.push(account);
+        }
+        while let Ok(request) = request_rx.try_recv() {
+            seen.requests.push(request);
+        }
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        continuation::clear_continuation_for_owner(Some(&owner));
+        (response, seen)
+    }
+
+    /// A pooled socket answers under the account of its handshake. Once the
+    /// saved login belongs to another account, the conversation's next turn
+    /// does not go out on it: a socket of its own is opened with the new
+    /// account, the turn is sent with its full context, and the response
+    /// carries none of the old account's windows.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_pooled_socket_is_not_reused_under_another_account() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
+        rate_limits::clear_for_tests();
+
+        let (response, seen) = second_turn_after_saving_login(
+            "live-pooled-socket-other-account",
+            test_login("token-b", "acct-b"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().keys().all(|name| {
+                !name.as_str().starts_with("anthropic-ratelimit-unified-5h-")
+                    && !name.as_str().starts_with("anthropic-ratelimit-unified-7d-")
+            }),
+            "{:?}",
+            response.headers()
+        );
+        assert_eq!(
+            seen.handshakes,
+            [Some("acct-a".to_string()), Some("acct-b".to_string())]
+        );
+        let sockets: Vec<usize> = seen.requests.iter().map(|(socket, _)| *socket).collect();
+        assert_eq!(
+            sockets,
+            [0, 1],
+            "nothing more may go out on acct-a's socket"
+        );
+        let resent = &seen.requests[1].1;
+        assert!(resent.get("previous_response_id").is_none());
+        assert_eq!(resent["input"].as_array().unwrap().len(), 2);
+        assert!(rate_limits::latest(Some("acct-b")).is_none());
+        rate_limits::clear_for_tests();
+    }
+
+    /// A refreshed token of the same account keeps the conversation on its
+    /// pooled socket: the next turn sends only what it adds, and no second
+    /// handshake is made.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_pooled_socket_is_reused_under_the_same_account() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
+        rate_limits::clear_for_tests();
+
+        let (response, seen) = second_turn_after_saving_login(
+            "live-pooled-socket-same-account",
+            test_login("token-a-refreshed", "acct-a"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .contains_key("anthropic-ratelimit-unified-5h-utilization"),
+            "{:?}",
+            response.headers()
+        );
+        assert_eq!(seen.handshakes, [Some("acct-a".to_string())]);
+        let sockets: Vec<usize> = seen.requests.iter().map(|(socket, _)| *socket).collect();
+        assert_eq!(sockets, [0, 0]);
+        let continued = &seen.requests[1].1;
+        assert_eq!(continued["previous_response_id"], "resp-0-1");
+        assert_eq!(continued["input"].as_array().unwrap().len(), 1);
+        rate_limits::clear_for_tests();
+    }
+
+    /// Once the response has started, the reader does not record again a
+    /// reading the stream task recorded before queuing it: replaying a queued
+    /// reading would take back a later one the task already recorded.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_reading_the_stream_task_recorded_is_not_recorded_again_after_output() {
+        let _rate_limits = rate_limits::lock_for_tests();
+        rate_limits::clear_for_tests();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let reading = |used_percent: f64| {
+            serde_json::json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary": {
+                        "used_percent": used_percent,
+                        "window_minutes": 300,
+                        "reset_at": now + 3_600
+                    }
+                }
+            })
+        };
+        // The task recorded the queued reading, then a later one of the same
+        // window that is not queued yet.
+        rate_limits::observe_event(Some("acct"), &reading(10.0));
+        rate_limits::observe_event(Some("acct"), &reading(50.0));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        for event in [
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "id": "msg-recorded"}
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": "answer"
+            }),
+            reading(10.0),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "resp-recorded", "status": "completed", "output": []}
+            }),
+        ] {
+            tx.send(Ok(event)).await.unwrap();
+        }
+        drop(tx);
+        let (mut events, publisher) = websocket::CodexWebSocketEventStream::pending(rx);
+        events.mark_rate_limits_observed();
+        publisher.publish_account(Some("acct"));
+
+        let request = live_test_request("one");
+        let mut ctx = live_test_context("live-recorded-reading-after-output");
+        ctx.session_id = None;
+        let start = live_stream_response_once(
+            events,
+            Vec::new(),
+            "message".to_string(),
+            &request.model,
+            ctx,
+            ContinuationReservation::for_owner_turn(None, None),
+            request.clone(),
+            LiveStreamCompaction {
+                compact_boundary: false,
+                attempt: None,
+            },
+        )
+        .await;
+        let LiveStreamStart::Response(response) = start else {
+            panic!("the output must start the response");
+        };
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            response.into_body().collect(),
+        )
+        .await
+        .expect("the response did not end")
+        .unwrap()
+        .to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("message_stop"));
+
+        let held = rate_limits::latest(Some("acct")).expect("the reading is held");
+        assert_eq!(held.five_hour.map(|window| window.utilization), Some(0.5));
+        rate_limits::clear_for_tests();
+    }
+
     #[tokio::test]
     async fn stale_request_cleanup_preserves_newer_turn_and_compaction_attempt() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;

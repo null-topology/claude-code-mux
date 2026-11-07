@@ -377,16 +377,27 @@ struct PoolEntry {
     socket_id: u64,
     created_at: u64,
     last_activity: AtomicU64,
+    /// The `ChatGPT-Account-Id` of the handshake. The backend answers every
+    /// request on the socket under that account, whatever account a later
+    /// request is built with.
+    account_id: Option<String>,
 }
 
 impl PoolEntry {
-    fn new(ws: CodexWebSocketStream) -> Self {
+    fn opened_with(ws: CodexWebSocketStream, handshake_headers: &HeaderMap) -> Self {
         Self {
             ws: Arc::new(AsyncMutex::new(ws)),
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
             created_at: now_ms(),
             last_activity: AtomicU64::new(next_pool_activity()),
+            account_id: request_account_id(handshake_headers).map(str::to_owned),
         }
+    }
+
+    /// An entry whose handshake named no account.
+    #[cfg(test)]
+    fn new(ws: CodexWebSocketStream) -> Self {
+        Self::opened_with(ws, &HeaderMap::new())
     }
 
     fn touch(&self) {
@@ -515,8 +526,15 @@ fn pool_take_for_turn(reservation: &ContinuationReservation) -> Option<Arc<PoolE
     .flatten()
 }
 
+/// The pooled socket a request may go out on. `account_id` is the
+/// `ChatGPT-Account-Id` the request is built with: a socket whose handshake
+/// named another account leaves the pool and counts as gone, since what the
+/// backend answers on it would be read as this account's. A request that
+/// needed it for its previous response then fails as one whose socket is
+/// gone; any other request opens a connection with its own headers.
 fn take_pool_entry_for_request(
     reservation: Option<&ContinuationReservation>,
+    account_id: Option<&str>,
 ) -> Result<Option<Arc<PoolEntry>>, CodexError> {
     let candidate = reservation.map(ContinuationReservation::candidate);
     let requires_origin = candidate
@@ -526,7 +544,8 @@ fn take_pool_entry_for_request(
     let pool_owner = reservation_pool_owner(reservation);
     let pooled = reservation
         .filter(|_| pool_owner.is_some())
-        .and_then(pool_take_for_turn);
+        .and_then(pool_take_for_turn)
+        .filter(|entry| entry.account_id.as_deref() == account_id);
 
     if requires_origin
         && (pool_owner.is_none()
@@ -857,12 +876,12 @@ pub(super) async fn codex_websocket_request(
     let requires_origin = continuation
         .and_then(|candidate| candidate.previous_response_id.as_deref())
         .is_some();
-    let pooled = take_pool_entry_for_request(reservation)?;
+    let pooled = take_pool_entry_for_request(reservation, request_account_id(headers))?;
     let mut used_pooled = pooled.is_some();
     let mut entry = if let Some(entry) = pooled {
         entry
     } else {
-        Arc::new(PoolEntry::new(
+        Arc::new(PoolEntry::opened_with(
             connect_with_timeout(
                 websocket_client,
                 proxy_config,
@@ -871,6 +890,7 @@ pub(super) async fn codex_websocket_request(
                 connect_timeout_ms,
             )
             .await?,
+            headers,
         ))
     };
     let mut guard = entry.ws.clone().lock_owned().await;
@@ -887,7 +907,7 @@ pub(super) async fn codex_websocket_request(
         if requires_origin {
             return Err(continuation_socket_missing_error());
         }
-        entry = Arc::new(PoolEntry::new(
+        entry = Arc::new(PoolEntry::opened_with(
             connect_with_timeout(
                 websocket_client,
                 proxy_config,
@@ -896,6 +916,7 @@ pub(super) async fn codex_websocket_request(
                 connect_timeout_ms,
             )
             .await?,
+            headers,
         ));
         guard = entry.ws.clone().lock_owned().await;
         used_pooled = false;
@@ -1062,7 +1083,7 @@ pub(super) async fn prepare_codex_websocket(
     let requires_origin = continuation
         .and_then(|candidate| candidate.previous_response_id.as_deref())
         .is_some();
-    let pooled = take_pool_entry_for_request(reservation)?;
+    let pooled = take_pool_entry_for_request(reservation, request_account_id(headers))?;
     let used_pooled = pooled.is_some();
     let entry = if let Some(entry) = pooled {
         entry
@@ -1075,7 +1096,7 @@ pub(super) async fn prepare_codex_websocket(
             connect_timeout_ms,
         )
         .await?;
-        Arc::new(PoolEntry::new(stream))
+        Arc::new(PoolEntry::opened_with(stream, headers))
     };
     let mut guard = entry.ws.clone().lock_owned().await;
     if used_pooled
@@ -2769,6 +2790,7 @@ mod tests {
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
             created_at: now_ms(),
             last_activity: AtomicU64::new(next_pool_activity()),
+            account_id: None,
         })
     }
 

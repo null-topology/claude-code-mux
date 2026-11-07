@@ -190,8 +190,9 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         }
     }
 
-    /// How many token refreshes this manager was asked for after a rejected
-    /// login, the ones that failed included.
+    /// How many times `force_refresh` was called after a rejected login,
+    /// whatever came of it: a token exchange, a newer saved login picked up
+    /// without one, or a failure.
     #[cfg(test)]
     pub fn forced_refreshes_for_tests(&self) -> usize {
         self.forced_refreshes
