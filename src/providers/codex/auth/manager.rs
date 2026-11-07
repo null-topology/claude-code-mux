@@ -17,6 +17,8 @@ pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
     pub store: CodexTokenStore<S>,
     #[cfg(test)]
     test_auth: Arc<Mutex<Option<StoredAuth>>>,
+    #[cfg(test)]
+    forced_refreshes: std::sync::atomic::AtomicUsize,
     refresh_lock: Arc<AsyncMutex<()>>,
     refresh_client: reqwest::Client,
     token_endpoint: String,
@@ -32,6 +34,8 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             store,
             #[cfg(test)]
             test_auth: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            forced_refreshes: std::sync::atomic::AtomicUsize::new(0),
             refresh_lock: CODEX_REFRESH_LOCK.clone(),
             refresh_client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
@@ -64,6 +68,9 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
     }
 
     pub async fn force_refresh(&self, rejected_access: &str) -> Result<StoredAuth, anyhow::Error> {
+        #[cfg(test)]
+        self.forced_refreshes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.refresh(true, Some(rejected_access)).await
     }
 
@@ -181,6 +188,15 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         if let Ok(mut guard) = self.test_auth.lock() {
             *guard = Some(auth);
         }
+    }
+
+    /// How many times `force_refresh` was called after a rejected login,
+    /// whatever came of it: a token exchange, a newer saved login picked up
+    /// without one, or a failure.
+    #[cfg(test)]
+    pub fn forced_refreshes_for_tests(&self) -> usize {
+        self.forced_refreshes
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 

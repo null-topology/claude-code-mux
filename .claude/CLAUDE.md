@@ -279,7 +279,7 @@ Request path:
      clobber each other; `compaction.rs` does server-side compaction;
      `events.rs` classifies stream failures and recognises the
      `usage_limit_reached` error; `rate_limits.rs` keeps the newest
-     `codex.rate_limits` reading and publishes it as
+     `codex.rate_limits` reading of one ChatGPT account and publishes it as
      `anthropic-ratelimit-unified-*` headers (see below). Auth reads the Codex
      CLI's `~/.codex/auth.json` (`CCP_CODEX_AUTH_FILE` overrides the path).
    - `kimi/`, `grok/`: Chat Completions / Responses translators with their own
@@ -760,9 +760,83 @@ and an opt-in server compaction request, which aborts instead of spending the
 normal request as well. The live HTTP stream hands its response headers to
 `usage_limit_from_event_with_headers`, so a limit event that carries only a
 relative reset still gets its window from the `X-Codex-*` headers; a header
-inside the event payload wins over the HTTP one. Only the explicit
-`usage_limit_reached` type is
+inside the event payload wins over the HTTP one; the committed branch after
+output reads them too (`response_headers` threaded from
+`stream_codex_http_events_for_owner`; a WebSocket stream has none). Only the
+explicit `usage_limit_reached` type and the terminal snapshot below are
 terminal; a transient 429 that happens to carry a reset clock stays retryable.
+`classify_event_failure` does not classify the snapshot at all, so no retry
+path sees it; the usage-limit readers answer it. A body holding both an
+explicit `usage_limit_reached` and a terminal snapshot is answered from the
+explicit one (`usage_limit_from_response` reads them in two passes), and the
+buffered WebSocket collector stops on a terminal snapshot as it does on a
+terminal event.
+A `codex.rate_limits` event reporting `limit_reached` with no usable credits
+(`is_terminal_rate_limit_event`: neither `credits.has_credits` nor
+`credits.unlimited` true) is answered as a spent window too, on every one of
+those paths. It carries no error object, so its reset and claim come from its
+own windows (`rate_limits::limiting_window`): a window is named only when
+exactly one window the event carries is at or past 100% and every window it
+carries is readable (`window_state`); otherwise none is, with no reset, no claim and
+nothing recorded. The snapshot itself still updates the held reading
+(`rate_limits::observe_event`) on the live HTTP stream and the buffered paths
+(`observe_rate_limits_in_body`), as on the live WebSocket start, before the
+limit is answered, and so does every window of an error body:
+`codex_status_error` (a failed live HTTP start, the search call, the buffered
+fallthrough) and `handshake_rejection_error` (a rejected upgrade) observe the
+whole body before reducing it to a spent window. Every spent-window answer
+(`usage_limit_response`), when the limit names a window and a reset, records
+that window as spent until its reset (`rate_limits::observe_usage_limit`,
+through the pure `mark_spent`).
+The reading is held for one ChatGPT account (`Held` in `rate_limits.rs`):
+each reading and spent window carries the request's account id (the login's
+`account_id`; on the live paths `CodexWebSocketEventStream::account_id`, on a
+rejected upgrade the request's `ChatGPT-Account-Id` header). A live WebSocket
+reading is recorded by `coordinate_live_websocket_events` under the account
+of the attempt that read it before it is queued, and the reader skips it
+(`rate_limits_observed`), because a 401 refresh can move the stream to
+another login while the reading waits in the queue; the response headers
+still follow the stream's final account. Since that task records them, the
+bare receivers of `stream_codex_websocket_events` and
+`stream_codex_auto_events` (the latter on its WebSocket branch) feed the
+gauge too, which no reader did for them before. A reading or spent window
+under another account replaces the held reading whole, and
+`with_rate_limit_headers` publishes it only for a request under the same
+account. A pooled WebSocket keeps the `ChatGPT-Account-Id` of its handshake
+(`PoolEntry::account_id`), since the backend answers every request on it
+under that account: `take_pool_entry_for_request` hands it only to a
+request built with the same account and otherwise drops it as gone, so a
+continuation that needed it takes the missing-socket path
+(`continuation_socket_missing_error`) and is sent again with full context,
+and any other request opens its own connection. A token of the same account
+renewed before it expires keeps the socket (a refresh forced by a 401 still
+drops the conversation's socket, as before), whereas the Codex CLI resets its
+connection on any auth change (`codex-rs/core/src/client.rs` at
+rust-v0.166.0). A reading whose
+`metered_limit_name`, else `limit_name`, names a limit other than `codex`
+updates nothing, and its refusal marks no window (`reads_codex_limit`,
+`CodexUsageLimit::feeds_gauge`); one naming neither reads `codex`, as the
+Codex CLI files it (`codex-rs/codex-api/src/rate_limits.rs:124-167` at
+rust-v0.166.0). `is_terminal_rate_limit_event` does not read the name, so
+such a refusal is still answered as a spent window.
+Under one account, every reading, healthy or refusing, and every spent window
+are merged window by window (`merge_snapshot`, `merge_window`), never swapped
+in whole: an
+incoming window whose reset has passed is ignored, a held window whose reset
+is more than `SAME_WINDOW_TOLERANCE_SECONDS` (60 s) after the incoming one is
+kept, and within that tolerance the incoming one replaces it as the same
+window, so a reset derived from a countdown a second or two off still marks
+it spent. A window the incoming reading does not carry, or carries unusable,
+keeps the held one, which `latest` drops once its reset passes.
+Healthy responses can then carry `unified-status: allowed` beside a
+utilization of 1.0 until the next reading of that window replaces it. A
+spent window after output started, as an error event or as that snapshot,
+ends the stream with an SSE `error` of type `rate_limit_error` and the same
+message, and records the window the same way; the status line has already
+left, so it carries no headers. Only live stream starts carry the gauge
+headers; a buffered answer has none. Tests that touch the reading take
+`rate_limits::lock_for_tests`, and a smoke test that leaves one behind clears
+it with `clear_codex_rate_limits_for_tests`.
 The representative claim is published only for a window duration that
 `claimable_window` in `rate_limits.rs` recognises (around 300 minutes for the
 five hour window, around 10080 for the weekly one; Codex has reported 299),
@@ -772,12 +846,34 @@ because clients sleep for its full value, which here is hours. Healthy
 readings become `-5h-utilization` / `-5h-reset` / `-7d-*`, and a window past
 its threshold (`CCP_CODEX_QUOTA_WARN_AT`, defaults 0.9 session / 0.75 weekly)
 adds `-surpassed-threshold`; readings whose reset time has passed are dropped.
+A reading drops a window, not the whole reading, when its `window_minutes`,
+`used_percent`, reset moment or countdown is not a finite, non-negative number
+in range (numeric strings are still read), and a countdown is added to the
+clock with saturating arithmetic (`window_state`). A reset moment or countdown
+that is present but unusable drops the window even when the other is usable;
+an absent or `null` one is not unusable.
 
 Other failures are classified by their error code first (`error_class` in
 `events.rs`, `CodexErrorClass`), in event payloads (`error`,
-`/response/error`) and in JSON error bodies of any status, on the live
-WebSocket and HTTP starts, the WebSocket handshake and the buffered paths. The
-code decides over the status and the message heuristics:
+`/response/error`) and in error bodies of any status (`error_class_from_body`:
+JSON, else the SSE events a buffered WebSocket relay builds under the status
+its `error` event named), on the live WebSocket and HTTP starts, the WebSocket
+handshake and the buffered paths. The buffered class lookup runs before the
+status-only arms. A 401's body or `error` event is read before any token
+refresh, on the live and buffered HTTP and WebSocket paths and `post_search`:
+a spent window (`usage_limit_reached` or a terminal snapshot) is answered
+first, then a known class, both with no refresh and one upstream attempt per
+transport: under `auto` a refused upgrade still falls back to HTTP, which
+reads its own answer. Only a 401 that names neither refreshes the token, at
+most once per client request (`should_refresh_after_unauthorized`,
+`unauthorized_needs_refresh`, and `unauthorized_event_needs_refresh` for a
+live WebSocket event): the buffered loop keeps one flag across both
+transports, and the live WebSocket task marks its refresh on the stream
+(`used_auth_refresh`), which the live `auto` fallback hands to the HTTP
+attempt (`auth_refresh_spent`). A terminal
+snapshot also closes the live WebSocket retry window
+(`event_closes_live_retry_window`), so no later 401 of that request refreshes.
+The code decides over the status and the message heuristics:
 
 - quota (`insufficient_quota`, `credit_balance_exhausted`,
   `organization_spend_limit_exceeded`, `project_spend_limit_exceeded`,
@@ -793,18 +889,34 @@ code decides over the status and the message heuristics:
   context window message path (`context_overflow_response`), native text kept;
 - `slow_down`, `rate_limit_exceeded`: 429 with `Retry-After` from the payload,
   else from the message's `try again in N s|ms|seconds`;
-- `server_is_overloaded`: 529 `overloaded_error`, with `Retry-After` only when
-  the payload carries one.
+- `server_is_overloaded`, and `policy_capacity_unavailable` as code or type:
+  529 `overloaded_error`, native text kept, with `Retry-After` only when the
+  payload carries one;
+- `model_not_found` (code or type) with no status or a 400, 403 or 404
+  (`class_with_status`, after `codex-rs/codex-api/src/error.rs:83-94` at
+  rust-v0.166.0): 404 `not_found_error` with the native text, else
+  `model_not_found`, also on the committed stream branch and a rejected
+  upgrade; any other status keeps its old handling.
 
-A classified `Retry-After` is normalised (`normalize_retry_after`): a number
-is rounded up to whole seconds, at least 1; anything else (an HTTP date)
-passes as it came. In a stream event (`classify_event_failure`, where the
+`usage_limit_reached` keeps precedence over every class.
+
+A classified `Retry-After` is normalised (`normalize_retry_after`, on the
+trimmed value): a finite number is rounded up to whole seconds, at least 1;
+other text (an HTTP date) passes as it came when it is at most
+`MAX_RETRY_AFTER_TEXT_BYTES` (64) of printable ASCII. Anything else, empty,
+longer, non-ASCII, with a control character, or `NaN`/`inf`, is not usable
+and counts as absent at that source, so the next source applies and the
+value reaches no header and no log line. In a stream event (`classify_event_failure`, where the
 error is the event's `error` or else `/response/error`) the first of these
 gives the value: `error.retry_after`, `error.retry_after_seconds`, the event's
 `retry_after_seconds`, the event's `headers` (`retry-after`, then
 `Retry-After`), then the error's own `headers` the same way, which is where
 `response.failed` carries them (`codex-rs/codex-api/src/sse/responses_error.rs`
-at rust-v0.162.0-alpha.17). Any of them wins over the message's delay. That
+at rust-v0.162.0-alpha.17). Any of them wins over the message's delay. A
+Codex error body, classified or not, and a rejected upgrade's body are read
+the same way (`retry_advice`, `retry_after_from_body`; `response_retry_after`
+on the live and buffered HTTP paths), with the response's normalised
+`Retry-After` header as the fallback. That
 value, a rejected upgrade's `Retry-After` header and a refused CONNECT
 tunnel's are normalised when they are read, so an unclassified 429 or 5xx
 passes them on in that form too. `CodexError.class` carries the class to `map_codex_error_to_response`
@@ -815,9 +927,15 @@ compaction refused as quota or `usage_not_included` answers the client with
 that class and does not send the normal request; any other compaction failure
 falls back to it. The WebSocket handshake reads the rejection body on both
 the direct upgrade and the HTTP CONNECT tunnel (on the tunnel only the bytes
-that arrived with the response head), never for a 407. It keeps up to 64 KiB
-of the body to read the class and a spent window from, and at most 1 KiB of
-its message as the detail. Under `auto` transport
+that arrived with the response head), never for a 407. It keeps up to
+`MAX_ERROR_BODY_BYTES` (64 KiB, in `client.rs`) of the body to read the class
+and a spent window from, and at most 1 KiB of its message as the detail. A
+non-2xx HTTP answer (live and buffered Messages requests, the compaction
+request, the search call) is read the same way, up to `MAX_ERROR_BODY_BYTES`
+and within one deadline of `body_idle_timeout_ms` for the whole read
+(`read_error_body`); the classification, a spent window and the traffic
+capture see only those bytes, and a read past the deadline fails with
+`detail: http_response_body` and is neither refreshed nor resent. Under `auto` transport
 (the default) a handshake failure, classified or not, falls back to HTTP unless the
 WebSocket proxy refused it (`should_fallback_to_http` in `client.rs`), and
 that HTTP answer is classified on its own. The codes and their shapes follow
