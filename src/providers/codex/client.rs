@@ -10,7 +10,7 @@ use crate::retry::should_retry_status;
 use crate::traffic::TrafficCapture;
 
 use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIGINATOR};
-use super::auth::manager::CodexAuthManager;
+use super::auth::manager::{CodexAuthManager, TransientRefreshError};
 use super::auth::token_store::{DefaultCodexAuthStore, StoredAuth, file_store};
 pub use super::events::{CodexErrorClass, CodexLimitWindow, CodexUsageLimit};
 use super::search::{SearchRequest, SearchResponse};
@@ -880,15 +880,7 @@ impl CodexHttpClient {
             .auth_manager
             .get_auth()
             .await
-            .map_err(|error| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(error.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                class: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+            .map_err(|error| auth_error(error, "Auth error"))?;
         let mut refresh_attempted = false;
 
         loop {
@@ -987,15 +979,7 @@ impl CodexHttpClient {
             .auth_manager
             .get_auth()
             .await
-            .map_err(|error| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(error.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                class: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+            .map_err(|error| auth_error(error, "Auth error"))?;
         let mut refresh_attempted = false;
 
         loop {
@@ -1075,15 +1059,7 @@ impl CodexHttpClient {
             .auth_manager
             .get_auth()
             .await
-            .map_err(|err| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(err.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                class: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+            .map_err(|err| auth_error(err, "Auth error"))?;
         let mut refresh_attempted = false;
 
         loop {
@@ -1180,15 +1156,11 @@ impl CodexHttpClient {
         body: &SearchRequest,
         ctx: &RequestContext,
     ) -> Result<SearchResponse, CodexError> {
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            class: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|e| auth_error(e, "Auth error"))?;
         let body_json = serde_json::to_string(body).map_err(|e| CodexError {
             status: 500,
             message: "Failed to serialize search request".to_string(),
@@ -1231,15 +1203,11 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            class: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|e| auth_error(e, "Auth error"))?;
         let body_json = serde_json::to_string(body).map_err(|e| CodexError {
             status: 500,
             message: "Failed to serialize request".to_string(),
@@ -1637,15 +1605,11 @@ impl CodexHttpClient {
     ) -> Result<OwnerAwareCodexResponse, CodexError> {
         use crate::config::CodexTransport;
 
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            class: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|e| auth_error(e, "Auth error"))?;
 
         let initial_pool_owner = websocket_pool_owner(continuation).cloned();
         if should_reset_websocket_pool(continuation)
@@ -1794,17 +1758,7 @@ impl CodexHttpClient {
                             full_context_continuation(active_continuation.as_ref());
                         continue;
                     }
-                    Err(e) => {
-                        return Err(CodexError {
-                            status: 401,
-                            message: "Unauthorized".to_string(),
-                            detail: Some(e.to_string()),
-                            retry_after: None,
-                            usage_limit: None,
-                            class: None,
-                            origin: CodexErrorOrigin::Http,
-                        });
-                    }
+                    Err(e) => return Err(auth_refresh_error(e)),
                 }
             }
 
@@ -1918,15 +1872,11 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
-        let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            class: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|e| auth_error(e, "Auth error"))?;
 
         let turn_id = continuation.and_then(super::continuation::ContinuationReservation::turn_id);
         if should_reset_websocket_pool(continuation)
@@ -2768,10 +2718,32 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
 }
 
 fn auth_refresh_error(err: anyhow::Error) -> CodexError {
+    auth_error(err, "Unauthorized")
+}
+
+/// What the client is told after a temporary Codex token refresh failure: the
+/// token endpoint was unreachable or answered 429 or 5xx, or the refresh did not
+/// finish.
+pub(crate) const TOKEN_REFRESH_UNAVAILABLE: &str = "Codex token refresh is temporarily unavailable";
+
+/// Maps a failure to obtain a Codex token. A transient refresh failure answers
+/// 503 with a fixed message, which the client may retry; any other failure
+/// answers 401 with its own text, which asks for a login.
+fn auth_error(err: anyhow::Error, message: &str) -> CodexError {
+    let transient = err.downcast_ref::<TransientRefreshError>().is_some();
+    let (status, message, detail) = if transient {
+        (
+            503,
+            TOKEN_REFRESH_UNAVAILABLE.to_string(),
+            TOKEN_REFRESH_UNAVAILABLE.to_string(),
+        )
+    } else {
+        (401, message.to_string(), err.to_string())
+    };
     CodexError {
-        status: 401,
-        message: "Unauthorized".to_string(),
-        detail: Some(err.to_string()),
+        status,
+        message,
+        detail: Some(detail),
         retry_after: None,
         usage_limit: None,
         class: None,
@@ -3228,6 +3200,123 @@ mod tests {
         let client = http_test_client(base_url, 100);
         client.auth_manager().set_test_auth(http_test_auth());
         client
+    }
+
+    /// How long a one-shot mock server waits for its request, and a test for it.
+    const MOCK_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// A mock server task, aborted when the test leaves it, however it leaves.
+    struct MockServer(tokio::task::JoinHandle<()>);
+
+    impl MockServer {
+        /// Answer one request with `response`. Accepting and reading give up after
+        /// `MOCK_DEADLINE`.
+        async fn answer_once(response: String) -> (std::net::SocketAddr, Self) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = tokio::time::timeout(MOCK_DEADLINE, listener.accept())
+                    .await
+                    .expect("mock server: no request arrived")
+                    .unwrap();
+                tokio::time::timeout(MOCK_DEADLINE, read_http_request(&mut stream))
+                    .await
+                    .expect("mock server: the request did not finish arriving");
+                let _ = tokio::time::timeout(MOCK_DEADLINE, stream.write_all(response.as_bytes()))
+                    .await;
+            });
+            (addr, Self(task))
+        }
+
+        /// Wait for the server to have answered, failing the test with its panic.
+        async fn join(mut self) {
+            tokio::time::timeout(MOCK_DEADLINE, &mut self.0)
+                .await
+                .expect("mock server did not finish")
+                .unwrap();
+        }
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    /// The client's answer to a buffered request the backend rejects with 401, when
+    /// the token endpoint answers the forced refresh with `refresh_status`.
+    async fn forced_refresh_answer(refresh_status: &'static str) -> axum::response::Response {
+        let (backend_addr, backend_server) = MockServer::answer_once(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                .to_string(),
+        )
+        .await;
+        let body = r#"{"error":"invalid_grant"}"#;
+        let (token_addr, token_server) = MockServer::answer_once(format!(
+            "HTTP/1.1 {refresh_status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = CodexAuthManager::new_with_token_endpoint(
+            super::super::auth::token_store::CodexTokenStore::codex_cli(
+                super::super::auth::token_store::CodexCliAuthStore::new(
+                    dir.path().join("auth.json"),
+                ),
+            ),
+            format!("http://{token_addr}/oauth/token"),
+        );
+        manager.set_test_auth(StoredAuth {
+            refresh: "refresh-test".into(),
+            ..http_test_auth()
+        });
+        let client = CodexHttpClient::new_with_client(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            manager,
+            format!("http://{backend_addr}/responses"),
+        );
+        let (body, context) = (buffered_test_request(), http_test_context());
+        let request = client.post_codex_with_transport(
+            &body,
+            &context,
+            None,
+            crate::config::CodexTransport::Http,
+        );
+        let error = match tokio::time::timeout(MOCK_DEADLINE, request)
+            .await
+            .expect("the request did not finish")
+        {
+            Ok(_) => panic!("a failed forced refresh must fail the request"),
+            Err(error) => error,
+        };
+        backend_server.join().await;
+        token_server.join().await;
+        super::super::map_codex_error_to_response(&error)
+    }
+
+    async fn error_body(response: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_forced_refresh_outage_after_a_401_answers_503() {
+        let response = forced_refresh_answer("503 Service Unavailable").await;
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], TOKEN_REFRESH_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_forced_refresh_the_endpoint_refuses_after_a_401_answers_401() {
+        let response = forced_refresh_answer("400 Bad Request").await;
+        assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "authentication_error");
     }
 
     async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {

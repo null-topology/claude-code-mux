@@ -376,6 +376,9 @@ where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
 {
     inner: std::sync::Arc<std::sync::Mutex<Option<T>>>,
+    /// Names this store and its clones in `path`, so state kept per store path
+    /// never mixes two in-memory stores.
+    id: uuid::Uuid,
 }
 
 impl<T> Default for InMemoryAuthStore<T>
@@ -394,6 +397,7 @@ where
     pub fn new() -> Self {
         Self {
             inner: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            id: uuid::Uuid::new_v4(),
         }
     }
 }
@@ -405,6 +409,7 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            id: self.id,
         }
     }
 }
@@ -440,7 +445,7 @@ where
     }
 
     fn path(&self) -> String {
-        "memory".to_string()
+        format!("memory:{}", self.id)
     }
 }
 
