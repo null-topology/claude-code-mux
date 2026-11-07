@@ -603,11 +603,12 @@ impl ProxyEnvironment {
         Self::from_lookup(|name| std::env::var_os(name))
     }
 
-    /// The proxy settings from the variables `var` returns. For each setting
-    /// the uppercase spelling is consulted before the lowercase one, and a
-    /// spelling whose value is not valid Unicode counts as unset, so the other
-    /// one applies; such a value cannot name a proxy, and taking it for an
-    /// invalid URL would panic while the client is built at startup.
+    /// The proxy settings from the variables `var` returns. For each proxy URL
+    /// the uppercase spelling, when set, is the one consulted, else the
+    /// lowercase one, and a value that is not valid Unicode is an invalid
+    /// proxy URL: skipping it would connect directly around the proxy. For
+    /// `NO_PROXY` a spelling that is not valid Unicode counts as unset, so the
+    /// other spelling, if any, applies.
     fn from_lookup(var: impl Fn(&str) -> Option<OsString>) -> Self {
         if var("REQUEST_METHOD").is_some() {
             return Self {
@@ -712,9 +713,10 @@ fn proxy_env_value(
     uppercase: &'static str,
     lowercase: &'static str,
 ) -> Result<Option<String>, &'static str> {
-    let Some(raw) = unicode_env_value(var, uppercase, lowercase) else {
+    let Some(raw) = var(uppercase).or_else(|| var(lowercase)) else {
         return Ok(None);
     };
+    let raw = raw.into_string().map_err(|_| uppercase)?;
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(None);
@@ -3710,51 +3712,76 @@ mod tests {
         OsString::from_vec(b"127.0.0.1:\xff".to_vec())
     }
 
+    /// The message `from_lookup` panics with for `vars`, or `None` when it
+    /// returns.
+    #[cfg(unix)]
+    fn proxy_lookup_panic(vars: Vec<(&'static str, OsString)>) -> Option<String> {
+        let lookup = env_lookup(vars);
+        let payload =
+            std::panic::catch_unwind(move || ProxyEnvironment::from_lookup(lookup)).err()?;
+        Some(
+            *payload
+                .downcast::<String>()
+                .expect("the panic message is a formatted string"),
+        )
+    }
+
     #[cfg(unix)]
     #[test]
-    fn non_unicode_proxy_variables_count_as_unset() {
-        for name in [
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "NO_PROXY",
-            "no_proxy",
+    fn non_unicode_proxy_url_variables_are_invalid_proxy_urls() {
+        for (name, uppercase) in [
+            ("HTTP_PROXY", "HTTP_PROXY"),
+            ("http_proxy", "HTTP_PROXY"),
+            ("HTTPS_PROXY", "HTTPS_PROXY"),
+            ("https_proxy", "HTTPS_PROXY"),
+            ("ALL_PROXY", "ALL_PROXY"),
+            ("all_proxy", "ALL_PROXY"),
         ] {
-            let proxies = ProxyEnvironment::from_lookup(env_lookup(vec![(name, not_unicode())]));
-            assert_eq!(proxies.http_proxy, None, "{name}");
-            assert_eq!(proxies.https_proxy, None, "{name}");
-            assert_eq!(proxies.all_proxy, None, "{name}");
-            assert_eq!(proxies.no_proxy_value, None, "{name}");
-            assert!(proxies.no_proxy.is_none(), "{name}");
+            assert_eq!(
+                proxy_lookup_panic(vec![(name, not_unicode())]),
+                Some(format!("invalid {uppercase} proxy URL")),
+                "{name}"
+            );
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn non_unicode_uppercase_proxy_variable_yields_to_the_lowercase_one() {
+    fn non_unicode_uppercase_proxy_variable_is_not_replaced_by_the_lowercase_one() {
+        for (uppercase, lowercase, valid) in [
+            ("HTTP_PROXY", "http_proxy", "127.0.0.1:3128"),
+            ("HTTPS_PROXY", "https_proxy", "http://127.0.0.1:3129"),
+            ("ALL_PROXY", "all_proxy", "socks5h://127.0.0.1:1080"),
+        ] {
+            assert_eq!(
+                proxy_lookup_panic(vec![(uppercase, not_unicode()), (lowercase, valid.into())]),
+                Some(format!("invalid {uppercase} proxy URL")),
+                "{uppercase}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_no_proxy_spelling_counts_as_unset() {
+        for name in ["NO_PROXY", "no_proxy"] {
+            let proxies = ProxyEnvironment::from_lookup(env_lookup(vec![
+                (name, not_unicode()),
+                ("HTTPS_PROXY", "http://127.0.0.1:3129".into()),
+            ]));
+            assert_eq!(proxies.no_proxy_value, None, "{name}");
+            assert!(proxies.no_proxy.is_none(), "{name}");
+            assert_eq!(
+                proxies.https_proxy,
+                normalize_proxy_url("http://127.0.0.1:3129"),
+                "{name}"
+            );
+        }
+
         let proxies = ProxyEnvironment::from_lookup(env_lookup(vec![
-            ("HTTP_PROXY", not_unicode()),
-            ("http_proxy", "127.0.0.1:3128".into()),
-            ("HTTPS_PROXY", not_unicode()),
-            ("https_proxy", "http://127.0.0.1:3129".into()),
-            ("ALL_PROXY", not_unicode()),
-            ("all_proxy", "socks5h://127.0.0.1:1080".into()),
             ("NO_PROXY", not_unicode()),
             ("no_proxy", "localhost".into()),
         ]));
-        assert_eq!(proxies.http_proxy, normalize_proxy_url("127.0.0.1:3128"));
-        assert_eq!(
-            proxies.https_proxy,
-            normalize_proxy_url("http://127.0.0.1:3129")
-        );
-        assert_eq!(
-            proxies.all_proxy,
-            normalize_proxy_url("socks5h://127.0.0.1:1080")
-        );
-        assert!(proxies.http_proxy.is_some() && proxies.all_proxy.is_some());
         assert_eq!(proxies.no_proxy_value.as_deref(), Some("localhost"));
         assert!(proxies.no_proxy.is_some());
     }

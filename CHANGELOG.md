@@ -28,10 +28,13 @@
     `config summary` never names them. Stored Kimi, Grok and Cursor logins
     under a config directory that is not valid UTF-8 still use a lossily
     converted path.
-  - `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` with such a value
-    count as unset for the Codex backend, with no warning, in either spelling.
-    When the uppercase one is not valid Unicode, a valid lowercase one
-    applies.
+  - `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are the exception, as in
+    v0.17.0: such a value, in either spelling, is an invalid proxy URL, and
+    the proxy stops at startup with, for example,
+    `invalid HTTPS_PROXY proxy URL` (the uppercase name, never the value)
+    rather than reach the Codex backend around the configured proxy. A valid
+    lowercase spelling does not stand in for an uppercase one that is not
+    valid Unicode. Set the variable to a valid URL to start the proxy.
 - Fix: in a terminal too small for the help (`?`) or setup (`b`) popup, the
   monitor no longer exits with a panic. The popup is now cut to the window.
   Normal sizes look the same as before.

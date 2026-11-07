@@ -1089,9 +1089,11 @@ This is the complete list of variables the proxy reads.
 
 The proxy also honors the usual `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
 `NO_PROXY` variables (lowercase spellings included) on the Codex backend,
-including the WebSocket transport. A value that is not valid Unicode counts
-as unset, so when the uppercase spelling holds one, a valid lowercase
-spelling applies.
+including the WebSocket transport. The uppercase spelling wins when set. An
+`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` value that is not valid Unicode
+is an invalid proxy URL and stops the proxy at startup; a `NO_PROXY`
+spelling that is not valid Unicode counts as unset, so the other spelling,
+if any, applies.
 
 ### Configuration file
 
