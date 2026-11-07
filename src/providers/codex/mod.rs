@@ -3675,7 +3675,7 @@ mod tests {
         let (handshake_tx, mut handshake_rx) = tokio::sync::mpsc::unbounded_channel();
         let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
         let server = tokio::spawn(async move {
-            for socket_index in 0_usize.. {
+            for socket_index in 0_usize..usize::MAX {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut account: Option<String> = None;
                 let mut websocket = tokio_tungstenite::accept_hdr_async(
