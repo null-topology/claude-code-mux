@@ -1,4 +1,4 @@
-## Unreleased
+## v0.17.1 (2026-11-07)
 
 - Codex token refresh no longer writes over a login it did not start from.
   The proxy now takes `auth.lock` in the directory of `auth.json` while it
