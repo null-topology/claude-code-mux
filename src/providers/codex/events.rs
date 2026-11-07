@@ -160,9 +160,7 @@ pub(crate) fn error_class_from_body(body: &[u8], status: u16) -> Option<CodexErr
 /// body that names one. Normalised (`normalize_retry_after`).
 pub(crate) fn retry_after_from_body(body: &[u8]) -> Option<String> {
     match serde_json::from_slice::<Value>(body) {
-        Ok(value) => {
-            retry_advice(&value, event_error(&value)).map(|value| normalize_retry_after(&value))
-        }
+        Ok(value) => retry_advice(&value, event_error(&value)),
         Err(_) => {
             sse_payloads(body).find_map(|payload| classify_event_failure(&payload)?.retry_after)
         }
@@ -186,14 +184,25 @@ pub(crate) fn retry_after_from_message(message: &str) -> Option<String> {
     Some(whole_seconds(seconds))
 }
 
-/// A `Retry-After` value a client can wait on: a number of seconds becomes
-/// whole seconds, rounded up and never below one, because a fraction or a zero
-/// reads as "retry at once". Any other value, such as an HTTP date, is kept as
-/// it came.
-pub(crate) fn normalize_retry_after(value: &str) -> String {
-    match value.trim().parse::<f64>() {
-        Ok(seconds) if seconds.is_finite() => whole_seconds(seconds),
-        _ => value.to_string(),
+/// The longest `Retry-After` value other than a number that is passed on; an
+/// HTTP date takes 29 bytes.
+const MAX_RETRY_AFTER_TEXT_BYTES: usize = 64;
+
+/// A `Retry-After` value a client can wait on, read from the trimmed value. A
+/// finite number of seconds becomes whole seconds, rounded up and never below
+/// one, because a fraction or a zero reads as "retry at once". Any other text,
+/// such as an HTTP date, is kept when it is at most
+/// `MAX_RETRY_AFTER_TEXT_BYTES` of printable ASCII. Anything else, a number
+/// that is not finite included, is not usable (`None`): the advice is then
+/// taken from its next source, and the value reaches no header or log line.
+pub(crate) fn normalize_retry_after(value: &str) -> Option<String> {
+    let value = value.trim();
+    match value.parse::<f64>() {
+        Ok(seconds) if seconds.is_finite() => Some(whole_seconds(seconds)),
+        Ok(_) => None,
+        Err(_) if value.is_empty() || value.len() > MAX_RETRY_AFTER_TEXT_BYTES => None,
+        Err(_) if value.bytes().all(|byte| matches!(byte, 0x20..=0x7e)) => Some(value.to_string()),
+        Err(_) => None,
     }
 }
 
@@ -326,7 +335,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
     });
     // Normalised once here, so a failure without a class passes whole seconds
     // as well; normalising a whole number again keeps it.
-    let retry_after = retry_advice(payload, error).map(|value| normalize_retry_after(&value));
+    let retry_after = retry_advice(payload, error);
 
     Some(CodexEventFailure {
         kind,
@@ -338,30 +347,24 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
     })
 }
 
-/// The retry delay a failure payload names, as it came: `error` is the
-/// payload's error object (`event_error`).
+/// The retry delay a failure payload names, normalised: `error` is the
+/// payload's error object (`event_error`). A field whose value is not usable
+/// (`normalize_retry_after`) counts as absent, so the next one is read.
 fn retry_advice(payload: &Value, error: Option<&Value>) -> Option<String> {
-    error
-        .and_then(|value| value.get("retry_after"))
-        .and_then(scalar_string_value)
-        .or_else(|| {
-            error
-                .and_then(|value| value.get("retry_after_seconds"))
-                .and_then(scalar_string_value)
-        })
-        .or_else(|| scalar_string(payload.get("retry_after_seconds")))
-        .or_else(|| scalar_string(payload.pointer("/headers/retry-after")))
-        .or_else(|| scalar_string(payload.pointer("/headers/Retry-After")))
+    let usable = |value: Option<&Value>| {
+        scalar_string(value).and_then(|value| normalize_retry_after(&value))
+    };
+    usable(error.and_then(|value| value.get("retry_after")))
+        .or_else(|| usable(error.and_then(|value| value.get("retry_after_seconds"))))
+        .or_else(|| usable(payload.get("retry_after_seconds")))
+        .or_else(|| usable(payload.pointer("/headers/retry-after")))
+        .or_else(|| usable(payload.pointer("/headers/Retry-After")))
         // The headers of the failed response, which `response.failed` carries
         // inside its error (codex-rs/codex-api/src/sse/responses_error.rs at
         // rust-v0.162.0-alpha.17). Read after the fields above, so a value
         // they give is kept.
-        .or_else(|| {
-            error.and_then(|value| {
-                scalar_string(value.pointer("/headers/retry-after"))
-                    .or_else(|| scalar_string(value.pointer("/headers/Retry-After")))
-            })
-        })
+        .or_else(|| usable(error.and_then(|value| value.pointer("/headers/retry-after"))))
+        .or_else(|| usable(error.and_then(|value| value.pointer("/headers/Retry-After"))))
 }
 
 /// Which known upstream quota window ran out.
@@ -1090,6 +1093,76 @@ mod tests {
         .unwrap();
         assert_eq!(dated.class, None);
         assert_eq!(dated.retry_after.as_deref(), Some(date));
+    }
+
+    #[test]
+    fn only_a_number_or_short_printable_ascii_is_usable_retry_advice() {
+        let date = "Wed, 21 Oct 2026 07:28:00 GMT";
+        let longest = "x".repeat(MAX_RETRY_AFTER_TEXT_BYTES);
+        let too_long = "x".repeat(MAX_RETRY_AFTER_TEXT_BYTES + 1);
+        let cases = [
+            ("0.25", Some("1")),
+            ("-3", Some("1")),
+            (" 7 ", Some("7")),
+            ("1e3", Some("1000")),
+            (date, Some(date)),
+            (" Wed, 21 Oct 2026 07:28:00 GMT\t", Some(date)),
+            (longest.as_str(), Some(longest.as_str())),
+            (too_long.as_str(), None),
+            ("", None),
+            ("  ", None),
+            ("NaN", None),
+            ("inf", None),
+            ("in 5 s\u{7f}", None),
+            ("in\u{0}5", None),
+            ("5 é", None),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(
+                normalize_retry_after(value).as_deref(),
+                expected,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unusable_retry_field_gives_way_to_the_next_one() {
+        let long = format!("{}é", "a".repeat(3999));
+        let failure = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "error": {
+                "code": "rate_limit_exceeded",
+                "message": "busy",
+                "retry_after": long,
+                "retry_after_seconds": "\u{7}",
+                "headers": {"retry-after": "4"}
+            }
+        }))
+        .unwrap();
+        assert_eq!(failure.retry_after.as_deref(), Some("4"));
+
+        // With no usable field, the stream event names no delay, and the
+        // message's delay applies where the class asks for one.
+        let failure = classify_event_failure(&serde_json::json!({
+            "type": "response.failed",
+            "response": {"error": {
+                "code": "rate_limit_exceeded",
+                "message": "Rate limit reached. Please try again in 20s.",
+                "retry_after": long
+            }}
+        }))
+        .unwrap();
+        assert_eq!(failure.retry_after, None);
+
+        let body = serde_json::json!({"error": {"code": "toy", "retry_after": long}}).to_string();
+        assert_eq!(retry_after_from_body(body.as_bytes()), None);
+        let body = serde_json::json!({
+            "error": {"code": "toy", "retry_after": ""},
+            "retry_after_seconds": 2
+        })
+        .to_string();
+        assert_eq!(retry_after_from_body(body.as_bytes()).as_deref(), Some("2"));
     }
 
     #[test]
