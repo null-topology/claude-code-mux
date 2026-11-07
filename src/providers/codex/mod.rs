@@ -1620,6 +1620,13 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
             "authentication_error",
             err.detail.as_deref().unwrap_or("Authentication failed"),
         ),
+        // A token refresh that may succeed later; its fixed message names
+        // Codex, so it bypasses the generic text `client_error` would choose.
+        503 if err.origin == client::CodexErrorOrigin::Auth => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            client::TOKEN_REFRESH_UNAVAILABLE,
+        ),
         403 => json_error(
             StatusCode::FORBIDDEN,
             "permission_error",
@@ -2257,6 +2264,60 @@ mod tests {
                 account_id: Some("acct".to_string()),
             });
         Arc::new(client)
+    }
+
+    #[tokio::test]
+    async fn a_token_refresh_outage_answers_503_and_a_dead_login_401() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let dir = tempfile::tempdir().unwrap();
+        for (refresh, status, error_type) in [
+            // Nothing listens on port 1, so the refresh cannot reach the endpoint.
+            ("refresh-test", StatusCode::SERVICE_UNAVAILABLE, "api_error"),
+            // Without a refresh token only a new login helps.
+            ("", StatusCode::UNAUTHORIZED, "authentication_error"),
+        ] {
+            let manager = auth::manager::CodexAuthManager::new_with_token_endpoint(
+                auth::token_store::CodexTokenStore::codex_cli(
+                    auth::token_store::CodexCliAuthStore::new(dir.path().join("auth.json")),
+                ),
+                "http://127.0.0.1:1/oauth/token".to_string(),
+            );
+            let client = CodexHttpClient::new_with_client(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+                manager,
+                "http://127.0.0.1:1/responses".to_string(),
+            );
+            client
+                .auth_manager()
+                .set_test_auth(auth::token_store::StoredAuth {
+                    access: "expired".to_string(),
+                    refresh: refresh.to_string(),
+                    expires: 0,
+                    account_id: Some("acct".to_string()),
+                });
+            let provider = CodexProvider {
+                client: Arc::new(client),
+            };
+            let body: MessagesRequest = serde_json::from_value(serde_json::json!({
+                "model": "gpt-5.6-luna",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap();
+            let response = provider
+                .handle_messages_inner(body, live_test_context("token-refresh-outage"), None)
+                .await;
+            assert_eq!(response.status(), status, "refresh token {refresh:?}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], error_type);
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                assert_eq!(body["error"]["message"], client::TOKEN_REFRESH_UNAVAILABLE);
+            }
+        }
     }
 
     async fn next_live_websocket_request(

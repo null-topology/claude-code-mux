@@ -23,7 +23,7 @@ use crate::config;
 use crate::provider::{ModelCapabilities, model_info};
 
 use super::auth::constants::{CODEX_CLIENT_VERSION, ORIGINATOR};
-use super::auth::manager::CodexAuthManager;
+use super::auth::manager::{CodexAuthManager, TransientRefreshError};
 use super::auth::token_store::{StoredAuth, codex_auth_file};
 use super::client::forward_client_headers;
 use super::translate::model_allowlist::full_lane_web_search_model;
@@ -340,11 +340,21 @@ fn build_request(
     Ok(request)
 }
 
+/// A failure to obtain a Codex token: a temporary refresh failure is
+/// `Unreachable`, anything else `Unauthorized`.
+fn auth_models_error(error: anyhow::Error) -> ModelsError {
+    if error.downcast_ref::<TransientRefreshError>().is_some() {
+        ModelsError::Unreachable(error.to_string())
+    } else {
+        ModelsError::Unauthorized(error.to_string())
+    }
+}
+
 /// Ask the backend which models this login may use. A 401 triggers one token
 /// refresh and one retry, mirroring the completions path. The result of a
 /// successful call that names at least one model is remembered for routing
 /// (see [`is_discovered_model`]).
-pub async fn fetch_models<S: AuthStorage<StoredAuth>>(
+pub async fn fetch_models<S: AuthStorage<StoredAuth> + 'static>(
     client: &reqwest::Client,
     auth_manager: &CodexAuthManager<S>,
     base_url: &str,
@@ -355,10 +365,7 @@ pub async fn fetch_models<S: AuthStorage<StoredAuth>>(
         models_endpoint(base_url),
         client_version()
     );
-    let mut auth = auth_manager
-        .get_auth()
-        .await
-        .map_err(|error| ModelsError::Unauthorized(error.to_string()))?;
+    let mut auth = auth_manager.get_auth().await.map_err(auth_models_error)?;
     let mut refresh_attempted = false;
     loop {
         let request = build_request(client, &url, &auth, client_headers)
@@ -377,7 +384,7 @@ pub async fn fetch_models<S: AuthStorage<StoredAuth>>(
             auth = auth_manager
                 .force_refresh(&auth.access)
                 .await
-                .map_err(|error| ModelsError::Unauthorized(error.to_string()))?;
+                .map_err(auth_models_error)?;
             continue;
         }
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -756,5 +763,153 @@ mod tests {
         let snippet = body_snippet(long.as_bytes());
         assert!(snippet.ends_with('…'));
         assert!(snippet.len() <= 204);
+    }
+
+    /// A temporary token refresh failure leaves the listing unreachable; a login
+    /// that needs `codex login` again leaves it unauthorized.
+    #[tokio::test]
+    async fn a_token_refresh_outage_is_unreachable_and_a_dead_login_unauthorized() {
+        use super::super::auth::token_store::{CodexCliAuthStore, CodexTokenStore};
+        // Nothing listens on port 1, so the refresh cannot reach the endpoint; without
+        // a refresh token only a new login helps.
+        for (refresh, unreachable) in [("refresh-test", true), ("", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let manager = CodexAuthManager::new_with_token_endpoint(
+                CodexTokenStore::codex_cli(CodexCliAuthStore::new(dir.path().join("auth.json"))),
+                "http://127.0.0.1:1/oauth/token".to_string(),
+            );
+            manager.set_test_auth(StoredAuth {
+                access: "expired".to_string(),
+                refresh: refresh.to_string(),
+                expires: 0,
+                account_id: Some("acct".to_string()),
+            });
+            let error = fetch_models(
+                &reqwest::Client::new(),
+                &manager,
+                "http://127.0.0.1:1/responses",
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                matches!(error, ModelsError::Unreachable(_)),
+                unreachable,
+                "refresh token {refresh:?}: {error:?}"
+            );
+        }
+    }
+
+    /// How long a one-shot mock server waits for its request, and a test for it.
+    const MOCK_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// A mock server task, aborted when the test leaves it, however it leaves.
+    struct MockServer(tokio::task::JoinHandle<()>);
+
+    impl MockServer {
+        /// Answer one request with `status` and a JSON `body`. Accepting and reading
+        /// give up after `MOCK_DEADLINE`.
+        async fn answer_once(status: &'static str, body: &'static str) -> (String, Self) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = tokio::time::timeout(MOCK_DEADLINE, listener.accept())
+                    .await
+                    .expect("mock server: no request arrived")
+                    .unwrap();
+                let read = async {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        assert!(read > 0, "request ended before its body was complete");
+                        request.extend_from_slice(&chunk[..read]);
+                        let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            return;
+                        }
+                    }
+                };
+                tokio::time::timeout(MOCK_DEADLINE, read)
+                    .await
+                    .expect("mock server: the request did not finish arriving");
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tokio::time::timeout(MOCK_DEADLINE, stream.write_all(response.as_bytes()))
+                    .await;
+            });
+            (format!("http://{addr}"), Self(task))
+        }
+
+        /// Wait for the server to have answered, failing the test with its panic.
+        async fn join(mut self) {
+            tokio::time::timeout(MOCK_DEADLINE, &mut self.0)
+                .await
+                .expect("mock server did not finish")
+                .unwrap();
+        }
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    /// The listing rejected with 401 forces a token refresh: one the endpoint cannot
+    /// serve right now leaves the listing unreachable, one it refuses unauthorized.
+    #[tokio::test]
+    async fn a_forced_refresh_after_a_401_maps_its_failure() {
+        use super::super::auth::token_store::{CodexCliAuthStore, CodexTokenStore};
+        for (refresh_status, unreachable) in [
+            ("503 Service Unavailable", true),
+            ("400 Bad Request", false),
+        ] {
+            let (backend, backend_server) = MockServer::answer_once("401 Unauthorized", "{}").await;
+            let (token, token_server) =
+                MockServer::answer_once(refresh_status, r#"{"error":"invalid_grant"}"#).await;
+            let dir = tempfile::tempdir().unwrap();
+            let manager = CodexAuthManager::new_with_token_endpoint(
+                CodexTokenStore::codex_cli(CodexCliAuthStore::new(dir.path().join("auth.json"))),
+                format!("{token}/oauth/token"),
+            );
+            manager.set_test_auth(StoredAuth {
+                access: "access-test".to_string(),
+                refresh: "refresh-test".to_string(),
+                expires: u64::MAX,
+                account_id: Some("acct".to_string()),
+            });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let base_url = format!("{backend}/responses");
+            let listing = fetch_models(&client, &manager, &base_url, None);
+            let error = tokio::time::timeout(MOCK_DEADLINE, listing)
+                .await
+                .expect("the listing did not finish")
+                .unwrap_err();
+            backend_server.join().await;
+            token_server.join().await;
+            assert_eq!(
+                matches!(error, ModelsError::Unreachable(_)),
+                unreachable,
+                "{refresh_status}: {error:?}"
+            );
+            assert_eq!(
+                matches!(error, ModelsError::Unauthorized(_)),
+                !unreachable,
+                "{refresh_status}: {error:?}"
+            );
+        }
     }
 }
