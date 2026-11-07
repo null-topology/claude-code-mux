@@ -45,7 +45,7 @@ pub struct RefreshedTokens {
 impl RefreshedTokens {
     /// Whether a store holding `access`, `refresh` and `account_id` still holds the
     /// login this refresh was made from.
-    fn same_login(
+    pub(super) fn same_login(
         &self,
         access: Option<&str>,
         refresh: Option<&str>,

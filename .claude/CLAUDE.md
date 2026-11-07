@@ -777,10 +777,13 @@ byte-exact.
   Tokens whose write failed that way stay in `UNWRITTEN_REFRESHES` in
   `manager.rs`, in memory only and never logged, keyed by the store path (an
   `InMemoryAuthStore` path names that store and its clones) and matched on
-  the access and refresh token they replaced. While the file still holds
-  that pair, `load` and `load_locked` serve them and a due refresh exchanges
-  their own refresh token and writes over the file's pair; once the file
-  holds anything else, a missing file included, they are dropped. They are
+  the login they replaced as their writeback matches it: the access and
+  refresh token and, when both are known, the `account_id`
+  (`RefreshedTokens::same_login`). While the file still holds that login,
+  `load` and `load_locked` serve them and a due refresh exchanges their own
+  refresh token and writes over the file's pair; once the file holds
+  anything else, another `account_id` or a missing file included, they are
+  dropped. They are
   written again at most once per `WRITEBACK_RETRY_INTERVAL` (30 s), due or
   not and before any backoff applies (`retry_write_back`). Between retries
   `get_auth` serves them without the single-flight guard or `auth.lock` while

@@ -15,11 +15,11 @@ static CODEX_REFRESH_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
     LazyLock::new(|| Arc::new(AsyncMutex::new(())));
 
 /// Tokens a refresh obtained but could not write back, per store path. They stand in
-/// for the login they replaced (`refreshed_access` and `refreshed_from`) while the
-/// store still holds it, and are dropped once it holds anything else, a document they
-/// cannot be matched to included, or once the token endpoint refused their refresh
-/// token and their access token has expired. They live in memory only and are never
-/// logged.
+/// for the login they replaced (`refreshed_access`, `refreshed_from` and, when the
+/// store names one too, `expected_account_id`) while the store still holds it, and
+/// are dropped once it holds anything else, a document they cannot be matched to
+/// included, or once the token endpoint refused their refresh token and their access
+/// token has expired. They live in memory only and are never logged.
 static UNWRITTEN_REFRESHES: LazyLock<Mutex<HashMap<String, Unwritten>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -265,8 +265,10 @@ impl<S: AuthStorage<StoredAuth> + 'static> CodexAuthManager<S> {
     }
 
     /// The store's reading, with the tokens of a refresh that could not write them
-    /// back in place of the login they replaced while the store still holds it. Once
-    /// it holds anything else, a missing file included, those tokens are dropped.
+    /// back in place of the login they replaced while the store still holds it, as
+    /// the writeback decides it (`RefreshedTokens::same_login`). Once it holds
+    /// anything else, another account id or a missing file included, those tokens
+    /// are dropped.
     fn with_unwritten(&self, stored: Option<StoredAuth>) -> Option<Loaded> {
         let mut slots = unwritten_refreshes();
         let path = self.store.auth_path();
@@ -275,8 +277,11 @@ impl<S: AuthStorage<StoredAuth> + 'static> CodexAuthManager<S> {
         };
         match stored {
             Some(stored)
-                if stored.access == entry.tokens.refreshed_access
-                    && stored.refresh == entry.tokens.refreshed_from =>
+                if entry.tokens.same_login(
+                    Some(&stored.access),
+                    Some(&stored.refresh),
+                    stored.account_id.as_deref(),
+                ) =>
             {
                 let unwritten = entry.tokens.clone();
                 Some(Loaded {
@@ -1830,6 +1835,57 @@ mod tests {
         assert_eq!(auth.refresh, "refresh-relogin");
         assert!(!manager.holds_unwritten_refresh());
         assert_eq!(endpoint.requests().len(), 1);
+    }
+
+    /// Tokens not yet written back are used only while the file holds the login their
+    /// writeback would write over: the same access and refresh token and, when both
+    /// name one, the same account id.
+    #[tokio::test]
+    async fn a_file_naming_another_account_drops_the_unwritten_refresh() {
+        // The account id the file names, the one the kept tokens replaced, and
+        // whether they are still used.
+        let cases = [
+            (Some("acct_other"), Some("acct_file"), false),
+            (Some("acct_file"), Some("acct_file"), true),
+            (None, Some("acct_file"), true),
+            (Some("acct_file"), None, true),
+        ];
+        for (file_account, replaced_account, kept) in cases {
+            let dir = tempfile::TempDir::new().unwrap();
+            let stored_access = jwt_expiring_in(7200);
+            let mut doc = auth_doc(&stored_access, "refresh-old");
+            let tokens = doc["tokens"].as_object_mut().unwrap();
+            match file_account {
+                Some(account) => tokens.insert("account_id".into(), json!(account)),
+                None => tokens.remove("account_id"),
+            };
+            let path = dir.path().join("auth.json");
+            write_doc(&path, &doc);
+            let manager = file_manager(&path, "http://127.0.0.1:1/should-not-be-called".into());
+            let unwritten_access = jwt_expiring_in(3600);
+            manager.keep_unwritten(RefreshedTokens {
+                refreshed_access: stored_access,
+                refreshed_from: "refresh-old".into(),
+                expected_account_id: replaced_account.map(str::to_string),
+                access_token: unwritten_access.clone(),
+                refresh_token: Some("refresh-new".into()),
+                id_token: None,
+                account_id: replaced_account.map(str::to_string),
+                expires: super::super::jwt::token_exp_ms(&unwritten_access).unwrap(),
+            });
+
+            let auth = manager.get_auth().await.unwrap();
+            let case = format!("file {file_account:?}, replaced {replaced_account:?}");
+            if kept {
+                assert_eq!(auth.access, unwritten_access, "{case}");
+                assert_eq!(auth.refresh, "refresh-new", "{case}");
+                assert_eq!(auth.account_id.as_deref(), Some("acct_file"), "{case}");
+                assert!(manager.holds_unwritten_refresh(), "{case}");
+            } else {
+                assert_eq!(Some(auth), manager.store.load_auth().unwrap(), "{case}");
+                assert!(!manager.holds_unwritten_refresh(), "{case}");
+            }
+        }
     }
 
     #[cfg(unix)]
