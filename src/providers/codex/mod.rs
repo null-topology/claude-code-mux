@@ -1768,9 +1768,9 @@ fn classified_error_response(
                 .into_response();
         }
         events::CodexErrorClass::Throttled => retry_after
-            .map(events::normalize_retry_after)
+            .and_then(events::normalize_retry_after)
             .or_else(|| events::retry_after_from_message(native)),
-        events::CodexErrorClass::Overloaded => retry_after.map(events::normalize_retry_after),
+        events::CodexErrorClass::Overloaded => retry_after.and_then(events::normalize_retry_after),
         events::CodexErrorClass::UsageNotIncluded
         | events::CodexErrorClass::Rejected
         | events::CodexErrorClass::ContextOverflow
@@ -2235,6 +2235,41 @@ mod tests {
         ));
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[http::header::RETRY_AFTER], "3");
+    }
+
+    #[tokio::test]
+    async fn a_failed_response_with_an_unusable_delay_takes_its_message_delay() {
+        for retry_after in [
+            format!("{}é", "a".repeat(3999)),
+            "x".repeat(65),
+            "\t".to_string(),
+        ] {
+            let failure = events::classify_event_failure(&serde_json::json!({
+                "type": "response.failed",
+                "response": {"error": {
+                    "code": "rate_limit_exceeded",
+                    "message": "Rate limit reached. Please try again in 20s.",
+                    "retry_after": retry_after
+                }}
+            }))
+            .unwrap();
+            let response = map_codex_error_to_response(&classified_codex_error(
+                failure.class.unwrap(),
+                failure.status,
+                &failure.message,
+                failure.retry_after.as_deref(),
+            ));
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()[http::header::RETRY_AFTER], "20");
+        }
+        // A value that reaches the mapping some other way is checked again.
+        let response = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::Overloaded,
+            529,
+            "busy",
+            Some("é"),
+        ));
+        assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
     }
 
     #[tokio::test]

@@ -181,6 +181,25 @@
   of seconds rounded up to a whole second, at least 1, and an HTTP date
   unchanged. A buffered 429 without a known code used to
   pass the header on as it came and ignore the body's delay.
+- A Codex retry delay is now used only when, with surrounding whitespace
+  removed, it is a finite number of seconds or at most 64 bytes of printable
+  ASCII, such as an HTTP date. Any other value (empty, longer, non-ASCII,
+  with a control character, or a number like `inf`) is ignored wherever it
+  is read: stream events, error bodies, and the `Retry-After` header of a
+  failed HTTP answer, a rejected WebSocket upgrade or a refused proxy
+  tunnel. The next source then gives the delay: the next field the error
+  names, then the response's header where there is one, and for `slow_down`
+  and `rate_limit_exceeded` the `try again in` delay of the message. Such a
+  value used to be passed on as it came, to the client's `Retry-After` and
+  to the `auto` fallback log line.
+- The body of a failed Codex HTTP answer (live and buffered requests, the
+  compaction request and the search call) is now read only up to 64 KiB, as
+  a rejected WebSocket upgrade's already was, and the whole read has to end
+  within the body idle timeout (5 minutes) instead of each chunk. The error
+  code, a spent usage window and the traffic capture are read from those
+  64 KiB. A body still arriving at the deadline fails the request with a
+  timeout of its own, which is neither refreshed nor sent again; it used to
+  hold the request for as long as the body kept coming.
 - A `codex.rate_limits` reading with a non-finite, negative or out-of-range
   window length, percentage, reset time or countdown now drops only that
   window; the other window is still published. A reset time or countdown

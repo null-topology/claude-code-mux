@@ -29,8 +29,8 @@ use crate::retry::sleep as retry_sleep;
 use crate::traffic::TrafficCapture;
 
 use super::client::{
-    ActualTransport, CodexError, CodexErrorOrigin, CodexResponse, OwnerAwareCodexResponse,
-    headers_to_json,
+    ActualTransport, CodexError, CodexErrorOrigin, CodexResponse, MAX_ERROR_BODY_BYTES,
+    OwnerAwareCodexResponse, headers_to_json,
 };
 use super::continuation::ContinuationReservation;
 
@@ -1350,10 +1350,9 @@ fn write_websocket_response_capture(
 // Connection helper
 // ---------------------------------------------------------------------------
 
+/// A rejection body is kept up to `MAX_ERROR_BODY_BYTES` to read its class
+/// and a spent window from; the detail keeps at most this much of it.
 const MAX_HANDSHAKE_ERROR_DETAIL_BYTES: usize = 1024;
-/// How much of a rejection body is kept to read its class and a spent window
-/// from; the detail keeps at most `MAX_HANDSHAKE_ERROR_DETAIL_BYTES` of it.
-const MAX_HANDSHAKE_ERROR_BODY_BYTES: usize = 64 * 1024;
 const GENERIC_HANDSHAKE_ERROR_DETAIL: &str = "WebSocket upgrade was rejected";
 
 fn handshake_error_detail(body: Option<&[u8]>) -> String {
@@ -1389,8 +1388,9 @@ fn request_account_id(headers: &HeaderMap) -> Option<&str> {
 /// A rejected upgrade, built the same way on the direct and the tunneled path.
 /// `body` is what was read of the rejection's body, `None` for a 407, which is
 /// never read. A `Retry-After` header is normalised the way a classified one
-/// is (`normalize_retry_after`); whether it reaches the client is up to the
-/// error mapping, which never sends it for a spent usage window or a quota.
+/// is (`normalize_retry_after`), and one that is not usable counts as absent;
+/// whether it reaches the client is up to the error mapping, which never
+/// sends it for a spent usage window or a quota.
 /// Every `codex.rate_limits` event the body holds reaches the quota gauge
 /// whole, under `account`, the ChatGPT account the upgrade was sent with,
 /// before the body is reduced to a spent window.
@@ -1404,7 +1404,7 @@ fn handshake_rejection_error(
         headers
             .get(http::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
-            .map(super::events::normalize_retry_after)
+            .and_then(super::events::normalize_retry_after)
     };
     let (detail, class, usage_limit, retry_after) = match body {
         Some(body) => {
@@ -1569,12 +1569,12 @@ fn validate_websocket_upgrade(
 
 async fn bounded_handshake_error_body(mut response: reqwest::Response) -> Vec<u8> {
     let mut body = Vec::new();
-    while body.len() < MAX_HANDSHAKE_ERROR_BODY_BYTES {
+    while body.len() < MAX_ERROR_BODY_BYTES {
         let chunk = match response.chunk().await {
             Ok(Some(chunk)) => chunk,
             Ok(None) | Err(_) => break,
         };
-        let remaining = MAX_HANDSHAKE_ERROR_BODY_BYTES - body.len();
+        let remaining = MAX_ERROR_BODY_BYTES - body.len();
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
     body
@@ -1773,7 +1773,7 @@ fn parse_connect_response_head(response: &[u8]) -> Result<(u16, Option<String>),
             }
             std::str::from_utf8(&value[1..])
                 .ok()
-                .map(|value| super::events::normalize_retry_after(value.trim()))
+                .and_then(super::events::normalize_retry_after)
         });
     Ok((status, retry_after))
 }
@@ -1929,7 +1929,7 @@ fn tungstenite_handshake_error(
             .body()
             .as_deref()
             .filter(|_| response.status() != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-            .map(|body| &body[..body.len().min(MAX_HANDSHAKE_ERROR_BODY_BYTES)]);
+            .map(|body| &body[..body.len().min(MAX_ERROR_BODY_BYTES)]);
         return handshake_rejection_error(
             response.status().as_u16(),
             response.headers(),
@@ -4331,6 +4331,34 @@ mod tests {
         let head = format!("HTTP/1.1 502 Bad Gateway\r\nretry-after: {date}\r\n\r\n");
         let (_, retry_after) = parse_connect_response_head(head.as_bytes()).unwrap();
         assert_eq!(retry_after.as_deref(), Some(date));
+        for unusable in ["x".repeat(65), "soon \u{1}".to_string(), "é".to_string()] {
+            let head =
+                format!("HTTP/1.1 503 Service Unavailable\r\nRetry-After: {unusable}\r\n\r\n");
+            let (_, retry_after) = parse_connect_response_head(head.as_bytes()).unwrap();
+            assert_eq!(retry_after, None, "{unusable:?}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_upgrade_takes_its_header_when_the_body_delay_is_unusable() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "error": {
+                "code": "policy_capacity_unavailable",
+                "message": "busy",
+                "retry_after": format!("{}é", "a".repeat(3999))
+            }
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, "9".parse().unwrap());
+        let err = handshake_rejection_error(503, &headers, Some(&body), None);
+        assert_eq!(err.retry_after.as_deref(), Some("9"));
+
+        headers.insert(http::header::RETRY_AFTER, "x".repeat(65).parse().unwrap());
+        let err = handshake_rejection_error(503, &headers, Some(&body), None);
+        assert_eq!(err.retry_after, None);
+        let err = handshake_rejection_error(407, &headers, None, None);
+        assert_eq!(err.retry_after, None);
     }
 
     #[tokio::test]

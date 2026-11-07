@@ -1006,9 +1006,13 @@ The code decides over the status and the message heuristics:
 
 `usage_limit_reached` keeps precedence over every class.
 
-A classified `Retry-After` is normalised (`normalize_retry_after`): a number
-is rounded up to whole seconds, at least 1; anything else (an HTTP date)
-passes as it came. In a stream event (`classify_event_failure`, where the
+A classified `Retry-After` is normalised (`normalize_retry_after`, on the
+trimmed value): a finite number is rounded up to whole seconds, at least 1;
+other text (an HTTP date) passes as it came when it is at most
+`MAX_RETRY_AFTER_TEXT_BYTES` (64) of printable ASCII. Anything else, empty,
+longer, non-ASCII, with a control character, or `NaN`/`inf`, is not usable
+and counts as absent at that source, so the next source applies and the
+value reaches no header and no log line. In a stream event (`classify_event_failure`, where the
 error is the event's `error` or else `/response/error`) the first of these
 gives the value: `error.retry_after`, `error.retry_after_seconds`, the event's
 `retry_after_seconds`, the event's `headers` (`retry-after`, then
@@ -1029,9 +1033,15 @@ compaction refused as quota or `usage_not_included` answers the client with
 that class and does not send the normal request; any other compaction failure
 falls back to it. The WebSocket handshake reads the rejection body on both
 the direct upgrade and the HTTP CONNECT tunnel (on the tunnel only the bytes
-that arrived with the response head), never for a 407. It keeps up to 64 KiB
-of the body to read the class and a spent window from, and at most 1 KiB of
-its message as the detail. Under `auto` transport
+that arrived with the response head), never for a 407. It keeps up to
+`MAX_ERROR_BODY_BYTES` (64 KiB, in `client.rs`) of the body to read the class
+and a spent window from, and at most 1 KiB of its message as the detail. A
+non-2xx HTTP answer (live and buffered Messages requests, the compaction
+request, the search call) is read the same way, up to `MAX_ERROR_BODY_BYTES`
+and within one deadline of `body_idle_timeout_ms` for the whole read
+(`read_error_body`); the classification, a spent window and the traffic
+capture see only those bytes, and a read past the deadline fails with
+`detail: http_response_body` and is neither refreshed nor resent. Under `auto` transport
 (the default) a handshake failure, classified or not, falls back to HTTP unless the
 WebSocket proxy refused it (`should_fallback_to_http` in `client.rs`), and
 that HTTP answer is classified on its own. The codes and their shapes follow
