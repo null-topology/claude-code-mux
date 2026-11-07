@@ -304,9 +304,12 @@ Request path:
    `config summary` warning that names it, except the path variables read
    with `var_os`, `paths::PATH_ENV_VARS` and `OS_PATH_ENV_VARS`
    (`CCP_CODEX_AUTH_FILE`); the Codex client's `ProxyEnvironment::from_env`
-   skips an `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` or `NO_PROXY` spelling,
-   either case, that is not valid Unicode, so the other spelling or none
-   applies). `read_file_config` keeps
+   reads `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` with `var_os`, the
+   uppercase spelling when set, else the lowercase one, and panics with
+   `invalid <NAME> proxy URL` on a value that is not valid Unicode rather
+   than connect around the proxy; it skips a `NO_PROXY` or `no_proxy`
+   spelling that is not valid Unicode, so the other one or none applies).
+   `read_file_config` keeps
    the parsed file per path in a process-wide cache for `CONFIG_FILE_TTL`
    (30 s), a missing file (`NotFound`) included as `None`, so an edit lands
    within 30 s. Any other read error and a file that does not parse are not
