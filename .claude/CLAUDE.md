@@ -902,9 +902,23 @@ reading is recorded by `coordinate_live_websocket_events` under the account
 of the attempt that read it before it is queued, and the reader skips it
 (`rate_limits_observed`), because a 401 refresh can move the stream to
 another login while the reading waits in the queue; the response headers
-still follow the stream's final account. A reading or spent window under
-another account replaces the held reading whole, and `with_rate_limit_headers`
-publishes it only for a request under the same account. A reading whose
+still follow the stream's final account. Since that task records them, the
+bare receivers of `stream_codex_websocket_events` and
+`stream_codex_auto_events` (the latter on its WebSocket branch) feed the
+gauge too, which no reader did for them before. A reading or spent window
+under another account replaces the held reading whole, and
+`with_rate_limit_headers` publishes it only for a request under the same
+account. A pooled WebSocket keeps the `ChatGPT-Account-Id` of its handshake
+(`PoolEntry::account_id`), since the backend answers every request on it
+under that account: `take_pool_entry_for_request` hands it only to a
+request built with the same account and otherwise drops it as gone, so a
+continuation that needed it takes the missing-socket path
+(`continuation_socket_missing_error`) and is sent again with full context,
+and any other request opens its own connection. A token of the same account
+renewed before it expires keeps the socket (a refresh forced by a 401 still
+drops the conversation's socket, as before), whereas the Codex CLI resets its
+connection on any auth change (`codex-rs/core/src/client.rs` at
+rust-v0.166.0). A reading whose
 `metered_limit_name`, else `limit_name`, names a limit other than `codex`
 updates nothing, and its refusal marks no window (`reads_codex_limit`,
 `CodexUsageLimit::feeds_gauge`); one naming neither reads `codex`, as the
