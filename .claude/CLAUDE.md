@@ -786,24 +786,23 @@ byte-exact.
   `get_auth` serves them without the single-flight guard or `auth.lock` while
   they are not due; once they are due it takes the single-flight guard for
   the exchange or the backoff check, and no `auth.lock` while that refresh
-  backs off. A
-  retry that fails for an I/O reason keeps them for another interval and
-  logs nothing, one that finds another login drops them, and one that finds
-  a document it cannot use (unreadable, not JSON, no `tokens` object) drops
-  them and the request fails as it would without them. After a retry the
-  store is read again under `auth.lock` before any exchange. When the token
-  endpoint refuses their refresh token (401 or 403 for the same login, or
-  any other status that is not retried), they stay while their access token
-  is unexpired and are dropped once it has expired
-  (`keep_unwritten_after_refusal`). The exchange, the writeback and the
-  retry run in a `tokio::spawn`ed task that owns the single-flight guard
-  (`lock_owned`), so a caller dropped mid-request neither frees the lock
-  early nor loses the tokens; no `std` mutex is held across an await. A
-  writeback that finds a changed login reads the store again with
-  `load_locked`. `load_locked` itself falls back
-  to a plain read when `auth.lock` cannot be taken, as the Codex CLI's own
-  read takes no lock (`codex-rs/login/src/auth/storage.rs` at rust-v0.166.0)
-  and a read-only home must keep working.
+  backs off. A retry that fails for an I/O reason keeps them for another
+  interval and logs nothing, one that finds another login drops them, and one
+  that finds a document it cannot use (unreadable, not JSON, no `tokens`
+  object) drops them and the request fails as it would without them. After a
+  retry the store is read again under `auth.lock` before any exchange. When
+  the token endpoint refuses their refresh token (401 or 403 for the same
+  login, or any other status that is not retried), they stay while their
+  access token is unexpired and are dropped once it has expired
+  (`keep_unwritten_after_refusal`). The exchange, the writeback and the retry
+  run in a `tokio::spawn`ed task that owns the single-flight guard
+  (`lock_owned`), so a caller dropped mid-request neither frees the lock early
+  nor loses the tokens; no `std` mutex is held across an await. A writeback
+  that finds a changed login reads the store again with `load_locked`.
+  `load_locked` itself falls back to a plain read when `auth.lock` cannot be
+  taken, as the Codex CLI's own read takes no lock
+  (`codex-rs/login/src/auth/storage.rs` at rust-v0.166.0) and a read-only home
+  must keep working.
   The same rule for another login covers a stored token that changed before
   the request went out and the re-read under `auth.lock` after the token
   endpoint answered 401 or 403. A proactive refresh that fails for any reason
@@ -812,21 +811,24 @@ byte-exact.
   only `class` and `status`, decided in the spawned task so that a dropped
   caller still logs it once. The two failures outside that task, a file the
   unlocked reload before it cannot read and a task that did not finish
-  (`refresh_task_answer`), fall back the same way in the caller. The forced
-  refresh after an upstream 401 never does. `PROACTIVE_REFRESH_FAILURES` remembers the last failed proactive
-  refresh per store path and access token: the proactive path then serves
-  the unexpired stored token without an exchange for
-  `TRANSIENT_REFRESH_BACKOFF` (60 s) after a transient failure, and after
-  any other failure until the access token changes; the forced path neither
-  reads nor writes it. A transient failure (the endpoint unreachable, a
-  timeout, 429, 5xx, a refresh task that did not finish,
-  `TransientRefreshError`) answers the client 503
-  `api_error` with the fixed message `Codex token refresh is temporarily
-  unavailable` (`auth_error` at every `get_auth` site in `client.rs`,
-  `auth_refresh_error` at every `force_refresh` site there); any other
-  failure answers 401. The model listing maps the same split to
-  `ModelsError::Unreachable` and `Unauthorized` (`auth_models_error` in
-  `models.rs`). No refresh error carries the token endpoint's response body.
+  (`refresh_task_answer`), fall back the same way in the caller without
+  recording a failure in `PROACTIVE_REFRESH_FAILURES`; after the failed
+  reload, a token the re-read under `auth.lock` finds not due is served with
+  no warning, as no refresh was tried (`after_failed_unlocked_reload`). The
+  forced refresh after an upstream 401 never falls back.
+  `PROACTIVE_REFRESH_FAILURES` remembers the last failed proactive refresh per
+  store path and access token: the proactive path then serves the unexpired
+  stored token without an exchange for `TRANSIENT_REFRESH_BACKOFF` (60 s)
+  after a transient failure, and after any other failure until the access
+  token changes; the forced path neither reads nor writes it. A transient
+  failure (the endpoint unreachable, a timeout, 429, 5xx, a refresh task that
+  did not finish, `TransientRefreshError`) answers the client 503 `api_error`
+  with the fixed message `Codex token refresh is temporarily unavailable`
+  (`auth_error` at every `get_auth` site in `client.rs`, `auth_refresh_error`
+  at every `force_refresh` site there); any other failure answers 401. The
+  model listing maps the same split to `ModelsError::Unreachable` and
+  `Unauthorized` (`auth_models_error` in `models.rs`). No refresh error
+  carries the token endpoint's response body.
 
 ## Codex rate limits
 

@@ -90,7 +90,7 @@ const NO_CREDENTIALS: &str =
     "No Codex credentials. Log in with the Codex CLI (`codex login`) to create ~/.codex/auth.json";
 const LOGIN_CHANGED_EXPIRED: &str = "The Codex login changed during a token refresh and the stored token has expired or was just rejected. Log in with the Codex CLI (`codex login`)";
 
-/// A refresh failure that may pass: the token endpoint could not be reached or
+/// A temporary refresh failure: the token endpoint could not be reached or
 /// answered 429 or 5xx, or the refresh task did not finish. Its text carries only a
 /// fixed message and the HTTP status, never a response body or a token. Requests
 /// answer it with 503.
@@ -119,7 +119,7 @@ impl std::fmt::Display for TransientRefreshError {
 
 impl std::error::Error for TransientRefreshError {}
 
-/// A refresh the token endpoint answered and that cannot pass by retrying: a 401 or
+/// A refresh failure that retrying cannot fix: the token endpoint answered 401 or
 /// 403, another non-2xx status, or a response that is not a usable token answer. Like
 /// `TransientRefreshError` its text never carries a response body or a token.
 #[derive(Debug)]
@@ -363,14 +363,14 @@ impl<S: AuthStorage<StoredAuth> + 'static> CodexAuthManager<S> {
         // Reload from durable storage after acquiring the single-flight lock.
         // Another request may have rotated and persisted the token while this
         // caller was waiting. A proactive refresh that cannot read the file here (a
-        // write caught halfway, for one) falls back to the stored token as after any
-        // other failure.
+        // write caught halfway, for one) reads it again under `auth.lock`
+        // (`after_failed_unlocked_reload`).
         let reloaded = self.load();
         #[cfg(test)]
         self.signal_unlocked_reload();
         let loaded = match reloaded {
             Ok(loaded) => loaded.ok_or_else(|| anyhow::anyhow!("Not authenticated"))?,
-            Err(err) if !force => return self.after_failed_proactive_refresh(err).await,
+            Err(err) if !force => return self.after_failed_unlocked_reload(err).await,
             Err(err) => return Err(err),
         };
         if !force && !loaded.retry_writeback && !Self::refresh_due(&loaded.auth) {
@@ -454,6 +454,20 @@ impl<S: AuthStorage<StoredAuth> + 'static> CodexAuthManager<S> {
         }
     }
 
+    /// A proactive refresh whose read without `auth.lock` failed reads the store
+    /// again under the lock. A token there that is not due is served as it is, with
+    /// no warning: no refresh was tried, so none failed. Any other outcome is that of
+    /// a failed proactive refresh.
+    async fn after_failed_unlocked_reload(
+        &self,
+        err: anyhow::Error,
+    ) -> Result<StoredAuth, anyhow::Error> {
+        match self.load_locked().await {
+            Ok(Some(reread)) if !Self::refresh_due(&reread.auth) => Ok(reread.auth),
+            reread => Self::stored_after_failed_refresh(err, reread),
+        }
+    }
+
     /// A proactive refresh that failed in any way keeps using the token in use while
     /// it is still valid, with one warning. The store is read again under
     /// `auth.lock`; a file that cannot be read keeps the refresh error.
@@ -461,11 +475,15 @@ impl<S: AuthStorage<StoredAuth> + 'static> CodexAuthManager<S> {
         &self,
         err: anyhow::Error,
     ) -> Result<StoredAuth, anyhow::Error> {
-        match self
-            .load_locked()
-            .await
-            .map(|loaded| loaded.map(|l| l.auth))
-        {
+        Self::stored_after_failed_refresh(err, self.load_locked().await)
+    }
+
+    /// `after_failed_proactive_refresh` once the store has been read again.
+    fn stored_after_failed_refresh(
+        err: anyhow::Error,
+        reread: Result<Option<Loaded>, anyhow::Error>,
+    ) -> Result<StoredAuth, anyhow::Error> {
+        match reread.map(|loaded| loaded.map(|l| l.auth)) {
             Ok(Some(stored)) if stored.expires > Self::now_ms() => {
                 let (class, status) = refresh_failure_fields(&err);
                 let fields = serde_json::Map::from_iter([
@@ -1984,12 +2002,14 @@ mod tests {
 
         // Until the next write is due, a request neither writes nor waits: not for
         // `auth.lock`, which another process holds here, nor for the single-flight
-        // lock.
+        // lock, which this test holds.
         drop(read_only);
         let holder = lock_auth_dir(dir.path());
+        let single_flight = manager.refresh_lock.lock().await;
         let served = futures_util::FutureExt::now_or_never(manager.get_auth())
             .expect("a request between two writes waited for a lock")
             .unwrap();
+        drop(single_flight);
         drop(holder);
         assert_eq!(served, unwritten);
         assert_eq!(manager.get_auth().await.unwrap(), unwritten);
@@ -2216,6 +2236,45 @@ mod tests {
             .collect();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0]["fields"]["status"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_torn_read_of_tokens_another_writer_refreshed_serves_them_without_a_warning() {
+        let log = CapturedLog::start().await;
+        let endpoint = CountingEndpoint::start(vec![("200 OK", rotated_body())], None);
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = auth_file(&dir, &jwt_expiring_in(60), "refresh-old");
+        let manager = file_manager(&path, endpoint.url.clone());
+
+        // The refresh reads the file while another writer, holding auth.lock, is
+        // halfway through storing tokens it refreshed; the writer finishes once that
+        // read is done, and the read under auth.lock finds tokens that are not due.
+        let fresh_access = jwt_expiring_in(7200);
+        let fresh = serde_json::to_vec_pretty(&auth_doc(&fresh_access, "refresh-new")).unwrap();
+        let holder = lock_auth_dir(dir.path());
+        std::fs::write(&path, &fresh[..fresh.len() / 2]).unwrap();
+        let reloaded = manager.on_unlocked_reload();
+        let partial = path.clone();
+        let writer = thread::spawn(move || {
+            reloaded
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the refresh read the file");
+            std::fs::write(&partial, fresh).unwrap();
+            drop(holder);
+        });
+        let auth = manager.refresh(false, None).await.unwrap();
+        writer.join().unwrap();
+        assert_eq!(auth.access, fresh_access);
+        assert_eq!(auth.refresh, "refresh-new");
+        assert!(endpoint.requests().is_empty());
+
+        // No refresh failed, so nothing is logged as one.
+        let warnings: Vec<_> = log
+            .events("codex_token_refresh_failed_using_stored_token")
+            .into_iter()
+            .filter(|event| event["fields"]["class"] == "auth")
+            .collect();
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[tokio::test]

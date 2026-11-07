@@ -340,8 +340,8 @@ fn build_request(
     Ok(request)
 }
 
-/// A failure to obtain a Codex token: a refresh that may pass is `Unreachable`,
-/// anything else `Unauthorized`.
+/// A failure to obtain a Codex token: a temporary refresh failure is
+/// `Unreachable`, anything else `Unauthorized`.
 fn auth_models_error(error: anyhow::Error) -> ModelsError {
     if error.downcast_ref::<TransientRefreshError>().is_some() {
         ModelsError::Unreachable(error.to_string())
@@ -765,8 +765,8 @@ mod tests {
         assert!(snippet.len() <= 204);
     }
 
-    /// A token refresh that may pass leaves the listing unreachable; a login that
-    /// needs `codex login` again leaves it unauthorized.
+    /// A temporary token refresh failure leaves the listing unreachable; a login
+    /// that needs `codex login` again leaves it unauthorized.
     #[tokio::test]
     async fn a_token_refresh_outage_is_unreachable_and_a_dead_login_unauthorized() {
         use super::super::auth::token_store::{CodexCliAuthStore, CodexTokenStore};

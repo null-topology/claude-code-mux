@@ -2721,8 +2721,9 @@ fn auth_refresh_error(err: anyhow::Error) -> CodexError {
     auth_error(err, "Unauthorized")
 }
 
-/// What the client is told when the Codex token refresh failed for a reason
-/// that may pass: the token endpoint was unreachable or answered 429 or 5xx.
+/// What the client is told after a temporary Codex token refresh failure: the
+/// token endpoint was unreachable or answered 429 or 5xx, or the refresh did not
+/// finish.
 pub(crate) const TOKEN_REFRESH_UNAVAILABLE: &str = "Codex token refresh is temporarily unavailable";
 
 /// Maps a failure to obtain a Codex token. A transient refresh failure answers
