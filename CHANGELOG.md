@@ -1,3 +1,19 @@
+## Unreleased
+
+- Codex over WebSocket: writing a request to a peer that stopped reading no
+  longer hangs the request or leaves its socket task running. Writing the
+  request frame now has a 300 s timeout, and the wait for the response
+  starts its own 300 s timeout once the frame is written. When the write
+  times out, the client receives the same response-start timeout error as
+  when the response never starts, and the request is neither resent on a
+  new socket nor replayed over HTTP, even under the default `auto`
+  transport. A Pong sent during a response gets the time left of that
+  wait. When it runs out, the response ends with that wait's timeout and
+  is not resent either. The Ping that checks a
+  pooled socket before reuse now counts toward the 15 s check. A check that
+  runs out discards the socket, like any other failed check. There is no
+  setting for these deadlines and no way back to unbounded writes.
+
 ## v0.17.0 (2026-11-05)
 
 - Breaking: `GET /v1/models` now answers in the Anthropic List Models shape

@@ -47,6 +47,9 @@ pub const WEBSOCKET_KEEPALIVE_FAILURE_DETAIL: &str = "websocket_keepalive_failur
 pub const WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL: &str =
     "websocket_continuation_socket_missing";
 pub(super) const WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL: &str = "websocket_proxy_tunnel_rejected";
+/// Marks a write that ran out of time. Part of the frame may already be on
+/// the socket, so the request is neither resent nor replayed over HTTP.
+pub(super) const WEBSOCKET_WRITE_TIMEOUT_DETAIL: &str = "websocket_write_timeout";
 
 const POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_POOL_ENTRIES: usize = 10_000;
@@ -346,6 +349,9 @@ static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<ConversationIdentity, Arc<Po
 static WS_POOL_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 static WS_CONNECT_GATE: once_cell::sync::Lazy<WebSocketConnectGate> =
     once_cell::sync::Lazy::new(|| WebSocketConnectGate::new(WEBSOCKET_CONNECT_START_SPACING));
+/// Test override of the request frame's write budget in milliseconds; 0 means
+/// the path's idle budget.
+static REQUEST_WRITE_TIMEOUT_MS_FOR_TESTS: AtomicU64 = AtomicU64::new(0);
 
 fn next_monotonic_nonzero(sequence: &AtomicU64, label: &str) -> u64 {
     // `fetch_update` is deprecated in favour of `try_update`, which older
@@ -373,6 +379,34 @@ fn now_ms() -> u64 {
 pub fn clear_codex_websocket_pool_for_tests() {
     let mut guard = WS_POOL.lock().unwrap();
     guard.clear();
+}
+
+/// Shortens the deadline of a request frame's write, so a test can wait out a
+/// peer that never reads without the full idle budget. `None` restores the
+/// idle budget.
+#[doc(hidden)]
+pub fn set_codex_websocket_request_write_timeout_for_tests(timeout: Option<Duration>) {
+    let millis = timeout.map_or(0, |timeout| (timeout.as_millis() as u64).max(1));
+    REQUEST_WRITE_TIMEOUT_MS_FOR_TESTS.store(millis, Ordering::Relaxed);
+}
+
+/// Holds the request write budget override for one test.
+#[cfg(test)]
+pub(crate) struct RequestWriteTimeoutOverride;
+
+#[cfg(test)]
+impl RequestWriteTimeoutOverride {
+    pub(crate) fn set(timeout: Duration) -> Self {
+        set_codex_websocket_request_write_timeout_for_tests(Some(timeout));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for RequestWriteTimeoutOverride {
+    fn drop(&mut self) {
+        set_codex_websocket_request_write_timeout_for_tests(None);
+    }
 }
 
 #[cfg(test)]
@@ -843,21 +877,11 @@ pub(super) async fn codex_websocket_request(
         used_pooled = false;
     }
 
-    guard
-        .send(Message::Text(body_json))
+    send_request_frame(&mut guard, body_json, idle_timeout_ms)
         .await
-        .map_err(|error| {
+        .inspect_err(|_| {
             if let Some(owner) = pool_owner {
                 pool_remove_entry(owner, &entry);
-            }
-            CodexError {
-                status: 0,
-                message: format!("WebSocket send error: {error}"),
-                detail: None,
-                retry_after: None,
-                usage_limit: None,
-                class: None,
-                origin: CodexErrorOrigin::WebSocket,
             }
         })?;
 
@@ -942,11 +966,13 @@ where
     let nonce = next_monotonic_nonzero(&POOLED_VALIDATION_SEQUENCE, "pooled validation")
         .to_be_bytes()
         .to_vec();
-    websocket
-        .send(Message::Ping(nonce.clone()))
-        .await
-        .map_err(|error| error.to_string())?;
+    // The Ping is written under the validation deadline too, so a socket the
+    // peer stopped reading fails validation instead of holding the request.
     tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+        websocket
+            .send(Message::Ping(nonce.clone()))
+            .await
+            .map_err(|error| error.to_string())?;
         loop {
             match websocket.next().await {
                 Some(Ok(Message::Pong(payload))) if payload == nonce => return Ok(()),
@@ -1089,23 +1115,13 @@ pub(super) fn start_codex_websocket_events(
             idle_timeout_ms,
         } = ready;
         let pool_owner = reservation_pool_owner(reservation.as_ref());
-        if let Err(error) = guard.send(Message::Text(body_json)).await {
+        if let Err(error) = send_request_frame(&mut guard, body_json, idle_timeout_ms).await {
             drop(guard);
             if let Some(owner) = pool_owner {
                 pool_remove_entry(owner, &entry);
             }
             socket_id_publisher.publish(None);
-            let _ = tx
-                .send(Err(CodexError {
-                    status: 0,
-                    message: format!("WebSocket send error: {error}"),
-                    detail: None,
-                    retry_after: None,
-                    usage_limit: None,
-                    class: None,
-                    origin: CodexErrorOrigin::WebSocket,
-                }))
-                .await;
+            let _ = tx.send(Err(error)).await;
             return;
         }
         let (reusable, terminal_item) =
@@ -1209,6 +1225,71 @@ fn response_start_timeout_error(timeout_ms: u64) -> CodexError {
         usage_limit: None,
         class: None,
         origin: CodexErrorOrigin::WebSocket,
+    }
+}
+
+/// The error a response wait answers when its idle deadline passes.
+fn response_wait_timeout_error(response_started: bool, idle_timeout_ms: u64) -> CodexError {
+    if response_started {
+        CodexError {
+            status: 0,
+            message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
+            detail: None,
+            retry_after: None,
+            usage_limit: None,
+            class: None,
+            origin: CodexErrorOrigin::WebSocket,
+        }
+    } else {
+        response_start_timeout_error(idle_timeout_ms)
+    }
+}
+
+/// The error a write answers when it runs out of time: the client sees the
+/// response wait's timeout, while the detail keeps the request out of the
+/// continuation retry and the HTTP fallback.
+fn write_timeout_error(response_started: bool, timeout_ms: u64) -> CodexError {
+    CodexError {
+        detail: Some(WEBSOCKET_WRITE_TIMEOUT_DETAIL.to_string()),
+        ..response_wait_timeout_error(response_started, timeout_ms)
+    }
+}
+
+/// Writes the request frame under the idle budget of the response wait that
+/// follows it, as the Codex CLI's `send_websocket_request` does
+/// (`codex-rs/codex-api/src/endpoint/responses_websocket.rs` at
+/// rust-v0.166.0). A peer that stops reading gets the answer of a peer that
+/// stays silent before the first response event, the response start timeout,
+/// and the request is neither resent nor replayed over HTTP.
+async fn send_request_frame<S>(
+    websocket: &mut WebSocketStream<S>,
+    body_json: String,
+    idle_timeout_ms: u64,
+) -> Result<(), CodexError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let budget_ms = match REQUEST_WRITE_TIMEOUT_MS_FOR_TESTS.load(Ordering::Relaxed) {
+        0 => idle_timeout_ms,
+        override_ms => override_ms,
+    };
+    match tokio::time::timeout(
+        Duration::from_millis(budget_ms),
+        websocket.send(Message::Text(body_json)),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(CodexError {
+            status: 0,
+            message: format!("WebSocket send error: {error}"),
+            detail: None,
+            retry_after: None,
+            usage_limit: None,
+            class: None,
+            origin: CodexErrorOrigin::WebSocket,
+        }),
+        Err(_) => Err(write_timeout_error(false, budget_ms)),
     }
 }
 
@@ -2107,7 +2188,7 @@ where
     let mut sse_body: Vec<u8> = Vec::new();
     let mut terminal_event: Option<WsEvent> = None;
     let response_event_budget = Duration::from_millis(idle_timeout_ms);
-    let response_wait_started = Instant::now();
+    let response_wait_started = tokio::time::Instant::now();
     let mut last_response_event_at = response_wait_started;
     let mut response_started = false;
 
@@ -2117,49 +2198,26 @@ where
         } else {
             response_wait_started
         };
-        let read_timeout = if response_started {
+        let read_timeout =
             match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
                 Some(remaining) if !remaining.is_zero() => remaining,
                 _ => {
                     invalidate_pool_owner(pool_owner, pool_entry);
-                    return Err(CodexError {
-                        status: 0,
-                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                        detail: None,
-                        retry_after: None,
-                        usage_limit: None,
-                        class: None,
-                        origin: CodexErrorOrigin::WebSocket,
-                    });
+                    return Err(response_wait_timeout_error(
+                        response_started,
+                        idle_timeout_ms,
+                    ));
                 }
-            }
-        } else {
-            match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
-                Some(remaining) if !remaining.is_zero() => remaining,
-                _ => {
-                    invalidate_pool_owner(pool_owner, pool_entry);
-                    return Err(response_start_timeout_error(idle_timeout_ms));
-                }
-            }
-        };
+            };
 
         let frame = match read_ws_frame_with_keepalive(ws, read_timeout, keepalive_interval).await {
             WebSocketRead::Frame(frame) => frame,
             WebSocketRead::Timeout => {
                 invalidate_pool_owner(pool_owner, pool_entry);
-                return Err(if response_started {
-                    CodexError {
-                        status: 0,
-                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                        detail: None,
-                        retry_after: None,
-                        usage_limit: None,
-                        class: None,
-                        origin: CodexErrorOrigin::WebSocket,
-                    }
-                } else {
-                    response_start_timeout_error(idle_timeout_ms)
-                });
+                return Err(response_wait_timeout_error(
+                    response_started,
+                    idle_timeout_ms,
+                ));
             }
             WebSocketRead::KeepaliveError(error) => {
                 invalidate_pool_owner(pool_owner, pool_entry);
@@ -2204,7 +2262,7 @@ where
 
                 if is_response_event(&parsed) {
                     response_started = true;
-                    last_response_event_at = Instant::now();
+                    last_response_event_at = tokio::time::Instant::now();
                 }
 
                 // Check for terminal events
@@ -2234,8 +2292,18 @@ where
                 });
             }
             Some(Ok(Message::Ping(data))) => {
-                // Respond to ping automatically, continue
-                let _ = ws.send(Message::Pong(data)).await;
+                // Respond to ping automatically, continue. The reply shares
+                // the read deadline, so a peer that stops reading cannot hold
+                // the wait past it.
+                let remaining =
+                    response_event_budget.saturating_sub(response_deadline_started.elapsed());
+                if tokio::time::timeout(remaining, ws.send(Message::Pong(data)))
+                    .await
+                    .is_err()
+                {
+                    invalidate_pool_owner(pool_owner, pool_entry);
+                    return Err(write_timeout_error(response_started, idle_timeout_ms));
+                }
                 continue;
             }
             Some(Ok(Message::Pong(_))) => {
@@ -2286,7 +2354,7 @@ where
     let started_at = Instant::now();
     let mut sse_body: Vec<u8> = Vec::new();
     let response_event_budget = Duration::from_millis(idle_timeout_ms);
-    let response_wait_started = Instant::now();
+    let response_wait_started = tokio::time::Instant::now();
     let mut last_response_event_at = response_wait_started;
     let mut response_started = false;
     let mut status = 200u16;
@@ -2303,19 +2371,10 @@ where
             match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
                 Some(remaining) if !remaining.is_zero() => remaining,
                 _ => {
-                    terminal_item = Some(Err(if response_started {
-                        CodexError {
-                            status: 0,
-                            message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                            detail: None,
-                            retry_after: None,
-                            usage_limit: None,
-                            class: None,
-                            origin: CodexErrorOrigin::WebSocket,
-                        }
-                    } else {
-                        response_start_timeout_error(idle_timeout_ms)
-                    }));
+                    terminal_item = Some(Err(response_wait_timeout_error(
+                        response_started,
+                        idle_timeout_ms,
+                    )));
                     break;
                 }
             };
@@ -2330,19 +2389,10 @@ where
             ) => match frame {
                 WebSocketRead::Frame(frame) => frame,
                 WebSocketRead::Timeout => {
-                    terminal_item = Some(Err(if response_started {
-                        CodexError {
-                            status: 0,
-                            message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                            detail: None,
-                            retry_after: None,
-                            usage_limit: None,
-                            class: None,
-                            origin: CodexErrorOrigin::WebSocket,
-                        }
-                    } else {
-                        response_start_timeout_error(idle_timeout_ms)
-                    }));
+                    terminal_item = Some(Err(response_wait_timeout_error(
+                        response_started,
+                        idle_timeout_ms,
+                    )));
                     break;
                 }
                 WebSocketRead::KeepaliveError(error) => {
@@ -2386,7 +2436,7 @@ where
 
                 if is_response_event(&parsed) {
                     response_started = true;
-                    last_response_event_at = Instant::now();
+                    last_response_event_at = tokio::time::Instant::now();
                 }
                 if parsed.get("type").and_then(|value| value.as_str()) == Some("error") {
                     status = event_error_status(&parsed).unwrap_or(500);
@@ -2428,7 +2478,18 @@ where
                 break;
             }
             Some(Ok(Message::Ping(data))) => {
-                let _ = ws.send(Message::Pong(data)).await;
+                // The reply shares the read deadline, so a peer that stops
+                // reading cannot hold the stream past it.
+                let remaining =
+                    response_event_budget.saturating_sub(response_deadline_started.elapsed());
+                if tokio::time::timeout(remaining, ws.send(Message::Pong(data)))
+                    .await
+                    .is_err()
+                {
+                    terminal_item =
+                        Some(Err(write_timeout_error(response_started, idle_timeout_ms)));
+                    break;
+                }
             }
             Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
             Some(Ok(Message::Close(_))) | None => {
@@ -2640,6 +2701,87 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    /// A peer that stops reading: while `delay` runs it takes every write,
+    /// then it hands out `input` once and never takes a written byte again.
+    struct StalledWriteIo {
+        input: Vec<u8>,
+        delay: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl AsyncRead for StalledWriteIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(delay) = self.delay.as_mut()
+                && std::future::Future::poll(delay.as_mut(), cx).is_pending()
+            {
+                return Poll::Pending;
+            }
+            self.delay = None;
+            if self.input.is_empty() {
+                return Poll::Pending;
+            }
+            let len = self.input.len().min(buffer.remaining());
+            buffer.put_slice(&self.input[..len]);
+            self.input.drain(..len);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for StalledWriteIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.delay.is_some() {
+                return Poll::Ready(Ok(buffer.len()));
+            }
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if self.delay.is_some() {
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// An unmasked server Ping with an empty payload.
+    const EMPTY_SERVER_PING: [u8; 2] = [0x89, 0x00];
+
+    /// A WebSocket origin that completes the upgrade and then never reads.
+    /// Its small receive buffer keeps a large frame from fitting in the
+    /// socket buffers.
+    async fn spawn_non_reading_origin() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(16).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            futures_util::future::pending::<()>().await;
+        });
+        (addr, task)
+    }
+
+    /// A request body larger than any socket buffer pair on loopback.
+    fn oversized_request_body() -> serde_json::Value {
+        serde_json::json!({
+            "type": "response.create",
+            "input": "x".repeat(16 * 1024 * 1024),
+        })
     }
 
     async fn raw_test_stream(
@@ -4631,6 +4773,251 @@ mod tests {
         );
         assert!(ping_count.load(Ordering::SeqCst) >= 2);
         server_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_write_shares_the_idle_budget() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let mut client = WebSocketStream::from_raw_socket(
+            StalledWriteIo {
+                input: Vec::new(),
+                delay: None,
+            },
+            Role::Client,
+            None,
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(600),
+            send_request_frame(&mut client, "{}".to_string(), 60_000),
+        )
+        .await
+        .expect("the request write must end within its idle budget");
+        let error = match result {
+            Ok(()) => panic!("expected the request write to time out"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_WRITE_TIMEOUT_DETAIL)
+        );
+        assert_eq!(
+            error.message,
+            "WebSocket response start timeout after 60000ms"
+        );
+        assert!(started.elapsed() >= Duration::from_secs(60));
+        assert!(started.elapsed() <= Duration::from_secs(61));
+    }
+
+    // The write budget is shorter than the read budget, so a frame the socket
+    // buffers absorbed would leave the test waiting on the read and fail it.
+    #[tokio::test]
+    async fn request_write_to_a_peer_that_stopped_reading_times_out() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let _write_timeout = RequestWriteTimeoutOverride::set(Duration::from_millis(200));
+        let (addr, origin) = spawn_non_reading_origin().await;
+        let context = RequestContext {
+            req_id: "stalled-write-request".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+            passthrough: None,
+        };
+        let started = Instant::now();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            codex_websocket_request(
+                &test_websocket_client(),
+                &WebSocketProxyConfig::direct(),
+                &format!("http://{addr}/responses"),
+                &HeaderMap::new(),
+                &oversized_request_body(),
+                &context,
+                None,
+                1_000,
+                60_000,
+                None,
+            ),
+        )
+        .await
+        .expect("the request write must end within its budget");
+        let error = match result {
+            Ok(_) => panic!("expected the request write to time out"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_WRITE_TIMEOUT_DETAIL)
+        );
+        assert_eq!(
+            error.message,
+            "WebSocket response start timeout after 200ms"
+        );
+        assert!(matches!(error.origin, CodexErrorOrigin::WebSocket));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        origin.abort();
+    }
+
+    // As above, a frame the socket buffers absorbed would fail the test.
+    #[tokio::test]
+    async fn live_request_write_to_a_peer_that_stopped_reading_ends_the_socket_task() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let _write_timeout = RequestWriteTimeoutOverride::set(Duration::from_millis(200));
+        let (addr, origin) = spawn_non_reading_origin().await;
+        let headers = HeaderMap::new();
+        let body = oversized_request_body();
+        let body_json = serde_json::to_string(&body).unwrap();
+        let ready = prepare_codex_websocket(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &format!("http://{addr}/responses"),
+            &headers,
+            None,
+            None,
+            1_000,
+            60_000,
+        )
+        .await
+        .unwrap();
+        let mut events = start_codex_websocket_events(ready, &body, body_json, &headers, None);
+
+        let error = match tokio::time::timeout(Duration::from_secs(30), events.recv())
+            .await
+            .expect("the request write must end within its budget")
+        {
+            Some(Err(error)) => error,
+            _ => panic!("expected the request write to time out"),
+        };
+
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_WRITE_TIMEOUT_DETAIL)
+        );
+        assert_eq!(
+            error.message,
+            "WebSocket response start timeout after 200ms"
+        );
+        assert!(matches!(error.origin, CodexErrorOrigin::WebSocket));
+        // The socket task ended with the error, which closes the channel.
+        let next = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("the socket task must end after the write timeout");
+        assert!(next.is_none());
+        origin.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pong_to_a_peer_that_stopped_reading_ends_the_response_wait() {
+        let mut client = WebSocketStream::from_raw_socket(
+            // The Ping arrives 50 s into the 60 s budget, so the Pong gets
+            // the 10 s left, not a budget of its own.
+            StalledWriteIo {
+                input: EMPTY_SERVER_PING.to_vec(),
+                delay: Some(Box::pin(tokio::time::sleep(Duration::from_secs(50)))),
+            },
+            Role::Client,
+            None,
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(600),
+            collect_ws_events_with_keepalive_interval(
+                &mut client,
+                60_000,
+                None,
+                None,
+                None,
+                WEBSOCKET_KEEPALIVE_INTERVAL,
+            ),
+        )
+        .await
+        .expect("the Pong write must end within the read deadline");
+        let error = match result {
+            Ok(_) => panic!("expected the response wait to time out"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_WRITE_TIMEOUT_DETAIL)
+        );
+        assert_eq!(
+            error.message,
+            "WebSocket response start timeout after 60000ms"
+        );
+        assert!(started.elapsed() >= Duration::from_secs(60));
+        assert!(started.elapsed() <= Duration::from_secs(61));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_pong_to_a_peer_that_stopped_reading_ends_the_stream() {
+        let mut client = WebSocketStream::from_raw_socket(
+            // The Ping arrives 50 s into the 60 s budget, so the Pong gets
+            // the 10 s left, not a budget of its own.
+            StalledWriteIo {
+                input: EMPTY_SERVER_PING.to_vec(),
+                delay: Some(Box::pin(tokio::time::sleep(Duration::from_secs(50)))),
+            },
+            Role::Client,
+            None,
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(64);
+        let started = tokio::time::Instant::now();
+
+        let (reusable, terminal_item) = tokio::time::timeout(
+            Duration::from_secs(600),
+            stream_ws_events(&mut client, 60_000, None, &tx),
+        )
+        .await
+        .expect("the Pong write must end within the read deadline");
+        let error = match terminal_item {
+            Some(Err(error)) => error,
+            _ => panic!("expected the stream to end with a timeout"),
+        };
+
+        assert!(!reusable);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_WRITE_TIMEOUT_DETAIL)
+        );
+        assert_eq!(
+            error.message,
+            "WebSocket response start timeout after 60000ms"
+        );
+        assert!(started.elapsed() >= Duration::from_secs(60));
+        assert!(started.elapsed() <= Duration::from_secs(61));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn validation_ping_to_a_peer_that_stopped_reading_fails_validation() {
+        let mut client = WebSocketStream::from_raw_socket(
+            StalledWriteIo {
+                input: Vec::new(),
+                delay: None,
+            },
+            Role::Client,
+            None,
+        )
+        .await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(600),
+            validate_pooled_websocket(&mut client, 15_000),
+        )
+        .await
+        .expect("the validation Ping must end within the validation deadline");
+
+        assert_eq!(result, Err("validation timeout".to_string()));
     }
 
     async fn create_dummy_stream_async() -> CodexWebSocketStream {
