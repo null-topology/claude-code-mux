@@ -181,7 +181,7 @@ fn prune_rotated_logs(path: &Path, just_rotated: &Path, keep: usize) {
             Some((stamp.parse().ok()?, entry.path()))
         })
         .collect();
-    rotated.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    rotated.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
     for (_, old) in rotated.into_iter().skip(keep.saturating_sub(1)) {
         let _ = fs::remove_file(old);
     }
