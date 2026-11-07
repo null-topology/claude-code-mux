@@ -29,8 +29,8 @@ use crate::retry::sleep as retry_sleep;
 use crate::traffic::TrafficCapture;
 
 use super::client::{
-    ActualTransport, CodexError, CodexErrorOrigin, CodexResponse, OwnerAwareCodexResponse,
-    headers_to_json,
+    ActualTransport, CodexError, CodexErrorOrigin, CodexResponse, MAX_ERROR_BODY_BYTES,
+    OwnerAwareCodexResponse, headers_to_json,
 };
 use super::continuation::ContinuationReservation;
 
@@ -74,6 +74,9 @@ pub(crate) struct CodexWebSocketEventStream {
     socket_id: Arc<AtomicU64>,
     full_context_retry: Arc<AtomicBool>,
     provider_retry_handoff: Arc<AtomicBool>,
+    auth_refresh: Arc<AtomicBool>,
+    account_id: Arc<std::sync::Mutex<Option<String>>>,
+    rate_limits_observed: bool,
 }
 
 #[derive(Clone)]
@@ -81,6 +84,8 @@ pub(crate) struct CodexWebSocketSocketIdPublisher {
     socket_id: Arc<AtomicU64>,
     full_context_retry: Arc<AtomicBool>,
     provider_retry_handoff: Arc<AtomicBool>,
+    auth_refresh: Arc<AtomicBool>,
+    account_id: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl CodexWebSocketEventStream {
@@ -90,19 +95,61 @@ impl CodexWebSocketEventStream {
         let socket_id = Arc::new(AtomicU64::new(0));
         let full_context_retry = Arc::new(AtomicBool::new(false));
         let provider_retry_handoff = Arc::new(AtomicBool::new(false));
+        let auth_refresh = Arc::new(AtomicBool::new(false));
+        let account_id = Arc::new(std::sync::Mutex::new(None));
         (
             Self {
                 receiver,
                 socket_id: socket_id.clone(),
                 full_context_retry: full_context_retry.clone(),
                 provider_retry_handoff: provider_retry_handoff.clone(),
+                auth_refresh: auth_refresh.clone(),
+                account_id: account_id.clone(),
+                rate_limits_observed: false,
             },
             CodexWebSocketSocketIdPublisher {
                 socket_id,
                 full_context_retry,
                 provider_retry_handoff,
+                auth_refresh,
+                account_id,
             },
         )
+    }
+
+    /// Whether the task behind the stream already refreshed the token for
+    /// this request, so a fallback that follows does not refresh it again.
+    pub(crate) fn used_auth_refresh(&self) -> bool {
+        self.auth_refresh.load(Ordering::Acquire)
+    }
+
+    /// The ChatGPT account the stream's request was last sent with, which
+    /// the quota gauge keys its readings by.
+    pub(crate) fn account_id(&self) -> Option<String> {
+        self.account_reader()()
+    }
+
+    /// Reads the stream's account after the stream itself has been handed
+    /// on, for a response built once the stream has started.
+    pub(crate) fn account_reader(&self) -> impl Fn() -> Option<String> + use<> {
+        let account_id = self.account_id.clone();
+        move || {
+            account_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    /// Whether the task behind the stream records each quota reading for the
+    /// account of the attempt that read it before queuing it, so the reader
+    /// does not record it again under the stream's current account.
+    pub(crate) fn rate_limits_observed(&self) -> bool {
+        self.rate_limits_observed
+    }
+
+    pub(super) fn mark_rate_limits_observed(&mut self) {
+        self.rate_limits_observed = true;
     }
 
     pub(crate) async fn recv(&mut self) -> Option<Result<serde_json::Value, CodexError>> {
@@ -144,6 +191,17 @@ impl CodexWebSocketSocketIdPublisher {
 
     pub(super) fn mark_full_context_retry(&self) {
         self.full_context_retry.store(true, Ordering::Release);
+    }
+
+    pub(super) fn mark_auth_refresh(&self) {
+        self.auth_refresh.store(true, Ordering::Release);
+    }
+
+    pub(super) fn publish_account(&self, account_id: Option<&str>) {
+        *self
+            .account_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = account_id.map(str::to_owned);
     }
 
     pub(super) fn is_provider_retry_handoff(&self) -> bool {
@@ -319,16 +377,27 @@ struct PoolEntry {
     socket_id: u64,
     created_at: u64,
     last_activity: AtomicU64,
+    /// The `ChatGPT-Account-Id` of the handshake. The backend answers every
+    /// request on the socket under that account, whatever account a later
+    /// request is built with.
+    account_id: Option<String>,
 }
 
 impl PoolEntry {
-    fn new(ws: CodexWebSocketStream) -> Self {
+    fn opened_with(ws: CodexWebSocketStream, handshake_headers: &HeaderMap) -> Self {
         Self {
             ws: Arc::new(AsyncMutex::new(ws)),
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
             created_at: now_ms(),
             last_activity: AtomicU64::new(next_pool_activity()),
+            account_id: request_account_id(handshake_headers).map(str::to_owned),
         }
+    }
+
+    /// An entry whose handshake named no account.
+    #[cfg(test)]
+    fn new(ws: CodexWebSocketStream) -> Self {
+        Self::opened_with(ws, &HeaderMap::new())
     }
 
     fn touch(&self) {
@@ -457,8 +526,15 @@ fn pool_take_for_turn(reservation: &ContinuationReservation) -> Option<Arc<PoolE
     .flatten()
 }
 
+/// The pooled socket a request may go out on. `account_id` is the
+/// `ChatGPT-Account-Id` the request is built with: a socket whose handshake
+/// named another account leaves the pool and counts as gone, since what the
+/// backend answers on it would be read as this account's. A request that
+/// needed it for its previous response then fails as one whose socket is
+/// gone; any other request opens a connection with its own headers.
 fn take_pool_entry_for_request(
     reservation: Option<&ContinuationReservation>,
+    account_id: Option<&str>,
 ) -> Result<Option<Arc<PoolEntry>>, CodexError> {
     let candidate = reservation.map(ContinuationReservation::candidate);
     let requires_origin = candidate
@@ -468,7 +544,8 @@ fn take_pool_entry_for_request(
     let pool_owner = reservation_pool_owner(reservation);
     let pooled = reservation
         .filter(|_| pool_owner.is_some())
-        .and_then(pool_take_for_turn);
+        .and_then(pool_take_for_turn)
+        .filter(|entry| entry.account_id.as_deref() == account_id);
 
     if requires_origin
         && (pool_owner.is_none()
@@ -799,12 +876,12 @@ pub(super) async fn codex_websocket_request(
     let requires_origin = continuation
         .and_then(|candidate| candidate.previous_response_id.as_deref())
         .is_some();
-    let pooled = take_pool_entry_for_request(reservation)?;
+    let pooled = take_pool_entry_for_request(reservation, request_account_id(headers))?;
     let mut used_pooled = pooled.is_some();
     let mut entry = if let Some(entry) = pooled {
         entry
     } else {
-        Arc::new(PoolEntry::new(
+        Arc::new(PoolEntry::opened_with(
             connect_with_timeout(
                 websocket_client,
                 proxy_config,
@@ -813,6 +890,7 @@ pub(super) async fn codex_websocket_request(
                 connect_timeout_ms,
             )
             .await?,
+            headers,
         ))
     };
     let mut guard = entry.ws.clone().lock_owned().await;
@@ -829,7 +907,7 @@ pub(super) async fn codex_websocket_request(
         if requires_origin {
             return Err(continuation_socket_missing_error());
         }
-        entry = Arc::new(PoolEntry::new(
+        entry = Arc::new(PoolEntry::opened_with(
             connect_with_timeout(
                 websocket_client,
                 proxy_config,
@@ -838,6 +916,7 @@ pub(super) async fn codex_websocket_request(
                 connect_timeout_ms,
             )
             .await?,
+            headers,
         ));
         guard = entry.ws.clone().lock_owned().await;
         used_pooled = false;
@@ -1004,7 +1083,7 @@ pub(super) async fn prepare_codex_websocket(
     let requires_origin = continuation
         .and_then(|candidate| candidate.previous_response_id.as_deref())
         .is_some();
-    let pooled = take_pool_entry_for_request(reservation)?;
+    let pooled = take_pool_entry_for_request(reservation, request_account_id(headers))?;
     let used_pooled = pooled.is_some();
     let entry = if let Some(entry) = pooled {
         entry
@@ -1017,7 +1096,7 @@ pub(super) async fn prepare_codex_websocket(
             connect_timeout_ms,
         )
         .await?;
-        Arc::new(PoolEntry::new(stream))
+        Arc::new(PoolEntry::opened_with(stream, headers))
     };
     let mut guard = entry.ws.clone().lock_owned().await;
     if used_pooled
@@ -1271,10 +1350,9 @@ fn write_websocket_response_capture(
 // Connection helper
 // ---------------------------------------------------------------------------
 
+/// A rejection body is kept up to `MAX_ERROR_BODY_BYTES` to read its class
+/// and a spent window from; the detail keeps at most this much of it.
 const MAX_HANDSHAKE_ERROR_DETAIL_BYTES: usize = 1024;
-/// How much of a rejection body is kept to read its class and a spent window
-/// from; the detail keeps at most `MAX_HANDSHAKE_ERROR_DETAIL_BYTES` of it.
-const MAX_HANDSHAKE_ERROR_BODY_BYTES: usize = 64 * 1024;
 const GENERIC_HANDSHAKE_ERROR_DETAIL: &str = "WebSocket upgrade was rejected";
 
 fn handshake_error_detail(body: Option<&[u8]>) -> String {
@@ -1300,17 +1378,35 @@ fn handshake_error_detail(body: Option<&[u8]>) -> String {
     sanitized[..end].to_string()
 }
 
+/// The ChatGPT account an upgrade request is sent with (`build_codex_headers`).
+fn request_account_id(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("chatgpt-account-id")
+        .and_then(|value| value.to_str().ok())
+}
+
 /// A rejected upgrade, built the same way on the direct and the tunneled path.
 /// `body` is what was read of the rejection's body, `None` for a 407, which is
 /// never read. A `Retry-After` header is normalised the way a classified one
-/// is (`normalize_retry_after`); whether it reaches the client is up to the
-/// error mapping, which never sends it for a spent usage window or a quota.
-fn handshake_rejection_error(status: u16, headers: &HeaderMap, body: Option<&[u8]>) -> CodexError {
-    let retry_after = headers
-        .get(http::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .map(super::events::normalize_retry_after);
-    let (detail, class, usage_limit) = match body {
+/// is (`normalize_retry_after`), and one that is not usable counts as absent;
+/// whether it reaches the client is up to the error mapping, which never
+/// sends it for a spent usage window or a quota.
+/// Every `codex.rate_limits` event the body holds reaches the quota gauge
+/// whole, under `account`, the ChatGPT account the upgrade was sent with,
+/// before the body is reduced to a spent window.
+fn handshake_rejection_error(
+    status: u16,
+    headers: &HeaderMap,
+    body: Option<&[u8]>,
+    account: Option<&str>,
+) -> CodexError {
+    let header_retry_after = || {
+        headers
+            .get(http::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(super::events::normalize_retry_after)
+    };
+    let (detail, class, usage_limit, retry_after) = match body {
         Some(body) => {
             let header_pairs: Vec<(String, String)> = headers
                 .iter()
@@ -1318,13 +1414,36 @@ fn handshake_rejection_error(status: u16, headers: &HeaderMap, body: Option<&[u8
                     Some((name.to_string(), value.to_str().ok()?.to_string()))
                 })
                 .collect();
+            let class = super::events::error_class_from_body(body, status);
+            let detail = match handshake_error_detail(Some(body)) {
+                // A missing model with no message is named by its code, as
+                // on the stream.
+                detail
+                    if class == Some(super::events::CodexErrorClass::ModelNotFound)
+                        && (detail.trim().is_empty()
+                            || detail == GENERIC_HANDSHAKE_ERROR_DETAIL) =>
+                {
+                    "model_not_found".to_string()
+                }
+                detail => detail,
+            };
+            super::events::observe_rate_limits_in_body(account, body);
             (
-                handshake_error_detail(Some(body)),
-                super::events::error_class_from_body(body),
-                super::events::usage_limit_from_response(body, &header_pairs).map(Box::new),
+                detail,
+                class,
+                super::events::usage_limit_from_response(body, &header_pairs)
+                    .map(|limit| Box::new(limit.for_account(account))),
+                // The delay the body names wins over the header, as on the
+                // other paths.
+                super::events::retry_after_from_body(body).or_else(header_retry_after),
             )
         }
-        None => (GENERIC_HANDSHAKE_ERROR_DETAIL.to_string(), None, None),
+        None => (
+            GENERIC_HANDSHAKE_ERROR_DETAIL.to_string(),
+            None,
+            None,
+            header_retry_after(),
+        ),
     };
     CodexError {
         status,
@@ -1450,12 +1569,12 @@ fn validate_websocket_upgrade(
 
 async fn bounded_handshake_error_body(mut response: reqwest::Response) -> Vec<u8> {
     let mut body = Vec::new();
-    while body.len() < MAX_HANDSHAKE_ERROR_BODY_BYTES {
+    while body.len() < MAX_ERROR_BODY_BYTES {
         let chunk = match response.chunk().await {
             Ok(Some(chunk)) => chunk,
             Ok(None) | Err(_) => break,
         };
-        let remaining = MAX_HANDSHAKE_ERROR_BODY_BYTES - body.len();
+        let remaining = MAX_ERROR_BODY_BYTES - body.len();
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
     body
@@ -1654,7 +1773,7 @@ fn parse_connect_response_head(response: &[u8]) -> Result<(u16, Option<String>),
             }
             std::str::from_utf8(&value[1..])
                 .ok()
-                .map(|value| super::events::normalize_retry_after(value.trim()))
+                .and_then(super::events::normalize_retry_after)
         });
     Ok((status, retry_after))
 }
@@ -1801,14 +1920,22 @@ fn websocket_destination(url: &str) -> Result<(String, String), CodexError> {
 /// body bytes arrived with its head, which may be all of a short body, part of
 /// it or nothing; they are read the way the direct path reads its body, and a
 /// 407 is not read at all.
-fn tungstenite_handshake_error(error: tokio_tungstenite::tungstenite::Error) -> CodexError {
+fn tungstenite_handshake_error(
+    error: tokio_tungstenite::tungstenite::Error,
+    account: Option<&str>,
+) -> CodexError {
     if let tokio_tungstenite::tungstenite::Error::Http(response) = error {
         let body = response
             .body()
             .as_deref()
             .filter(|_| response.status() != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-            .map(|body| &body[..body.len().min(MAX_HANDSHAKE_ERROR_BODY_BYTES)]);
-        return handshake_rejection_error(response.status().as_u16(), response.headers(), body);
+            .map(|body| &body[..body.len().min(MAX_ERROR_BODY_BYTES)]);
+        return handshake_rejection_error(
+            response.status().as_u16(),
+            response.headers(),
+            body,
+            account,
+        );
     }
     CodexError {
         status: 0,
@@ -1868,7 +1995,7 @@ async fn connect_via_http_proxy_tunnel(
         .map_err(ConnectAttemptError::Origin)?;
     let (websocket, response) = tokio_tungstenite::client_async(request, stream)
         .await
-        .map_err(tungstenite_handshake_error)
+        .map_err(|error| tungstenite_handshake_error(error, request_account_id(headers)))
         .map_err(ConnectAttemptError::Origin)?;
     validate_websocket_upgrade(
         response.version(),
@@ -1914,13 +2041,18 @@ async fn connect_via_http_upgrade(
     let response = request.send().await.map_err(reqwest_handshake_error)?;
     if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
         let status = response.status().as_u16();
-        let headers = response.headers().clone();
+        let response_headers = response.headers().clone();
         let body = if status == http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16() {
             None
         } else {
             Some(bounded_handshake_error_body(response).await)
         };
-        return Err(handshake_rejection_error(status, &headers, body.as_deref()));
+        return Err(handshake_rejection_error(
+            status,
+            &response_headers,
+            body.as_deref(),
+            request_account_id(headers),
+        ));
     }
 
     validate_websocket_upgrade(
@@ -2207,8 +2339,11 @@ where
                     last_response_event_at = Instant::now();
                 }
 
-                // Check for terminal events
-                if is_terminal_event(&parsed) {
+                // Check for terminal events. A `codex.rate_limits` event that
+                // ends the request is one too, so the spent window is answered.
+                if is_terminal_event(&parsed)
+                    || super::events::is_terminal_rate_limit_event(&parsed)
+                {
                     terminal_event = Some(WsEvent {
                         event_type: parsed
                             .get("type")
@@ -2655,6 +2790,7 @@ mod tests {
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
             created_at: now_ms(),
             last_activity: AtomicU64::new(next_pool_activity()),
+            account_id: None,
         })
     }
 
@@ -3892,7 +4028,7 @@ mod tests {
         .unwrap();
         let err = match tokio_tungstenite::client_async(request, client_io).await {
             Ok(_) => panic!("expected the tunneled upgrade to be rejected"),
-            Err(error) => tungstenite_handshake_error(error),
+            Err(error) => tungstenite_handshake_error(error, None),
         };
 
         assert_eq!(err.status, 403);
@@ -3911,8 +4047,10 @@ mod tests {
             .status(http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
             .body(Some(body.as_bytes().to_vec()))
             .unwrap();
-        let err =
-            tungstenite_handshake_error(tokio_tungstenite::tungstenite::Error::Http(rejected));
+        let err = tungstenite_handshake_error(
+            tokio_tungstenite::tungstenite::Error::Http(rejected),
+            None,
+        );
         assert_eq!(err.status, 407);
         assert_eq!(err.class, None);
         assert_eq!(err.detail.as_deref(), Some(GENERIC_HANDSHAKE_ERROR_DETAIL));
@@ -4020,13 +4158,16 @@ mod tests {
         .unwrap();
         match tokio_tungstenite::client_async(request, client_io).await {
             Ok(_) => panic!("expected the tunneled upgrade to be rejected"),
-            Err(error) => tungstenite_handshake_error(error),
+            Err(error) => tungstenite_handshake_error(error, None),
         }
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_rejected_upgrade_answers_retry_after_by_the_class_rules() {
         let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = super::super::rate_limits::lock_for_tests();
+        super::super::rate_limits::clear_for_tests();
         let date = "Wed, 21 Oct 2026 07:28:00 GMT";
         let stop: &[(&str, &str)] = &[("x-should-retry", "false")];
         let spent: &[(&str, &str)] = &[
@@ -4108,11 +4249,15 @@ mod tests {
                 }
             }
         }
+        super::super::rate_limits::clear_for_tests();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_long_rejection_body_still_reports_a_spent_window() {
         let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = super::super::rate_limits::lock_for_tests();
+        super::super::rate_limits::clear_for_tests();
         let message = format!("The usage limit has been reached. {}", "x".repeat(2048));
         let body = serde_json::json!({"error": {
             "type": "usage_limit_reached",
@@ -4136,11 +4281,15 @@ mod tests {
             );
             assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
         }
+        super::super::rate_limits::clear_for_tests();
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_rejected_upgrade_takes_the_spent_window_from_codex_headers() {
         let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = super::super::rate_limits::lock_for_tests();
+        super::super::rate_limits::clear_for_tests();
         let raw = raw_rejection(
             "429 Too Many Requests",
             &[
@@ -4169,6 +4318,7 @@ mod tests {
             );
             assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
         }
+        super::super::rate_limits::clear_for_tests();
     }
 
     #[test]
@@ -4181,6 +4331,34 @@ mod tests {
         let head = format!("HTTP/1.1 502 Bad Gateway\r\nretry-after: {date}\r\n\r\n");
         let (_, retry_after) = parse_connect_response_head(head.as_bytes()).unwrap();
         assert_eq!(retry_after.as_deref(), Some(date));
+        for unusable in ["x".repeat(65), "soon \u{1}".to_string(), "é".to_string()] {
+            let head =
+                format!("HTTP/1.1 503 Service Unavailable\r\nRetry-After: {unusable}\r\n\r\n");
+            let (_, retry_after) = parse_connect_response_head(head.as_bytes()).unwrap();
+            assert_eq!(retry_after, None, "{unusable:?}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_upgrade_takes_its_header_when_the_body_delay_is_unusable() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "error": {
+                "code": "policy_capacity_unavailable",
+                "message": "busy",
+                "retry_after": format!("{}é", "a".repeat(3999))
+            }
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, "9".parse().unwrap());
+        let err = handshake_rejection_error(503, &headers, Some(&body), None);
+        assert_eq!(err.retry_after.as_deref(), Some("9"));
+
+        headers.insert(http::header::RETRY_AFTER, "x".repeat(65).parse().unwrap());
+        let err = handshake_rejection_error(503, &headers, Some(&body), None);
+        assert_eq!(err.retry_after, None);
+        let err = handshake_rejection_error(407, &headers, None, None);
+        assert_eq!(err.retry_after, None);
     }
 
     #[tokio::test]
@@ -4681,5 +4859,46 @@ mod tests {
                 GENERIC_HANDSHAKE_ERROR_DETAIL
             );
         }
+    }
+
+    #[test]
+    fn a_rejected_upgrade_for_a_missing_model_without_a_message_names_the_code() {
+        for error in [
+            serde_json::json!({"code": "model_not_found"}),
+            serde_json::json!({"code": "model_not_found", "message": "  \t "}),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({ "error": error })).unwrap();
+            let err = handshake_rejection_error(404, &HeaderMap::new(), Some(&body), None);
+            assert_eq!(
+                err.class,
+                Some(super::super::events::CodexErrorClass::ModelNotFound)
+            );
+            assert_eq!(err.detail.as_deref(), Some("model_not_found"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_upgrade_reads_the_delay_its_body_names_before_the_header() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "error": {"code": "policy_capacity_unavailable", "message": "busy", "retry_after": 2.5}
+        }))
+        .unwrap();
+        let err = handshake_rejection_error(503, &HeaderMap::new(), Some(&body), None);
+        assert_eq!(
+            err.class,
+            Some(super::super::events::CodexErrorClass::Overloaded)
+        );
+        assert_eq!(err.retry_after.as_deref(), Some("3"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, "9".parse().unwrap());
+        let err = handshake_rejection_error(503, &headers, Some(&body), None);
+        assert_eq!(err.retry_after.as_deref(), Some("3"));
+        let without_delay = serde_json::to_vec(&serde_json::json!({
+            "error": {"code": "policy_capacity_unavailable", "message": "busy"}
+        }))
+        .unwrap();
+        let err = handshake_rejection_error(503, &headers, Some(&without_delay), None);
+        assert_eq!(err.retry_after.as_deref(), Some("9"));
     }
 }

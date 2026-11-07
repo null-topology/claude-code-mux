@@ -73,6 +73,11 @@ pub(crate) fn clear_session_compaction(session_id: &str) {
     compaction::clear_compaction(session_id);
 }
 
+/// Forget the newest Codex quota reading, for a test that leaves one behind.
+pub fn clear_codex_rate_limits_for_tests() {
+    rate_limits::clear_for_tests();
+}
+
 pub struct CodexProvider {
     client: Arc<CodexHttpClient>,
 }
@@ -828,28 +833,25 @@ async fn live_stream_response(
     let mut continuation = Some(continuation);
 
     loop {
+        // The stream, and the HTTP response headers when it is an HTTP one:
+        // they hold the quota clocks a spent window's event may leave out.
         let upstream_events = match transport {
             config::CodexTransport::Http => {
                 client
-                    .stream_codex_http_events_for_owner(&request_body, &ctx)
+                    .stream_codex_http_events_for_owner(&request_body, &ctx, false)
                     .await
             }
-            config::CodexTransport::WebSocket => {
-                client
-                    .stream_codex_websocket_events_for_owner(
-                        &request_body,
-                        &ctx,
-                        continuation.as_ref(),
-                    )
-                    .await
-            }
+            config::CodexTransport::WebSocket => client
+                .stream_codex_websocket_events_for_owner(&request_body, &ctx, continuation.as_ref())
+                .await
+                .map(|events| (events, Vec::new())),
             config::CodexTransport::Auto => {
                 client
                     .stream_codex_auto_events_for_owner(&request_body, &ctx, continuation.as_ref())
                     .await
             }
         };
-        let upstream_events = match upstream_events {
+        let (upstream_events, response_headers) = match upstream_events {
             Ok(events) => events,
             // The continuation is the proxy's own state, so a request the
             // backend no longer remembers is resent once with full context.
@@ -867,8 +869,10 @@ async fn live_stream_response(
             }
         };
 
+        let account_id = upstream_events.account_reader();
         match live_stream_response_once(
             upstream_events,
+            response_headers,
             message_id.clone(),
             &model,
             ctx.clone(),
@@ -880,7 +884,7 @@ async fn live_stream_response(
         {
             LiveStreamStart::Response(response) => {
                 cleanup.disarm();
-                return with_rate_limit_headers(response);
+                return with_rate_limit_headers(response, account_id().as_deref());
             }
             LiveStreamStart::Retry {
                 error,
@@ -915,6 +919,7 @@ fn provider_retry(
 #[allow(clippy::too_many_arguments)]
 async fn live_stream_response_once(
     mut upstream_events: websocket::CodexWebSocketEventStream,
+    response_headers: Vec<(String, String)>,
     message_id: String,
     model: &str,
     ctx: RequestContext,
@@ -955,26 +960,31 @@ async fn live_stream_response_once(
             }
             generation_started = true;
         }
-        rate_limits::observe_event(&payload);
+        if !upstream_events.rate_limits_observed() {
+            rate_limits::observe_event(upstream_events.account_id().as_deref(), &payload);
+        }
         turn_state::observe_event(&ctx.req_id, &payload);
         append_upstream_sse_payload(&mut upstream_sse_body, &payload);
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, None)
         {
             Ok(result) => result,
             Err(message) => {
-                // A spent subscription window reopens hours from now, so the
-                // retry budget can only burn the request down to the same 429.
-                // Report it once, with the reset clock upstream supplied.
-                if let Some(limit) = events::usage_limit_from_event(&payload) {
+                // A spent subscription window reopens hours from now: answer
+                // it once, with the reset clock upstream supplied, and never
+                // as something to retry.
+                if let Some(limit) =
+                    events::usage_limit_from_event_with_headers(&payload, &response_headers)
+                {
                     abort_request_state(
                         ctx.session_id.as_deref(),
                         &request_continuation,
                         compaction.attempt,
                     );
+                    let limit = limit.for_account(upstream_events.account_id().as_deref());
                     return LiveStreamStart::Response(usage_limit_response(&limit));
                 }
-                let class =
-                    events::classify_event_failure(&payload).and_then(|failure| failure.class);
+                let failure = events::classify_event_failure(&payload);
+                let class = failure.as_ref().and_then(|failure| failure.class);
                 if retryable_live_start_payload(&payload, &message) {
                     let lower_message = message.to_ascii_lowercase();
                     let status = class
@@ -990,10 +1000,7 @@ async fn live_stream_response_once(
                                     || error.get("type").and_then(|value| value.as_str())
                                         == Some("overloaded_error")
                             });
-                            if payload.get("type").and_then(|value| value.as_str())
-                                == Some("codex.rate_limits")
-                                || lower_message.contains("rate limit")
-                            {
+                            if lower_message.contains("rate limit") {
                                 429
                             } else if overloaded || lower_message.contains("overloaded") {
                                 529
@@ -1020,8 +1027,14 @@ async fn live_stream_response_once(
                     compaction.attempt,
                 );
                 if let Some(class) = class {
+                    // The classifier's message, as the buffered paths answer
+                    // with, so a code that stands in for a missing message
+                    // does so here too.
+                    let native = failure
+                        .as_ref()
+                        .map_or(message.as_str(), |failure| failure.message.as_str());
                     return LiveStreamStart::Response(classified_error_response(
-                        class, &message, None,
+                        class, native, None,
                     ));
                 }
                 return LiveStreamStart::Response(map_codex_failure_to_response(&message));
@@ -1049,6 +1062,7 @@ async fn live_stream_response_once(
             }
             return LiveStreamStart::Response(remaining_live_stream_response(
                 upstream_events,
+                response_headers,
                 translator,
                 pending_chunk,
                 ctx,
@@ -1181,6 +1195,7 @@ fn empty_live_stream_response(outcome: ResponseOutcome) -> Response {
 #[allow(clippy::too_many_arguments)]
 fn remaining_live_stream_response(
     mut upstream_events: websocket::CodexWebSocketEventStream,
+    response_headers: Vec<(String, String)>,
     mut translator: LiveStreamTranslator,
     first_chunk: Vec<u8>,
     ctx: RequestContext,
@@ -1192,6 +1207,10 @@ fn remaining_live_stream_response(
     let outcome = live_stream_outcome(&translator);
     let response_outcome = outcome.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    // Output has started, so the request is not sent again under another
+    // account; the gauge keys this stream's readings by the one it went with.
+    let account_id = upstream_events.account_id();
+    let rate_limits_observed = upstream_events.rate_limits_observed();
     tokio::spawn(async move {
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
             abort_request_state(
@@ -1237,7 +1256,9 @@ fn remaining_live_stream_response(
             };
             match item {
                 Ok(payload) => {
-                    rate_limits::observe_event(&payload);
+                    if !rate_limits_observed {
+                        rate_limits::observe_event(account_id.as_deref(), &payload);
+                    }
                     turn_state::observe_event(&ctx.req_id, &payload);
                     append_upstream_sse_payload(&mut upstream_sse_body, &payload);
                     let (chunk, terminal) = match translate_live_stream_payload(
@@ -1252,14 +1273,34 @@ fn remaining_live_stream_response(
                                 &request_continuation,
                                 compaction.attempt,
                             );
-                            let error_type = events::classify_event_failure(&payload)
-                                .and_then(|failure| failure.class)
-                                .map_or("api_error", events::CodexErrorClass::error_type);
-                            let chunk = translator.error_chunk(
-                                client_error_text(&message, error_type),
-                                error_type,
-                                ctx.traffic.as_deref(),
-                            );
+                            // A spent window after output started is still a
+                            // rate limit, told the way the status line would
+                            // have told it, and the gauge learns of it.
+                            let limit = events::usage_limit_from_event_with_headers(
+                                &payload,
+                                &response_headers,
+                            )
+                            .map(|limit| limit.for_account(account_id.as_deref()));
+                            if let Some(limit) = limit.as_ref() {
+                                rate_limits::observe_usage_limit(limit);
+                            }
+                            // A classified failure is told in the classifier's
+                            // words, which name a missing model that came with
+                            // no message by its code.
+                            let classified = events::classify_event_failure(&payload)
+                                .and_then(|failure| Some((failure.class?, failure.message)));
+                            let (error_type, text) = match (limit.as_ref(), classified.as_ref()) {
+                                (Some(limit), _) => ("rate_limit_error", limit.message.as_str()),
+                                (None, Some((class, native))) => {
+                                    let error_type = class.error_type();
+                                    (error_type, client_error_text(native, error_type))
+                                }
+                                (None, None) => {
+                                    ("api_error", client_error_text(&message, "api_error"))
+                                }
+                            };
+                            let chunk =
+                                translator.error_chunk(text, error_type, ctx.traffic.as_deref());
                             // The status left with the first chunk, so the
                             // failure travels beside the body instead.
                             outcome.fail(message);
@@ -1533,15 +1574,17 @@ fn update_continuation_from_upstream(
 /// carries the exact state of the window that refused it, which is better than
 /// a snapshot taken a turn earlier. So is one that tells the client not to
 /// retry: a spent credit balance is not a window, and a snapshot saying the
-/// window is allowed would contradict the refusal.
-fn with_rate_limit_headers(mut response: Response) -> Response {
+/// window is allowed would contradict the refusal. The snapshot is the one
+/// held for `account`, the ChatGPT account the request went out with; one
+/// held for another account says nothing about this request.
+fn with_rate_limit_headers(mut response: Response, account: Option<&str>) -> Response {
     let headers = response.headers();
     if headers.contains_key("anthropic-ratelimit-unified-status")
         || headers.contains_key("x-should-retry")
     {
         return response;
     }
-    let Some(snapshot) = rate_limits::latest() else {
+    let Some(snapshot) = rate_limits::latest(account) else {
         return response;
     };
 
@@ -1562,7 +1605,11 @@ fn with_rate_limit_headers(mut response: Response) -> Response {
 /// `Retry-After` is deliberately absent: clients sleep for its full value, and
 /// here that is hours. `x-should-retry: false` stops the retry loop instead,
 /// which is the honest signal — a spent window does not reopen on a backoff.
+///
+/// The window the limit names is recorded as spent until its reset
+/// (`rate_limits::observe_usage_limit`), so later responses carry it.
 fn usage_limit_response(limit: &events::CodexUsageLimit) -> Response {
+    rate_limits::observe_usage_limit(limit);
     let mut headers = HeaderMap::new();
     headers.insert(
         HeaderName::from_static("x-should-retry"),
@@ -1693,10 +1740,13 @@ fn classified_error_response(
     retry_after: Option<&str>,
 ) -> Response {
     let error_type = class.error_type();
-    let native = if native.trim().is_empty() {
-        generic_error_text(error_type)
-    } else {
+    let native = if !native.trim().is_empty() {
         native
+    } else if class == events::CodexErrorClass::ModelNotFound {
+        // As the Codex CLI does, the code stands in for an empty message.
+        "model_not_found"
+    } else {
+        generic_error_text(error_type)
     };
     if class == events::CodexErrorClass::ContextOverflow {
         return context_overflow_response(native);
@@ -1718,12 +1768,13 @@ fn classified_error_response(
                 .into_response();
         }
         events::CodexErrorClass::Throttled => retry_after
-            .map(events::normalize_retry_after)
+            .and_then(events::normalize_retry_after)
             .or_else(|| events::retry_after_from_message(native)),
-        events::CodexErrorClass::Overloaded => retry_after.map(events::normalize_retry_after),
+        events::CodexErrorClass::Overloaded => retry_after.and_then(events::normalize_retry_after),
         events::CodexErrorClass::UsageNotIncluded
         | events::CodexErrorClass::Rejected
-        | events::CodexErrorClass::ContextOverflow => None,
+        | events::CodexErrorClass::ContextOverflow
+        | events::CodexErrorClass::ModelNotFound => None,
     };
     match retry_after {
         Some(retry_after) => ([(http::header::RETRY_AFTER, retry_after)], response).into_response(),
@@ -1779,6 +1830,7 @@ fn generic_error_text(error_type: &str) -> &'static str {
         "invalid_request_error" => "Invalid request",
         "permission_error" => "Permission denied",
         "request_too_large" => "Request too large",
+        "not_found_error" => "Not found",
         _ => "Internal server error",
     }
 }
@@ -1902,20 +1954,29 @@ mod tests {
 
     #[test]
     fn a_refusal_keeps_the_state_of_the_window_that_refused_it() {
+        let _rate_limits = rate_limits::lock_for_tests();
         // The snapshot from an earlier turn says the allowance was fine.
-        rate_limits::observe_event(&serde_json::json!({
-            "type": "codex.rate_limits",
-            "rate_limits": {
-                "primary": {"used_percent": 5.0, "window_minutes": 300, "resets_at": 1u64},
-                "secondary": {"used_percent": 5.0, "window_minutes": 10080, "resets_at": 2u64}
-            }
-        }));
+        rate_limits::observe_event(
+            None,
+            &serde_json::json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {
+                    "primary": {"used_percent": 5.0, "window_minutes": 300, "resets_at": 1u64},
+                    "secondary": {"used_percent": 5.0, "window_minutes": 10080, "resets_at": 2u64}
+                }
+            }),
+        );
 
-        let refusal = with_rate_limit_headers(usage_limit_response(&events::CodexUsageLimit {
-            message: "The usage limit has been reached".to_string(),
-            resets_at: Some(1788879437),
-            window: Some(events::CodexLimitWindow::FiveHour),
-        }));
+        let refusal = with_rate_limit_headers(
+            usage_limit_response(&events::CodexUsageLimit {
+                message: "The usage limit has been reached".to_string(),
+                resets_at: Some(1788879437),
+                window: Some(events::CodexLimitWindow::FiveHour),
+                account: None,
+                feeds_gauge: true,
+            }),
+            None,
+        );
 
         let headers = refusal.headers();
         assert_eq!(
@@ -1995,6 +2056,12 @@ mod tests {
                 StatusCode::from_u16(529).unwrap(),
                 "overloaded_error",
             ),
+            (
+                events::CodexErrorClass::ModelNotFound,
+                400,
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+            ),
         ];
         for (class, backend_status, status, error_type) in cases {
             let response = map_codex_error_to_response(&classified_codex_error(
@@ -2010,22 +2077,125 @@ mod tests {
         }
     }
 
+    /// What a client gets for a failure event that reached it before any
+    /// output, through the same classification the buffered paths use.
+    fn response_to_failure_event(payload: serde_json::Value) -> Response {
+        let failure = events::classify_event_failure(&payload).expect("a failure event");
+        map_codex_error_to_response(&client::CodexError {
+            status: failure.status,
+            message: failure.message.clone(),
+            detail: Some(failure.message),
+            retry_after: failure.retry_after,
+            usage_limit: None,
+            class: failure.class,
+            origin: client::CodexErrorOrigin::BufferedHttp,
+        })
+    }
+
+    #[tokio::test]
+    async fn no_capacity_is_an_overload_with_only_the_delay_it_names() {
+        let cases = [
+            (serde_json::json!({}), None),
+            (serde_json::json!({"status": 503}), None),
+            (serde_json::json!({"retry_after": 1.5}), Some("2")),
+            (
+                serde_json::json!({"status": 503, "retry_after": 7}),
+                Some("7"),
+            ),
+        ];
+        for (extra, retry_after) in cases {
+            let mut payload = serde_json::json!({
+                "type": "error",
+                "error": {"code": "policy_capacity_unavailable", "message": "toy capacity message"}
+            });
+            if let Some(status) = extra.get("status") {
+                payload["status"] = status.clone();
+            }
+            if let Some(delay) = extra.get("retry_after") {
+                payload["error"]["retry_after"] = delay.clone();
+            }
+            let response = response_to_failure_event(payload);
+            assert_eq!(response.status().as_u16(), 529, "{extra}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                retry_after,
+                "{extra}"
+            );
+            let body = error_body(response).await;
+            assert_eq!(body["error"]["type"], "overloaded_error", "{extra}");
+            assert_eq!(body["error"]["message"], "toy capacity message", "{extra}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_model_is_answered_as_not_found() {
+        let cases = [
+            (
+                serde_json::json!({"type": "error", "error": {
+                    "code": "model_not_found", "message": "toy model message"
+                }}),
+                "toy model message",
+            ),
+            (
+                serde_json::json!({"type": "error", "status": 400, "error": {
+                    "code": "model_not_found", "message": "toy model message"
+                }}),
+                "toy model message",
+            ),
+            (
+                serde_json::json!({"type": "response.failed", "response": {"error": {
+                    "type": "model_not_found"
+                }}}),
+                "model_not_found",
+            ),
+        ];
+        for (payload, message) in cases {
+            let response = response_to_failure_event(payload.clone());
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{payload}");
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+            let body = error_body(response).await;
+            assert_eq!(body["error"]["type"], "not_found_error", "{payload}");
+            assert_eq!(body["error"]["message"], message, "{payload}");
+        }
+        // An empty message from any other source is named by the code too.
+        let response = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::ModelNotFound,
+            404,
+            "",
+            None,
+        ));
+        assert_eq!(
+            error_body(response).await["error"]["message"],
+            "model_not_found"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn spent_credits_stop_the_retry_loop_without_naming_a_window() {
+        let _rate_limits = rate_limits::lock_for_tests();
         // An earlier turn left a quota snapshot behind.
-        rate_limits::observe_event(&serde_json::json!({
-            "type": "codex.rate_limits",
-            "rate_limits": {
-                "primary": {"used_percent": 5.0, "window_minutes": 300, "resets_at": 1u64}
-            }
-        }));
-        let response =
-            with_rate_limit_headers(map_codex_error_to_response(&classified_codex_error(
+        rate_limits::observe_event(
+            None,
+            &serde_json::json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {
+                    "primary": {"used_percent": 5.0, "window_minutes": 300, "resets_at": 1u64}
+                }
+            }),
+        );
+        let response = with_rate_limit_headers(
+            map_codex_error_to_response(&classified_codex_error(
                 events::CodexErrorClass::QuotaExceeded,
                 429,
                 "You exceeded your current quota, please check your plan and billing details.",
                 Some("30"),
-            )));
+            )),
+            None,
+        );
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         let headers = response.headers();
@@ -2065,6 +2235,41 @@ mod tests {
         ));
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[http::header::RETRY_AFTER], "3");
+    }
+
+    #[tokio::test]
+    async fn a_failed_response_with_an_unusable_delay_takes_its_message_delay() {
+        for retry_after in [
+            format!("{}é", "a".repeat(3999)),
+            "x".repeat(65),
+            "\t".to_string(),
+        ] {
+            let failure = events::classify_event_failure(&serde_json::json!({
+                "type": "response.failed",
+                "response": {"error": {
+                    "code": "rate_limit_exceeded",
+                    "message": "Rate limit reached. Please try again in 20s.",
+                    "retry_after": retry_after
+                }}
+            }))
+            .unwrap();
+            let response = map_codex_error_to_response(&classified_codex_error(
+                failure.class.unwrap(),
+                failure.status,
+                &failure.message,
+                failure.retry_after.as_deref(),
+            ));
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()[http::header::RETRY_AFTER], "20");
+        }
+        // A value that reaches the mapping some other way is checked again.
+        let response = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::Overloaded,
+            529,
+            "busy",
+            Some("é"),
+        ));
+        assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
     }
 
     #[tokio::test]
@@ -2664,6 +2869,7 @@ mod tests {
         let continuation = ContinuationReservation::for_owner_turn(None, None);
         let response = match live_stream_response_once(
             rx,
+            Vec::new(),
             "msg_test".to_string(),
             "claude-opus-4-8",
             ctx,
@@ -2899,7 +3105,8 @@ mod tests {
 
     #[test]
     fn live_start_payload_retry_detection_covers_rate_limit_and_overload() {
-        assert!(retryable_live_start_payload(
+        // A terminal snapshot is a spent window, answered once and never retried.
+        assert!(!retryable_live_start_payload(
             &serde_json::json!({
                 "type": "codex.rate_limits",
                 "rate_limits": {"limit_reached": true}
@@ -2979,10 +3186,12 @@ mod tests {
         response
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn usage_limit_fast_fails_websocket_and_aborts_request_state() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
         let response = run_live_failure_case(
             "live-usage-limit-cleanup",
             serde_json::json!({
@@ -3084,10 +3293,12 @@ mod tests {
         assert_eq!(body["error"]["type"], "rate_limit_error");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn failed_live_attempt_is_reported_without_backoff() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
         let session_id = "live-retry-backoff-cleanup";
         let owner = ConversationIdentity::Main(session_id.to_string());
         continuation::clear_continuation_for_owner(Some(&owner));
@@ -3240,6 +3451,522 @@ mod tests {
         websocket::invalidate_codex_websocket_pool_owner(&owner);
     }
 
+    /// A plain 401 on the live WebSocket refreshes the login, and the one it
+    /// reloads may belong to another account. A reading the first attempt
+    /// queued before the refresh stays with the account that read it, so the
+    /// response, sent with the reloaded account, publishes none of its windows.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_queued_reading_stays_with_the_account_that_read_it() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
+        rate_limits::clear_for_tests();
+        let session_id = "live-queued-reading-account";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let request = live_test_request("one");
+        let continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let login = |access: &str, account: &str| auth::token_store::StoredAuth {
+            access: access.to_string(),
+            refresh: String::new(),
+            expires: u64::MAX,
+            account_id: Some(account.to_string()),
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        client
+            .auth_manager()
+            .set_test_auth(login("token-a", "acct-a"));
+        let rotating_client = client.clone();
+        let rotated = login("token-b", "acct-b");
+        let (resent_tx, resent_rx) = tokio::sync::oneshot::channel();
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = next_live_websocket_request(&mut websocket).await;
+            emit_live_event(
+                &mut websocket,
+                &serde_json::json!({
+                    "type": "codex.rate_limits",
+                    "rate_limits": {
+                        "allowed": true,
+                        "limit_reached": false,
+                        "primary": {
+                            "used_percent": 40.0,
+                            "window_minutes": 300,
+                            "reset_at": now + 3_600
+                        },
+                        "secondary": {
+                            "used_percent": 20.0,
+                            "window_minutes": 10080,
+                            "reset_at": now + 86_400
+                        }
+                    }
+                }),
+            )
+            .await;
+            rotating_client.auth_manager().set_test_auth(rotated);
+            emit_live_event(
+                &mut websocket,
+                &serde_json::json!({
+                    "type": "error",
+                    "status": 401,
+                    "error": {"message": "Your token has expired."}
+                }),
+            )
+            .await;
+            drop(websocket);
+
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _ = next_live_websocket_request(&mut websocket).await;
+            resent_tx.send(()).unwrap();
+            answer_rx.await.unwrap();
+            emit_live_event(
+                &mut websocket,
+                &serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "message", "id": "msg-reloaded"}
+                }),
+            )
+            .await;
+            emit_live_event(
+                &mut websocket,
+                &serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": "answer"
+                }),
+            )
+            .await;
+            while websocket.next().await.is_some() {}
+        });
+
+        let ctx = live_test_context(session_id);
+        let events = client
+            .stream_codex_websocket_events_for_owner(&request, &ctx, Some(&continuation))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), resent_rx)
+            .await
+            .expect("the request was not sent again after the refresh")
+            .unwrap();
+        // Nothing has read the queue yet: the first attempt's reading waits in
+        // it while the stream already stands for the reloaded account.
+        assert_eq!(events.account_id().as_deref(), Some("acct-b"));
+        answer_tx.send(()).unwrap();
+        let account_id = events.account_reader();
+        let start = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            live_stream_response_once(
+                events,
+                Vec::new(),
+                "message".to_string(),
+                &request.model,
+                ctx,
+                continuation.clone(),
+                request.clone(),
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+            ),
+        )
+        .await
+        .expect("the live response did not start");
+        let LiveStreamStart::Response(response) = start else {
+            panic!("the reloaded account's answer must start the response");
+        };
+        let response = with_rate_limit_headers(response, account_id().as_deref());
+
+        assert!(
+            response
+                .headers()
+                .keys()
+                .all(|name| !name.as_str().starts_with("anthropic-ratelimit-unified")),
+            "{:?}",
+            response.headers()
+        );
+        let held = rate_limits::latest(Some("acct-a")).expect("the reading keeps its account");
+        assert_eq!(
+            held.five_hour.map(|window| window.resets_at),
+            Some(now + 3_600)
+        );
+        assert_eq!(
+            held.seven_day.map(|window| window.resets_at),
+            Some(now + 86_400)
+        );
+        assert!(rate_limits::latest(Some("acct-b")).is_none());
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("dropping the response did not close the upstream socket")
+            .unwrap();
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        continuation::clear_continuation_for_owner(Some(&owner));
+        rate_limits::clear_for_tests();
+    }
+
+    fn test_login(access: &str, account: &str) -> auth::token_store::StoredAuth {
+        auth::token_store::StoredAuth {
+            access: access.to_string(),
+            refresh: String::new(),
+            expires: u64::MAX,
+            account_id: Some(account.to_string()),
+        }
+    }
+
+    /// What the mock backend of `second_turn_after_saving_login` saw: the
+    /// `ChatGPT-Account-Id` of each WebSocket handshake, and each request with
+    /// the index of the socket it came on.
+    struct SeenUpstream {
+        handshakes: Vec<Option<String>>,
+        requests: Vec<(usize, serde_json::Value)>,
+    }
+
+    /// Two turns of one conversation on the live WebSocket: the first under
+    /// `acct-a`, the second after `second_login` is saved. The mock backend
+    /// answers a request under the account of the socket it came on, with a
+    /// reading of that account's windows for `acct-a` and none for another.
+    /// Returns the second turn's response and what the backend saw.
+    // tungstenite's own callback type fixes the error response size.
+    #[allow(clippy::result_large_err)]
+    async fn second_turn_after_saving_login(
+        session_id: &str,
+        second_login: auth::token_store::StoredAuth,
+    ) -> (Response, SeenUpstream) {
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let reading = serde_json::json!({
+            "type": "codex.rate_limits",
+            "rate_limits": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary": {
+                    "used_percent": 40.0,
+                    "window_minutes": 300,
+                    "reset_at": now + 3_600
+                },
+                "secondary": {
+                    "used_percent": 20.0,
+                    "window_minutes": 10080,
+                    "reset_at": now + 86_400
+                }
+            }
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (handshake_tx, mut handshake_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for socket_index in 0_usize..usize::MAX {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut account: Option<String> = None;
+                let mut websocket = tokio_tungstenite::accept_hdr_async(
+                    socket,
+                    |request: &http::Request<()>, response| {
+                        account = request
+                            .headers()
+                            .get("chatgpt-account-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+                handshake_tx.send(account.clone()).unwrap();
+                let request_tx = request_tx.clone();
+                let reading = reading.clone();
+                tokio::spawn(async move {
+                    let mut answered = 0;
+                    while let Some(Ok(message)) = websocket.next().await {
+                        match message {
+                            Message::Ping(payload) => {
+                                let _ = websocket.send(Message::Pong(payload)).await;
+                            }
+                            Message::Text(text) => {
+                                let request: serde_json::Value =
+                                    serde_json::from_str(&text).unwrap();
+                                request_tx.send((socket_index, request)).unwrap();
+                                answered += 1;
+                                if account.as_deref() == Some("acct-a") {
+                                    emit_live_event(&mut websocket, &reading).await;
+                                }
+                                emit_live_event(
+                                    &mut websocket,
+                                    &serde_json::json!({
+                                        "type": "response.completed",
+                                        "response": {
+                                            "id": format!("resp-{socket_index}-{answered}"),
+                                            "status": "completed",
+                                            "output": []
+                                        }
+                                    }),
+                                )
+                                .await;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        client
+            .auth_manager()
+            .set_test_auth(test_login("token-a", "acct-a"));
+        let compaction = LiveStreamCompaction {
+            compact_boundary: false,
+            attempt: None,
+        };
+        let first = live_test_request("one");
+        let first_turn = continuation_candidate_for_owner(Some(&owner), &first, true);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            live_stream_response(
+                client.clone(),
+                "message".to_string(),
+                &first.model,
+                live_test_context(session_id),
+                first.clone(),
+                first_turn,
+                compaction,
+                config::CodexTransport::WebSocket,
+            ),
+        )
+        .await
+        .expect("the first turn did not finish");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        client.auth_manager().set_test_auth(second_login);
+        let mut second = live_test_request("one");
+        second.input.extend(live_test_request("two").input);
+        let second_turn = continuation_candidate_for_owner(Some(&owner), &second, true);
+        // The second turn only appends, so its continuation names the first response.
+        assert_eq!(
+            second_turn.candidate().previous_response_id.as_deref(),
+            Some("resp-0-1")
+        );
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            live_stream_response(
+                client,
+                "message".to_string(),
+                &second.model,
+                live_test_context(session_id),
+                second.clone(),
+                second_turn,
+                compaction,
+                config::CodexTransport::WebSocket,
+            ),
+        )
+        .await
+        .expect("the second turn did not finish");
+        server.abort();
+
+        let mut seen = SeenUpstream {
+            handshakes: Vec::new(),
+            requests: Vec::new(),
+        };
+        while let Ok(account) = handshake_rx.try_recv() {
+            seen.handshakes.push(account);
+        }
+        while let Ok(request) = request_rx.try_recv() {
+            seen.requests.push(request);
+        }
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        continuation::clear_continuation_for_owner(Some(&owner));
+        (response, seen)
+    }
+
+    /// A pooled socket answers under the account of its handshake. Once the
+    /// saved login belongs to another account, the conversation's next turn
+    /// does not go out on it: a socket of its own is opened with the new
+    /// account, the turn is sent with its full context, and the response
+    /// carries none of the old account's windows.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_pooled_socket_is_not_reused_under_another_account() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
+        rate_limits::clear_for_tests();
+
+        let (response, seen) = second_turn_after_saving_login(
+            "live-pooled-socket-other-account",
+            test_login("token-b", "acct-b"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().keys().all(|name| {
+                !name.as_str().starts_with("anthropic-ratelimit-unified-5h-")
+                    && !name.as_str().starts_with("anthropic-ratelimit-unified-7d-")
+            }),
+            "{:?}",
+            response.headers()
+        );
+        assert_eq!(
+            seen.handshakes,
+            [Some("acct-a".to_string()), Some("acct-b".to_string())]
+        );
+        let sockets: Vec<usize> = seen.requests.iter().map(|(socket, _)| *socket).collect();
+        assert_eq!(
+            sockets,
+            [0, 1],
+            "nothing more may go out on acct-a's socket"
+        );
+        let resent = &seen.requests[1].1;
+        assert!(resent.get("previous_response_id").is_none());
+        assert_eq!(resent["input"].as_array().unwrap().len(), 2);
+        assert!(rate_limits::latest(Some("acct-b")).is_none());
+        rate_limits::clear_for_tests();
+    }
+
+    /// A refreshed token of the same account keeps the conversation on its
+    /// pooled socket: the next turn sends only what it adds, and no second
+    /// handshake is made.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_pooled_socket_is_reused_under_the_same_account() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
+        rate_limits::clear_for_tests();
+
+        let (response, seen) = second_turn_after_saving_login(
+            "live-pooled-socket-same-account",
+            test_login("token-a-refreshed", "acct-a"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .contains_key("anthropic-ratelimit-unified-5h-utilization"),
+            "{:?}",
+            response.headers()
+        );
+        assert_eq!(seen.handshakes, [Some("acct-a".to_string())]);
+        let sockets: Vec<usize> = seen.requests.iter().map(|(socket, _)| *socket).collect();
+        assert_eq!(sockets, [0, 0]);
+        let continued = &seen.requests[1].1;
+        assert_eq!(continued["previous_response_id"], "resp-0-1");
+        assert_eq!(continued["input"].as_array().unwrap().len(), 1);
+        rate_limits::clear_for_tests();
+    }
+
+    /// Once the response has started, the reader does not record again a
+    /// reading the stream task recorded before queuing it: replaying a queued
+    /// reading would take back a later one the task already recorded.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_reading_the_stream_task_recorded_is_not_recorded_again_after_output() {
+        let _rate_limits = rate_limits::lock_for_tests();
+        rate_limits::clear_for_tests();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let reading = |used_percent: f64| {
+            serde_json::json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary": {
+                        "used_percent": used_percent,
+                        "window_minutes": 300,
+                        "reset_at": now + 3_600
+                    }
+                }
+            })
+        };
+        // The task recorded the queued reading, then a later one of the same
+        // window that is not queued yet.
+        rate_limits::observe_event(Some("acct"), &reading(10.0));
+        rate_limits::observe_event(Some("acct"), &reading(50.0));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        for event in [
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "id": "msg-recorded"}
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": "answer"
+            }),
+            reading(10.0),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "resp-recorded", "status": "completed", "output": []}
+            }),
+        ] {
+            tx.send(Ok(event)).await.unwrap();
+        }
+        drop(tx);
+        let (mut events, publisher) = websocket::CodexWebSocketEventStream::pending(rx);
+        events.mark_rate_limits_observed();
+        publisher.publish_account(Some("acct"));
+
+        let request = live_test_request("one");
+        let mut ctx = live_test_context("live-recorded-reading-after-output");
+        ctx.session_id = None;
+        let start = live_stream_response_once(
+            events,
+            Vec::new(),
+            "message".to_string(),
+            &request.model,
+            ctx,
+            ContinuationReservation::for_owner_turn(None, None),
+            request.clone(),
+            LiveStreamCompaction {
+                compact_boundary: false,
+                attempt: None,
+            },
+        )
+        .await;
+        let LiveStreamStart::Response(response) = start else {
+            panic!("the output must start the response");
+        };
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            response.into_body().collect(),
+        )
+        .await
+        .expect("the response did not end")
+        .unwrap()
+        .to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("message_stop"));
+
+        let held = rate_limits::latest(Some("acct")).expect("the reading is held");
+        assert_eq!(held.five_hour.map(|window| window.utilization), Some(0.5));
+        rate_limits::clear_for_tests();
+    }
+
     #[tokio::test]
     async fn stale_request_cleanup_preserves_newer_turn_and_compaction_attempt() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
@@ -3272,42 +3999,90 @@ mod tests {
     async fn retryable_live_failure_aborts_request_state_after_one_attempt() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
-        let status = run_live_failure_case(
+        let response = run_live_failure_case(
             "live-retryable-failure-cleanup",
             serde_json::json!({
+                "type": "error",
+                "error": {"code": "rate_limit_exceeded", "message": "Please slow down."}
+            }),
+            1,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!response.headers().contains_key("x-should-retry"));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn terminal_rate_limit_snapshot_fails_a_live_start_as_a_spent_window() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
+        let response = run_live_failure_case(
+            "live-terminal-snapshot-cleanup",
+            serde_json::json!({
                 "type": "codex.rate_limits",
+                "credits": {"has_credits": false, "unlimited": false},
                 "rate_limits": {
                     "allowed": false,
                     "limit_reached": true,
-                    "primary": {"reset_after_seconds": 0}
+                    "primary": {
+                        "used_percent": 100.0,
+                        "window_minutes": 300,
+                        "reset_after_seconds": 9569,
+                        "reset_at": 1788879437u64
+                    },
+                    "secondary": {
+                        "used_percent": 40.0,
+                        "window_minutes": 10080,
+                        "reset_after_seconds": 596369,
+                        "reset_at": 1789466238u64
+                    }
                 }
             }),
             1,
         )
-        .await
-        .status();
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["x-should-retry"], "false");
+        assert_eq!(
+            response.headers()["anthropic-ratelimit-unified-status"],
+            "rejected"
+        );
+        assert_eq!(
+            response.headers()["anthropic-ratelimit-unified-reset"],
+            "1788879437"
+        );
+        assert_eq!(
+            response.headers()["anthropic-ratelimit-unified-representative-claim"],
+            "five_hour"
+        );
+        assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["message"], "Usage limit reached");
     }
 
     #[tokio::test]
     async fn excessive_retry_after_aborts_live_request_state() {
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
-        let status = run_live_failure_case(
+        let response = run_live_failure_case(
             "live-excessive-retry-after-cleanup",
             serde_json::json!({
-                "type": "codex.rate_limits",
-                "rate_limits": {
-                    "allowed": false,
-                    "limit_reached": true,
-                    "primary": {"reset_after_seconds": 31}
+                "type": "error",
+                "error": {
+                    "code": "rate_limit_exceeded",
+                    "message": "Please slow down.",
+                    "retry_after": 31
                 }
             }),
             1,
         )
-        .await
-        .status();
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[http::header::RETRY_AFTER], "31");
     }
 
     #[tokio::test]

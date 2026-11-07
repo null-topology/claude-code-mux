@@ -103,6 +103,108 @@
 - Fix: in a terminal too small for the help (`?`) or setup (`b`) popup, the
   monitor no longer exits with a panic. The popup is now cut to the window.
   Normal sizes look the same as before.
+- A Codex `codex.rate_limits` event that reports `limit_reached` with no
+  usable credits is now answered as a spent window, the way a
+  `usage_limit_reached` error already was, on the live WebSocket and HTTP
+  streams and the buffered paths: 429 `rate_limit_error` with
+  `x-should-retry: false`, `anthropic-ratelimit-unified-status: rejected`,
+  and `-reset` and `-representative-claim` only when exactly one of the
+  windows it carries is spent and every one it carries is readable; two
+  spent windows name neither. It no longer sends `Retry-After`, which used to carry
+  the window's whole countdown (hours on a weekly window) for a client to
+  sleep through before retrying; `x-should-retry: false` tells it not to
+  retry instead. A snapshot that still has credits keeps streaming as before.
+- A spent window after the answer started streaming, as a
+  `usage_limit_reached` error or as that snapshot, now ends the stream with
+  an SSE `error` of type `rate_limit_error` instead of `api_error`.
+- Every spent-window answer that names a window and a reset still ahead now
+  records that window as spent until then, and a refusing snapshot updates
+  the held reading too, so later responses carry it in their
+  `anthropic-ratelimit-unified-5h-*` or `-7d-*` headers. Until the next
+  reading those responses can say `unified-status: allowed` beside a
+  utilization of 1.0. A spent window that arrives after output on the HTTP
+  transport takes its window from the response's `X-Codex-*` headers when
+  the event names none.
+- Every `codex.rate_limits` reading, healthy or refusing, and every spent
+  window now update the held reading one window at a time instead of
+  replacing it: a window whose reset has already passed is ignored, and a
+  held window that resets more than 60 seconds after the incoming one is
+  kept, so a reading that arrives late cannot take a newer window back.
+  Within 60 seconds the two count as the same window, so a spent window is
+  still recorded when its reset is a second or two off. A window a reading
+  does not carry keeps the one held until its reset passes; a reading with
+  only one window used to drop the other from the headers.
+- Codex `policy_capacity_unavailable` errors (as code or type) are answered
+  like `server_is_overloaded`: 529 `overloaded_error` with the native
+  message, and `Retry-After` only when the error carries a delay. They used
+  to be 502 `api_error`, a server failure.
+- Codex `model_not_found` errors (as code or type) that come with no status
+  or with 400, 403 or 404 are answered 404 `not_found_error` with the native
+  message, or `model_not_found` when it is empty or missing, instead of
+  502 `api_error` or a status-based answer. With any other status they keep
+  their previous answer.
+- A buffered WebSocket request whose `error` event carries a status is now
+  answered by the event's error code as well, like an HTTP error body.
+- A Codex 401 whose body or `error` event reports a spent usage window or
+  names one of the known codes is now answered as that window or code
+  without a token refresh, on the live and buffered HTTP and WebSocket paths
+  and the standalone search call. Each of them makes one upstream attempt,
+  except that under the default `auto` transport a rejected WebSocket
+  upgrade still falls back to HTTP, which reads its own answer. A plain 401
+  still refreshes the token and sends the request again, at most once per
+  client request: under `auto` a live request whose WebSocket attempt
+  already refreshed no longer refreshes a second time on the HTTP fallback.
+- A rejected WebSocket upgrade and a failed live HTTP start or search call
+  now update the held reading with every `codex.rate_limits` window their
+  error body carries before the body is turned into a spent window, as the
+  buffered paths already did. The refusal itself is answered as before: two
+  spent windows still name neither, but later responses now carry both in
+  their `anthropic-ratelimit-unified-5h-*` and `-7d-*` headers.
+- The held `codex.rate_limits` reading now belongs to the ChatGPT account of
+  the request it came with. A reading or spent window under another account
+  replaces it instead of merging into it, and a response to a request under
+  another account carries none of its `anthropic-ratelimit-unified-5h-*` or
+  `-7d-*` headers, so after switching Codex logins the previous account's
+  windows are no longer shown. A pooled WebSocket opened under another login
+  is no longer reused: the next request opens a new connection, and a
+  continuation that depended on the old socket is sent again with its full
+  context, as when a pooled socket is gone. A token of the same account
+  renewed before it expires keeps the socket.
+- A `codex.rate_limits` reading that names a metered limit other than
+  `codex` in `metered_limit_name` or `limit_name` no longer updates the held
+  reading or records a spent window. A refusing reading of that kind is
+  still answered as a spent window.
+- On live and buffered HTTP responses and rejected WebSocket upgrades, a
+  delay the Codex error body names (`retry_after`, `retry_after_seconds` or
+  a `headers` object) now takes precedence over the response's own
+  `Retry-After` header. Whichever is used is sent as `Retry-After`: a number
+  of seconds rounded up to a whole second, at least 1, and an HTTP date
+  unchanged. A buffered 429 without a known code used to
+  pass the header on as it came and ignore the body's delay.
+- A Codex retry delay is now used only when, with surrounding whitespace
+  removed, it is a finite number of seconds or at most 64 bytes of printable
+  ASCII, such as an HTTP date. Any other value (empty, longer, non-ASCII,
+  with a control character, or a number like `inf`) is ignored wherever it
+  is read: stream events, error bodies, and the `Retry-After` header of a
+  failed HTTP answer, a rejected WebSocket upgrade or a refused proxy
+  tunnel. The next source then gives the delay: the next field the error
+  names, then the response's header where there is one, and for `slow_down`
+  and `rate_limit_exceeded` the `try again in` delay of the message. Such a
+  value used to be passed on as it came, to the client's `Retry-After` and
+  to the `auto` fallback log line.
+- The body of a failed Codex HTTP answer (live and buffered requests, the
+  compaction request and the search call) is now read only up to 64 KiB, as
+  a rejected WebSocket upgrade's already was, and the whole read has to end
+  within the body idle timeout (5 minutes) instead of each chunk. The error
+  code, a spent usage window and the traffic capture are read from those
+  64 KiB. A body still arriving at the deadline fails the request with a
+  timeout of its own, which is neither refreshed nor sent again; it used to
+  hold the request for as long as the body kept coming.
+- A `codex.rate_limits` reading with a non-finite, negative or out-of-range
+  window length, percentage, reset time or countdown now drops only that
+  window; the other window is still published. A reset time or countdown
+  that is present but unusable drops its window even when the other one is
+  usable. A huge countdown no longer wraps the reset time.
 
 ## v0.17.0 (2026-11-05)
 
