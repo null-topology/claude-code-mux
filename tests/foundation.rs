@@ -53,7 +53,7 @@ fn messages_fixture_and_sse_parsing() {
 #[test]
 fn path_resolvers_cover_platform_rules() {
     let mut env = HashMap::new();
-    env.insert("CCP_CONFIG_DIR".to_string(), "/tmp/ccp-config".to_string());
+    env.insert("CCP_CONFIG_DIR".to_string(), "/tmp/ccp-config".into());
     let deps = DirResolverEnv {
         platform: "darwin".to_string(),
         home: "/home/u".into(),

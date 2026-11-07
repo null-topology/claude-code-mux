@@ -1,36 +1,51 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
+
+/// The variables the directory resolvers read besides `HOME` and
+/// `USERPROFILE`. They hold paths, which need not be valid Unicode, so they
+/// are read with `var_os` and used as they are.
+pub const PATH_ENV_VARS: [&str; 5] = [
+    "CCP_CONFIG_DIR",
+    "APPDATA",
+    "XDG_CONFIG_HOME",
+    "LOCALAPPDATA",
+    "XDG_STATE_HOME",
+];
 
 #[derive(Debug, Clone)]
 pub struct DirResolverEnv {
     pub platform: String,
-    pub env: HashMap<String, String>,
-    pub home: String,
+    pub env: HashMap<String, OsString>,
+    pub home: OsString,
 }
 
 impl Default for DirResolverEnv {
     fn default() -> Self {
         Self {
             platform: std::env::consts::OS.into(),
-            env: std::env::vars().collect(),
-            home: std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
-                .unwrap_or_else(|_| "/".to_string()),
+            env: PATH_ENV_VARS
+                .iter()
+                .filter_map(|&name| Some((name.to_string(), std::env::var_os(name)?)))
+                .collect(),
+            home: std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .unwrap_or_else(|| "/".into()),
         }
     }
 }
 
 pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
     if let Some(override_dir) = deps.env.get("CCP_CONFIG_DIR") {
-        return Path::new(override_dir).to_path_buf();
+        return PathBuf::from(override_dir);
     }
 
     if deps.platform == "win32" {
-        let appdata = deps
-            .env
-            .get("APPDATA")
-            .cloned()
-            .unwrap_or_else(|| format!("{}\\AppData\\Roaming", deps.home));
+        let appdata = deps.env.get("APPDATA").cloned().unwrap_or_else(|| {
+            let mut appdata = deps.home.clone();
+            appdata.push("\\AppData\\Roaming");
+            appdata
+        });
         return join_with_sep(&appdata, &["claude-code-proxy"], true);
     }
 
@@ -38,29 +53,28 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
         return join_with_sep(&deps.home, &[".config", "claude-code-proxy"], false);
     }
 
-    let base = deps.env.get("XDG_CONFIG_HOME").cloned().unwrap_or_else(|| {
-        join_with_sep(&deps.home, &[".config"], false)
-            .to_string_lossy()
-            .into_owned()
-    });
+    let base = deps
+        .env
+        .get("XDG_CONFIG_HOME")
+        .cloned()
+        .unwrap_or_else(|| join_with_sep(&deps.home, &[".config"], false).into_os_string());
     join_with_sep(&base, &["claude-code-proxy"], false)
 }
 
 pub fn resolve_state_dir(deps: &DirResolverEnv) -> PathBuf {
     if deps.platform == "win32" {
-        let local = deps
-            .env
-            .get("LOCALAPPDATA")
-            .cloned()
-            .unwrap_or_else(|| format!("{}\\AppData\\Local", deps.home));
+        let local = deps.env.get("LOCALAPPDATA").cloned().unwrap_or_else(|| {
+            let mut local = deps.home.clone();
+            local.push("\\AppData\\Local");
+            local
+        });
         return join_with_sep(&local, &["claude-code-proxy"], true);
     }
 
-    let base = deps.env.get("XDG_STATE_HOME").cloned().unwrap_or_else(|| {
-        join_with_sep(&deps.home, &[".local", "state"], false)
-            .to_string_lossy()
-            .into_owned()
-    });
+    let base =
+        deps.env.get("XDG_STATE_HOME").cloned().unwrap_or_else(|| {
+            join_with_sep(&deps.home, &[".local", "state"], false).into_os_string()
+        });
     join_with_sep(&base, &["claude-code-proxy"], false)
 }
 
@@ -106,17 +120,23 @@ pub fn provider_legacy_auth_file(provider: &str) -> PathBuf {
     legacy_config_dir(&deps).join(provider).join("auth.json")
 }
 
-fn join_with_sep(base: &str, parts: &[&str], win32: bool) -> PathBuf {
-    let sep = '/';
+fn join_with_sep(base: &OsStr, parts: &[&str], win32: bool) -> PathBuf {
+    let sep = "/";
     let _ = win32;
-    let mut out = String::new();
-    for part in std::iter::once(base).chain(parts.iter().copied()) {
-        if !out.is_empty() && !out.ends_with(sep) {
+    let mut out = OsString::new();
+    for part in std::iter::once(base).chain(parts.iter().map(OsStr::new)) {
+        if !out.is_empty() && !out.as_encoded_bytes().ends_with(sep.as_bytes()) {
             out.push(sep);
         }
-        out.push_str(part);
+        out.push(part);
     }
-    Path::new(&out).to_path_buf()
+    PathBuf::from(out)
+}
+
+fn os_env(env: &HashMap<String, String>) -> HashMap<String, OsString> {
+    env.iter()
+        .map(|(name, value)| (name.clone(), OsString::from(value)))
+        .collect()
 }
 
 pub fn resolve_config_dir_for_env(
@@ -126,8 +146,8 @@ pub fn resolve_config_dir_for_env(
 ) -> PathBuf {
     resolve_config_dir(&DirResolverEnv {
         platform: platform.to_string(),
-        env: env.clone(),
-        home: home.to_string(),
+        env: os_env(env),
+        home: home.into(),
     })
 }
 
@@ -138,7 +158,7 @@ pub fn resolve_state_dir_for_env(
 ) -> PathBuf {
     resolve_state_dir(&DirResolverEnv {
         platform: platform.to_string(),
-        env: env.clone(),
-        home: home.to_string(),
+        env: os_env(env),
+        home: home.into(),
     })
 }

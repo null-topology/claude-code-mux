@@ -137,6 +137,50 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
     }
 }
 
+/// The process environment as a map, leaving out every variable whose name or
+/// value is not valid Unicode. `std::env::vars` panics on such a variable, so
+/// one stray entry anywhere in the environment would stop every config read;
+/// here it reads as unset and the next source of the setting applies.
+/// [`config_override_summary`] reports the proxy's own variables left out this
+/// way. Variables that hold a path are not read here but with `var_os`, so a
+/// path that is not valid Unicode still applies (see [`paths::PATH_ENV_VARS`]
+/// and [`OS_PATH_ENV_VARS`]).
+pub(crate) fn env_vars() -> HashMap<String, String> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
+}
+
+/// The proxy's own path variables read with `var_os` outside
+/// [`paths::PATH_ENV_VARS`]: the Codex CLI credential file override that
+/// `codex_auth_file` reads. Their value applies even when it is not valid
+/// Unicode.
+const OS_PATH_ENV_VARS: [&str; 1] = ["CCP_CODEX_AUTH_FILE"];
+
+/// The proxy's own variables (`PORT` and every `CCP_*` name) whose value is not
+/// valid Unicode and is therefore ignored, sorted by name. A path variable is
+/// never one of them: it applies as it is.
+fn non_unicode_env_names() -> Vec<String> {
+    non_unicode_names_in(std::env::vars_os())
+}
+
+fn non_unicode_names_in(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<String> {
+    let mut names: Vec<String> = vars
+        .into_iter()
+        .filter(|(_, value)| value.to_str().is_none())
+        .filter_map(|(key, _)| key.into_string().ok())
+        .filter(|key| key == "PORT" || key.starts_with("CCP_"))
+        .filter(|key| {
+            !paths::PATH_ENV_VARS.contains(&key.as_str())
+                && !OS_PATH_ENV_VARS.contains(&key.as_str())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// How long a parsed `config.json` is reused before the file is read again.
 const CONFIG_FILE_TTL: Duration = Duration::from_secs(30);
 
@@ -191,9 +235,7 @@ pub fn clear_config_file_cache_for_tests() {
 }
 
 pub fn load_config() -> LoadedConfig {
-    let env = paths::DirResolverEnv::default();
-    let config_dir = paths::resolve_config_dir(&env);
-    load_config_from_env(&env.env, config_dir)
+    load_config_from_env(&env_vars(), paths::config_dir())
 }
 
 pub fn load_config_for_env(env: &HashMap<String, String>) -> LoadedConfig {
@@ -202,12 +244,7 @@ pub fn load_config_for_env(env: &HashMap<String, String>) -> LoadedConfig {
         .or_else(|| env.get("USERPROFILE"))
         .cloned()
         .unwrap_or_else(|| "/".to_string());
-    let resolver_env = paths::DirResolverEnv {
-        platform: std::env::consts::OS.to_string(),
-        env: env.clone(),
-        home,
-    };
-    let config_dir = paths::resolve_config_dir(&resolver_env);
+    let config_dir = paths::resolve_config_dir_for_env(std::env::consts::OS, &home, env);
     load_config_from_env(env, config_dir)
 }
 
@@ -350,7 +387,7 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
 /// order.
 pub fn config_override_summary(cfg: &LoadedConfig) -> Vec<ConfigSummaryLine> {
     let file = read_file_config(&cfg.config_dir);
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     let lane_settings = codex_lane_settings(&env, file.as_ref().and_then(|f| f.codex.as_ref()));
     let mut out = Vec::new();
     for (key, name) in [
@@ -399,6 +436,11 @@ pub fn config_override_summary(cfg: &LoadedConfig) -> Vec<ConfigSummaryLine> {
         .is_some_and(|raw| !raw.is_empty())
     {
         out.push(ConfigSummaryLine::set("CCP_AUTO_REVIEW_MODEL (env)"));
+    }
+    for name in non_unicode_env_names() {
+        out.push(ConfigSummaryLine::ignored(&format!(
+            "{name} (env): not valid Unicode; ignored"
+        )));
     }
     if let Some(file_cfg) = file {
         if let Some(bind_address) = file_cfg.bind_address {
@@ -470,7 +512,7 @@ pub fn config_override_summary(cfg: &LoadedConfig) -> Vec<ConfigSummaryLine> {
 }
 
 pub fn grok_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_GROK_BASE_URL") {
         return raw.clone();
     }
@@ -483,7 +525,7 @@ pub fn grok_base_url() -> String {
 }
 
 pub fn grok_client_version() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_GROK_CLIENT_VERSION") {
         return raw.clone();
     }
@@ -556,7 +598,7 @@ pub fn is_verbose() -> bool {
 }
 
 pub fn anthropic_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_ANTHROPIC_BASE_URL") {
         return raw.clone();
     }
@@ -574,7 +616,7 @@ pub fn anthropic_catalog_url() -> String {
 }
 
 pub fn kimi_oauth_host() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_KIMI_OAUTH_HOST") {
         return raw.clone();
     }
@@ -589,7 +631,7 @@ pub fn kimi_oauth_host() -> String {
 }
 
 pub fn kimi_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_KIMI_BASE_URL") {
         return raw.clone();
     }
@@ -604,7 +646,7 @@ pub fn kimi_base_url() -> String {
 }
 
 pub fn kimi_user_agent(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_KIMI_USER_AGENT") {
         return raw.clone();
     }
@@ -626,7 +668,7 @@ pub fn kimi_user_agent(default: &str) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn codex_base_url(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_BASE_URL") {
         return raw.clone();
     }
@@ -644,7 +686,7 @@ pub fn codex_base_url(default: &str) -> String {
 }
 
 pub fn codex_originator(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_ORIGINATOR") {
         return raw.clone();
     }
@@ -664,7 +706,7 @@ pub fn codex_originator(default: &str) -> String {
 /// Empty by default, since the Codex route builds its own headers and sends
 /// none of the client's. A name that is not a valid header name is skipped.
 pub fn codex_forward_headers() -> Vec<http::HeaderName> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     let names: Vec<String> = if let Some(raw) = env.get("CCP_CODEX_FORWARD_HEADERS") {
         raw.split(',').map(str::to_string).collect()
     } else {
@@ -680,7 +722,7 @@ pub fn codex_forward_headers() -> Vec<http::HeaderName> {
 }
 
 pub fn codex_user_agent(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_USER_AGENT") {
         return raw.clone();
     }
@@ -700,7 +742,7 @@ pub fn codex_user_agent(default: &str) -> String {
 /// `client_version` for the Codex model listing call, when configured.
 /// `CCP_CODEX_CLIENT_VERSION`, then `codex.clientVersion` in `config.json`.
 pub fn codex_client_version() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_CLIENT_VERSION") {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
@@ -719,7 +761,7 @@ pub fn codex_client_version() -> Option<String> {
 }
 
 pub fn codex_previous_response_id() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_PREVIOUS_RESPONSE_ID") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
@@ -894,7 +936,7 @@ fn codex_lane_summary_line(
 /// parses wins; an unusable one is skipped and reported by
 /// [`config_override_summary_lines`].
 pub fn codex_lane_policy() -> CodexLanePolicy {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     let codex = read_file_config(&paths::config_dir()).and_then(|file| file.codex);
     codex_lane_settings(&env, codex.as_ref())
         .into_iter()
@@ -912,7 +954,7 @@ pub fn codex_full_lane() -> bool {
 }
 
 pub fn codex_server_compaction() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION") {
         match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => return true,
@@ -931,7 +973,7 @@ pub fn codex_server_compaction() -> bool {
 }
 
 pub fn codex_responses_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_RESPONSES_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
@@ -946,7 +988,7 @@ pub fn codex_responses_api() -> bool {
 }
 
 pub fn codex_images_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_IMAGES_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
@@ -961,7 +1003,7 @@ pub fn codex_images_api() -> bool {
 }
 
 pub fn codex_transcriptions_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_TRANSCRIPTIONS_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
@@ -976,7 +1018,7 @@ pub fn codex_transcriptions_api() -> bool {
 }
 
 pub fn codex_images_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_IMAGES_BASE_URL") {
         return raw.clone();
     }
@@ -1007,7 +1049,7 @@ pub struct ConfiguredServiceTier {
 /// then `codex.serviceTier`. The map is looked up by exact id; a map that is
 /// not an object is ignored and a `null` entry counts as absent.
 pub fn codex_service_tier_for_model(model: &str) -> Option<ConfiguredServiceTier> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_SERVICE_TIER") {
         return Some(ConfiguredServiceTier {
             raw: raw.clone(),
@@ -1042,7 +1084,7 @@ pub fn codex_service_tier_for_model(model: &str) -> Option<ConfiguredServiceTier
 }
 
 pub fn codex_effort() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_EFFORT") {
         return Some(raw.clone());
     }
@@ -1056,7 +1098,7 @@ pub fn codex_effort() -> Option<String> {
 }
 
 pub fn codex_reasoning_summary() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env
         .get("CCP_CODEX_REASONING_SUMMARY")
         .filter(|raw| !raw.is_empty())
@@ -1074,7 +1116,7 @@ pub fn codex_reasoning_summary() -> Option<String> {
 }
 
 pub fn codex_model() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_MODEL") {
         return Some(raw.clone());
     }
@@ -1090,7 +1132,7 @@ pub fn codex_model() -> Option<String> {
 /// An explicit model for status labels in the `upstream` mode, overriding the
 /// per-provider choice.
 pub fn agent_summary_model() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     env.get("CCP_AGENT_SUMMARY_MODEL")
         .filter(|raw| !raw.is_empty())
         .cloned()
@@ -1121,7 +1163,7 @@ fn parse_agent_summary_mode(raw: &str) -> Option<AgentSummaryMode> {
 /// `CCP_AGENT_SUMMARY`, then `agentSummary`. The first source that parses
 /// wins; with neither, status line requests are forwarded natively.
 pub fn agent_summary_mode() -> AgentSummaryMode {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     env.get("CCP_AGENT_SUMMARY")
         .and_then(|raw| parse_agent_summary_mode(raw))
         .or_else(|| {
@@ -1133,7 +1175,7 @@ pub fn agent_summary_mode() -> AgentSummaryMode {
 }
 
 pub fn auto_review_model() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env
         .get("CCP_AUTO_REVIEW_MODEL")
         .filter(|raw| !raw.is_empty())
@@ -1176,7 +1218,7 @@ fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
 }
 
 pub fn codex_transport() -> CodexTransport {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CODEX_TRANSPORT")
         && let Some(transport) = parse_codex_transport(raw)
     {
@@ -1197,7 +1239,7 @@ pub fn codex_transport() -> CodexTransport {
 // ---------------------------------------------------------------------------
 
 pub fn cursor_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CURSOR_BASE_URL") {
         return raw.clone();
     }
@@ -1212,7 +1254,7 @@ pub fn cursor_base_url() -> String {
 }
 
 pub fn cursor_client_version() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CURSOR_CLIENT_VERSION") {
         return raw.clone();
     }
@@ -1247,7 +1289,7 @@ fn detect_cursor_agent_version() -> Option<String> {
 }
 
 pub fn cursor_agent_bundle() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
+    let env = env_vars();
     if let Some(raw) = env.get("CCP_CURSOR_AGENT_BUNDLE") {
         return Some(raw.clone());
     }
@@ -1274,6 +1316,7 @@ mod tests {
         "CCP_CODEX_TRANSPORT",
         "CCP_LOG_VERBOSE",
         "CCP_LOG_STDERR",
+        "CCP_TRAFFIC_LOG",
         "CCP_CODEX_REASONING_SUMMARY",
         "CCP_CODEX_SERVER_COMPACTION",
         "CCP_CODEX_FULL_LANE",
@@ -1408,6 +1451,108 @@ mod tests {
         let _cleared = clear_env();
         let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", "");
         assert_eq!(codex_transport(), CodexTransport::Auto);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_env_values_are_skipped_without_panicking() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_dir = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"transport":"http"}}"#,
+        )
+        .unwrap();
+        clear_config_file_cache_for_tests();
+        let not_unicode = OsStr::from_bytes(b"caf\xe9");
+        let _unrelated = EnvGuard::set("CLAUDE_CODE_MUX_TEST_NOT_UNICODE", not_unicode);
+        let _transport = EnvGuard::set("CCP_CODEX_TRANSPORT", not_unicode);
+
+        let cfg = load_config();
+        assert_eq!(cfg.config_dir, config.path());
+        assert_eq!(paths::config_dir(), config.path());
+        assert!(!crate::traffic::traffic_capture_enabled());
+        let _ = (
+            codex_lane_policy(),
+            codex_client_version(),
+            codex_effort(),
+            agent_summary_mode(),
+            grok_base_url(),
+            kimi_base_url(),
+            anthropic_catalog_url(),
+        );
+        // The unusable env value is skipped, so the file decides.
+        assert_eq!(codex_transport(), CodexTransport::Http);
+
+        let summary = config_override_summary(&cfg);
+        let ignored: Vec<&ConfigSummaryLine> = summary.iter().filter(|line| line.ignored).collect();
+        assert_eq!(
+            ignored,
+            [&ConfigSummaryLine::ignored(
+                "CCP_CODEX_TRANSPORT (env): not valid Unicode; ignored"
+            )]
+        );
+        assert!(
+            summary
+                .iter()
+                .all(|line| !line.text.contains("caf") && !line.text.contains("MUX_TEST"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_path_variables_apply_and_are_not_reported() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        clear_config_file_cache_for_tests();
+        // Only resolved, never created: some filesystems refuse such names.
+        let root = tempfile::TempDir::new().unwrap();
+        let config_dir = root.path().join(OsStr::from_bytes(b"config-\xff"));
+        let state_home = root.path().join(OsStr::from_bytes(b"state-\xff"));
+        let _config_dir = EnvGuard::set("CCP_CONFIG_DIR", &config_dir);
+        let _state_home = EnvGuard::set("XDG_STATE_HOME", &state_home);
+
+        assert_eq!(paths::config_dir(), config_dir);
+        assert_eq!(paths::state_dir(), state_home.join("claude-code-proxy"));
+        assert_eq!(
+            paths::log_file(),
+            state_home.join("claude-code-proxy").join("proxy.log")
+        );
+        let cfg = load_config();
+        assert_eq!(cfg.config_dir, config_dir);
+        let summary = config_override_summary(&cfg);
+        assert!(summary.iter().all(|line| !line.ignored), "{summary:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn not_unicode_warning_leaves_out_path_variables() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let vars = [
+            "CCP_CONFIG_DIR",
+            "CCP_CODEX_AUTH_FILE",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "CCP_CODEX_TRANSPORT",
+            "PORT",
+        ]
+        .map(|name| {
+            (
+                OsString::from(name),
+                OsString::from_vec(b"caf\xe9".to_vec()),
+            )
+        });
+        assert_eq!(non_unicode_names_in(vars), ["CCP_CODEX_TRANSPORT", "PORT"]);
     }
 
     #[test]

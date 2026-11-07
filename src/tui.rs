@@ -1071,7 +1071,7 @@ fn display_conversation_label(conversation: &str) -> String {
     };
     let shortened = match base.split_once('-') {
         Some((first, _)) if uuid::Uuid::parse_str(base).is_ok() => first,
-        _ => &base[..base.len().min(SHORT_CONVERSATION_LEN)],
+        _ => &base[..base.floor_char_boundary(SHORT_CONVERSATION_LEN)],
     };
     format!("{shortened}{suffix}")
 }
@@ -3395,12 +3395,15 @@ fn render_shutdown_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, tick: usi
 fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let width = 52.min(area.width.saturating_sub(4)).max(24);
     let height = 13.min(area.height.saturating_sub(2)).max(8);
+    // The minimum size can be larger than a small terminal, and `Clear` resets
+    // every cell of its rect without clipping, so keep the popup in the frame.
     let popup = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
-    };
+    }
+    .intersection(area);
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(Span::styled(" Shortcuts ", Style::default().fg(TEAL)))
@@ -3443,12 +3446,14 @@ fn render_setup_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, setup_text: 
     let height = (content_height + 4)
         .min(area.height.saturating_sub(2))
         .max(8);
+    // Clipped to the frame for the same reason as the help popup.
     let popup = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
-    };
+    }
+    .intersection(area);
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(Span::styled(" Setup ", Style::default().fg(TEAL)))
@@ -3924,6 +3929,43 @@ mod tests {
             display_conversation_label("57c7c914-ada4-4f40-9672-985f950fbb66"),
             "57c7c914"
         );
+    }
+
+    #[test]
+    fn display_conversation_label_cuts_on_a_character_boundary() {
+        // `é` takes bytes 7 and 8, so a cut at byte 8 would split it.
+        assert_eq!(display_conversation_label("abcdefgé12"), "abcdefg");
+        assert_eq!(
+            display_conversation_label("abcdefgé12/side"),
+            "abcdefg/side"
+        );
+    }
+
+    #[test]
+    fn help_and_setup_popups_render_on_tiny_terminals() {
+        let setup_text = "export ANTHROPIC_BASE_URL=http://127.0.0.1:8080\nclaude";
+        for (width, height) in [(20, 6), (10, 3), (1, 1)] {
+            draw(width, height, |frame| {
+                render_help_overlay(frame, frame.area())
+            });
+            draw(width, height, |frame| {
+                render_setup_overlay(frame, frame.area(), setup_text)
+            });
+        }
+    }
+
+    #[test]
+    fn help_and_setup_popups_draw_nothing_outside_an_empty_area() {
+        let setup_text = "export ANTHROPIC_BASE_URL=http://127.0.0.1:8080";
+        let blank = Buffer::empty(Rect::new(0, 0, 40, 12));
+        for area in [Rect::new(0, 0, 0, 12), Rect::new(0, 0, 40, 0)] {
+            let help = draw(40, 12, |frame| render_help_overlay(frame, area));
+            assert_eq!(help, blank, "help in {area:?}");
+            let setup = draw(40, 12, |frame| {
+                render_setup_overlay(frame, area, setup_text)
+            });
+            assert_eq!(setup, blank, "setup in {area:?}");
+        }
     }
 
     #[test]
