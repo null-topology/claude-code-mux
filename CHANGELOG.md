@@ -1,3 +1,12 @@
+## Unreleased
+
+- Dependencies are refreshed to their newest releases within the version
+  ranges `Cargo.toml` already allows. This brings rustls 0.23.46, which fixes
+  RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption
+  levels), and h2 0.4.20, which fixes RUSTSEC-2026-0258 (unbounded empty
+  DATA frames). TLS still uses the ring crypto provider, and nothing changes
+  in configuration or behaviour.
+
 ## v0.18.1 (2026-11-12)
 
 - Error messages about a failed upstream call no longer include the request
