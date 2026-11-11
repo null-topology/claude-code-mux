@@ -1766,8 +1766,14 @@ Match the surrounding code. `reqwest` is built without gzip or brotli so bodies
 are never auto-decompressed, and with rustls so no OS keychain is touched.
 Every client starts from `http_client::client_builder` or
 `blocking_client_builder`, which install ring and trust only the bundled
-Mozilla roots; a bare `Client::builder()` would fall back to the platform
-verifier. Keep
+Mozilla roots, less every root whose `webpki-roots` anchor carries a name
+constraint its certificate does not produce (`BUNDLED_ROOTS`): `tls_certs_only`
+takes certificates, so such a root would otherwise be trusted without its
+limit. A bare `Client::builder()` would fall back to the platform verifier,
+so `clippy.toml` lists the reqwest client constructors and `reqwest::get` under
+`disallowed-methods`, allowed only on the two calls in `src/http_client.rs`;
+the lint cannot see `Client::default()`, which builds a client inside
+reqwest. Keep
 new code in the same shape as the module it lives in. Stay close to upstream
 and avoid style-only divergence so ports in either direction stay cheap.
 

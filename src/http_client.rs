@@ -2,15 +2,49 @@
 //! all of them use the same TLS setup: ring as the crypto provider and the
 //! Mozilla root set bundled at build time. The operating system's store and
 //! the platform verifier are never consulted.
+//!
+//! The roots reach reqwest as certificates, and a certificate cannot carry a
+//! name constraint that Mozilla sets on a root outside the certificate. A root
+//! whose Mozilla trust anchor has such a constraint is left out rather than
+//! trusted for every name, so these clients never trust more than the
+//! constrained anchor set does. `clippy.toml` forbids building a client any
+//! other way.
 
 use once_cell::sync::Lazy;
+use rustls::pki_types::{CertificateDer, TrustAnchor};
 
 static BUNDLED_ROOTS: Lazy<Vec<reqwest::Certificate>> = Lazy::new(|| {
-    webpki_root_certs::TLS_SERVER_ROOT_CERTS
-        .iter()
+    bundled_root_certs()
         .map(|der| reqwest::Certificate::from_der(der).expect("bundled root certificate"))
         .collect()
 });
+
+/// The bundled root certificates whose trust anchor matches a Mozilla anchor
+/// with the same name constraints.
+fn bundled_root_certs() -> impl Iterator<Item = &'static CertificateDer<'static>> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .filter(|der| {
+            trust_anchor(der).is_some_and(|anchor| {
+                webpki_roots::TLS_SERVER_ROOTS.iter().any(|mozilla| {
+                    same_root(mozilla, &anchor)
+                        && mozilla.name_constraints == anchor.name_constraints
+                })
+            })
+        })
+}
+
+/// The trust anchor rustls makes of a root certificate.
+fn trust_anchor(der: &CertificateDer<'_>) -> Option<TrustAnchor<'static>> {
+    let mut store = rustls::RootCertStore::empty();
+    store.add(der.clone()).ok()?;
+    store.roots.pop()
+}
+
+/// Two anchors are the same root when subject and public key agree.
+fn same_root(a: &TrustAnchor<'_>, b: &TrustAnchor<'_>) -> bool {
+    a.subject == b.subject && a.subject_public_key_info == b.subject_public_key_info
+}
 
 /// reqwest is built without a crypto provider of its own and takes rustls'
 /// process default, so ring is installed as that default unless one is
@@ -24,13 +58,17 @@ fn install_crypto_provider() {
 /// An async client builder that trusts only the bundled roots.
 pub fn client_builder() -> reqwest::ClientBuilder {
     install_crypto_provider();
-    reqwest::Client::builder().tls_certs_only(BUNDLED_ROOTS.iter().cloned())
+    #[allow(clippy::disallowed_methods)]
+    let builder = reqwest::Client::builder();
+    builder.tls_certs_only(BUNDLED_ROOTS.iter().cloned())
 }
 
 /// A blocking client builder that trusts only the bundled roots.
 pub fn blocking_client_builder() -> reqwest::blocking::ClientBuilder {
     install_crypto_provider();
-    reqwest::blocking::Client::builder().tls_certs_only(BUNDLED_ROOTS.iter().cloned())
+    #[allow(clippy::disallowed_methods)]
+    let builder = reqwest::blocking::Client::builder();
+    builder.tls_certs_only(BUNDLED_ROOTS.iter().cloned())
 }
 
 #[cfg(test)]
@@ -50,41 +88,55 @@ mod tests {
         assert_eq!(names(&provider.kx_groups), names(&ring.kx_groups));
     }
 
-    /// The bundled DER set is the same set of anchors webpki-roots carries,
-    /// except that Mozilla constrains one root (TUBITAK Kamu SM, to `.tr`)
-    /// outside the certificate itself. webpki-roots keeps that constraint and
-    /// the certificate cannot, so through `tls_certs_only` that root is
-    /// trusted without it. A second such root fails this test.
+    /// Every bundled root carries the name constraints of its Mozilla anchor.
+    /// The Mozilla anchors left out are exactly those with a name constraint
+    /// their certificate does not produce, and there are only a few of them.
     #[test]
     fn bundled_roots_are_the_mozilla_anchor_set() {
-        let mut store = rustls::RootCertStore::empty();
-        for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-            store.add(der.clone()).expect("bundled root parses");
-        }
-        assert_eq!(store.roots.len(), webpki_roots::TLS_SERVER_ROOTS.len());
+        let certificates: Vec<TrustAnchor<'static>> = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|der| trust_anchor(der).expect("bundled root parses"))
+            .collect();
+        let bundled: Vec<TrustAnchor<'static>> = bundled_root_certs()
+            .map(|der| trust_anchor(der).expect("bundled root parses"))
+            .collect();
+        assert_eq!(BUNDLED_ROOTS.len(), bundled.len());
+        assert!(bundled.len() >= 100, "only {} roots bundled", bundled.len());
 
-        let mut unconstrained = 0;
-        for anchor in webpki_roots::TLS_SERVER_ROOTS {
-            let bundled = store
-                .roots
-                .iter()
-                .find(|bundled| {
-                    bundled.subject == anchor.subject
-                        && bundled.subject_public_key_info == anchor.subject_public_key_info
-                })
-                .expect("every Mozilla anchor is bundled");
-            if bundled.name_constraints != anchor.name_constraints {
-                assert!(bundled.name_constraints.is_none());
-                assert!(
-                    anchor
-                        .subject
-                        .as_ref()
-                        .windows(b"TUBITAK".len())
-                        .any(|window| window == b"TUBITAK")
-                );
-                unconstrained += 1;
-            }
+        for root in &bundled {
+            assert!(
+                webpki_roots::TLS_SERVER_ROOTS.iter().any(|anchor| {
+                    same_root(anchor, root) && anchor.name_constraints == root.name_constraints
+                }),
+                "bundled root without a Mozilla anchor of the same name constraints: {root:?}"
+            );
         }
-        assert_eq!(unconstrained, 1);
+
+        let left_out: Vec<&TrustAnchor<'static>> = webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .filter(|anchor| !bundled.iter().any(|root| same_root(anchor, root)))
+            .collect();
+        let constrained_outside: Vec<&TrustAnchor<'static>> = webpki_roots::TLS_SERVER_ROOTS
+            .iter()
+            .filter(|anchor| {
+                let certificate = certificates
+                    .iter()
+                    .find(|certificate| same_root(anchor, certificate))
+                    .expect("every Mozilla anchor has its certificate");
+                certificate.name_constraints != anchor.name_constraints
+            })
+            .collect();
+        assert_eq!(left_out, constrained_outside);
+        for anchor in &left_out {
+            assert!(
+                anchor.name_constraints.is_some(),
+                "Mozilla anchor left out without a name constraint: {anchor:?}"
+            );
+        }
+        assert!(
+            left_out.len() <= 2,
+            "{} Mozilla anchors left out: {left_out:?}",
+            left_out.len()
+        );
     }
 }

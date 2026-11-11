@@ -1,0 +1,10 @@
+disallowed-methods = [
+    { path = "reqwest::Client::builder", reason = "start from http_client::client_builder, which installs ring and trusts only the bundled roots" },
+    { path = "reqwest::Client::new", reason = "build from http_client::client_builder, which installs ring and trusts only the bundled roots" },
+    { path = "reqwest::ClientBuilder::new", reason = "start from http_client::client_builder, which installs ring and trusts only the bundled roots" },
+    { path = "reqwest::blocking::Client::builder", reason = "start from http_client::blocking_client_builder, which installs ring and trusts only the bundled roots" },
+    { path = "reqwest::blocking::Client::new", reason = "build from http_client::blocking_client_builder, which installs ring and trusts only the bundled roots" },
+    { path = "reqwest::blocking::ClientBuilder::new", reason = "start from http_client::blocking_client_builder, which installs ring and trusts only the bundled roots" },
+    { path = "reqwest::get", reason = "send through a client built from http_client::client_builder, which installs ring and trusts only the bundled roots" },
+    { path = "reqwest::blocking::get", reason = "send through a client built from http_client::blocking_client_builder, which installs ring and trusts only the bundled roots" },
+]

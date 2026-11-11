@@ -11,7 +11,9 @@
 - The HTTP client library is updated to reqwest 0.13. TLS still uses the
   ring crypto provider and the Mozilla root certificates bundled with the
   proxy, never the operating system's store, and nothing changes in
-  configuration.
+  configuration. One root that Mozilla limits to the domains of a single
+  country is no longer trusted by the HTTP clients, since they take the
+  roots as plain certificates and that limit cannot be applied there.
 
 ## v0.18.1 (2026-11-12)
 
