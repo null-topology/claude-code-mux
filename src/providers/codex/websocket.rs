@@ -58,9 +58,10 @@ const MAX_MESSAGE_BYTES_HEADER: &str = "x-codex-websocket-max-message-bytes";
 /// Marks a request frame longer than the limit its socket's handshake named.
 /// Nothing was written, so under `auto` the request goes over HTTP.
 pub(super) const WEBSOCKET_MESSAGE_TOO_LARGE_DETAIL: &str = "websocket_message_too_large";
-/// Marks a 1009 (message too big) close that arrived before any text frame of
-/// the response: the peer refused the request frame for its size and answered
-/// nothing, so under `auto` the request goes over HTTP.
+/// Marks a close with code 1009 (message too big) that arrived before any text
+/// frame of the response. The proxy treats it as the Codex CLI does, as a
+/// request too large for the WebSocket, so under `auto` the request goes over
+/// HTTP.
 pub(super) const WEBSOCKET_CLOSED_MESSAGE_TOO_LARGE_DETAIL: &str =
     "websocket_closed_message_too_large";
 
@@ -478,8 +479,9 @@ fn log_advertised_message_limit(ctx: &RequestContext, entry: &PoolEntry) {
 }
 
 /// True for the two refusals of a request frame for its size: one kept off the
-/// socket by the advertised limit, and a 1009 close before any response text.
-/// The backend processed nothing in either case.
+/// socket by the advertised limit, and a close with code 1009 seen before any
+/// text frame of the response, which the Codex CLI also reads as a request too
+/// large for the WebSocket.
 pub(super) fn is_message_size_refusal(error: &CodexError) -> bool {
     error.origin == CodexErrorOrigin::WebSocket
         && matches!(
@@ -514,14 +516,6 @@ fn closed_message_too_large_error() -> CodexError {
     }
 }
 
-/// Puts back a socket the request never wrote to, as an unused pooled socket
-/// goes back, so the conversation's next request can use it.
-fn return_unused_entry(owner: Option<&ConversationIdentity>, entry: &Arc<PoolEntry>) {
-    if let Some(owner) = owner {
-        pool_insert_if_vacant_or_same(owner.clone(), entry.clone());
-    }
-}
-
 /// The numeric code of a close frame, 0 when the frame carries none.
 fn close_code(frame: Option<&CloseFrame<'_>>) -> u16 {
     frame.map_or(0, |frame| u16::from(frame.code))
@@ -536,8 +530,9 @@ fn closed_for_message_size(frame: Option<&CloseFrame<'_>>, text_received: bool) 
 
 /// Logs a close frame that ended a response: its numeric code and whether
 /// response text had arrived. The close reason is never logged.
-fn log_response_close(code: u16, text_received: bool) {
+fn log_response_close(req_id: &str, code: u16, text_received: bool) {
     let fields = serde_json::Map::from_iter([
+        ("reqId".to_string(), serde_json::json!(req_id)),
         ("closeCode".to_string(), serde_json::json!(code)),
         ("textStarted".to_string(), serde_json::json!(text_received)),
     ]);
@@ -1095,8 +1090,12 @@ pub(super) async fn codex_websocket_request(
     }
 
     if let Err(error) = entry.check_message_size(body_json.len()) {
+        // The socket goes as on a failed write; the conversation's next
+        // request opens a new one.
         drop(guard);
-        return_unused_entry(pool_owner, &entry);
+        if let Some(owner) = pool_owner {
+            pool_remove_entry(owner, &entry);
+        }
         return Err(error);
     }
 
@@ -1114,6 +1113,7 @@ pub(super) async fn codex_websocket_request(
         pool_owner,
         Some(&entry),
         traffic,
+        &ctx.req_id,
     )
     .await;
     drop(guard);
@@ -1311,6 +1311,7 @@ pub(super) fn start_codex_websocket_events(
     body_json: String,
     headers: &HeaderMap,
     reservation: Option<&ContinuationReservation>,
+    req_id: String,
 ) -> CodexWebSocketEventStream {
     if let Some(tc) = ready.traffic.as_deref() {
         write_websocket_metadata_capture(tc, &ready.ws_url, reservation, ready.used_pooled);
@@ -1339,8 +1340,11 @@ pub(super) fn start_codex_websocket_events(
         } = ready;
         let pool_owner = reservation_pool_owner(reservation.as_ref());
         if let Err(error) = entry.check_message_size(body_json.len()) {
+            // The socket goes as on a failed write.
             drop(guard);
-            return_unused_entry(pool_owner, &entry);
+            if let Some(owner) = pool_owner {
+                pool_remove_entry(owner, &entry);
+            }
             socket_id_publisher.publish(None);
             let _ = tx.send(Err(error)).await;
             return;
@@ -1355,7 +1359,7 @@ pub(super) fn start_codex_websocket_events(
             return;
         }
         let (reusable, terminal_item) =
-            stream_ws_events(&mut guard, idle_timeout_ms, traffic, &tx).await;
+            stream_ws_events(&mut guard, idle_timeout_ms, traffic, &tx, &req_id).await;
         drop(guard);
 
         let origin_reinserted = if reusable {
@@ -1422,6 +1426,7 @@ pub(super) async fn codex_websocket_event_stream(
         body_json,
         headers,
         reservation,
+        ctx.req_id.clone(),
     ))
 }
 
@@ -2464,6 +2469,7 @@ async fn collect_ws_events<S>(
     pool_owner: Option<&ConversationIdentity>,
     pool_entry: Option<&Arc<PoolEntry>>,
     traffic: Option<&TrafficCapture>,
+    req_id: &str,
 ) -> Result<(Vec<u8>, Option<WsEvent>), CodexError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2474,6 +2480,7 @@ where
         pool_owner,
         pool_entry,
         traffic,
+        req_id,
         WEBSOCKET_KEEPALIVE_INTERVAL,
     )
     .await
@@ -2485,6 +2492,7 @@ async fn collect_ws_events_with_keepalive_interval<S>(
     pool_owner: Option<&ConversationIdentity>,
     pool_entry: Option<&Arc<PoolEntry>>,
     traffic: Option<&TrafficCapture>,
+    req_id: &str,
     keepalive_interval: Duration,
 ) -> Result<(Vec<u8>, Option<WsEvent>), CodexError>
 where
@@ -2626,7 +2634,7 @@ where
             Some(Ok(Message::Close(frame))) => {
                 // Connection closed - invalidate pool
                 invalidate_pool_owner(pool_owner, pool_entry);
-                log_response_close(close_code(frame.as_ref()), text_received);
+                log_response_close(req_id, close_code(frame.as_ref()), text_received);
                 if closed_for_message_size(frame.as_ref(), text_received) {
                     return Err(closed_message_too_large_error());
                 }
@@ -2661,6 +2669,7 @@ async fn stream_ws_events<S>(
     idle_timeout_ms: u64,
     traffic: Option<Arc<TrafficCapture>>,
     tx: &mpsc::Sender<Result<serde_json::Value, CodexError>>,
+    req_id: &str,
 ) -> (bool, Option<Result<serde_json::Value, CodexError>>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2809,7 +2818,7 @@ where
             }
             Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
             Some(Ok(Message::Close(frame))) => {
-                log_response_close(close_code(frame.as_ref()), text_received);
+                log_response_close(req_id, close_code(frame.as_ref()), text_received);
                 terminal_item = Some(Err(
                     if closed_for_message_size(frame.as_ref(), text_received) {
                         closed_message_too_large_error()
@@ -3051,7 +3060,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_request_over_the_limit_leaves_the_pooled_socket_unused_in_the_pool() {
+    async fn a_request_over_the_limit_drops_the_pooled_socket() {
         let _registry_guard =
             super::super::continuation::lock_continuation_registry_for_async_tests().await;
         let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
@@ -3138,8 +3147,10 @@ mod tests {
             buffered.detail.as_deref(),
             Some(WEBSOCKET_MESSAGE_TOO_LARGE_DETAIL)
         );
-        assert_eq!(pooled_socket_id_for_tests(&owner), Some(entry.socket_id));
+        assert_eq!(pooled_socket_id_for_tests(&owner), None);
 
+        // The same socket pooled again for the live path.
+        pool_insert(owner.clone(), entry.clone());
         let ready = prepare_codex_websocket(
             &test_websocket_client(),
             &WebSocketProxyConfig::direct(),
@@ -3160,6 +3171,7 @@ mod tests {
             body_json,
             &HeaderMap::new(),
             Some(&continuation),
+            "test-request".to_string(),
         );
         let live = match tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await
@@ -3178,7 +3190,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(pooled_socket_id_for_tests(&owner), Some(entry.socket_id));
+        assert_eq!(pooled_socket_id_for_tests(&owner), None);
 
         // Both validation Pings were answered, so the peer has read past
         // anything written before them; no request frame reached it.
@@ -4421,6 +4433,7 @@ mod tests {
             serde_json::to_string(&body).unwrap(),
             &headers,
             Some(&continuation),
+            "test-request".to_string(),
         );
 
         request_seen_rx.await.unwrap();
@@ -5233,7 +5246,9 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let err = match collect_ws_events(&mut ws, 1_000, Some(&owner), None, None).await {
+        let err = match collect_ws_events(&mut ws, 1_000, Some(&owner), None, None, "test-request")
+            .await
+        {
             Ok(_) => panic!("expected binary frame to fail"),
             Err(err) => err,
         };
@@ -5274,10 +5289,11 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let err = match collect_ws_events(&mut ws, 50, Some(&owner), None, None).await {
-            Ok(_) => panic!("expected response start timeout"),
-            Err(err) => err,
-        };
+        let err =
+            match collect_ws_events(&mut ws, 50, Some(&owner), None, None, "test-request").await {
+                Ok(_) => panic!("expected response start timeout"),
+                Err(err) => err,
+            };
 
         assert_eq!(
             err.detail.as_deref(),
@@ -5319,10 +5335,11 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let err = match collect_ws_events(&mut ws, 50, Some(&owner), None, None).await {
-            Ok(_) => panic!("expected response idle timeout"),
-            Err(err) => err,
-        };
+        let err =
+            match collect_ws_events(&mut ws, 50, Some(&owner), None, None, "test-request").await {
+                Ok(_) => panic!("expected response idle timeout"),
+                Err(err) => err,
+            };
 
         assert!(err.message.contains("idle timeout"));
         assert_eq!(err.detail, None);
@@ -5368,6 +5385,7 @@ mod tests {
             None,
             None,
             None,
+            "test-request",
             WEBSOCKET_KEEPALIVE_INTERVAL,
         )
         .await
@@ -5407,6 +5425,7 @@ mod tests {
             None,
             None,
             None,
+            "test-request",
             Duration::from_millis(10),
         )
         .await
@@ -5534,7 +5553,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut events = start_codex_websocket_events(ready, &body, body_json, &headers, None);
+        let mut events = start_codex_websocket_events(
+            ready,
+            &body,
+            body_json,
+            &headers,
+            None,
+            "test-request".to_string(),
+        );
 
         let error = match tokio::time::timeout(Duration::from_secs(30), events.recv())
             .await
@@ -5584,6 +5610,7 @@ mod tests {
                 None,
                 None,
                 None,
+                "test-request",
                 WEBSOCKET_KEEPALIVE_INTERVAL,
             ),
         )
@@ -5624,7 +5651,7 @@ mod tests {
 
         let (reusable, terminal_item) = tokio::time::timeout(
             Duration::from_secs(600),
-            stream_ws_events(&mut client, 60_000, None, &tx),
+            stream_ws_events(&mut client, 60_000, None, &tx, "test-request"),
         )
         .await
         .expect("the Pong write must end within the read deadline");

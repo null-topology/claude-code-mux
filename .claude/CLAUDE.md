@@ -275,21 +275,29 @@ Request path:
      `PoolEntry` (`advertised_max_message_bytes`) and logged at info as
      `codex_websocket_message_limit` with `reqId` and `maxMessageBytes` for
      a new socket that carries one. A request frame longer than the limit
-     is never written (`PoolEntry::check_message_size`) and the socket goes
-     back to the pool unused. A close with code 1009 (message too big)
-     before any text frame of the response is the same refusal, and the
-     exception: under `auto` that request goes out again over HTTP, as the
-     peer refused it for its size without processing it. Both refusals
+     is never written (`PoolEntry::check_message_size`). A close with code
+     1009 (message too big) seen before any text frame of the response is
+     the same refusal, and the exception: under `auto` that request goes
+     out again over HTTP, as the Codex CLI treats that close. Both refusals
      carry status 413 and one of `WEBSOCKET_MESSAGE_TOO_LARGE_DETAIL` and
      `WEBSOCKET_CLOSED_MESSAGE_TOO_LARGE_DETAIL`
-     (`is_message_size_refusal`); neither is a continuation retry. Under
-     `auto` the request is sent over HTTP once with its full context, which
-     like any HTTP answer leaves no continuation state; under `websocket`
-     it is answered once with 413 `request_too_large`, never resent. A 1009
-     after response text and any other close keep their handling. A close
-     frame that ends a response logs `codex_websocket_closed` at info with
-     `closeCode` (0 without a frame) and `textStarted`, never the reason
-     text. WebSocket writes share the idle deadline
+     (`is_message_size_refusal`); neither is a continuation retry. Either
+     drops the socket like any failed attempt, so the conversation's next
+     request opens a new socket and sends its full context. Under `auto`
+     the request is sent over HTTP with its full context, which like any
+     HTTP answer leaves no continuation state, and every later attempt of
+     that client request (a 401 refresh) stays on HTTP
+     (`post_codex_with_transport`); the next client request starts on the
+     WebSocket again. Under `websocket` it is answered once with 413
+     `request_too_large`, never resent, and the message adds that the
+     `auto` transport sends such a request over HTTP; any other 413 of a
+     size refusal (buffered `auto` whose HTTP fallback is off behind a
+     WebSocket proxy) states only what happened
+     (`map_codex_transport_error_to_response` in `mod.rs`). A 1009 after
+     response text and any other close keep their handling. A close frame
+     that ends a response logs `codex_websocket_closed` at info with
+     `reqId`, `closeCode` (0 without a frame) and `textStarted`, never the
+     reason text. WebSocket writes share the idle deadline
      of their path: the request frame (`send_request_frame`) and Pong
      replies that of the response wait, and the validation Ping that of the
      pooled-socket validation. A timed-out request frame or Pong answers as
@@ -301,9 +309,10 @@ Request path:
      (`log_websocket_fallback_to_http`) with `reqId`, the handshake `status`
      (0 when none came), `class`, `usageLimit`, `retryAfter` and a `detail`
      holding the rejection text or connect error cut to 300 characters, or
-     for a size refusal (status 413) a fixed text naming only the frame
-     length and the limit or the 1009 close, never anything from the
-     request. Claude Code's compaction summary goes over
+     for a size refusal a fixed text naming only the frame length and the
+     limit or the 1009 close, never anything from the request. For a size
+     refusal `status` is the proxy's own 413, not a status the backend
+     sent. Claude Code's compaction summary goes over
      HTTP whatever the setting (`transport_for_request` in `mod.rs`), and so
      does the opt-in server compaction call (`request_compaction` in
      `compaction.rs`).
@@ -1111,9 +1120,9 @@ the proxy's own state (a forgotten `previous_response_id`, a 401 token refresh).
 The `auto` fallback to HTTP is not a resend: it happens only when the
 handshake failed, before the request went out, or when the request was
 refused for its size. A frame over the limit the handshake advertised is
-never written; a WebSocket closed with 1009 before any response text is the
-one case where a request already on the socket goes out again over HTTP,
-since the peer refused it for its size without processing it. With
+never written; a WebSocket seen closing with code 1009 before any text frame
+of the response is the one case where a request already on the socket goes
+out again over HTTP, as the Codex CLI treats that close. With
 `websocket` transport either refusal is one 413 answer, and a 429 on the
 WebSocket handshake reaches the client as a plain 429 unless its body names
 one of the codes above; under `auto` it falls back to HTTP.

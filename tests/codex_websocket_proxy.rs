@@ -588,6 +588,8 @@ enum WebSocketReply {
     Complete,
     /// A close frame with this code before any response event.
     CloseBeforeText(u16),
+    /// A close with no close frame, so no code, before any response event.
+    CloseWithoutFrame,
     /// The first response event, then a close frame with this code.
     CloseAfterText(u16),
 }
@@ -671,6 +673,7 @@ async fn spawn_size_limited_origin(
                             .map(|event| Message::Text(event.to_string()))
                             .collect(),
                         WebSocketReply::CloseBeforeText(code) => vec![close(code)],
+                        WebSocketReply::CloseWithoutFrame => vec![Message::Close(None)],
                         WebSocketReply::CloseAfterText(code) => {
                             vec![Message::Text(events[0].to_string()), close(code)]
                         }
@@ -1327,7 +1330,7 @@ async fn codex_default_transport_sends_a_request_over_the_advertised_limit_over_
                     json!([{"role": "user", "content": big}]),
                     "transport fallback ok",
                 ),
-                // On the socket the first request never wrote to.
+                // Under the limit, answered over the WebSocket.
                 (
                     json!([{"role": "user", "content": "one"}]),
                     "websocket reply 1",
@@ -1370,9 +1373,9 @@ async fn codex_default_transport_sends_a_request_over_the_advertised_limit_over_
 
         // The WebSocket received no oversized frame. Without continuations no
         // socket is pooled, so each request opens one. With them, the third
-        // request takes the second one's pooled socket and leaves it unused,
-        // and the first and the last, having nothing to continue, start on a
-        // new socket as before.
+        // request takes the second one's pooled socket, which is dropped once
+        // its frame is refused, and the other three, having nothing to
+        // continue, each start on a new socket.
         assert_eq!(
             transports(&origin.seen),
             ["http", "websocket", "http", "websocket"],
@@ -1595,6 +1598,7 @@ async fn codex_default_transport_keeps_its_handling_of_other_closes() {
         (WebSocketReply::CloseAfterText(1009), 1009, true),
         (WebSocketReply::CloseBeforeText(1000), 1000, false),
         (WebSocketReply::CloseBeforeText(1011), 1011, false),
+        (WebSocketReply::CloseWithoutFrame, 0, false),
     ] {
         for stream in [false, true] {
             let label = format!("{reply:?}, stream {stream}");
@@ -1602,7 +1606,7 @@ async fn codex_default_transport_keeps_its_handling_of_other_closes() {
             clear_all_continuations_for_tests();
             let origin = spawn_size_limited_origin(None, vec![reply]).await;
             let state_dir = TempDir::new().unwrap();
-            let (status, body, fallbacks, closes) = {
+            let (status, body, fallbacks, closes, started) = {
                 let mut guards = clear_proxy_environment();
                 guards.extend(configure_codex(config_dir.path(), &origin.url));
                 guards.push(EnvGuard::unset("CCP_CODEX_TRANSPORT"));
@@ -1618,6 +1622,7 @@ async fn codex_default_transport_keeps_its_handling_of_other_closes() {
                     body,
                     fallback_log_lines(),
                     log_lines_named("codex_websocket_closed"),
+                    log_lines_named("codex_upstream_request_started"),
                 )
             };
             // Sent once, not over HTTP, and answered as a response that never
@@ -1631,6 +1636,13 @@ async fn codex_default_transport_keeps_its_handling_of_other_closes() {
             assert!(!closes.is_empty(), "{label}");
             assert_eq!(closes[0]["fields"]["closeCode"], code, "{label}");
             assert_eq!(closes[0]["fields"]["textStarted"], text_started, "{label}");
+            // The close names the request it ended.
+            assert_eq!(started.len(), 1, "{label}");
+            assert!(started[0]["fields"]["reqId"].is_string(), "{label}");
+            assert_eq!(
+                closes[0]["fields"]["reqId"], started[0]["fields"]["reqId"],
+                "{label}"
+            );
             for line in &closes {
                 assert!(!line.to_string().contains(CLOSE_REASON), "{label}");
             }
