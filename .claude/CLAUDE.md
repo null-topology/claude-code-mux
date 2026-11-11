@@ -320,7 +320,27 @@ Request path:
      for a size refusal a fixed text naming only the frame length and the
      limit or the 1009 close, never anything from the request. For a size
      refusal `status` is the proxy's own 413, not a status the backend
-     sent. Claude Code's compaction summary goes over
+     sent. A connect that got no answer (the connect timeout, a refused or
+     failed connection, a failed TLS handshake:
+     `ConnectAttemptError::Unreachable`) made for a request that falls back
+     to HTTP pauses new connections to its target (scheme, host and port,
+     `connect_pause_key`) for `WEBSOCKET_CONNECT_PAUSE` (5 min) in the
+     process-wide `WS_CONNECT_PAUSES`, and logs one
+     `codex_websocket_connect_paused` warning with `reqId`, `seconds` and
+     the connect error as `detail`. While it runs, such a request that would
+     open a new connection there, a reconnect after a pooled socket failed
+     validation included, makes no connect attempt and fails as a handshake
+     with status 0 and `WEBSOCKET_CONNECT_PAUSED_DETAIL`, which the usual
+     fallback sends to HTTP at once (`connect_with_timeout`,
+     `OnConnectFailure::FallBackToHttp`); a usable pooled socket still
+     serves its conversation. Those requests are the live `auto` path and
+     the buffered one whose HTTP fallback is on; `websocket` transport and a
+     buffered `auto` with the fallback off connect every time and start no
+     pause. A rejected upgrade with a status, a 407, a refused proxy tunnel,
+     a write timeout and a size refusal start none either. Once the pause
+     ends the next request tries again. The Codex CLI instead keeps its
+     fallback for the rest of the session (`codex-rs/core/src/client.rs` at
+     `4460449921`). Claude Code's compaction summary goes over
      HTTP whatever the setting (`transport_for_request` in `mod.rs`), and so
      does the opt-in server compaction call (`request_compaction` in
      `compaction.rs`).
@@ -1132,7 +1152,10 @@ written to the socket goes out over HTTP in two cases only: a WebSocket seen
 closing with code 1009 before any text frame of the response, as the Codex CLI
 treats that close, and a resend the proxy makes anyway, such as the
 full-context one that repairs a continuation, when its frame is over the limit
-of the socket it would go to. With
+of the socket it would go to. After a connect that got no answer, `auto`
+requests to that target skip the connect and go to HTTP at once for five
+minutes (the connect pause in the transport paragraph); `websocket` transport
+still connects every time. With
 `websocket` transport either refusal is one 413 answer, and a 429 on the
 WebSocket handshake reaches the client as a plain 429 unless its body names
 one of the codes above; under `auto` it falls back to HTTP.

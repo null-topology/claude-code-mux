@@ -1391,7 +1391,7 @@ impl CodexHttpClient {
         CodexError,
     > {
         let mut websocket = self
-            .stream_codex_websocket_events_for_owner(body, ctx, continuation)
+            .stream_live_websocket_events(body, ctx, continuation, true)
             .await?;
         match websocket.recv().await {
             Some(Err(err)) if should_fallback_to_http(&err) => {
@@ -1755,6 +1755,7 @@ impl CodexHttpClient {
                         super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                         super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
                         active_continuation.as_ref(),
+                        super::websocket::OnConnectFailure::Fail,
                     )
                     .await
                 }
@@ -1775,6 +1776,13 @@ impl CodexHttpClient {
                     super::turn_state::apply_to_websocket_request(&ctx.req_id, &mut ws_body);
 
                     // Try WebSocket first
+                    let on_connect_failure = if self.auto_http_fallback_enabled {
+                        super::websocket::OnConnectFailure::FallBackToHttp {
+                            req_id: &ctx.req_id,
+                        }
+                    } else {
+                        super::websocket::OnConnectFailure::Fail
+                    };
                     let ws_result = super::websocket::codex_websocket_request(
                         &self.websocket_client,
                         &self.websocket_proxy_config,
@@ -1786,6 +1794,7 @@ impl CodexHttpClient {
                         super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                         super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
                         active_continuation.as_ref(),
+                        on_connect_failure,
                     )
                     .await;
 
@@ -1974,6 +1983,19 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+        self.stream_live_websocket_events(body, ctx, continuation, false)
+            .await
+    }
+
+    /// `http_fallback` says the caller answers a failed connect over HTTP, so
+    /// the connect pause applies (`OnConnectFailure::FallBackToHttp`).
+    async fn stream_live_websocket_events(
+        self: &Arc<Self>,
+        body: &ResponsesRequest,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+        http_fallback: bool,
+    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
         let auth = self
             .auth_manager
             .get_auth()
@@ -2005,6 +2027,7 @@ impl CodexHttpClient {
                     auth,
                     tx,
                     socket_id_publisher,
+                    http_fallback,
                 )
                 .await;
         });
@@ -2021,7 +2044,15 @@ impl CodexHttpClient {
         mut auth: StoredAuth,
         tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
         socket_id_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
+        http_fallback: bool,
     ) {
+        let on_connect_failure = if http_fallback {
+            super::websocket::OnConnectFailure::FallBackToHttp {
+                req_id: &ctx.req_id,
+            }
+        } else {
+            super::websocket::OnConnectFailure::Fail
+        };
         let mut auth_refresh_attempted = false;
         let mut continuation_retry_available = continuation
             .as_ref()
@@ -2067,6 +2098,7 @@ impl CodexHttpClient {
                 super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                 super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
                 continuation.as_ref(),
+                on_connect_failure,
             );
             let mut stream = tokio::select! {
                 biased;
@@ -3152,12 +3184,7 @@ const FALLBACK_LOG_DETAIL_CHARS: usize = 300;
 /// length and the limit, or the 1009 close. It carries nothing from the
 /// request.
 fn log_websocket_fallback_to_http(ctx: &RequestContext, err: &CodexError) {
-    let detail = if super::websocket::is_message_size_refusal(err) {
-        err.message.as_str()
-    } else {
-        err.detail.as_deref().unwrap_or(&err.message)
-    };
-    let detail: String = detail.chars().take(FALLBACK_LOG_DETAIL_CHARS).collect();
+    let detail = websocket_fallback_log_detail(err);
     let mut fields = serde_json::Map::from_iter([
         ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
         ("status".to_string(), serde_json::json!(err.status)),
@@ -3175,6 +3202,17 @@ fn log_websocket_fallback_to_http(ctx: &RequestContext, err: &CodexError) {
         fields.insert("retryAfter".to_string(), serde_json::json!(retry_after));
     }
     create_logger("codex").warn("codex_websocket_fallback_to_http", Some(fields));
+}
+
+/// The `detail` of a WebSocket failure's log line: the rejection text or
+/// connect error, or the size refusal's fixed text, cut short.
+pub(super) fn websocket_fallback_log_detail(err: &CodexError) -> String {
+    let detail = if super::websocket::is_message_size_refusal(err) {
+        err.message.as_str()
+    } else {
+        err.detail.as_deref().unwrap_or(&err.message)
+    };
+    detail.chars().take(FALLBACK_LOG_DETAIL_CHARS).collect()
 }
 
 fn should_retry_without_continuation(
@@ -6762,6 +6800,217 @@ mod tests {
         assert_eq!(upgrades.load(Ordering::SeqCst), 1);
         assert_eq!(frames.load(Ordering::SeqCst), 1);
         assert_eq!(posts.load(Ordering::SeqCst), 2);
+    }
+
+    /// An origin that refuses every WebSocket upgrade with a 503 and
+    /// completes every HTTP request, counting both.
+    fn spawn_upgrade_refusing_origin(
+        listener: TcpListener,
+        upgrades: Arc<std::sync::atomic::AtomicUsize>,
+        posts: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> tokio::task::JoinHandle<()> {
+        use std::sync::atomic::Ordering;
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut first = [0_u8; 1];
+                if stream.peek(&mut first).await.unwrap_or(0) == 0 {
+                    continue;
+                }
+                let _request = read_http_request(&mut stream).await;
+                let response = if first[0] == b'G' {
+                    upgrades.fetch_add(1, Ordering::SeqCst);
+                    "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    posts.fetch_add(1, Ordering::SeqCst);
+                    let body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http\"}}\n\n";
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        })
+    }
+
+    /// A loopback address nothing listens on yet.
+    async fn released_loopback_addr() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_connect_sends_the_next_buffered_auto_requests_straight_to_http() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        let addr = released_loopback_addr().await;
+        let url = format!("http://{addr}/responses");
+        let client = Arc::new(authenticated_http_test_client(url.clone()));
+        let (body, context) = (buffered_test_request(), http_test_context());
+        let send = || {
+            let request = client.post_codex_with_transport(
+                &body,
+                &context,
+                None,
+                crate::config::CodexTransport::Auto,
+            );
+            async move {
+                tokio::time::timeout(MOCK_DEADLINE, request)
+                    .await
+                    .expect("the request did not finish")
+            }
+        };
+
+        // Nothing listens: the connect is refused, and so is the HTTP request.
+        assert!(send().await.is_err());
+
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let upgrades = Arc::new(AtomicUsize::new(0));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let server = spawn_upgrade_refusing_origin(listener, upgrades.clone(), posts.clone());
+
+        // The target is paused: HTTP at once, no upgrade.
+        let response = send().await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.transport, ActualTransport::Http);
+        assert_eq!(upgrades.load(Ordering::SeqCst), 0);
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+
+        // Once the pause ended the next request tries the WebSocket again. A
+        // refused upgrade falls back as before and starts no pause.
+        super::super::websocket::expire_codex_websocket_connect_pause_for_tests(&url);
+        for attempt in 1..=2 {
+            let response = send().await.unwrap();
+            assert_eq!(response.transport, ActualTransport::Http);
+            assert_eq!(upgrades.load(Ordering::SeqCst), attempt);
+            assert_eq!(posts.load(Ordering::SeqCst), attempt + 1);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_connect_sends_the_next_live_auto_requests_straight_to_http() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        let addr = released_loopback_addr().await;
+        let url = format!("http://{addr}/responses");
+        let client = Arc::new(authenticated_http_test_client(url.clone()));
+        let (body, context) = (buffered_test_request(), http_test_context());
+        let send = || {
+            let request = client.stream_codex_auto_events_for_owner(&body, &context, None);
+            async move {
+                let started = tokio::time::timeout(MOCK_DEADLINE, request)
+                    .await
+                    .expect("the request did not start");
+                let (mut events, _) = started?;
+                match tokio::time::timeout(MOCK_DEADLINE, events.recv())
+                    .await
+                    .expect("no event arrived")
+                {
+                    Some(Ok(_)) => Ok(()),
+                    Some(Err(error)) => Err(error),
+                    None => panic!("the stream ended without an event"),
+                }
+            }
+        };
+
+        // Nothing listens: the connect is refused, and so is the HTTP request.
+        assert!(send().await.is_err());
+
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let upgrades = Arc::new(AtomicUsize::new(0));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let server = spawn_upgrade_refusing_origin(listener, upgrades.clone(), posts.clone());
+
+        // The target is paused: HTTP at once, no upgrade.
+        send().await.unwrap();
+        assert_eq!(upgrades.load(Ordering::SeqCst), 0);
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+
+        super::super::websocket::expire_codex_websocket_connect_pause_for_tests(&url);
+        for attempt in 1..=2 {
+            send().await.unwrap();
+            assert_eq!(upgrades.load(Ordering::SeqCst), attempt);
+            assert_eq!(posts.load(Ordering::SeqCst), attempt + 1);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_paused_target_is_still_tried_where_nothing_falls_back_to_http() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/responses", listener.local_addr().unwrap());
+        let upgrades = Arc::new(AtomicUsize::new(0));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let server = spawn_upgrade_refusing_origin(listener, upgrades.clone(), posts.clone());
+        super::super::websocket::pause_codex_websocket_connects_for_tests(&url);
+        let client = Arc::new(authenticated_http_test_client(url.clone()));
+        let mut without_fallback = authenticated_http_test_client(url.clone());
+        without_fallback.auto_http_fallback_enabled = false;
+        let (body, context) = (buffered_test_request(), http_test_context());
+
+        // The `websocket` transport, buffered and live.
+        let buffered = tokio::time::timeout(
+            MOCK_DEADLINE,
+            client.post_codex_with_transport(
+                &body,
+                &context,
+                None,
+                crate::config::CodexTransport::WebSocket,
+            ),
+        )
+        .await
+        .expect("the request did not finish");
+        assert_eq!(buffered.err().map(|error| error.status), Some(503));
+        assert_eq!(upgrades.load(Ordering::SeqCst), 1);
+
+        let live = tokio::time::timeout(MOCK_DEADLINE, async {
+            let mut events = client
+                .stream_codex_websocket_events_for_owner(&body, &context, None)
+                .await?;
+            match events.recv().await {
+                Some(Err(error)) => Err(error),
+                _ => panic!("a refused upgrade must end the stream with an error"),
+            }
+        })
+        .await
+        .expect("the request did not finish");
+        assert_eq!(live.map_err(|error| error.status), Err::<(), _>(503));
+        assert_eq!(upgrades.load(Ordering::SeqCst), 2);
+
+        // `auto` on a client whose HTTP fallback is off.
+        let buffered = tokio::time::timeout(
+            MOCK_DEADLINE,
+            without_fallback.post_codex_with_transport(
+                &body,
+                &context,
+                None,
+                crate::config::CodexTransport::Auto,
+            ),
+        )
+        .await
+        .expect("the request did not finish");
+        assert_eq!(buffered.err().map(|error| error.status), Some(503));
+        assert_eq!(upgrades.load(Ordering::SeqCst), 3);
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+
+        super::super::websocket::expire_codex_websocket_connect_pause_for_tests(&url);
+        server.abort();
     }
 
     /// An error answer whose body never ends, `piece` bytes per chunk,
