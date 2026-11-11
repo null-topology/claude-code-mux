@@ -35,7 +35,7 @@ pub struct GrokAuthManager<S: AuthStorage<StoredAuth>> {
 
 impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
     pub fn new(store: GrokTokenStore<S>) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
@@ -177,7 +177,10 @@ mod tests {
     }
 
     fn test_client() -> reqwest::Client {
-        reqwest::Client::builder().no_proxy().build().unwrap()
+        crate::http_client::client_builder()
+            .no_proxy()
+            .build()
+            .unwrap()
     }
 
     #[tokio::test]

@@ -307,7 +307,10 @@ mod tests {
     const SECRET_TARGET: &str = "/toy-secret-path?token=toy-secret-query";
 
     fn loopback_client() -> reqwest::Client {
-        reqwest::Client::builder().no_proxy().build().unwrap()
+        crate::http_client::client_builder()
+            .no_proxy()
+            .build()
+            .unwrap()
     }
 
     fn assert_no_url(text: &str) {
@@ -370,7 +373,7 @@ mod tests {
 
     #[test]
     fn a_blocking_send_error_carries_the_url_that_url_free_error_drops() {
-        let error = reqwest::blocking::Client::builder()
+        let error = crate::http_client::blocking_client_builder()
             .no_proxy()
             .build()
             .unwrap()
@@ -473,7 +476,7 @@ mod tests {
         target: &str,
         limit: usize,
     ) -> Result<Vec<u8>, BodyReadError> {
-        let response = reqwest::blocking::Client::builder()
+        let response = crate::http_client::blocking_client_builder()
             .no_proxy()
             .timeout(Duration::from_secs(5))
             .build()
@@ -512,7 +515,7 @@ mod tests {
             }
         });
         let deadline = Duration::from_secs(1);
-        let response = reqwest::blocking::Client::builder()
+        let response = crate::http_client::blocking_client_builder()
             .no_proxy()
             .timeout(Duration::from_secs(30))
             .build()

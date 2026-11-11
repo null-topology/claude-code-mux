@@ -196,7 +196,7 @@ impl<S: AuthStorage<StoredAuth> + 'static> CodexAuthManager<S> {
             #[cfg(test)]
             forced_refreshes: std::sync::atomic::AtomicUsize::new(0),
             refresh_lock: CODEX_REFRESH_LOCK.clone(),
-            refresh_client: reqwest::Client::builder()
+            refresh_client: crate::http_client::client_builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(30))
                 .build()

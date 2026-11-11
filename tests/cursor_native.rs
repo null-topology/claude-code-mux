@@ -1031,7 +1031,9 @@ async fn cursor_proxy_http_path_reaches_mock_cursor_upstream() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let client = reqwest::Client::new();
+    let client = claude_code_mux::http_client::client_builder()
+        .build()
+        .unwrap();
     let resp = client
         .post(format!("http://{proxy_addr}/v1/messages"))
         .header("authorization", "Bearer ignored")

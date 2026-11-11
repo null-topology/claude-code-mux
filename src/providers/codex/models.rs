@@ -807,7 +807,7 @@ mod tests {
                 account_id: Some("acct".to_string()),
             });
             let error = fetch_models(
-                &reqwest::Client::new(),
+                &crate::http_client::client_builder().build().unwrap(),
                 &manager,
                 "http://127.0.0.1:1/responses",
                 None,
@@ -840,7 +840,10 @@ mod tests {
         });
         // Nothing listens on port 1.
         let error = fetch_models(
-            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &crate::http_client::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
             &manager,
             "http://127.0.0.1:1/toy-secret-path/responses",
             None,
@@ -969,7 +972,10 @@ mod tests {
                 expires: u64::MAX,
                 account_id: Some("acct".to_string()),
             });
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let client = crate::http_client::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap();
             let base_url = format!("{backend}/responses");
             let listing = fetch_models_capped(&client, &manager, &base_url, None, limit);
             let result = tokio::time::timeout(MOCK_DEADLINE, listing)
@@ -1016,7 +1022,10 @@ mod tests {
                 expires: u64::MAX,
                 account_id: Some("acct".to_string()),
             });
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let client = crate::http_client::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap();
             let base_url = format!("{backend}/responses");
             let listing = fetch_models(&client, &manager, &base_url, None);
             let error = tokio::time::timeout(MOCK_DEADLINE, listing)

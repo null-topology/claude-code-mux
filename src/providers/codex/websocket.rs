@@ -3342,7 +3342,7 @@ mod tests {
     }
 
     fn test_websocket_client() -> reqwest::Client {
-        reqwest::Client::builder()
+        crate::http_client::client_builder()
             .http1_only()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -5529,7 +5529,7 @@ mod tests {
                 .unwrap();
         });
 
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::client_builder()
             .http1_only()
             .redirect(reqwest::redirect::Policy::none())
             .proxy(
@@ -5698,7 +5698,7 @@ mod tests {
         });
 
         let proxy_url = format!("http://secret-user:secret-pass@{proxy_addr}");
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::client_builder()
             .http1_only()
             .redirect(reqwest::redirect::Policy::none())
             .proxy(reqwest::Proxy::https(&proxy_url).unwrap())

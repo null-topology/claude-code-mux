@@ -8,6 +8,10 @@
   in configuration or behaviour.
 - The monitor's terminal libraries are updated to ratatui 0.30 and
   crossterm 0.29. The monitor works as before and no setting changes.
+- The HTTP client library is updated to reqwest 0.13. TLS still uses the
+  ring crypto provider and the Mozilla root certificates bundled with the
+  proxy, never the operating system's store, and nothing changes in
+  configuration.
 
 ## v0.18.1 (2026-11-12)
 

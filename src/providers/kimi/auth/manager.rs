@@ -88,7 +88,7 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
         }
 
         let headers = common_headers()?;
-        let client = reqwest::blocking::Client::builder()
+        let client = crate::http_client::blocking_client_builder()
             .timeout(HTTP_TIMEOUT)
             .build()?;
         self.refresh_at(&client, &oauth_host(), &headers, current)
@@ -266,7 +266,7 @@ mod tests {
     }
 
     fn refresh_from(host: &str) -> Result<StoredAuth, anyhow::Error> {
-        let client = reqwest::blocking::Client::builder()
+        let client = crate::http_client::blocking_client_builder()
             .no_proxy()
             .build()
             .unwrap();

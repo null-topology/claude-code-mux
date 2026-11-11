@@ -44,7 +44,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn run_device_login() -> Result<TokenResponse, anyhow::Error> {
     let headers = common_headers()?;
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::http_client::blocking_client_builder()
         .timeout(HTTP_TIMEOUT)
         .build()?;
     device_login_at(&client, &oauth_host(), &headers)
@@ -177,7 +177,7 @@ mod tests {
     const TOKEN: &str = r#"{"access_token":"toy-access"}"#;
 
     fn login(host: &str) -> anyhow::Result<TokenResponse> {
-        let client = reqwest::blocking::Client::builder()
+        let client = crate::http_client::blocking_client_builder()
             .no_proxy()
             .build()
             .unwrap();

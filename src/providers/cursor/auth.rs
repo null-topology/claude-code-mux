@@ -231,7 +231,7 @@ fn wait_for_cursor_login_at(
     max_attempts: usize,
     mut on_progress: impl FnMut(usize),
 ) -> anyhow::Result<Option<RefreshResponse>> {
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::http_client::blocking_client_builder()
         .timeout(HTTP_TIMEOUT)
         .build()?;
     let base = base_url.trim_end_matches('/').to_string();
@@ -288,7 +288,7 @@ fn refresh_cursor_auth_at(
     base_url: &str,
     refresh_token: &str,
 ) -> anyhow::Result<Option<RefreshResponse>> {
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::http_client::blocking_client_builder()
         .timeout(HTTP_TIMEOUT)
         .build()?;
     let url = format!("{}/auth/refresh", base_url.trim_end_matches('/'));

@@ -1345,7 +1345,10 @@ async fn serve_lists_models_at_start_so_the_first_request_needs_no_refresh() {
         .unwrap();
     let _child = ChildGuard(child);
 
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let client = claude_code_mux::http_client::client_builder()
+        .no_proxy()
+        .build()
+        .unwrap();
     let base = format!("http://127.0.0.1:{port}");
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while !client

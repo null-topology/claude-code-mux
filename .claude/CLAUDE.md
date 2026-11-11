@@ -1763,7 +1763,11 @@ capture may still contain a title as part of a recorded title reply.
 ## Style
 
 Match the surrounding code. `reqwest` is built without gzip or brotli so bodies
-are never auto-decompressed, and with rustls so no OS keychain is touched. Keep
+are never auto-decompressed, and with rustls so no OS keychain is touched.
+Every client starts from `http_client::client_builder` or
+`blocking_client_builder`, which install ring and trust only the bundled
+Mozilla roots; a bare `Client::builder()` would fall back to the platform
+verifier. Keep
 new code in the same shape as the module it lives in. Stay close to upstream
 and avoid style-only divergence so ports in either direction stay cheap.
 

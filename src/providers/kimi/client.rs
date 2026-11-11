@@ -38,7 +38,7 @@ impl Default for KimiHttpClient {
 impl KimiHttpClient {
     pub fn new() -> Self {
         Self {
-            client: reqwest::blocking::Client::builder()
+            client: crate::http_client::blocking_client_builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("failed to create HTTP client"),
@@ -272,7 +272,7 @@ mod tests {
     }
 
     fn read_served(status: u16, size: usize) -> Result<KimiResponse, KimiError> {
-        let resp = reqwest::blocking::Client::builder()
+        let resp = crate::http_client::blocking_client_builder()
             .no_proxy()
             .build()
             .unwrap()
@@ -313,7 +313,7 @@ mod tests {
     fn an_undeclared_response_over_the_limit_is_an_upstream_error() {
         use crate::upstream_http::test_support::serve_in_order_undeclared;
         let url = serve_in_order_undeclared(vec![(200, vec![b'a'; 32]), (200, vec![b'a'; 33])]);
-        let client = reqwest::blocking::Client::builder()
+        let client = crate::http_client::blocking_client_builder()
             .no_proxy()
             .build()
             .unwrap();

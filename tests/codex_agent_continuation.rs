@@ -696,7 +696,7 @@ impl TestHarness {
         let server_task = tokio::spawn(server::serve_listener(listener, None, async move {
             let _ = shutdown.await;
         }));
-        let client = reqwest::Client::builder()
+        let client = claude_code_mux::http_client::client_builder()
             .http1_only()
             .no_proxy()
             .build()
