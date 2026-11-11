@@ -53,6 +53,8 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
     "gpt-6-astra",
     "gpt-6-luna",
     "gpt-6-sol",
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
 ];
 
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
@@ -820,6 +822,28 @@ mod tests {
         let registry = Registry::new(AliasProvider::Anthropic);
         let p = registry.provider_for_model("gpt-5.6-terra", None);
         assert_eq!(p.expect("provider").name(), "codex");
+    }
+
+    /// The 6.1 ids route on the compiled-in list, base id and `-fast` alike,
+    /// before Codex has listed anything.
+    #[test]
+    fn gpt_6_1_ids_route_to_codex_before_a_listing() {
+        let listed = LISTED_MODELS
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .providers
+            .contains_key("codex");
+        assert!(!listed, "no Codex listing is recorded in this test binary");
+        let registry = Registry::new(AliasProvider::Anthropic);
+        for model in [
+            "gpt-6.1-sol",
+            "gpt-6.1-sol-fast",
+            "gpt-6.1-terra",
+            "gpt-6.1-terra-fast",
+        ] {
+            let p = registry.provider_for_model(model, None);
+            assert_eq!(p.expect(model).name(), "codex", "{model}");
+        }
     }
 
     #[test]

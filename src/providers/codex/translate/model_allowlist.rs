@@ -17,6 +17,8 @@ pub const ALLOWED_MODELS: &[&str] = &[
     "gpt-6-astra",
     "gpt-6-luna",
     "gpt-6-sol",
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
 ];
 
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
@@ -184,6 +186,8 @@ fn uses_responses_lite_with_full_lane(
             | "gpt-6-astra"
             | "gpt-6-luna"
             | "gpt-6-sol"
+            | "gpt-6.1-sol"
+            | "gpt-6.1-terra"
     )
 }
 
@@ -281,6 +285,26 @@ mod tests {
         assert!(assert_allowed_model("gpt-6-astra").is_ok());
         assert!(assert_allowed_model("gpt-6-luna").is_ok());
         assert!(assert_allowed_model("gpt-6-sol").is_ok());
+        assert!(assert_allowed_model("gpt-6.1-sol").is_ok());
+        assert!(assert_allowed_model("gpt-6.1-terra").is_ok());
+    }
+
+    /// Before any listing, `-fast` on a 6.1 id resolves as it does on
+    /// `gpt-6-sol`: the base id at the priority tier.
+    #[test]
+    fn gpt_6_1_fast_suffix_resolves_like_gpt_6_sol() {
+        for model in ["gpt-6-sol", "gpt-6.1-sol", "gpt-6.1-terra"] {
+            let fast = format!("{model}-fast");
+            assert!(is_valid_model_for_codex(&fast), "{fast}");
+            let r = resolve_model_request_with_config_override(&fast, false);
+            assert_eq!(r.model, model);
+            assert_eq!(r.service_tier, Some(ServiceTier::Priority), "{fast}");
+        }
+    }
+
+    #[test]
+    fn allowed_models_match_the_registry_list() {
+        assert_eq!(ALLOWED_MODELS, crate::registry::CODEX_MODELS);
     }
 
     #[test]
@@ -312,6 +336,8 @@ mod tests {
             "gpt-6-astra",
             "gpt-6-luna",
             "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
         ] {
             assert!(uses_responses_lite_with_full_lane(model, None, false));
         }
@@ -329,6 +355,8 @@ mod tests {
             "gpt-6-astra",
             "gpt-6-luna",
             "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
         ] {
             assert!(!uses_responses_lite_with_full_lane(model, None, true));
             assert!(!uses_responses_lite_with_full_lane(model, Some(true), true));
