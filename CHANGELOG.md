@@ -6,6 +6,8 @@
   levels), and h2 0.4.20, which fixes RUSTSEC-2026-0258 (unbounded empty
   DATA frames). TLS still uses the ring crypto provider, and nothing changes
   in configuration or behaviour.
+- The monitor's terminal libraries are updated to ratatui 0.30 and
+  crossterm 0.29. The monitor works as before and no setting changes.
 
 ## v0.18.1 (2026-11-12)
 
