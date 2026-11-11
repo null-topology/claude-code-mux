@@ -538,10 +538,21 @@ async fn spawn_websocket_usage_limit_upstream(attempts: Arc<AtomicUsize>) -> Str
 /// Answers every connection with one failure event and counts the attempts,
 /// so a test can see that the proxy did not try again.
 async fn spawn_websocket_failure_upstream(event: Value, attempts: Arc<AtomicUsize>) -> String {
+    spawn_counting_websocket_failure_upstream(event, attempts, Arc::new(AtomicUsize::new(0))).await
+}
+
+/// Same, also counting every connection accepted, so a test can see that no
+/// plain HTTP request followed the WebSocket one.
+async fn spawn_counting_websocket_failure_upstream(
+    event: Value,
+    attempts: Arc<AtomicUsize>,
+    connections: Arc<AtomicUsize>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
+            connections.fetch_add(1, Ordering::SeqCst);
             if let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await {
                 let _ = websocket.next().await;
                 attempts.fetch_add(1, Ordering::SeqCst);
@@ -682,6 +693,12 @@ const WEBSOCKET_FAILED_AFTER_TEXT: &[&str] = &[
     r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#,
     r#"{"type":"response.output_text.delta","output_index":0,"delta":"partial answer"}"#,
     r#"{"type":"response.failed","response":{"id":"resp_failed","status":"failed","error":{"message":"generation failed midway"}}}"#,
+];
+
+const WEBSOCKET_DENIED_AFTER_TEXT: &[&str] = &[
+    r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_up"}}"#,
+    r#"{"type":"response.output_text.delta","output_index":0,"delta":"partial answer"}"#,
+    r#"{"type":"error","error":{"code":"inference_hook_denied"}}"#,
 ];
 
 const WEBSOCKET_RESET_AFTER_CLOSED_TOOL_CALL: &[&str] = &[
@@ -3886,6 +3903,93 @@ async fn smoke_codex_websocket_rejected_prompt_is_a_client_error() {
     let body: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["error"]["type"], "invalid_request_error");
     assert_eq!(body["error"]["message"], "Invalid prompt: toy refusal.");
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_terminal_code_before_output_is_answered_once() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let connections = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_counting_websocket_failure_upstream(
+        json!({"type": "error", "error": {"code": "inference_hook_denied"}}),
+        attempts.clone(),
+        connections.clone(),
+    )
+    .await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "permission_error");
+    assert_eq!(
+        body["error"]["message"],
+        "Your workspace inference hook blocked this request."
+    );
+    // One request over the WebSocket, and no HTTP request after it.
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_terminal_code_after_output_ends_the_stream() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream =
+        spawn_websocket_reset_upstream(attempts.clone(), WEBSOCKET_DENIED_AFTER_TEXT).await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = drain_stream(response).await;
+    assert!(text.contains("partial answer"), "stream body: {text}");
+    let error = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+        .find(|event| event["type"] == "error")
+        .unwrap_or_else(|| panic!("no error event in stream body: {text}"));
+    assert_eq!(error["error"]["type"], "permission_error");
+    assert_eq!(
+        error["error"]["message"],
+        "Your workspace inference hook blocked this request."
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
     clear_codex_websocket_pool_for_tests();
 }
 

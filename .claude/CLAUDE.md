@@ -1019,11 +1019,15 @@ The code decides over the status and the message heuristics:
   `invalid_request_error`; `budget_reached` (no status or 400) is quota, 429
   with `x-should-retry: false`; `inference_hook_denied` and
   `access_program_not_enabled` (no status or 403) are the `PermissionDenied`
-  class, 403 `permission_error` with no `Retry-After`. A stream event of one
-  of these codes whose message is missing or blank takes the CLI's text for
-  the code (`budget_reached` excepted); a JSON error body has no code by the
-  time it is answered, so a blank message there gets the class's short text.
-  The CLI itself reads the access program codes only with no status.
+  class, 403 `permission_error` with no `Retry-After`. One of these codes
+  whose message is missing or blank takes the CLI's text for the code,
+  whether it came as a stream event (`classify_event_failure`), a JSON error
+  body (`codex_status_error`) or a rejected upgrade
+  (`handshake_rejection_error`), both of the latter through
+  `terminal_code_text_from_body`; `budget_reached` has no text of its own and
+  gets the quota class's short text. A message that is not blank is kept,
+  subject to the same client text rule as every other class. The CLI itself
+  reads the access program codes only with no status.
 
 `usage_limit_reached` keeps precedence over every class.
 
@@ -1052,9 +1056,10 @@ the class's error type. An unknown code keeps the old handling, and
 `usage_limit_reached` keeps precedence over all of these. An opt-in server
 compaction refused as quota, `usage_not_included` or `PermissionDenied`
 answers the client with that class and does not send the normal request; any
-other compaction failure, a rejected one included, falls back to it. The WebSocket handshake reads the rejection body on both
-the direct upgrade and the HTTP CONNECT tunnel (on the tunnel only the bytes
-that arrived with the response head), never for a 407. It keeps up to
+other compaction failure, a rejected one included, falls back to it. The
+WebSocket handshake reads the rejection body on both the direct upgrade and
+the HTTP CONNECT tunnel (on the tunnel only the bytes that arrived with the
+response head), never for a 407. It keeps up to
 `MAX_ERROR_BODY_BYTES` (64 KiB, in `client.rs`) of the body to read the class
 and a spent window from, and at most 1 KiB of its message as the detail. A
 non-2xx HTTP answer (live and buffered Messages requests, the compaction

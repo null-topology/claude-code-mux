@@ -111,8 +111,8 @@ struct TerminalCode {
 /// Read by `code` only, never by `type`. The CLI reads the access program
 /// codes this way only with no status and leaves an HTTP 400 or 403 carrying
 /// them to its handling of that status; the proxy names the class under that
-/// status as well. It ends a session on `budget_reached`, which the proxy
-/// answers as spent credits.
+/// status as well. It ends the turn on `budget_reached` and never retries it;
+/// the proxy answers it as spent credits.
 const TERMINAL_CODES: [TerminalCode; 6] = [
     TerminalCode {
         code: "content_policy_violation",
@@ -159,6 +159,17 @@ fn terminal_code(error: &Value, status: Option<u16>) -> Option<&'static Terminal
     TERMINAL_CODES.iter().find(|terminal| {
         terminal.code == code && status.is_none_or(|status| terminal.statuses.contains(&status))
     })
+}
+
+/// The CLI's text for the terminal code a JSON error body names, when the code
+/// holds with `status`, the status the body came with. It stands in for a
+/// missing or blank message, as it does on a stream event.
+pub(crate) fn terminal_code_text_from_body(body: &[u8], status: u16) -> Option<&'static str> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let error = value.get("error")?;
+    // A spent subscription window keeps its own answer.
+    error_class(error, Some(status))?;
+    terminal_code(error, Some(status))?.fallback
 }
 
 /// The class an error object's `code` (or, for quota, plan, capacity and

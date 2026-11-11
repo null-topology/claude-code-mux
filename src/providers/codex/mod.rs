@@ -2101,6 +2101,20 @@ mod tests {
         })
     }
 
+    /// What a client gets for a non-success answer whose body is `body`, read
+    /// the way the HTTP and buffered paths read it.
+    fn response_to_error_body(status: u16, body: serde_json::Value) -> Response {
+        map_codex_error_to_response(&client::codex_status_error(
+            client::CodexResponse {
+                body: serde_json::to_vec(&body).unwrap(),
+                status,
+                headers: Vec::new(),
+                transport: client::ActualTransport::Http,
+            },
+            None,
+        ))
+    }
+
     #[tokio::test]
     async fn no_capacity_is_an_overload_with_only_the_delay_it_names() {
         let cases = [
@@ -2461,17 +2475,58 @@ mod tests {
             assert_eq!(body["error"]["message"], "toy message");
         }
 
-        // A blank message on a path that knows only the class gets the
-        // class's short text.
-        let response = map_codex_error_to_response(&classified_codex_error(
-            events::CodexErrorClass::PermissionDenied,
+        // An error body with a blank message takes the CLI's text for the
+        // code as well.
+        let response = response_to_error_body(
             403,
-            "",
-            None,
-        ));
+            serde_json::json!({"error": {"code": "inference_hook_denied", "message": ""}}),
+        );
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body = error_body(response).await;
-        assert_eq!(body["error"]["message"], "Permission denied");
+        assert_eq!(body["error"]["type"], "permission_error");
+        assert_eq!(
+            body["error"]["message"],
+            "Your workspace inference hook blocked this request."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_code_in_an_error_body_without_a_message_gets_the_cli_text() {
+        for error in [
+            serde_json::json!({"code": "content_policy_violation", "message": ""}),
+            serde_json::json!({"code": "content_policy_violation", "message": " "}),
+            serde_json::json!({"code": "content_policy_violation"}),
+        ] {
+            let response = response_to_error_body(400, serde_json::json!({ "error": error }));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{error}");
+            let body = error_body(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{error}");
+            assert_eq!(
+                body["error"]["message"], "The input was rejected by the content policy.",
+                "{error}"
+            );
+        }
+
+        // A message that is not blank is kept as it came.
+        let response = response_to_error_body(
+            400,
+            serde_json::json!({"error": {"code": "content_policy_violation", "message": "toy message"}}),
+        );
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["message"], "toy message");
+
+        // Spent credits have no text of their own and keep the quota text.
+        for error in [
+            serde_json::json!({"code": "budget_reached", "message": ""}),
+            serde_json::json!({"code": "budget_reached"}),
+        ] {
+            let response = response_to_error_body(400, serde_json::json!({ "error": error }));
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{error}");
+            assert_eq!(response.headers()["x-should-retry"], "false", "{error}");
+            let body = error_body(response).await;
+            assert_eq!(body["error"]["type"], "rate_limit_error", "{error}");
+            assert_eq!(body["error"]["message"], "Rate limited", "{error}");
+        }
     }
 
     #[test]

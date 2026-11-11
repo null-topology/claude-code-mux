@@ -2974,22 +2974,29 @@ fn response_retry_after(body: &[u8], headers: &[(String, String)]) -> Option<Str
 /// A non-success answer of the request sent for `account`. Every
 /// `codex.rate_limits` event its body holds reaches the quota gauge whole
 /// before the body is reduced to a spent window.
-fn codex_status_error(response: CodexResponse, account: Option<&str>) -> CodexError {
+pub(super) fn codex_status_error(response: CodexResponse, account: Option<&str>) -> CodexError {
     super::events::observe_rate_limits_in_body(account, &response.body);
     let usage_limit = super::events::usage_limit_from_response(&response.body, &response.headers)
         .map(|limit| Box::new(limit.for_account(account)));
     let retry_after = response_retry_after(&response.body, &response.headers);
     let class = super::events::error_class_from_body(&response.body, response.status);
-    let message = codex_status_error_message(&response.body).unwrap_or_else(|| {
-        if class == Some(super::events::CodexErrorClass::ModelNotFound) {
-            // The code names a missing model that came with no message.
-            return "model_not_found".to_string();
-        }
-        format!(
-            "Upstream Codex request failed with status {}",
-            response.status
-        )
-    });
+    // A terminal code with a missing or blank message takes the CLI's text for
+    // it, as on a stream event.
+    let terminal_text =
+        super::events::terminal_code_text_from_body(&response.body, response.status);
+    let message = codex_status_error_message(&response.body)
+        .filter(|message| terminal_text.is_none() || !message.trim().is_empty())
+        .or_else(|| terminal_text.map(str::to_string))
+        .unwrap_or_else(|| {
+            if class == Some(super::events::CodexErrorClass::ModelNotFound) {
+                // The code names a missing model that came with no message.
+                return "model_not_found".to_string();
+            }
+            format!(
+                "Upstream Codex request failed with status {}",
+                response.status
+            )
+        });
     CodexError {
         status: response.status,
         message: message.clone(),

@@ -4,17 +4,20 @@
   `invalid_access_program`, `unsupported_access_program`, `budget_reached`,
   `inference_hook_denied` and `access_program_not_enabled` are now answered
   once and marked as not to be retried; the Codex CLI does not retry them
-  either.
-  They used to come back as a retryable 500, so Claude Code retried a request
-  that could not succeed. A content policy or access program refusal is now a
+  either. A refusal that arrived as a stream event with no status used to
+  come back as a retryable 500, so Claude Code retried a request that could
+  not succeed, and an HTTP 400 whose body names one of these codes came back
+  as a 400 `api_error`. A content policy or access program refusal is now a
   400 `invalid_request_error`, a spent budget a 429 `rate_limit_error` with
   `x-should-retry: false`, and an inference hook or access program that is
   not enabled a 403 `permission_error`. A code counts only with no status or
   with 400 (403 for the last two); under any other status the failure is
-  handled as before. When a streamed refusal carries no message, the Codex
-  CLI's own text for the code is shown. An
-  opt-in server compaction refused by the inference hook or an access
-  program that is not enabled no longer sends the normal request after it.
+  handled as before. When a refusal carries no message, as a stream event,
+  an error body or a rejected WebSocket upgrade, the Codex CLI's own text for
+  the code is shown; a spent budget has no text of its own and reads
+  `Rate limited`. An opt-in server compaction refused by the inference hook
+  or an access program that is not enabled no longer sends the normal
+  request after it.
 
 ## v0.17.1 (2026-11-07)
 

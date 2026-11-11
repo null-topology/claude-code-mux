@@ -1506,6 +1506,12 @@ fn handshake_rejection_error(
                 {
                     "model_not_found".to_string()
                 }
+                // A terminal code with no message takes the CLI's text for it,
+                // as on the stream.
+                detail if detail.trim().is_empty() || detail == GENERIC_HANDSHAKE_ERROR_DETAIL => {
+                    super::events::terminal_code_text_from_body(body, status)
+                        .map_or(detail, str::to_string)
+                }
                 detail => detail,
             };
             super::events::observe_rate_limits_in_body(account, body);
@@ -4276,6 +4282,33 @@ mod tests {
         }
     }
 
+    /// The direct path's answer to one attempt, without the connect policy,
+    /// which tries an origin 403 again after a cooldown.
+    async fn direct_handshake_rejection_once(response: Vec<u8>) -> CodexError {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            socket.write_all(&response).await.unwrap();
+        });
+        match connect_once(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &format!("ws://{addr}/backend-api/codex/responses"),
+            &HeaderMap::new(),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected websocket handshake to fail"),
+            Err(err) => err.into_error(),
+        }
+    }
+
     async fn tunneled_handshake_rejection(response: Vec<u8>) -> CodexError {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -5262,6 +5295,62 @@ mod tests {
             );
             assert_eq!(err.detail.as_deref(), Some("model_not_found"), "{error}");
         }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_rejected_upgrade_naming_a_terminal_code_without_a_message_gets_the_cli_text() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = super::super::rate_limits::lock_for_tests();
+        super::super::rate_limits::clear_for_tests();
+        // Status line, body, then the client's status, error type and message.
+        let cases = [
+            (
+                "400 Bad Request",
+                r#"{"error":{"code":"content_policy_violation"}}"#,
+                400,
+                "invalid_request_error",
+                "The input was rejected by the content policy.",
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":{"code":"content_policy_violation","message":"toy message"}}"#,
+                400,
+                "invalid_request_error",
+                "toy message",
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":{"code":"budget_reached","message":""}}"#,
+                429,
+                "rate_limit_error",
+                "Rate limited",
+            ),
+            (
+                "403 Forbidden",
+                r#"{"error":{"code":"inference_hook_denied","message":""}}"#,
+                403,
+                "permission_error",
+                "Your workspace inference hook blocked this request.",
+            ),
+        ];
+        for (status_line, body, status, error_type, message) in cases {
+            let raw = raw_rejection(status_line, &[], body);
+            let direct = direct_handshake_rejection_once(raw.clone()).await;
+            let tunneled = tunneled_handshake_rejection(raw).await;
+            for (path, err) in [("direct", direct), ("tunneled", tunneled)] {
+                let case = format!("{path} {status_line} {body}");
+                let response = super::super::map_codex_error_to_response(&err);
+                assert_eq!(response.status().as_u16(), status, "{case}");
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let answer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(answer["error"]["type"], error_type, "{case}");
+                assert_eq!(answer["error"]["message"], message, "{case}");
+            }
+        }
+        super::super::rate_limits::clear_for_tests();
     }
 
     #[test]
