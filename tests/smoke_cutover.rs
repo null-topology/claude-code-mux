@@ -1934,6 +1934,13 @@ async fn smoke_codex_http_server_compaction_refused_for_credits_or_plan_sends_no
             "permission_error",
             None,
         ),
+        (
+            StatusCode::FORBIDDEN,
+            "inference_hook_denied",
+            "A workspace hook refused this request.",
+            "permission_error",
+            None,
+        ),
     ];
     for (status, code, message, error_type, should_retry) in cases {
         clear_all_compactions_for_tests();

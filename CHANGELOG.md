@@ -1,3 +1,21 @@
+## Unreleased
+
+- The Codex backend's refusals by `content_policy_violation`,
+  `invalid_access_program`, `unsupported_access_program`, `budget_reached`,
+  `inference_hook_denied` and `access_program_not_enabled` are now answered
+  once and marked as not to be retried; the Codex CLI does not retry them
+  either.
+  They used to come back as a retryable 500, so Claude Code retried a request
+  that could not succeed. A content policy or access program refusal is now a
+  400 `invalid_request_error`, a spent budget a 429 `rate_limit_error` with
+  `x-should-retry: false`, and an inference hook or access program that is
+  not enabled a 403 `permission_error`. A code counts only with no status or
+  with 400 (403 for the last two); under any other status the failure is
+  handled as before. When a streamed refusal carries no message, the Codex
+  CLI's own text for the code is shown. An
+  opt-in server compaction refused by the inference hook or an access
+  program that is not enabled no longer sends the normal request after it.
+
 ## v0.17.1 (2026-11-07)
 
 - Codex token refresh no longer writes over a login it did not start from.

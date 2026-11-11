@@ -306,8 +306,9 @@ impl CodexProvider {
                         );
                     }
                 }
-                // Spent allowance, credits or plan access refuse the normal
-                // request the same way, so it is not sent after them.
+                // Spent allowance, credits, plan access or a workspace that may
+                // not make the request refuse the normal request the same way,
+                // so it is not sent after them.
                 Err(CompactionError::Upstream(error))
                     if error.usage_limit.is_some()
                         || matches!(
@@ -315,6 +316,7 @@ impl CodexProvider {
                             Some(
                                 events::CodexErrorClass::QuotaExceeded
                                     | events::CodexErrorClass::UsageNotIncluded
+                                    | events::CodexErrorClass::PermissionDenied
                             )
                         ) =>
                 {
@@ -1774,7 +1776,8 @@ fn classified_error_response(
         events::CodexErrorClass::UsageNotIncluded
         | events::CodexErrorClass::Rejected
         | events::CodexErrorClass::ContextOverflow
-        | events::CodexErrorClass::ModelNotFound => None,
+        | events::CodexErrorClass::ModelNotFound
+        | events::CodexErrorClass::PermissionDenied => None,
     };
     match retry_after {
         Some(retry_after) => ([(http::header::RETRY_AFTER, retry_after)], response).into_response(),
@@ -2062,6 +2065,12 @@ mod tests {
                 StatusCode::NOT_FOUND,
                 "not_found_error",
             ),
+            (
+                events::CodexErrorClass::PermissionDenied,
+                500,
+                StatusCode::FORBIDDEN,
+                "permission_error",
+            ),
         ];
         for (class, backend_status, status, error_type) in cases {
             let response = map_codex_error_to_response(&classified_codex_error(
@@ -2315,6 +2324,7 @@ mod tests {
             events::CodexErrorClass::UsageNotIncluded,
             events::CodexErrorClass::Rejected,
             events::CodexErrorClass::ContextOverflow,
+            events::CodexErrorClass::PermissionDenied,
         ] {
             let response = map_codex_error_to_response(&classified_codex_error(
                 class,
@@ -2355,6 +2365,113 @@ mod tests {
         ));
         let body = error_body(response).await;
         assert_eq!(body["error"]["message"], "Invalid request");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_code_is_answered_once_with_its_class() {
+        let cases = [
+            (
+                "content_policy_violation",
+                400,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "The input was rejected by the content policy.",
+            ),
+            (
+                "invalid_access_program",
+                400,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "The requested access program cannot be used with this model.",
+            ),
+            (
+                "unsupported_access_program",
+                400,
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "The requested access program cannot be used with this model.",
+            ),
+            (
+                "inference_hook_denied",
+                403,
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "Your workspace inference hook blocked this request.",
+            ),
+            (
+                "access_program_not_enabled",
+                403,
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "The requested access program is not enabled.",
+            ),
+        ];
+        for (code, held, status, error_type, fallback) in cases {
+            for event in [
+                serde_json::json!({"type": "error", "error": {"code": code, "message": "toy message"}}),
+                serde_json::json!({
+                    "type": "error",
+                    "status": held,
+                    "error": {"code": code, "message": "toy message", "retry_after": 5}
+                }),
+            ] {
+                let response = response_to_failure_event(event);
+                assert_eq!(response.status(), status, "{code}");
+                assert!(
+                    !response.headers().contains_key(http::header::RETRY_AFTER),
+                    "{code}"
+                );
+                assert!(!response.headers().contains_key("x-should-retry"), "{code}");
+                let body = error_body(response).await;
+                assert_eq!(body["error"]["type"], error_type, "{code}");
+                assert_eq!(body["error"]["message"], "toy message", "{code}");
+            }
+            for message in ["", " "] {
+                let response = response_to_failure_event(serde_json::json!({
+                    "type": "error",
+                    "error": {"code": code, "message": message}
+                }));
+                let body = error_body(response).await;
+                assert_eq!(body["error"]["message"], fallback, "{code}");
+            }
+        }
+
+        // Spent credits are answered like any other: never to be retried,
+        // with no delay and no subscription window named.
+        for event in [
+            serde_json::json!({"type": "error", "error": {"code": "budget_reached", "message": "toy message"}}),
+            serde_json::json!({
+                "type": "error",
+                "status": 400,
+                "error": {"code": "budget_reached", "message": "toy message", "retry_after": 5}
+            }),
+        ] {
+            let response = response_to_failure_event(event);
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()["x-should-retry"], "false");
+            assert!(!response.headers().contains_key(http::header::RETRY_AFTER));
+            assert!(
+                !response
+                    .headers()
+                    .keys()
+                    .any(|name| name.as_str().starts_with("anthropic-ratelimit-unified"))
+            );
+            let body = error_body(response).await;
+            assert_eq!(body["error"]["type"], "rate_limit_error");
+            assert_eq!(body["error"]["message"], "toy message");
+        }
+
+        // A blank message on a path that knows only the class gets the
+        // class's short text.
+        let response = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::PermissionDenied,
+            403,
+            "",
+            None,
+        ));
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["message"], "Permission denied");
     }
 
     #[test]
