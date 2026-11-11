@@ -10,6 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -17,6 +18,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    ErrorResponse, Request as UpgradeRequest, Response as UpgradeResponse,
+};
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
 use tower::util::ServiceExt;
 
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -458,7 +463,7 @@ async fn spawn_dual_transport_origin() -> (String, SeenRequests) {
     let seen: SeenRequests = Arc::new(Mutex::new(Vec::new()));
     let task_seen = seen.clone();
     tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
+        while let Ok((stream, _)) = listener.accept().await {
             let seen = task_seen.clone();
             tokio::spawn(async move {
                 let mut first = [0_u8; 1];
@@ -466,35 +471,7 @@ async fn spawn_dual_transport_origin() -> (String, SeenRequests) {
                     return;
                 }
                 if first[0] != b'G' {
-                    let request = read_http_head(&mut stream).await;
-                    let (head, partial) = request.split_once("\r\n\r\n").unwrap();
-                    let length = head
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            if name.eq_ignore_ascii_case("content-length") {
-                                value.trim().parse::<usize>().ok()
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(0);
-                    let mut body = partial.as_bytes().to_vec();
-                    let mut buffer = [0_u8; 8192];
-                    while body.len() < length {
-                        let read = stream.read(&mut buffer).await.unwrap();
-                        if read == 0 {
-                            break;
-                        }
-                        body.extend_from_slice(&buffer[..read]);
-                    }
-                    let body = serde_json::from_slice(&body).unwrap();
-                    seen.lock().unwrap().push(("http", body));
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{HTTP_FALLBACK_SSE}",
-                        HTTP_FALLBACK_SSE.len()
-                    );
-                    stream.write_all(response.as_bytes()).await.unwrap();
+                    record_http_request(stream, &seen).await;
                     return;
                 }
                 let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await else {
@@ -510,37 +487,8 @@ async fn spawn_dual_transport_origin() -> (String, SeenRequests) {
                         Message::Close(_) => break,
                         _ => continue,
                     };
-                    let number = {
-                        let mut seen = seen.lock().unwrap();
-                        seen.push(("websocket", serde_json::from_str(&text).unwrap()));
-                        seen.iter()
-                            .filter(|(transport, _)| *transport == "websocket")
-                            .count()
-                    };
-                    for event in [
-                        json!({
-                            "type": "response.output_item.added",
-                            "output_index": 0,
-                            "item": {"type": "message", "id": format!("msg_ws_{number}")}
-                        }),
-                        json!({
-                            "type": "response.output_text.delta",
-                            "output_index": 0,
-                            "delta": format!("websocket reply {number}")
-                        }),
-                        json!({
-                            "type": "response.output_item.done",
-                            "output_index": 0,
-                            "item": {"type": "message"}
-                        }),
-                        json!({
-                            "type": "response.completed",
-                            "response": {
-                                "id": format!("resp_ws_{number}"),
-                                "usage": {"input_tokens": 5, "output_tokens": 2}
-                            }
-                        }),
-                    ] {
+                    let number = record_websocket_request(&seen, &text);
+                    for event in websocket_reply_events(number) {
                         if websocket
                             .send(Message::Text(event.to_string()))
                             .await
@@ -554,6 +502,212 @@ async fn spawn_dual_transport_origin() -> (String, SeenRequests) {
         }
     });
     (format!("http://{addr}/responses"), seen)
+}
+
+/// Reads one HTTP request, records its JSON body as `http` and answers it
+/// with `HTTP_FALLBACK_SSE`.
+async fn record_http_request(mut stream: TcpStream, seen: &SeenRequests) {
+    let request = read_http_head(&mut stream).await;
+    let (head, partial) = request.split_once("\r\n\r\n").unwrap();
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let mut body = partial.as_bytes().to_vec();
+    let mut buffer = [0_u8; 8192];
+    while body.len() < length {
+        let read = stream.read(&mut buffer).await.unwrap();
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&buffer[..read]);
+    }
+    let body = serde_json::from_slice(&body).unwrap();
+    seen.lock().unwrap().push(("http", body));
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{HTTP_FALLBACK_SSE}",
+        HTTP_FALLBACK_SSE.len()
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+}
+
+/// Records a `response.create` frame as `websocket` and returns how many
+/// WebSocket requests the origin has seen, this one included.
+fn record_websocket_request(seen: &SeenRequests, text: &str) -> usize {
+    let mut seen = seen.lock().unwrap();
+    seen.push(("websocket", serde_json::from_str(text).unwrap()));
+    seen.iter()
+        .filter(|(transport, _)| *transport == "websocket")
+        .count()
+}
+
+/// The events of a complete answer to the Nth WebSocket request: the text
+/// `websocket reply N` in response `resp_ws_N`.
+fn websocket_reply_events(number: usize) -> [Value; 4] {
+    [
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "message", "id": format!("msg_ws_{number}")}
+        }),
+        json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": format!("websocket reply {number}")
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {"type": "message"}
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": format!("resp_ws_{number}"),
+                "usage": {"input_tokens": 5, "output_tokens": 2}
+            }
+        }),
+    ]
+}
+
+/// The reason text of every close frame `spawn_size_limited_origin` sends. It
+/// must never reach the log.
+const CLOSE_REASON: &str = "close-reason-text";
+
+/// What `spawn_size_limited_origin` does with a WebSocket request.
+#[derive(Clone, Copy, Debug)]
+enum WebSocketReply {
+    /// The complete answer of `websocket_reply_events`.
+    Complete,
+    /// A close frame with this code before any response event.
+    CloseBeforeText(u16),
+    /// The first response event, then a close frame with this code.
+    CloseAfterText(u16),
+}
+
+struct SizeLimitedOrigin {
+    url: String,
+    seen: SeenRequests,
+    upgrades: Arc<AtomicUsize>,
+}
+
+/// A Codex origin like `spawn_dual_transport_origin` whose WebSocket upgrade
+/// answers `x-codex-websocket-max-message-bytes: <advertised>` when one is
+/// given. The Nth WebSocket request gets `replies[N - 1]`, and `Complete`
+/// once the list runs out. Counts upgrades, so a test can tell a pooled
+/// socket from a new one.
+async fn spawn_size_limited_origin(
+    advertised: Option<&'static str>,
+    replies: Vec<WebSocketReply>,
+) -> SizeLimitedOrigin {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen: SeenRequests = Arc::new(Mutex::new(Vec::new()));
+    let upgrades = Arc::new(AtomicUsize::new(0));
+    let replies = Arc::new(replies);
+    let task_seen = seen.clone();
+    let task_upgrades = upgrades.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let seen = task_seen.clone();
+            let upgrades = task_upgrades.clone();
+            let replies = replies.clone();
+            tokio::spawn(async move {
+                let mut first = [0_u8; 1];
+                if stream.peek(&mut first).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                if first[0] != b'G' {
+                    record_http_request(stream, &seen).await;
+                    return;
+                }
+                #[allow(clippy::result_large_err)]
+                let callback = move |_: &UpgradeRequest, mut response: UpgradeResponse| {
+                    if let Some(value) = advertised {
+                        response.headers_mut().insert(
+                            "x-codex-websocket-max-message-bytes",
+                            http::HeaderValue::from_static(value),
+                        );
+                    }
+                    Ok::<_, ErrorResponse>(response)
+                };
+                let Ok(mut websocket) = tokio_tungstenite::accept_hdr_async(stream, callback).await
+                else {
+                    return;
+                };
+                upgrades.fetch_add(1, Ordering::SeqCst);
+                while let Some(Ok(message)) = websocket.next().await {
+                    let text = match message {
+                        Message::Text(text) => text,
+                        Message::Ping(data) => {
+                            let _ = websocket.send(Message::Pong(data)).await;
+                            continue;
+                        }
+                        Message::Close(_) => break,
+                        _ => continue,
+                    };
+                    let number = record_websocket_request(&seen, &text);
+                    let events = websocket_reply_events(number);
+                    let close = |code: u16| {
+                        Message::Close(Some(CloseFrame {
+                            code: CloseCode::from(code),
+                            reason: CLOSE_REASON.into(),
+                        }))
+                    };
+                    let reply = replies
+                        .get(number - 1)
+                        .copied()
+                        .unwrap_or(WebSocketReply::Complete);
+                    let frames: Vec<Message> = match reply {
+                        WebSocketReply::Complete => events
+                            .iter()
+                            .map(|event| Message::Text(event.to_string()))
+                            .collect(),
+                        WebSocketReply::CloseBeforeText(code) => vec![close(code)],
+                        WebSocketReply::CloseAfterText(code) => {
+                            vec![Message::Text(events[0].to_string()), close(code)]
+                        }
+                    };
+                    for frame in frames {
+                        if websocket.send(frame).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    SizeLimitedOrigin {
+        url: format!("http://{addr}/responses"),
+        seen,
+        upgrades,
+    }
+}
+
+/// The proxy log lines named `msg`, oldest first. Read while `XDG_STATE_HOME`
+/// points at the test's own directory.
+fn log_lines_named(msg: &str) -> Vec<Value> {
+    std::fs::read_to_string(log_file())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["msg"] == msg)
+        .collect()
+}
+
+fn transports(seen: &SeenRequests) -> Vec<&'static str> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .map(|(transport, _)| *transport)
+        .collect()
 }
 
 #[tokio::test]
@@ -1108,5 +1262,379 @@ async fn codex_websocket_inherits_environment_proxy_configuration() {
             .is_err()
     );
 
+    clear_codex_websocket_pool_for_tests();
+}
+
+/// The limit `spawn_size_limited_origin` advertises in the size tests. A
+/// request holding `oversized_text` is over it, a short conversation is not.
+const ADVERTISED_LIMIT: &str = "100000";
+
+fn oversized_text() -> String {
+    "oversized ".repeat(15_000)
+}
+
+/// The fallback warning of a request kept off the socket by the limit: its
+/// detail names the frame length and the limit, and nothing from the request.
+fn assert_oversized_fallback_logged(line: &Value, context: &str) {
+    let fields = &line["fields"];
+    assert_eq!(line["level"], "warn", "{context}");
+    assert!(
+        fields["reqId"].as_str().is_some_and(|id| !id.is_empty()),
+        "{context}: {fields}"
+    );
+    assert_eq!(fields["status"], 413, "{context}: {fields}");
+    let detail = fields["detail"].as_str().unwrap();
+    let frame_bytes = detail
+        .strip_prefix("The WebSocket request frame is ")
+        .and_then(|rest| {
+            rest.strip_suffix(
+                " bytes, over the 100000-byte message limit the Codex backend advertised",
+            )
+        })
+        .and_then(|bytes| bytes.parse::<usize>().ok());
+    assert!(
+        frame_bytes.is_some_and(|bytes| bytes > 100_000),
+        "{context}: {detail}"
+    );
+    assert!(!line.to_string().contains("oversized"), "{context}: {line}");
+}
+
+#[tokio::test]
+async fn codex_default_transport_sends_a_request_over_the_advertised_limit_over_http() {
+    let _env = ENV_LOCK.lock().await;
+    let _retry_delay = ZeroRetryDelayGuard::new();
+    let config_dir = TempDir::new().unwrap();
+    write_codex_auth(config_dir.path());
+    let big = oversized_text();
+
+    for (stream, continuations) in [(false, false), (true, false), (false, true), (true, true)] {
+        let label = format!("stream {stream}, continuations {continuations}");
+        clear_codex_websocket_pool_for_tests();
+        clear_all_continuations_for_tests();
+        let origin = spawn_size_limited_origin(Some(ADVERTISED_LIMIT), vec![]).await;
+        let state_dir = TempDir::new().unwrap();
+        let (fallbacks, limits) = {
+            let mut guards = clear_proxy_environment();
+            guards.extend(configure_codex(config_dir.path(), &origin.url));
+            guards.push(EnvGuard::unset("CCP_CODEX_TRANSPORT"));
+            if continuations {
+                guards.push(EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1"));
+            }
+            guards.push(EnvGuard::set("XDG_STATE_HOME", state_dir.path()));
+            let turns = [
+                // Over the limit on a new socket.
+                (
+                    json!([{"role": "user", "content": big}]),
+                    "transport fallback ok",
+                ),
+                // On the socket the first request never wrote to.
+                (
+                    json!([{"role": "user", "content": "one"}]),
+                    "websocket reply 1",
+                ),
+                // Over the limit on the pooled socket, continuing `resp_ws_1`.
+                (
+                    json!([
+                        {"role": "user", "content": "one"},
+                        {"role": "assistant", "content": "websocket reply 1"},
+                        {"role": "user", "content": big}
+                    ]),
+                    "transport fallback ok",
+                ),
+                // The oversized turn rewound: `resp_ws_1` still matches the
+                // prefix, but it predates the request answered over HTTP.
+                (
+                    json!([
+                        {"role": "user", "content": "one"},
+                        {"role": "assistant", "content": "websocket reply 1"},
+                        {"role": "user", "content": "three"}
+                    ]),
+                    "websocket reply 2",
+                ),
+            ];
+            for (messages, reply) in turns {
+                let (status, body) = call_messages_with_history(
+                    &format!("size-limit-oversized-{stream}-{continuations}"),
+                    stream,
+                    messages,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{label}: {body}");
+                assert!(body.contains(reply), "{label}: {body}");
+            }
+            (
+                fallback_log_lines(),
+                log_lines_named("codex_websocket_message_limit"),
+            )
+        };
+
+        // The WebSocket received no oversized frame. Without continuations no
+        // socket is pooled, so each request opens one. With them, the third
+        // request takes the second one's pooled socket and leaves it unused,
+        // and the first and the last, having nothing to continue, start on a
+        // new socket as before.
+        assert_eq!(
+            transports(&origin.seen),
+            ["http", "websocket", "http", "websocket"],
+            "{label}"
+        );
+        let sockets = if continuations { 3 } else { 4 };
+        assert_eq!(origin.upgrades.load(Ordering::SeqCst), sockets, "{label}");
+        // With continuations the third request continued `resp_ws_1`; over
+        // HTTP it went with full context, and the last one continues nothing
+        // that predates the HTTP answer.
+        let seen = origin.seen.lock().unwrap();
+        for (index, (_, request)) in seen.iter().enumerate() {
+            assert!(
+                request["previous_response_id"].is_null(),
+                "{label}: request {index}"
+            );
+        }
+        assert!(seen[0].1["input"].to_string().contains(&big), "{label}");
+        let full = seen[2].1["input"].to_string();
+        assert!(
+            full.contains("websocket reply 1") && full.contains(&big),
+            "{label}"
+        );
+        assert!(seen[3].1["input"].to_string().contains("three"), "{label}");
+
+        assert_eq!(fallbacks.len(), 2, "{label}: {fallbacks:?}");
+        for line in &fallbacks {
+            assert_oversized_fallback_logged(line, &label);
+        }
+        assert_eq!(limits.len(), sockets, "{label}: {limits:?}");
+        for line in &limits {
+            assert_eq!(line["fields"]["maxMessageBytes"], 100_000, "{label}");
+            assert!(
+                line["fields"]["reqId"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty()),
+                "{label}"
+            );
+        }
+    }
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+}
+
+#[tokio::test]
+async fn codex_default_transport_sends_a_request_closed_with_1009_over_http() {
+    let _env = ENV_LOCK.lock().await;
+    let _retry_delay = ZeroRetryDelayGuard::new();
+    let config_dir = TempDir::new().unwrap();
+    write_codex_auth(config_dir.path());
+
+    for stream in [false, true] {
+        let label = format!("stream {stream}");
+        clear_codex_websocket_pool_for_tests();
+        clear_all_continuations_for_tests();
+        let origin = spawn_size_limited_origin(
+            None,
+            vec![
+                WebSocketReply::Complete,
+                WebSocketReply::CloseBeforeText(1009),
+            ],
+        )
+        .await;
+        let state_dir = TempDir::new().unwrap();
+        let (fallbacks, closes) = {
+            let mut guards = clear_proxy_environment();
+            guards.extend(configure_codex(config_dir.path(), &origin.url));
+            guards.push(EnvGuard::unset("CCP_CODEX_TRANSPORT"));
+            guards.push(EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1"));
+            guards.push(EnvGuard::set("XDG_STATE_HOME", state_dir.path()));
+            let turns = [
+                (
+                    json!([{"role": "user", "content": "one"}]),
+                    "websocket reply 1",
+                ),
+                (
+                    json!([
+                        {"role": "user", "content": "one"},
+                        {"role": "assistant", "content": "websocket reply 1"},
+                        {"role": "user", "content": "two"}
+                    ]),
+                    "transport fallback ok",
+                ),
+                (
+                    json!([
+                        {"role": "user", "content": "one"},
+                        {"role": "assistant", "content": "websocket reply 1"},
+                        {"role": "user", "content": "three"}
+                    ]),
+                    "websocket reply 3",
+                ),
+            ];
+            for (messages, reply) in turns {
+                let (status, body) = call_messages_with_history(
+                    &format!("size-limit-closed-{stream}"),
+                    stream,
+                    messages,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{label}: {body}");
+                assert!(body.contains(reply), "{label}: {body}");
+            }
+            (
+                fallback_log_lines(),
+                log_lines_named("codex_websocket_closed"),
+            )
+        };
+
+        // The refused frame went out once, then the request once over HTTP
+        // with its full context, and nothing continues from before it.
+        assert_eq!(
+            transports(&origin.seen),
+            ["websocket", "websocket", "http", "websocket"],
+            "{label}"
+        );
+        let seen = origin.seen.lock().unwrap();
+        assert_eq!(seen[1].1["previous_response_id"], "resp_ws_1", "{label}");
+        assert!(seen[2].1["previous_response_id"].is_null(), "{label}");
+        let full = seen[2].1["input"].to_string();
+        assert!(
+            full.contains("websocket reply 1") && full.contains("two"),
+            "{label}: {full}"
+        );
+        assert!(seen[3].1["previous_response_id"].is_null(), "{label}");
+
+        assert_eq!(fallbacks.len(), 1, "{label}: {fallbacks:?}");
+        let fields = &fallbacks[0]["fields"];
+        assert_eq!(fields["status"], 413, "{label}: {fields}");
+        assert_eq!(
+            fields["detail"],
+            "The Codex backend closed the WebSocket with code 1009 (message too big) before any response",
+            "{label}"
+        );
+        assert!(
+            !fallbacks[0].to_string().contains("two"),
+            "{label}: {fields}"
+        );
+        assert_eq!(closes.len(), 1, "{label}: {closes:?}");
+        assert_eq!(closes[0]["fields"]["closeCode"], 1009, "{label}");
+        assert_eq!(closes[0]["fields"]["textStarted"], false, "{label}");
+        assert!(!closes[0].to_string().contains(CLOSE_REASON), "{label}");
+    }
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+}
+
+#[tokio::test]
+async fn codex_websocket_transport_answers_a_size_refusal_once_with_413() {
+    let _env = ENV_LOCK.lock().await;
+    let _retry_delay = ZeroRetryDelayGuard::new();
+    let config_dir = TempDir::new().unwrap();
+    write_codex_auth(config_dir.path());
+    let big = oversized_text();
+
+    for stream in [false, true] {
+        for (advertised, reply, messages, expected) in [
+            (
+                Some(ADVERTISED_LIMIT),
+                WebSocketReply::Complete,
+                json!([{"role": "user", "content": big}]),
+                "-byte message limit the Codex backend advertised",
+            ),
+            (
+                None,
+                WebSocketReply::CloseBeforeText(1009),
+                json!([{"role": "user", "content": "hello"}]),
+                "The Codex backend closed the WebSocket with code 1009 (message too big) before any response",
+            ),
+        ] {
+            let label = format!("stream {stream}, advertised {advertised:?}");
+            clear_codex_websocket_pool_for_tests();
+            clear_all_continuations_for_tests();
+            let origin = spawn_size_limited_origin(advertised, vec![reply]).await;
+            let state_dir = TempDir::new().unwrap();
+            let (status, body, fallbacks) = {
+                let mut guards = clear_proxy_environment();
+                guards.extend(configure_codex(config_dir.path(), &origin.url));
+                guards.push(EnvGuard::set("XDG_STATE_HOME", state_dir.path()));
+                let (status, body) = call_messages_with_history(
+                    &format!("size-limit-websocket-{stream}"),
+                    stream,
+                    messages,
+                )
+                .await;
+                (status, body, fallback_log_lines())
+            };
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{label}: {body}");
+            let error: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(error["error"]["type"], "request_too_large", "{label}");
+            let message = error["error"]["message"].as_str().unwrap();
+            assert!(message.contains(expected), "{label}: {message}");
+            assert!(
+                message.ends_with("The auto transport sends such a request over HTTP."),
+                "{label}: {message}"
+            );
+            assert!(!message.contains("oversized"), "{label}: {message}");
+            // Nothing over HTTP and nothing resent: an oversized frame is never
+            // written, and a refused one is written once.
+            let expected_transports: &[&str] = match reply {
+                WebSocketReply::CloseBeforeText(_) => &["websocket"],
+                _ => &[],
+            };
+            assert_eq!(transports(&origin.seen), expected_transports, "{label}");
+            assert_eq!(origin.upgrades.load(Ordering::SeqCst), 1, "{label}");
+            assert!(fallbacks.is_empty(), "{label}: {fallbacks:?}");
+        }
+    }
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+}
+
+#[tokio::test]
+async fn codex_default_transport_keeps_its_handling_of_other_closes() {
+    let _env = ENV_LOCK.lock().await;
+    let _retry_delay = ZeroRetryDelayGuard::new();
+    let config_dir = TempDir::new().unwrap();
+    write_codex_auth(config_dir.path());
+
+    for (reply, code, text_started) in [
+        (WebSocketReply::CloseAfterText(1009), 1009, true),
+        (WebSocketReply::CloseBeforeText(1000), 1000, false),
+        (WebSocketReply::CloseBeforeText(1011), 1011, false),
+    ] {
+        for stream in [false, true] {
+            let label = format!("{reply:?}, stream {stream}");
+            clear_codex_websocket_pool_for_tests();
+            clear_all_continuations_for_tests();
+            let origin = spawn_size_limited_origin(None, vec![reply]).await;
+            let state_dir = TempDir::new().unwrap();
+            let (status, body, fallbacks, closes) = {
+                let mut guards = clear_proxy_environment();
+                guards.extend(configure_codex(config_dir.path(), &origin.url));
+                guards.push(EnvGuard::unset("CCP_CODEX_TRANSPORT"));
+                guards.push(EnvGuard::set("XDG_STATE_HOME", state_dir.path()));
+                let (status, body) = call_messages_with_history(
+                    &format!("size-limit-other-close-{code}-{stream}"),
+                    stream,
+                    json!([{"role": "user", "content": "hello"}]),
+                )
+                .await;
+                (
+                    status,
+                    body,
+                    fallback_log_lines(),
+                    log_lines_named("codex_websocket_closed"),
+                )
+            };
+            // Sent once, not over HTTP, and answered as a response that never
+            // finished, as before.
+            assert_eq!(transports(&origin.seen), ["websocket"], "{label}: {body}");
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{label}: {body}");
+            assert!(body.contains("api_error"), "{label}: {body}");
+            assert!(!body.contains("transport fallback ok"), "{label}: {body}");
+            assert!(!body.contains("request_too_large"), "{label}: {body}");
+            assert!(fallbacks.is_empty(), "{label}: {fallbacks:?}");
+            assert!(!closes.is_empty(), "{label}");
+            assert_eq!(closes[0]["fields"]["closeCode"], code, "{label}");
+            assert_eq!(closes[0]["fields"]["textStarted"], text_started, "{label}");
+            for line in &closes {
+                assert!(!line.to_string().contains(CLOSE_REASON), "{label}");
+            }
+        }
+    }
     clear_codex_websocket_pool_for_tests();
 }

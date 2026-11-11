@@ -1651,6 +1651,19 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
     if let Some(limit) = err.usage_limit.as_ref() {
         return usage_limit_response(limit);
     }
+    // The `websocket` transport's answer to a request the WebSocket refused
+    // for its size; `auto`, where its HTTP fallback is enabled, sends such a
+    // request over HTTP instead.
+    if websocket::is_message_size_refusal(err) {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            format!(
+                "{}. The auto transport sends such a request over HTTP.",
+                err.message
+            ),
+        );
+    }
     if let Some(class) = err.class {
         return classified_error_response(
             class,

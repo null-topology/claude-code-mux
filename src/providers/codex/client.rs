@@ -3112,7 +3112,16 @@ fn unauthorized_event_needs_refresh(payload: &serde_json::Value) -> bool {
         && super::events::usage_limit_from_event_with_headers(payload, &[]).is_none()
 }
 
+/// A failed handshake falls back to HTTP, and so does a request the WebSocket
+/// refused for its size: one longer than the socket's advertised limit, never
+/// written, or one the peer closed with 1009 before any response text. The
+/// latter is the one request already written that goes over HTTP, as the
+/// Codex CLI sends it (`codex-rs/codex-api/src/endpoint/responses_websocket.rs`
+/// at `ed7ca22bb6`, HTTP fallback at `bc3ccba6e1`).
 fn should_fallback_to_http(err: &CodexError) -> bool {
+    if super::websocket::is_message_size_refusal(err) {
+        return true;
+    }
     err.origin == CodexErrorOrigin::WebSocketHandshake
         && err.status != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
         && !matches!(
@@ -3127,19 +3136,20 @@ fn should_fallback_to_http(err: &CodexError) -> bool {
 /// The longest `detail` a fallback log line carries, in characters.
 const FALLBACK_LOG_DETAIL_CHARS: usize = 300;
 
-/// Logs a WebSocket setup failure that `auto` answers over HTTP, so a refused
+/// Logs a WebSocket failure that `auto` answers over HTTP, so a refused
 /// WebSocket stays visible. The line carries only what the handshake itself
 /// returned: its status (0 when none came), class, usage-limit flag,
-/// `Retry-After` and the rejection text or connect error, cut short. It
-/// carries nothing from the request.
+/// `Retry-After` and the rejection text or connect error, cut short. For a
+/// request refused for its size the detail is a fixed text naming the frame
+/// length and the limit, or the 1009 close. It carries nothing from the
+/// request.
 fn log_websocket_fallback_to_http(ctx: &RequestContext, err: &CodexError) {
-    let detail: String = err
-        .detail
-        .as_deref()
-        .unwrap_or(&err.message)
-        .chars()
-        .take(FALLBACK_LOG_DETAIL_CHARS)
-        .collect();
+    let detail = if super::websocket::is_message_size_refusal(err) {
+        err.message.as_str()
+    } else {
+        err.detail.as_deref().unwrap_or(&err.message)
+    };
+    let detail: String = detail.chars().take(FALLBACK_LOG_DETAIL_CHARS).collect();
     let mut fields = serde_json::Map::from_iter([
         ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
         ("status".to_string(), serde_json::json!(err.status)),

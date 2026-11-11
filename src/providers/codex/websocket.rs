@@ -18,7 +18,7 @@ use tokio_tungstenite::{
         Message,
         client::IntoClientRequest,
         handshake::{client::generate_key, derive_accept_key},
-        protocol::Role,
+        protocol::{CloseFrame, Role, frame::coding::CloseCode},
     },
 };
 
@@ -50,6 +50,19 @@ pub(super) const WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL: &str = "websocket_proxy
 /// Marks a write that ran out of time. Part of the frame may already be on
 /// the socket, so the request is neither resent nor replayed over HTTP.
 pub(super) const WEBSOCKET_WRITE_TIMEOUT_DETAIL: &str = "websocket_write_timeout";
+/// The handshake response header naming the largest request frame, in bytes,
+/// that the socket accepts. The Codex CLI reads it and keeps a longer request
+/// off the socket (`codex-rs/codex-api/src/endpoint/responses_websocket.rs`
+/// at `ed7ca22bb6`).
+const MAX_MESSAGE_BYTES_HEADER: &str = "x-codex-websocket-max-message-bytes";
+/// Marks a request frame longer than the limit its socket's handshake named.
+/// Nothing was written, so under `auto` the request goes over HTTP.
+pub(super) const WEBSOCKET_MESSAGE_TOO_LARGE_DETAIL: &str = "websocket_message_too_large";
+/// Marks a 1009 (message too big) close that arrived before any text frame of
+/// the response: the peer refused the request frame for its size and answered
+/// nothing, so under `auto` the request goes over HTTP.
+pub(super) const WEBSOCKET_CLOSED_MESSAGE_TOO_LARGE_DETAIL: &str =
+    "websocket_closed_message_too_large";
 
 const POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_POOL_ENTRIES: usize = 10_000;
@@ -384,29 +397,151 @@ struct PoolEntry {
     /// request on the socket under that account, whatever account a later
     /// request is built with.
     account_id: Option<String>,
+    /// The message size limit the handshake response advertised, if any. A
+    /// pooled socket keeps the limit of its own handshake.
+    max_message_bytes: Option<usize>,
 }
 
 impl PoolEntry {
-    fn opened_with(ws: CodexWebSocketStream, handshake_headers: &HeaderMap) -> Self {
+    fn opened_with(connected: ConnectedWebSocket, handshake_headers: &HeaderMap) -> Self {
         Self {
-            ws: Arc::new(AsyncMutex::new(ws)),
+            ws: Arc::new(AsyncMutex::new(connected.stream)),
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
             created_at: now_ms(),
             last_activity: AtomicU64::new(next_pool_activity()),
             account_id: request_account_id(handshake_headers).map(str::to_owned),
+            max_message_bytes: connected.max_message_bytes,
         }
     }
 
-    /// An entry whose handshake named no account.
+    /// An entry whose handshake named no account and no message size limit.
     #[cfg(test)]
     fn new(ws: CodexWebSocketStream) -> Self {
-        Self::opened_with(ws, &HeaderMap::new())
+        Self::opened_with(
+            ConnectedWebSocket {
+                stream: ws,
+                max_message_bytes: None,
+            },
+            &HeaderMap::new(),
+        )
     }
 
     fn touch(&self) {
         self.last_activity
             .fetch_max(next_pool_activity(), Ordering::Relaxed);
     }
+
+    /// Refuses a request frame longer than the limit this socket's handshake
+    /// advertised, before anything is written, as the Codex CLI's
+    /// `send_websocket_request` does
+    /// (`codex-rs/codex-api/src/endpoint/responses_websocket.rs` at
+    /// `ed7ca22bb6`).
+    fn check_message_size(&self, frame_bytes: usize) -> Result<(), CodexError> {
+        match self.max_message_bytes {
+            Some(limit) if frame_bytes > limit => Err(message_too_large_error(frame_bytes, limit)),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A socket whose handshake succeeded, with the message size limit that
+/// handshake advertised.
+struct ConnectedWebSocket {
+    stream: CodexWebSocketStream,
+    max_message_bytes: Option<usize>,
+}
+
+/// Reads the message size limit a successful handshake advertised: a trimmed
+/// positive integer is the limit, and an absent, empty, zero or unparsable
+/// value means none.
+fn advertised_max_message_bytes(headers: &HeaderMap) -> Option<usize> {
+    headers
+        .get(MAX_MESSAGE_BYTES_HEADER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| *limit > 0)
+}
+
+/// Logs the message size limit a new socket's handshake advertised. The line
+/// carries the request id and the number, and no other header value.
+fn log_advertised_message_limit(ctx: &RequestContext, entry: &PoolEntry) {
+    if let Some(limit) = entry.max_message_bytes {
+        let fields = serde_json::Map::from_iter([
+            ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+            ("maxMessageBytes".to_string(), serde_json::json!(limit)),
+        ]);
+        create_logger("codex").info("codex_websocket_message_limit", Some(fields));
+    }
+}
+
+/// True for the two refusals of a request frame for its size: one kept off the
+/// socket by the advertised limit, and a 1009 close before any response text.
+/// The backend processed nothing in either case.
+pub(super) fn is_message_size_refusal(error: &CodexError) -> bool {
+    error.origin == CodexErrorOrigin::WebSocket
+        && matches!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_MESSAGE_TOO_LARGE_DETAIL | WEBSOCKET_CLOSED_MESSAGE_TOO_LARGE_DETAIL)
+        )
+}
+
+fn message_too_large_error(frame_bytes: usize, limit: usize) -> CodexError {
+    CodexError {
+        status: http::StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+        message: format!(
+            "The WebSocket request frame is {frame_bytes} bytes, over the {limit}-byte message limit the Codex backend advertised"
+        ),
+        detail: Some(WEBSOCKET_MESSAGE_TOO_LARGE_DETAIL.to_string()),
+        retry_after: None,
+        usage_limit: None,
+        class: None,
+        origin: CodexErrorOrigin::WebSocket,
+    }
+}
+
+fn closed_message_too_large_error() -> CodexError {
+    CodexError {
+        status: http::StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+        message: "The Codex backend closed the WebSocket with code 1009 (message too big) before any response".to_string(),
+        detail: Some(WEBSOCKET_CLOSED_MESSAGE_TOO_LARGE_DETAIL.to_string()),
+        retry_after: None,
+        usage_limit: None,
+        class: None,
+        origin: CodexErrorOrigin::WebSocket,
+    }
+}
+
+/// Puts back a socket the request never wrote to, as an unused pooled socket
+/// goes back, so the conversation's next request can use it.
+fn return_unused_entry(owner: Option<&ConversationIdentity>, entry: &Arc<PoolEntry>) {
+    if let Some(owner) = owner {
+        pool_insert_if_vacant_or_same(owner.clone(), entry.clone());
+    }
+}
+
+/// The numeric code of a close frame, 0 when the frame carries none.
+fn close_code(frame: Option<&CloseFrame<'_>>) -> u16 {
+    frame.map_or(0, |frame| u16::from(frame.code))
+}
+
+/// True for a 1009 close that arrived before any text frame of the response,
+/// the case the Codex CLI answers as a message too large for the socket
+/// (`codex-rs/codex-api/src/endpoint/responses_websocket.rs` at `ed7ca22bb6`).
+fn closed_for_message_size(frame: Option<&CloseFrame<'_>>, text_received: bool) -> bool {
+    !text_received && frame.is_some_and(|frame| frame.code == CloseCode::Size)
+}
+
+/// Logs a close frame that ended a response: its numeric code and whether
+/// response text had arrived. The close reason is never logged.
+fn log_response_close(code: u16, text_received: bool) {
+    let fields = serde_json::Map::from_iter([
+        ("closeCode".to_string(), serde_json::json!(code)),
+        ("textStarted".to_string(), serde_json::json!(text_received)),
+    ]);
+    create_logger("codex").info("codex_websocket_closed", Some(fields));
 }
 
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
@@ -864,7 +999,7 @@ pub(super) async fn codex_websocket_request(
     url: &str,
     headers: &HeaderMap,
     body_value: &serde_json::Value,
-    _ctx: &RequestContext,
+    ctx: &RequestContext,
     traffic: Option<&TrafficCapture>,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
@@ -954,6 +1089,15 @@ pub(super) async fn codex_websocket_request(
         ));
         guard = entry.ws.clone().lock_owned().await;
         used_pooled = false;
+    }
+    if !used_pooled {
+        log_advertised_message_limit(ctx, &entry);
+    }
+
+    if let Err(error) = entry.check_message_size(body_json.len()) {
+        drop(guard);
+        return_unused_entry(pool_owner, &entry);
+        return Err(error);
     }
 
     send_request_frame(&mut guard, body_json, idle_timeout_ms)
@@ -1114,7 +1258,7 @@ pub(super) async fn prepare_codex_websocket(
     let entry = if let Some(entry) = pooled {
         entry
     } else {
-        let stream = connect_with_timeout(
+        let connected = connect_with_timeout(
             websocket_client,
             proxy_config,
             &ws_url,
@@ -1122,7 +1266,7 @@ pub(super) async fn prepare_codex_websocket(
             connect_timeout_ms,
         )
         .await?;
-        Arc::new(PoolEntry::opened_with(stream, headers))
+        Arc::new(PoolEntry::opened_with(connected, headers))
     };
     let mut guard = entry.ws.clone().lock_owned().await;
     if used_pooled
@@ -1194,6 +1338,13 @@ pub(super) fn start_codex_websocket_events(
             idle_timeout_ms,
         } = ready;
         let pool_owner = reservation_pool_owner(reservation.as_ref());
+        if let Err(error) = entry.check_message_size(body_json.len()) {
+            drop(guard);
+            return_unused_entry(pool_owner, &entry);
+            socket_id_publisher.publish(None);
+            let _ = tx.send(Err(error)).await;
+            return;
+        }
         if let Err(error) = send_request_frame(&mut guard, body_json, idle_timeout_ms).await {
             drop(guard);
             if let Some(owner) = pool_owner {
@@ -1236,7 +1387,7 @@ pub(super) async fn codex_websocket_event_stream(
     url: &str,
     headers: &HeaderMap,
     body_value: &serde_json::Value,
-    _ctx: &RequestContext,
+    ctx: &RequestContext,
     traffic: Option<Arc<TrafficCapture>>,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
@@ -1262,6 +1413,9 @@ pub(super) async fn codex_websocket_event_stream(
         idle_timeout_ms,
     )
     .await?;
+    if !ready.used_pooled {
+        log_advertised_message_limit(ctx, &ready.entry);
+    }
     Ok(start_codex_websocket_events(
         ready,
         body_value,
@@ -2066,7 +2220,7 @@ async fn connect_via_http_proxy_tunnel(
     route: WebSocketProxyRoute,
     url: &str,
     headers: &HeaderMap,
-) -> Result<CodexWebSocketStream, ConnectAttemptError> {
+) -> Result<ConnectedWebSocket, ConnectAttemptError> {
     let (host, authority) = websocket_destination(url).map_err(ConnectAttemptError::Origin)?;
     let stream = connect_to_http_proxy(&route, proxy_config.tls_config.clone())
         .await
@@ -2097,14 +2251,17 @@ async fn connect_via_http_proxy_tunnel(
         &subprotocols,
     )
     .map_err(ConnectAttemptError::Origin)?;
-    Ok(websocket)
+    Ok(ConnectedWebSocket {
+        stream: websocket,
+        max_message_bytes: advertised_max_message_bytes(response.headers()),
+    })
 }
 
 async fn connect_via_http_upgrade(
     websocket_client: &reqwest::Client,
     url: &str,
     headers: &HeaderMap,
-) -> Result<CodexWebSocketStream, CodexError> {
+) -> Result<ConnectedWebSocket, CodexError> {
     let http_url = to_http_upgrade_url(url).map_err(|error| CodexError {
         status: 0,
         message: error.message,
@@ -2154,12 +2311,16 @@ async fn connect_via_http_upgrade(
         &websocket_key,
         &subprotocols,
     )?;
+    let max_message_bytes = advertised_max_message_bytes(response.headers());
     let upgraded = response
         .upgrade()
         .await
         .map_err(|_| websocket_protocol_error("WebSocket upgrade stream was not available"))?;
     let upgraded: BoxedWebSocketIo = Box::new(upgraded);
-    Ok(WebSocketStream::from_raw_socket(upgraded, Role::Client, None).await)
+    Ok(ConnectedWebSocket {
+        stream: WebSocketStream::from_raw_socket(upgraded, Role::Client, None).await,
+        max_message_bytes,
+    })
 }
 
 async fn connect_once(
@@ -2167,7 +2328,7 @@ async fn connect_once(
     proxy_config: &WebSocketProxyConfig,
     url: &str,
     headers: &HeaderMap,
-) -> Result<CodexWebSocketStream, ConnectAttemptError> {
+) -> Result<ConnectedWebSocket, ConnectAttemptError> {
     if let Some(route) = proxy_config
         .http_connect_route(url)
         .map_err(ConnectAttemptError::Origin)?
@@ -2228,7 +2389,7 @@ async fn connect_with_timeout(
     url: &str,
     headers: &HeaderMap,
     connect_timeout_ms: u64,
-) -> Result<CodexWebSocketStream, CodexError> {
+) -> Result<ConnectedWebSocket, CodexError> {
     connect_with_policy(
         &WS_CONNECT_GATE,
         Duration::from_millis(connect_timeout_ms),
@@ -2335,6 +2496,7 @@ where
     let response_wait_started = tokio::time::Instant::now();
     let mut last_response_event_at = response_wait_started;
     let mut response_started = false;
+    let mut text_received = false;
 
     loop {
         let response_deadline_started = if response_started {
@@ -2379,6 +2541,7 @@ where
 
         match frame {
             Some(Ok(Message::Text(text))) => {
+                text_received = true;
                 // Parse JSON
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
@@ -2460,9 +2623,13 @@ where
                 // Raw frame passthrough - continue
                 continue;
             }
-            Some(Ok(Message::Close(_))) => {
+            Some(Ok(Message::Close(frame))) => {
                 // Connection closed - invalidate pool
                 invalidate_pool_owner(pool_owner, pool_entry);
+                log_response_close(close_code(frame.as_ref()), text_received);
+                if closed_for_message_size(frame.as_ref(), text_received) {
+                    return Err(closed_message_too_large_error());
+                }
                 break;
             }
             Some(Err(e)) => {
@@ -2504,6 +2671,7 @@ where
     let response_wait_started = tokio::time::Instant::now();
     let mut last_response_event_at = response_wait_started;
     let mut response_started = false;
+    let mut text_received = false;
     let mut status = 200u16;
     let mut reusable = false;
     let mut terminal_item = None;
@@ -2559,6 +2727,7 @@ where
 
         match frame {
             Some(Ok(Message::Text(text))) => {
+                text_received = true;
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(value) => value,
                     Err(_) => {
@@ -2639,7 +2808,18 @@ where
                 }
             }
             Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
-            Some(Ok(Message::Close(_))) | None => {
+            Some(Ok(Message::Close(frame))) => {
+                log_response_close(close_code(frame.as_ref()), text_received);
+                terminal_item = Some(Err(
+                    if closed_for_message_size(frame.as_ref(), text_received) {
+                        closed_message_too_large_error()
+                    } else {
+                        missing_terminal_error()
+                    },
+                ));
+                break;
+            }
+            None => {
                 terminal_item = Some(Err(missing_terminal_error()));
                 break;
             }
@@ -2758,6 +2938,255 @@ mod tests {
             .no_proxy()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn advertised_message_limit_is_a_trimmed_positive_integer() {
+        let read = |value: &[u8]| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                MAX_MESSAGE_BYTES_HEADER,
+                http::HeaderValue::from_bytes(value).unwrap(),
+            );
+            advertised_max_message_bytes(&headers)
+        };
+        assert_eq!(read(b"4096"), Some(4096));
+        assert_eq!(read(b" 4096\t"), Some(4096));
+        for unusable in [
+            &b""[..],
+            b"0",
+            b"-1",
+            b"4k",
+            b"1.5",
+            b"99999999999999999999999",
+            b"\xff",
+        ] {
+            assert_eq!(read(unusable), None, "{unusable:?}");
+        }
+        assert_eq!(advertised_max_message_bytes(&HeaderMap::new()), None);
+    }
+
+    #[tokio::test]
+    async fn direct_upgrade_reads_the_advertised_message_limit() {
+        use tokio_tungstenite::tungstenite::handshake::server::{
+            ErrorResponse, Request as UpgradeRequest, Response as UpgradeResponse,
+        };
+
+        for (advertised, expected) in [
+            (Some("4096"), Some(4096)),
+            (Some(" 2048 "), Some(2048)),
+            (Some("0"), None),
+            (Some("many"), None),
+            (Some(""), None),
+            (None, None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                #[allow(clippy::result_large_err)]
+                let callback = move |_: &UpgradeRequest, mut response: UpgradeResponse| {
+                    if let Some(value) = advertised {
+                        response.headers_mut().insert(
+                            MAX_MESSAGE_BYTES_HEADER,
+                            http::HeaderValue::from_static(value),
+                        );
+                    }
+                    Ok::<_, ErrorResponse>(response)
+                };
+                let _websocket = tokio_tungstenite::accept_hdr_async(socket, callback).await;
+                futures_util::future::pending::<()>().await;
+            });
+            let connected = connect_with_timeout(
+                &test_websocket_client(),
+                &WebSocketProxyConfig::direct(),
+                &format!("ws://{addr}/"),
+                &HeaderMap::new(),
+                2_000,
+            )
+            .await
+            .unwrap();
+            assert_eq!(connected.max_message_bytes, expected, "{advertised:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_over_the_advertised_limit_is_refused_and_one_at_it_is_not() {
+        let mut entry = PoolEntry::new(create_dummy_stream_async().await);
+        assert!(entry.check_message_size(usize::MAX).is_ok());
+
+        entry.max_message_bytes = Some(100);
+        assert!(entry.check_message_size(100).is_ok());
+        let error = entry.check_message_size(101).unwrap_err();
+        assert!(is_message_size_refusal(&error));
+        assert_eq!(error.status, 413);
+        assert_eq!(
+            error.message,
+            "The WebSocket request frame is 101 bytes, over the 100-byte message limit the Codex backend advertised"
+        );
+        assert!(!is_message_size_refusal(&missing_terminal_error()));
+    }
+
+    #[test]
+    fn only_a_1009_close_before_any_text_is_a_size_refusal() {
+        let frame = |code: CloseCode| CloseFrame {
+            code,
+            reason: "reason text".into(),
+        };
+        let size = frame(CloseCode::Size);
+        assert!(closed_for_message_size(Some(&size), false));
+        assert!(!closed_for_message_size(Some(&size), true));
+        assert!(!closed_for_message_size(
+            Some(&frame(CloseCode::Normal)),
+            false
+        ));
+        assert!(!closed_for_message_size(
+            Some(&frame(CloseCode::Error)),
+            false
+        ));
+        assert!(!closed_for_message_size(None, false));
+        assert_eq!(close_code(Some(&size)), 1009);
+        assert_eq!(close_code(None), 0);
+        assert!(is_message_size_refusal(&closed_message_too_large_error()));
+    }
+
+    #[tokio::test]
+    async fn a_request_over_the_limit_leaves_the_pooled_socket_unused_in_the_pool() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let owner = main_owner("size-limit-pooled-session");
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        invalidate_codex_websocket_pool_owner(&owner);
+
+        // A peer that answers the validation Ping and counts the text frames
+        // it receives.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let text_frames = Arc::new(AtomicUsize::new(0));
+        let counted = text_frames.clone();
+        let origin = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = websocket.next().await {
+                if matches!(message, Message::Text(_)) {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        let url = format!("http://{addr}/responses");
+        let connected = connect_with_timeout(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &format!("ws://{addr}/responses"),
+            &HeaderMap::new(),
+            1_000,
+        )
+        .await
+        .unwrap();
+        let entry = Arc::new(PoolEntry::opened_with(
+            ConnectedWebSocket {
+                stream: connected.stream,
+                max_message_bytes: Some(64),
+            },
+            &HeaderMap::new(),
+        ));
+        let reserved = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &continuation_request(),
+            true,
+        );
+        let continuation = test_continuation(
+            Some(owner.clone()),
+            reserved.turn_id(),
+            Some("resp_previous"),
+            Some(entry.socket_id),
+        );
+        pool_insert(owner.clone(), entry.clone());
+        let body = serde_json::json!({
+            "type": "response.create",
+            "input": "x".repeat(100),
+        });
+        let context = RequestContext {
+            req_id: "size-limit-pooled-request".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+            passthrough: None,
+        };
+
+        let buffered = match codex_websocket_request(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &url,
+            &HeaderMap::new(),
+            &body,
+            &context,
+            None,
+            1_000,
+            2_000,
+            Some(&continuation),
+        )
+        .await
+        {
+            Ok(_) => panic!("a frame over the limit must not be sent"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            buffered.detail.as_deref(),
+            Some(WEBSOCKET_MESSAGE_TOO_LARGE_DETAIL)
+        );
+        assert_eq!(pooled_socket_id_for_tests(&owner), Some(entry.socket_id));
+
+        let ready = prepare_codex_websocket(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &url,
+            &HeaderMap::new(),
+            None,
+            Some(&continuation),
+            1_000,
+            2_000,
+        )
+        .await
+        .unwrap();
+        assert!(ready.used_pooled);
+        let body_json = serde_json::to_string(&body).unwrap();
+        let mut events = start_codex_websocket_events(
+            ready,
+            &body,
+            body_json,
+            &HeaderMap::new(),
+            Some(&continuation),
+        );
+        let live = match tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("the refusal must arrive at once")
+        {
+            Some(Err(error)) => error,
+            _ => panic!("a frame over the limit must not be sent"),
+        };
+        assert_eq!(
+            live.detail.as_deref(),
+            Some(WEBSOCKET_MESSAGE_TOO_LARGE_DETAIL)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(pooled_socket_id_for_tests(&owner), Some(entry.socket_id));
+
+        // Both validation Pings were answered, so the peer has read past
+        // anything written before them; no request frame reached it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(text_frames.load(Ordering::SeqCst), 0);
+        super::super::continuation::abort_continuation_for_owner(&reserved);
+        invalidate_codex_websocket_pool_owner(&owner);
+        origin.abort();
     }
 
     fn handshake_error(status: u16) -> CodexError {
@@ -2945,6 +3374,7 @@ mod tests {
             created_at: now_ms(),
             last_activity: AtomicU64::new(next_pool_activity()),
             account_id: None,
+            max_message_bytes: None,
         })
     }
 
@@ -4603,7 +5033,8 @@ mod tests {
             2_000,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .stream;
         websocket
             .send(Message::Text("hello".to_string()))
             .await
@@ -5258,6 +5689,7 @@ mod tests {
         )
         .await
         .unwrap()
+        .stream
     }
 
     #[test]

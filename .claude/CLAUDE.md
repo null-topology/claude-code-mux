@@ -263,9 +263,33 @@ Request path:
      Transport (`CCP_CODEX_TRANSPORT` = `auto|websocket|http`)
      defaults to `auto`: a WebSocket from a per-conversation pool in
      `websocket.rs`, falling back to HTTP only when the handshake failed
-     before anything was sent (`should_fallback_to_http` in `client.rs`). A
-     request already sent over the WebSocket is never replayed over HTTP, and
-     `websocket` never falls back. WebSocket writes share the idle deadline
+     before anything was sent, or when the request was refused for its size
+     (`should_fallback_to_http` in `client.rs`). A request already sent over
+     the WebSocket is never replayed over HTTP, with one exception below,
+     and `websocket` never falls back. The size refusals follow the Codex
+     CLI (`codex-rs/codex-api/src/endpoint/responses_websocket.rs` at
+     `ed7ca22bb6`, the HTTP fallback at `bc3ccba6e1`); whether the backend
+     sends the header is not established. A successful handshake's
+     `x-codex-websocket-max-message-bytes` (a trimmed positive integer;
+     empty, zero or anything else means no limit) is kept on the
+     `PoolEntry` (`advertised_max_message_bytes`) and logged at info as
+     `codex_websocket_message_limit` with `reqId` and `maxMessageBytes` for
+     a new socket that carries one. A request frame longer than the limit
+     is never written (`PoolEntry::check_message_size`) and the socket goes
+     back to the pool unused. A close with code 1009 (message too big)
+     before any text frame of the response is the same refusal, and the
+     exception: under `auto` that request goes out again over HTTP, as the
+     peer refused it for its size without processing it. Both refusals
+     carry status 413 and one of `WEBSOCKET_MESSAGE_TOO_LARGE_DETAIL` and
+     `WEBSOCKET_CLOSED_MESSAGE_TOO_LARGE_DETAIL`
+     (`is_message_size_refusal`); neither is a continuation retry. Under
+     `auto` the request is sent over HTTP once with its full context, which
+     like any HTTP answer leaves no continuation state; under `websocket`
+     it is answered once with 413 `request_too_large`, never resent. A 1009
+     after response text and any other close keep their handling. A close
+     frame that ends a response logs `codex_websocket_closed` at info with
+     `closeCode` (0 without a frame) and `textStarted`, never the reason
+     text. WebSocket writes share the idle deadline
      of their path: the request frame (`send_request_frame`) and Pong
      replies that of the response wait, and the validation Ping that of the
      pooled-socket validation. A timed-out request frame or Pong answers as
@@ -276,8 +300,10 @@ Request path:
      buffered, logs a `codex_websocket_fallback_to_http` warning
      (`log_websocket_fallback_to_http`) with `reqId`, the handshake `status`
      (0 when none came), `class`, `usageLimit`, `retryAfter` and a `detail`
-     holding the rejection text or connect error cut to 300 characters, never
-     anything from the request. Claude Code's compaction summary goes over
+     holding the rejection text or connect error cut to 300 characters, or
+     for a size refusal (status 413) a fixed text naming only the frame
+     length and the limit or the 1009 close, never anything from the
+     request. Claude Code's compaction summary goes over
      HTTP whatever the setting (`transport_for_request` in `mod.rs`), and so
      does the opt-in server compaction call (`request_compaction` in
      `compaction.rs`).
@@ -1083,9 +1109,14 @@ The proxy does not retry a failed Codex request: one attempt, then the error
 goes to the client, which owns the retry policy. The only resends left repair
 the proxy's own state (a forgotten `previous_response_id`, a 401 token refresh).
 The `auto` fallback to HTTP is not a resend: it happens only when the
-handshake failed, before the request went out. With `websocket` transport a
-429 on the WebSocket handshake reaches the client as a plain 429 unless its
-body names one of the codes above; under `auto` it falls back to HTTP.
+handshake failed, before the request went out, or when the request was
+refused for its size. A frame over the limit the handshake advertised is
+never written; a WebSocket closed with 1009 before any response text is the
+one case where a request already on the socket goes out again over HTTP,
+since the peer refused it for its size without processing it. With
+`websocket` transport either refusal is one 413 answer, and a 429 on the
+WebSocket handshake reaches the client as a plain 429 unless its body names
+one of the codes above; under `auto` it falls back to HTTP.
 
 ## Naming and distribution
 
