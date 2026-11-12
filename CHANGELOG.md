@@ -30,6 +30,13 @@
   bound; it is not sent again, not retried after a token refresh and not
   replayed over HTTP, and its WebSocket is closed rather than kept for the
   conversation. Streaming requests are not affected. The cap has no setting.
+- Under the default `auto` transport, a Codex request the WebSocket refused
+  as too large is replayed over HTTP only under the ChatGPT account the
+  WebSocket attempt used. When the Codex CLI's login has moved to another
+  account between the two attempts, the proxy sends nothing over HTTP,
+  answers with the size refusal (413 `request_too_large`) and logs a
+  `codex_websocket_size_fallback_refused` warning. A renewed token of the
+  same account replays as before.
 
 ## v0.18.0 (2026-11-12)
 
