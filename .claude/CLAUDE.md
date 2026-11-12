@@ -146,7 +146,12 @@ Request path:
    Optional OpenAI-compatible
    surfaces gated by `AppFeatures`: `/v1/responses` and `/v1/chat/completions`
    (`CCP_CODEX_RESPONSES_API`; a buffered chat completion reads at most
-   `MAX_PROVIDER_STREAM_BYTES`, 32 MiB, of the Codex answer, and neither
+   `MAX_PROVIDER_STREAM_BYTES`, 32 MiB, of the Codex answer; a streaming one
+   (`chat_completions/stream.rs`) fails with a 502 `api_error` SSE error and
+   reads no further once the bytes it holds without a complete SSE frame pass
+   `MAX_HTTP_SSE_FRAME_BYTES` (8 MiB) or a text delta would take the output
+   text it keeps (`CompletionState::text`) past `MAX_PROVIDER_STREAM_BYTES`,
+   that delta not appended; neither
    surface's error text names the request URL), `/v1/images/*` (`CCP_CODEX_IMAGES_API`),
    `/v1/audio/transcriptions` (`CCP_CODEX_TRANSCRIPTIONS_API`).
    `dispatch_request` handles the Anthropic routes: read the body, normalize

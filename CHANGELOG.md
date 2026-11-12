@@ -24,7 +24,11 @@
   answer fails the way an answer that could not be read did before: the
   listing reports the backend as unreachable, the token refresh fails as a
   transient error, the search call fails without being sent again, and the
-  chat completion answers 502. These limits cannot be changed.
+  chat completion answers 502. A streaming chat completion now ends with an
+  error event (`api_error`) and reads nothing more when a single event of
+  the Codex answer passes 8 MiB before it is complete, or when its text
+  would pass 32 MiB; the text already relayed stays with the client. These
+  limits cannot be changed.
 - The `codex_upstream_request_failed` warning in `proxy.log` now has a
   `detail` field: the failure's detail as the proxy recorded it, such as
   `http_response_body` for an answer that could not be read or the start of

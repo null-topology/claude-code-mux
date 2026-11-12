@@ -436,7 +436,7 @@ pub struct CodexResponse {
 pub type CodexHttpEventReceiver =
     tokio::sync::mpsc::Receiver<Result<serde_json::Value, CodexError>>;
 
-const MAX_HTTP_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const MAX_HTTP_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
 struct HttpSseDecoder {

@@ -1,8 +1,11 @@
 use serde_json::{Value, json};
 
 use crate::anthropic::sse::parse_sse_events;
+use crate::openai_compat::MAX_PROVIDER_STREAM_BYTES;
 
 use super::ChatError;
+
+const OUTPUT_TEXT_TOO_LARGE: &str = "Codex output text exceeds the size limit";
 
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
@@ -29,6 +32,9 @@ pub struct CompletionState {
     pub usage: Usage,
     pub finish_reason: &'static str,
     pub completed: bool,
+    /// The most output text `text` keeps; a delta that would take it past
+    /// this fails the response and is not appended.
+    text_limit: usize,
 }
 
 impl CompletionState {
@@ -41,7 +47,13 @@ impl CompletionState {
             usage: Usage::default(),
             finish_reason: "stop",
             completed: false,
+            text_limit: MAX_PROVIDER_STREAM_BYTES,
         }
+    }
+
+    pub(super) fn with_text_limit(mut self, text_limit: usize) -> Self {
+        self.text_limit = text_limit;
+        self
     }
 
     pub fn observe(&mut self, event: &Value) -> Result<Option<String>, ChatError> {
@@ -59,6 +71,9 @@ impl CompletionState {
                 let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
                     ChatError::upstream("Codex output-text delta did not contain text")
                 })?;
+                if self.text.len().saturating_add(delta.len()) > self.text_limit {
+                    return Err(ChatError::upstream(OUTPUT_TEXT_TOO_LARGE));
+                }
                 self.text.push_str(delta);
                 return Ok(Some(delta.to_string()));
             }
@@ -196,6 +211,24 @@ mod tests {
         assert_eq!(value["id"], "chatcmpl-123");
         assert_eq!(value["choices"][0]["message"]["content"], "hello");
         assert_eq!(value["usage"]["total_tokens"], 6);
+    }
+
+    /// Text up to the limit is kept; a delta that would pass it fails and
+    /// is not appended.
+    #[test]
+    fn a_delta_past_the_text_limit_fails_without_being_kept() {
+        let mut state = CompletionState::new("model").with_text_limit(5);
+        let delta = |text: &str| json!({"type": "response.output_text.delta", "delta": text});
+        assert_eq!(
+            state.observe(&delta("hel")).unwrap().as_deref(),
+            Some("hel")
+        );
+        assert_eq!(state.observe(&delta("lo")).unwrap().as_deref(), Some("lo"));
+        let error = state.observe(&delta("!")).unwrap_err();
+        assert_eq!(error.status, http::StatusCode::BAD_GATEWAY);
+        assert_eq!(error.kind, "api_error");
+        assert_eq!(error.message, OUTPUT_TEXT_TOO_LARGE);
+        assert_eq!(state.text, "hello");
     }
 
     #[test]
