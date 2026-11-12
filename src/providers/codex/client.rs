@@ -619,6 +619,27 @@ pub(super) fn buffered_response_too_large_error(origin: CodexErrorOrigin) -> Cod
     }
 }
 
+/// Whether the part of a buffered answer held when it crossed its limit
+/// names a refusal that `post_codex_with_transport` answers as such from the
+/// body: a spent window (an explicit `usage_limit_reached` or a terminal
+/// `codex.rate_limits` snapshot), or a failure with an error class. Such an
+/// answer goes on to those readers instead of the size error, so it is
+/// answered as without the limit. Keep this in step with the readers there.
+pub(super) fn capped_body_names_refusal(
+    body: &[u8],
+    status: u16,
+    headers: &[(String, String)],
+) -> bool {
+    if super::events::usage_limit_from_response(body, headers).is_some() {
+        return true;
+    }
+    if (200..300).contains(&status) {
+        super::events::first_reportable_failure(body).is_some_and(|failure| failure.class.is_some())
+    } else {
+        super::events::error_class_from_body(body, status).is_some()
+    }
+}
+
 #[derive(Clone)]
 struct ProxyEnvironment {
     http_proxy: Option<String>,
@@ -2572,9 +2593,18 @@ impl CodexHttpClient {
                 }
                 response_started = true;
             }
-            // Dropping the response here closes its connection unread.
-            if body_bytes.len() + chunk.len() > self.buffered_response_limit {
-                return Err(buffered_response_too_large_error(CodexErrorOrigin::Http));
+            // Past the limit the bytes held up to it are read for a refusal;
+            // whatever comes after them is never read. Dropping the response
+            // closes its connection unread.
+            let room = self
+                .buffered_response_limit
+                .saturating_sub(body_bytes.len());
+            if chunk.len() > room {
+                body_bytes.extend_from_slice(&chunk[..room]);
+                if !capped_body_names_refusal(&body_bytes, status, &headers) {
+                    return Err(buffered_response_too_large_error(CodexErrorOrigin::Http));
+                }
+                break;
             }
             body_bytes.extend_from_slice(&chunk);
         }
@@ -5149,6 +5179,214 @@ mod tests {
         super::super::continuation::abort_continuation_for_owner(&candidate);
     }
 
+    /// Refusals a buffered answer can end with, by name: a spent window, a
+    /// terminal snapshot naming one spent window, and a quota failure.
+    fn buffered_refusal_events() -> [(&'static str, String); 3] {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        [
+            (
+                "spent window",
+                serde_json::json!({
+                    "type": "error",
+                    "status_code": 429,
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "The usage limit has been reached",
+                        "resets_at": now + 10_000
+                    }
+                })
+                .to_string(),
+            ),
+            (
+                "terminal snapshot",
+                serde_json::json!({
+                    "type": "codex.rate_limits",
+                    "rate_limits": {
+                        "allowed": false,
+                        "limit_reached": true,
+                        "primary": {"used_percent": 100.0, "window_minutes": 300, "reset_at": now + 10_000},
+                        "secondary": {"used_percent": 40.0, "window_minutes": 10080, "reset_at": now + 500_000}
+                    }
+                })
+                .to_string(),
+            ),
+            (
+                "quota",
+                serde_json::json!({
+                    "type": "error",
+                    "status_code": 429,
+                    "error": {
+                        "type": "insufficient_quota",
+                        "code": "insufficient_quota",
+                        "message": "You exceeded your current quota."
+                    }
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
+    /// What the client is answered for `error`: status, sorted headers, body.
+    async fn answered_parts(
+        error: &CodexError,
+    ) -> (http::StatusCode, Vec<(String, String)>, serde_json::Value) {
+        let response = super::super::map_codex_error_to_response(error);
+        let status = response.status();
+        let mut headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.to_string(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        headers.sort();
+        (status, headers, error_body(response).await)
+    }
+
+    /// Asserts that `answer` is the refusal `case` names, not the 502 of an
+    /// answer over the limit.
+    fn assert_refusal_answer(
+        case: &str,
+        (status, headers, body): &(http::StatusCode, Vec<(String, String)>, serde_json::Value),
+    ) {
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(*status, http::StatusCode::TOO_MANY_REQUESTS, "{case}");
+        assert_eq!(body["error"]["type"], "rate_limit_error", "{case}");
+        assert_eq!(header("x-should-retry"), Some("false"), "{case}");
+        let unified = header("anthropic-ratelimit-unified-status");
+        if case == "quota" {
+            assert_eq!(unified, None, "{case}");
+        } else {
+            assert_eq!(unified, Some("rejected"), "{case}");
+        }
+    }
+
+    /// Sends one buffered request over a WebSocket answered by `events`,
+    /// with the client's buffered limit set to `limit` when given. Returns
+    /// the error, the upgrades and HTTP requests the origin saw, and whether
+    /// a socket stayed pooled. The caller holds the registry and pool locks.
+    async fn buffered_websocket_answer(
+        events: Vec<String>,
+        limit: Option<usize>,
+    ) -> (CodexError, usize, usize, bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let owner = ConversationIdentity::Main("buffered-refusal-session".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upgrades = Arc::new(AtomicUsize::new(0));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let server = {
+            let (upgrades, posts) = (upgrades.clone(), posts.clone());
+            tokio::spawn(async move {
+                let mut sockets = Vec::new();
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut first = [0_u8; 1];
+                    if stream.peek(&mut first).await.unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    if first[0] == b'G' {
+                        let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                        upgrades.fetch_add(1, Ordering::SeqCst);
+                        let _request = next_websocket_json(&mut websocket).await;
+                        for event in &events {
+                            websocket
+                                .send(tokio_tungstenite::tungstenite::Message::Text(event.clone()))
+                                .await
+                                .unwrap();
+                        }
+                        sockets.push(websocket);
+                        continue;
+                    }
+                    let _request = read_http_request(&mut stream).await;
+                    posts.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+
+        let mut client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        if let Some(limit) = limit {
+            client = client.with_buffered_response_limit(limit);
+        }
+        let request = buffered_test_request();
+        let candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &request,
+            true,
+        );
+        let result = tokio::time::timeout(
+            MOCK_DEADLINE,
+            client.post_codex_with_transport(
+                &request,
+                &http_test_context(),
+                Some(&candidate),
+                crate::config::CodexTransport::Auto,
+            ),
+        )
+        .await
+        .expect("the request did not finish");
+        let pooled = super::super::websocket::pooled_socket_id_for_tests(&owner).is_some();
+        server.abort();
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        super::super::continuation::abort_continuation_for_owner(&candidate);
+        let error = match result {
+            Ok(_) => panic!("a refusal must fail the request"),
+            Err(error) => error,
+        };
+        (
+            error,
+            upgrades.load(Ordering::SeqCst),
+            posts.load(Ordering::SeqCst),
+            pooled,
+        )
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_buffered_websocket_refusal_that_crosses_the_limit_keeps_its_answer() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = super::super::rate_limits::lock_for_tests();
+        let created = r#"{"type":"response.created","response":{"id":"resp_refusal"}}"#;
+        // The created event fits; the refusal after it crosses the limit.
+        let limit = format!("data: {created}\n\n").len() + 1;
+        for (case, refusal) in buffered_refusal_events() {
+            let events = vec![created.to_string(), refusal];
+            let mut answers = Vec::new();
+            for limit in [None, Some(limit)] {
+                super::super::rate_limits::clear_for_tests();
+                let (error, upgrades, posts, pooled) =
+                    buffered_websocket_answer(events.clone(), limit).await;
+                assert_eq!((upgrades, posts, pooled), (1, 0, false), "{case}");
+                let answer = answered_parts(&error).await;
+                answers.push((answer, published_utilizations(Some("acct"))));
+            }
+            super::super::rate_limits::clear_for_tests();
+
+            assert_eq!(answers[0], answers[1], "{case}");
+            let (answer, gauge) = &answers[1];
+            assert_refusal_answer(case, answer);
+            if case == "terminal snapshot" {
+                assert_eq!(gauge[0].as_deref(), Some("1.0000"));
+                assert_eq!(gauge[1].as_deref(), Some("0.4000"));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn live_request_write_timeout_is_neither_resent_nor_replayed_over_http() {
         let _registry_guard =
@@ -6184,7 +6422,7 @@ mod tests {
     /// An origin that answers every HTTP request with `body` and counts them.
     fn spawn_fixed_body_origin(
         listener: TcpListener,
-        body: &'static str,
+        body: String,
         posts: Arc<std::sync::atomic::AtomicUsize>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -6209,7 +6447,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/responses", listener.local_addr().unwrap());
         let posts = Arc::new(AtomicUsize::new(0));
-        let server = spawn_fixed_body_origin(listener, answer, posts.clone());
+        let server = spawn_fixed_body_origin(listener, answer.to_string(), posts.clone());
         let (body, context) = (buffered_test_request(), http_test_context());
 
         let over = authenticated_http_test_client(url.clone())
@@ -6257,6 +6495,102 @@ mod tests {
         server.abort();
         assert_eq!(response.status, 200);
         assert_eq!(posts.load(Ordering::SeqCst), 2);
+    }
+
+    /// Sends one buffered HTTP request answered by `body`, with the client's
+    /// buffered limit set to `limit` when given. Returns the error and the
+    /// requests the origin saw.
+    async fn buffered_http_answer(body: String, limit: Option<usize>) -> (CodexError, usize) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/responses", listener.local_addr().unwrap());
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = spawn_fixed_body_origin(listener, body, posts.clone());
+        let mut client = authenticated_http_test_client(url);
+        if let Some(limit) = limit {
+            client = client.with_buffered_response_limit(limit);
+        }
+        let (request, context) = (buffered_test_request(), http_test_context());
+        let result = tokio::time::timeout(
+            MOCK_DEADLINE,
+            client.post_codex_with_transport(
+                &request,
+                &context,
+                None,
+                crate::config::CodexTransport::Http,
+            ),
+        )
+        .await
+        .expect("the request did not finish");
+        server.abort();
+        let error = match result {
+            Ok(_) => panic!("a refusal must fail the request"),
+            Err(error) => error,
+        };
+        (error, posts.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    const HTTP_LIMIT_CREATED: &str =
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_http\"}}\n\n";
+
+    /// An event that only makes the body larger.
+    fn http_padding_event() -> String {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({"type": "response.output_text.delta", "delta": "x".repeat(256)})
+        )
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_buffered_http_refusal_held_when_the_limit_is_crossed_keeps_its_answer() {
+        let _rate_limits = super::super::rate_limits::lock_for_tests();
+        for (case, refusal) in buffered_refusal_events() {
+            let held = format!("{HTTP_LIMIT_CREATED}data: {refusal}\n\n");
+            // The refusal is held whole; the padding after it crosses the limit.
+            let limit = held.len() + 8;
+            let body = format!("{held}{}", http_padding_event());
+            let mut answers = Vec::new();
+            for limit in [None, Some(limit)] {
+                super::super::rate_limits::clear_for_tests();
+                let (error, posts) = buffered_http_answer(body.clone(), limit).await;
+                assert_eq!(posts, 1, "{case}");
+                let answer = answered_parts(&error).await;
+                answers.push((answer, published_utilizations(Some("acct"))));
+            }
+            super::super::rate_limits::clear_for_tests();
+
+            assert_eq!(answers[0], answers[1], "{case}");
+            let (answer, gauge) = &answers[1];
+            assert_refusal_answer(case, answer);
+            if case == "terminal snapshot" {
+                assert_eq!(gauge[0].as_deref(), Some("1.0000"));
+                assert_eq!(gauge[1].as_deref(), Some("0.4000"));
+            }
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_buffered_http_refusal_wholly_past_the_limit_is_not_seen() {
+        let _rate_limits = super::super::rate_limits::lock_for_tests();
+        super::super::rate_limits::clear_for_tests();
+        let [(_, refusal), ..] = buffered_refusal_events();
+        let padding = http_padding_event();
+        let body = format!("{HTTP_LIMIT_CREATED}{padding}data: {refusal}\n\n");
+        let limit = HTTP_LIMIT_CREATED.len() + padding.len() / 2;
+
+        let (error, posts) = buffered_http_answer(body, Some(limit)).await;
+        let gauge = published_utilizations(Some("acct"));
+        super::super::rate_limits::clear_for_tests();
+
+        assert_eq!(posts, 1);
+        assert_eq!(error.status, 502);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(BUFFERED_RESPONSE_TOO_LARGE_DETAIL)
+        );
+        assert!(error.usage_limit.is_none());
+        assert_eq!(gauge, [None, None]);
     }
 
     #[test]

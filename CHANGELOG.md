@@ -12,8 +12,7 @@
   answer fails the way an answer that could not be read did before: the
   listing reports the backend as unreachable, the token refresh fails as a
   transient error, the search call fails without being sent again, and the
-  chat completion answers 502. These limits sit far above what the backend
-  sends and cannot be changed.
+  chat completion answers 502. These limits cannot be changed.
 - The `codex_upstream_request_failed` warning in `proxy.log` now has a
   `detail` field: the failure's detail as the proxy recorded it, such as
   `http_response_body` for an answer that could not be read or the start of
@@ -27,7 +26,13 @@
 - A buffered (non-streaming) Codex answer is now capped at 64 MiB of
   upstream events, over HTTP and over the WebSocket alike. A larger answer
   fails with a 502 `api_error` instead of growing the proxy's memory without
-  bound; it is not sent again, not retried after a token refresh and not
+  bound, unless what the proxy holds when it reaches the cap is already a
+  refusal: a spent usage window, or a failure with a known error code such as
+  a quota or policy refusal, is answered as it is without the cap. Over the
+  WebSocket the event that reaches the cap counts when it is the error or
+  usage reading that ends the answer; over HTTP only the bytes before the cap
+  are read, so a refusal that comes after them still answers 502. Either way
+  the request is not sent again, not retried after a token refresh and not
   replayed over HTTP, and its WebSocket is closed rather than kept for the
   conversation. The cap has no setting.
 - A streaming Codex response is still relayed whole, but the copy of its

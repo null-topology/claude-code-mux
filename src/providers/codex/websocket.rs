@@ -980,6 +980,14 @@ fn encode_sse(text: &str) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// The length of `encode_sse(text)`, worked out without building it: each
+/// line takes `data: ` and a newline, and the event a closing newline.
+fn encoded_sse_len(text: &str) -> usize {
+    text.lines().fold(1, |len, line| {
+        len.saturating_add(line.len().saturating_add(7))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Terminal event detection
 // ---------------------------------------------------------------------------
@@ -1213,11 +1221,7 @@ pub(super) async fn codex_websocket_request(
         }
         false
     };
-    let status = if terminal_event.event_type == "error" {
-        event_error_status(&terminal_event.payload).unwrap_or(500)
-    } else {
-        200
-    };
+    let status = buffered_answer_status(&terminal_event);
 
     if let Some(tc) = traffic {
         write_websocket_metadata_capture(tc, &ws_url, reservation, used_pooled);
@@ -2695,6 +2699,47 @@ struct WsEvent {
     payload: serde_json::Value,
 }
 
+/// The status a buffered WebSocket answer carries: an `error` event's own,
+/// else 500, and 200 for any other terminal event.
+fn buffered_answer_status(terminal_event: &WsEvent) -> u16 {
+    if terminal_event.event_type == "error" {
+        event_error_status(&terminal_event.payload).unwrap_or(500)
+    } else {
+        200
+    }
+}
+
+/// The event that took a buffered answer past its limit, when the collector
+/// would stop on it as a failure anyway: an `error` or `response.failed`
+/// event, or a `codex.rate_limits` snapshot that ends the request, other than
+/// a missing previous response, which is sent again. Only the `type` is read
+/// from any other event, so no copy of it is built.
+fn failure_past_limit(text: &str) -> Option<WsEvent> {
+    #[derive(serde::Deserialize)]
+    struct EventType<'a> {
+        #[serde(borrow, rename = "type")]
+        event_type: Option<std::borrow::Cow<'a, str>>,
+    }
+
+    let event_type = serde_json::from_str::<EventType<'_>>(text)
+        .ok()?
+        .event_type?;
+    if !matches!(
+        event_type.as_ref(),
+        "error" | "response.failed" | "codex.rate_limits"
+    ) {
+        return None;
+    }
+    let payload: serde_json::Value = serde_json::from_str(text).ok()?;
+    let stops_as_failure = (is_terminal_event(&payload)
+        || super::events::is_terminal_rate_limit_event(&payload))
+        && !is_previous_response_missing(&payload);
+    stops_as_failure.then(|| WsEvent {
+        event_type: event_type.into_owned(),
+        payload,
+    })
+}
+
 async fn collect_ws_events<S>(
     ws: &mut WebSocketStream<S>,
     idle_timeout_ms: u64,
@@ -2721,7 +2766,11 @@ where
 }
 
 /// `body_limit` bounds the SSE body held for the answer; past it the request
-/// fails and the socket is not kept.
+/// fails and the socket is not kept. The one exception is an event that
+/// crosses the limit and that the request would stop on as a refusal
+/// (`failure_past_limit`, `capped_body_names_refusal`): it is added to the
+/// body and ends the collection as its terminal event, and the socket is
+/// still not kept.
 #[allow(clippy::too_many_arguments)]
 async fn collect_ws_events_with_keepalive_interval<S>(
     ws: &mut WebSocketStream<S>,
@@ -2788,13 +2837,27 @@ where
         match frame {
             Some(Ok(Message::Text(text))) => {
                 text_received = true;
-                let event = encode_sse(&text);
-                if sse_body.len() + event.len() > body_limit {
+                if sse_body.len().saturating_add(encoded_sse_len(&text)) > body_limit {
                     invalidate_pool_owner(pool_owner, pool_entry);
+                    // A refusal the request stops on is still answered as
+                    // one, read from the events held and this one, which is
+                    // added in its compact form, a single line.
+                    if let Some(failure) = failure_past_limit(&text) {
+                        sse_body.extend_from_slice(&encode_sse(&failure.payload.to_string()));
+                        if let Some(tc) = traffic {
+                            tc.write_json_event("040-upstream-event", &failure.payload);
+                        }
+                        let status = buffered_answer_status(&failure);
+                        if super::client::capped_body_names_refusal(&sse_body, status, &[]) {
+                            terminal_event = Some(failure);
+                            break;
+                        }
+                    }
                     return Err(buffered_response_too_large_error(
                         CodexErrorOrigin::WebSocket,
                     ));
                 }
+                let event = encode_sse(&text);
                 // Parse JSON
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
@@ -2932,12 +2995,11 @@ impl LiveCaptureBody {
         if self.full {
             return;
         }
-        let event = encode_sse(text);
-        if self.bytes.len().saturating_add(event.len()) > self.limit {
+        if self.bytes.len().saturating_add(encoded_sse_len(text)) > self.limit {
             self.full = true;
             return;
         }
-        self.bytes.extend_from_slice(&event);
+        self.bytes.extend_from_slice(&encode_sse(text));
     }
 }
 
@@ -4282,6 +4344,24 @@ mod tests {
     }
 
     #[test]
+    fn encoded_sse_len_is_the_length_of_the_encoding() {
+        for text in [
+            r#"{"type":"test","data":"hello"}"#,
+            "line1\nline2\nline3",
+            "",
+            "\n",
+            "\n\n\n",
+            "line1\n\nline2",
+            "line1\n",
+            "line1\r\nline2\r\n",
+            "\r\n\r\n",
+            "line1\rline2",
+        ] {
+            assert_eq!(encoded_sse_len(text), encode_sse(text).len(), "{text:?}");
+        }
+    }
+
+    #[test]
     fn is_terminal_event_detection() {
         let completed = serde_json::json!({"type": "response.completed"});
         assert!(is_terminal_event(&completed));
@@ -5612,13 +5692,20 @@ mod tests {
     /// `LIMIT_COMPLETED_EVENT`, as a buffered answer of two events.
     async fn connect_to_two_event_answer()
     -> WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+        connect_to_answer(&[LIMIT_CREATED_EVENT, LIMIT_COMPLETED_EVENT]).await
+    }
+
+    /// A socket that answers with `events`, one text frame each.
+    async fn connect_to_answer(
+        events: &'static [&'static str],
+    ) -> WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            for event in [LIMIT_CREATED_EVENT, LIMIT_COMPLETED_EVENT] {
-                ws.send(Message::Text(event.into())).await.unwrap();
+            for event in events {
+                ws.send(Message::Text((*event).into())).await.unwrap();
             }
             let _ = ws.next().await;
         });
@@ -5626,6 +5713,81 @@ mod tests {
             .await
             .unwrap();
         ws
+    }
+
+    /// A spent window sent as indented JSON over several lines.
+    const LIMIT_SPENT_WINDOW_EVENT: &str = "{\n  \"type\": \"error\",\n  \"status_code\": 429,\n  \"error\": {\n    \"type\": \"usage_limit_reached\",\n    \"message\": \"The usage limit has been reached\",\n    \"resets_in_seconds\": 90\n  }\n}";
+    const LIMIT_SERVER_ERROR_EVENT: &str = r#"{"type":"error","status_code":500,"error":{"type":"server_error","message":"The server had an error"}}"#;
+
+    #[tokio::test]
+    async fn a_refusal_that_crosses_the_limit_ends_the_body_and_drops_the_socket() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let pooled_stream = create_dummy_stream_async().await;
+        let owner = agent_owner("limit-refusal-session", "limit-agent");
+        {
+            let mut guard = WS_POOL.lock().unwrap();
+            guard.insert(owner.clone(), Arc::new(PoolEntry::new(pooled_stream)));
+        }
+        let created = encode_sse(LIMIT_CREATED_EVENT);
+        let limit = created.len() + 1;
+
+        let mut ws = connect_to_answer(&[LIMIT_CREATED_EVENT, LIMIT_SPENT_WINDOW_EVENT]).await;
+        let (body, terminal) = collect_ws_events(
+            &mut ws,
+            1_000,
+            limit,
+            Some(&owner),
+            None,
+            None,
+            "test-request",
+        )
+        .await
+        .expect("a refusal past the limit is kept for its answer");
+
+        let refusal: serde_json::Value = serde_json::from_str(LIMIT_SPENT_WINDOW_EVENT).unwrap();
+        let terminal = terminal.expect("the refusal ends the body");
+        assert_eq!(terminal.event_type, "error");
+        assert_eq!(terminal.payload, refusal);
+        assert_eq!(buffered_answer_status(&terminal), 429);
+        assert_eq!(body, [created, encode_sse(&refusal.to_string())].concat());
+        assert!(!WS_POOL.lock().unwrap().contains_key(&owner));
+    }
+
+    #[tokio::test]
+    async fn a_failure_past_the_limit_that_names_no_refusal_still_fails() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let pooled_stream = create_dummy_stream_async().await;
+        let owner = agent_owner("limit-failure-session", "limit-agent");
+        {
+            let mut guard = WS_POOL.lock().unwrap();
+            guard.insert(owner.clone(), Arc::new(PoolEntry::new(pooled_stream)));
+        }
+        let limit = encode_sse(LIMIT_CREATED_EVENT).len() + 1;
+
+        let mut ws = connect_to_answer(&[LIMIT_CREATED_EVENT, LIMIT_SERVER_ERROR_EVENT]).await;
+        let err = match collect_ws_events(
+            &mut ws,
+            1_000,
+            limit,
+            Some(&owner),
+            None,
+            None,
+            "test-request",
+        )
+        .await
+        {
+            Ok(_) => panic!("a failure that names no refusal must not be kept"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.status, 502);
+        assert_eq!(
+            err.detail.as_deref(),
+            Some(BUFFERED_RESPONSE_TOO_LARGE_DETAIL)
+        );
+        assert!(!WS_POOL.lock().unwrap().contains_key(&owner));
     }
 
     #[tokio::test]
@@ -5683,8 +5845,35 @@ mod tests {
     }
 
     #[test]
-    fn a_live_stream_without_a_capture_keeps_no_copy_of_its_events() {
+    fn no_capture_body_is_made_without_a_traffic_capture() {
         assert!(LiveCaptureBody::for_capture(None, MAX_BUFFERED_RESPONSE_BYTES).is_none());
+    }
+
+    #[test]
+    fn a_live_capture_event_past_its_room_leaves_the_copy_as_it_was() {
+        let created = encode_sse(LIMIT_CREATED_EVENT);
+        let completed = encode_sse(LIMIT_COMPLETED_EVENT);
+        let mut capture = LiveCaptureBody {
+            bytes: Vec::new(),
+            limit: created.len() + completed.len(),
+            full: false,
+        };
+
+        capture.append(LIMIT_CREATED_EVENT);
+        capture.append(&"\n".repeat(completed.len()));
+        assert!(capture.full);
+        assert_eq!(capture.bytes, created);
+        capture.append(LIMIT_COMPLETED_EVENT);
+        assert_eq!(capture.bytes, created);
+
+        let mut capture = LiveCaptureBody {
+            bytes: created.clone(),
+            limit: created.len() + completed.len(),
+            full: false,
+        };
+        capture.append(LIMIT_COMPLETED_EVENT);
+        assert!(!capture.full);
+        assert_eq!(capture.bytes, [created, completed].concat());
     }
 
     #[tokio::test]

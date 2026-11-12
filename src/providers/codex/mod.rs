@@ -1431,10 +1431,8 @@ impl LiveUpstreamCopy {
         let Some(body) = self.body.as_mut() else {
             return false;
         };
-        let mut event = Vec::new();
-        append_upstream_sse_payload(&mut event, payload);
-        if body.len().saturating_add(event.len()) <= self.limit {
-            body.extend_from_slice(&event);
+        let room = self.limit.saturating_sub(body.len());
+        if append_upstream_sse_payload(body, payload, room) {
             return false;
         }
         self.body = None;
@@ -1483,14 +1481,49 @@ fn live_stream_copy_dropped_fields(
     ])
 }
 
-fn append_upstream_sse_payload(buffer: &mut Vec<u8>, payload: &serde_json::Value) {
-    let text = payload.to_string();
-    for line in text.lines() {
-        buffer.extend_from_slice(b"data: ");
-        buffer.extend_from_slice(line.as_bytes());
-        buffer.push(b'\n');
+/// Adds `payload` to `buffer` as one SSE event, `data: ` and its compact JSON
+/// on a single line (compact JSON holds no line break), when the event takes
+/// at most `room` bytes, and returns whether it did. The payload is
+/// serialised into the buffer and stops at `room`, so an event that does not
+/// fit is never built whole; the buffer is then left as it was.
+fn append_upstream_sse_payload(
+    buffer: &mut Vec<u8>,
+    payload: &serde_json::Value,
+    room: usize,
+) -> bool {
+    use std::io::Write as _;
+
+    let start = buffer.len();
+    let mut writer = RoomLimitedWriter { buffer, room };
+    let written = writer.write_all(b"data: ").is_ok()
+        && serde_json::to_writer(&mut writer, payload).is_ok()
+        && writer.write_all(b"\n\n").is_ok();
+    if !written {
+        buffer.truncate(start);
     }
-    buffer.push(b'\n');
+    written
+}
+
+/// Appends to a buffer and fails a write that would take it past `room`
+/// more bytes, so a serialiser stops there.
+struct RoomLimitedWriter<'a> {
+    buffer: &'a mut Vec<u8>,
+    room: usize,
+}
+
+impl std::io::Write for RoomLimitedWriter<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if data.len() > self.room {
+            return Err(std::io::Error::other("event past the copy limit"));
+        }
+        self.room -= data.len();
+        self.buffer.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn event_stream_response<S>(stream: S) -> Response
@@ -4253,8 +4286,7 @@ mod tests {
     #[test]
     fn a_live_upstream_copy_is_released_once_by_the_event_that_passes_its_limit() {
         let event = serde_json::json!({"type": "response.created", "response": {"id": "resp"}});
-        let mut encoded = Vec::new();
-        append_upstream_sse_payload(&mut encoded, &event);
+        let encoded = format!("data: {event}\n\n").into_bytes();
         let mut copy = LiveUpstreamCopy::new(encoded.len() * 2);
 
         assert!(!copy.append("request-copy", &event));
@@ -4264,6 +4296,48 @@ mod tests {
         assert!(copy.body.is_none());
         assert!(!copy.append("request-copy", &event));
         assert!(copy.body.is_none());
+    }
+
+    /// The framing is the one the copy always had: compact JSON holds no
+    /// line break, so splitting it into lines gave one `data:` line.
+    #[test]
+    fn an_upstream_event_is_framed_as_one_compact_data_line() {
+        let event = serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "one\ntwo\r\nthree\n\n"
+        });
+        let text = event.to_string();
+        let mut by_lines = Vec::new();
+        for line in text.lines() {
+            by_lines.extend_from_slice(b"data: ");
+            by_lines.extend_from_slice(line.as_bytes());
+            by_lines.push(b'\n');
+        }
+        by_lines.push(b'\n');
+
+        let mut framed = Vec::new();
+        assert!(append_upstream_sse_payload(&mut framed, &event, usize::MAX));
+        assert_eq!(framed, by_lines);
+        assert_eq!(framed, format!("data: {text}\n\n").into_bytes());
+    }
+
+    #[test]
+    fn an_upstream_event_past_the_room_leaves_the_copy_as_it_was() {
+        let held = b"data: {\"type\":\"response.created\"}\n\n".to_vec();
+        let event = serde_json::json!({"type": "response.output_text.delta", "delta": "abc"});
+        let size = format!("data: {event}\n\n").len();
+
+        let mut copy = held.clone();
+        assert!(!append_upstream_sse_payload(&mut copy, &event, size - 1));
+        assert_eq!(copy, held);
+        assert!(append_upstream_sse_payload(&mut copy, &event, size));
+        assert_eq!(copy.len(), held.len() + size);
+
+        let large = serde_json::json!({"delta": "x".repeat(1024 * 1024)});
+        let mut copy = held.clone();
+        assert!(!append_upstream_sse_payload(&mut copy, &large, 64));
+        assert_eq!(copy, held);
+        assert!(copy.capacity() < 1024, "{}", copy.capacity());
     }
 
     #[test]

@@ -1193,11 +1193,26 @@ and within one deadline of `body_idle_timeout_ms` for the whole read
 capture see only those bytes, and a read past the deadline fails with
 `detail: http_response_body` and is neither refreshed nor resent. A
 successful buffered Messages answer is held up to
-`MAX_BUFFERED_RESPONSE_BYTES` (64 MiB of SSE, in `client.rs`), over HTTP
+`MAX_BUFFERED_RESPONSE_BYTES` (64 MiB of SSE, in `client.rs`; no setting,
+`with_buffered_response_limit` is for tests), over HTTP
 (`collect_http_response`) and WebSocket (`collect_ws_events`) alike; one
 byte more fails it with a 502 `api_error` whose detail is
 `BUFFERED_RESPONSE_TOO_LARGE_DETAIL`, drops the socket, and is neither
-refreshed, resent nor replayed over HTTP. A live stream is relayed as it
+refreshed, resent nor replayed over HTTP. The exception is a refusal the
+proxy holds at that point (`capped_body_names_refusal`: a spent window from
+`usage_limit_from_response`, else a classified failure from
+`first_reportable_failure` for a 2xx or `error_class_from_body` otherwise):
+the collector ends the body there and returns it, so the readers of
+`post_codex_with_transport` answer it as without the limit, the spent window
+recorded and the readings merged; the socket is still dropped and nothing
+is resent. On HTTP the bytes examined are those held, the crossing chunk
+cut at the limit, so a refusal that arrives wholly after the limit is not
+seen and the answer is the 502. On WebSocket the event that crosses the
+limit is examined when its `type` is `error`, `response.failed` or
+`codex.rate_limits` and the collector would stop on it as a failure
+(`failure_past_limit`: a terminal event or a terminal snapshot, not a
+missing previous response); it joins the body as one compact `data:` line.
+A live stream is relayed as it
 arrives, and the copies of its events kept beside the relay stop at the
 client's same limit (`CodexHttpClient::buffered_response_limit`). The copy
 its continuation state is read from (`LiveUpstreamCopy` in `mod.rs`) is
@@ -1209,7 +1224,10 @@ context without `previous_response_id`. The WebSocket reader's copy for the
 response-body capture (`LiveCaptureBody` in `websocket.rs`) exists only
 while a traffic capture is on and stops before the event that would pass
 the limit, so `032-upstream-response-body.sse` then holds the events up to
-that point. The client receives every event either way. The live HTTP
+that point. The client receives every event either way. No copy is built
+before it is known to fit: `encoded_sse_len` gives `encode_sse`'s framed
+length without allocating, and `append_upstream_sse_payload` serialises into
+a writer that stops at the room left. The live HTTP
 reader keeps no copy of the stream; it captures event by event.
 Text built from a `reqwest::Error` in these paths goes through
 `upstream_http::error_text`, which leaves out the request URL. Under `auto` transport
