@@ -23,6 +23,14 @@
   only at that root now fails certificate verification; no setting brings
   the root back.
 
+- The WebSocket library is updated to tokio-tungstenite 0.30, and rand to
+  0.10, sha2 to 0.11, prost to 0.14 and base64 to 0.23. Nothing changes for
+  someone upgrading: Codex WebSocket requests, pings and closes go out as
+  before with the same message and frame limits, no compression extension
+  is offered, WebSocket TLS keeps the ring crypto provider and its trust
+  settings, and the Grok and Cursor logins and the Cursor protocol encode
+  as before.
+
 ## v0.18.1 (2026-11-12)
 
 - Error messages about a failed upstream call no longer include the request
