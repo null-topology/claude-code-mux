@@ -4420,8 +4420,8 @@ mod tests {
         assert!(copy.body.is_none());
     }
 
-    /// The framing is the one the copy always had: compact JSON holds no
-    /// line break, so splitting it into lines gave one `data:` line.
+    /// Compact JSON holds no line break, so an event takes one `data:` line
+    /// followed by a blank one.
     #[test]
     fn an_upstream_event_is_framed_as_one_compact_data_line() {
         let event = serde_json::json!({

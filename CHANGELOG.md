@@ -1,23 +1,25 @@
 ## Unreleased
 
-- Error messages no longer include the request URL. A base URL or proxy URL
-  that carries a credential in its path or query used to show up in client
-  error answers, in the terminal (the `models` command and the login
-  commands) and in `proxy.log`. This covers the Codex provider (Messages
-  requests, live and buffered, the model listing, the native Responses and
-  chat completions surfaces, the hosted search call, and the transcription
-  and image endpoints), the Anthropic passthrough, whose relayed bytes are
-  untouched, and the Kimi, Grok and Cursor providers with their login and
-  token refresh. The text of a failed Kimi, Grok or Cursor login or token
-  refresh changes in other ways too. A request that cannot be sent, or an
-  answer that cannot be read, now reports only the first line of the error,
-  so the `Caused by:` lines that used to follow it, such as a refused
-  connection, are gone. In a Kimi or Cursor login or token refresh and in
-  Grok's login and device flow, a connection that breaks while the answer
-  is being read now reports `request or response body error` instead of
-  `error decoding response body`, and an answer that is still arriving
-  piece by piece when the client's timeout has run out reports `timed out
-  reading the response body`. Grok's token refresh keeps its wording.
+- Error messages about a failed upstream call no longer include the request
+  URL. A base URL or proxy URL that carries a credential in its path or
+  query used to show up in client error answers, in the terminal (the
+  `models` command and the login commands) and in `proxy.log`. This covers
+  the Codex provider (Messages requests, live and buffered, the model
+  listing, the native Responses and chat completions surfaces, the hosted
+  search call, and the transcription and image endpoints), the Anthropic
+  passthrough, whose relayed bytes are untouched, and the Kimi, Grok and
+  Cursor providers with their login and token refresh. The text of a failed
+  Kimi, Grok or Cursor login or token refresh changes in other ways too. A
+  request that cannot be sent, or an answer that cannot be read, now reports
+  only the first line of the error, so the `Caused by:` lines that used to
+  follow it, such as a refused connection, are gone. In a Kimi or Cursor
+  login or token refresh and in Grok's login and device flow, a connection
+  that breaks while the answer is being read now reports
+  `request or response body error` instead of
+  `error decoding response body`, and an answer that is still arriving piece
+  by piece when the client's timeout has run out reports
+  `timed out reading the response body`. Grok's token refresh keeps its
+  wording.
 - Some Codex answers are now read only up to a size limit: the model
   listing up to 4 MiB, a token refresh answer up to 1 MiB, the hosted search
   answer up to 8 MiB and a buffered chat completion up to 32 MiB. A larger
@@ -34,7 +36,7 @@
   `http_response_body` for an answer that could not be read or the start of
   the backend's error answer, cut to 300 characters, or null when there is
   none.
-- A buffered (non-streaming) Codex answer is now capped at 64 MiB of
+- A buffered (non-streaming) Codex Messages answer is now capped at 64 MiB of
   upstream events, over HTTP and over the WebSocket alike. A larger answer
   fails with a 502 `api_error` instead of growing the proxy's memory without
   bound, unless what the proxy holds when it reaches the cap is already a
@@ -45,11 +47,11 @@
   are read, so a refusal that comes after them still answers 502. Either way
   the request is not sent again, not retried after a token refresh and not
   replayed over HTTP, and its WebSocket is closed rather than kept for the
-  conversation. A streaming Codex response is held to the same cap until its
-  output starts: one that would pass it before then fails with the same 502,
-  over either transport, and is not sent again either. The cap has no
-  setting.
-- A streaming Codex response is now bounded as well. The copy of its
+  conversation. A streaming Codex Messages response is held to the same cap
+  until its output starts: one that would pass it before then fails with the
+  same 502, over either transport, and is not sent again either. The cap has
+  no setting.
+- A streaming Codex Messages response is now bounded as well. The copy of its
   upstream events the proxy keeps beside the relay stops at the same
   64 MiB: the response goes on, but leaves no state to continue from, so the
   conversation's next request sends its full context instead of only what
@@ -61,10 +63,10 @@
   while it translates the response stop at 64 MiB too, counted as their
   bytes plus a fixed charge for every piece kept, with each web search
   result counted again for every search it is reported under: the piece
-  that would pass that is neither kept nor relayed, and the request fails
-  with a 502 `api_error` when nothing was relayed yet, or else the stream
-  ends with an SSE `error` event of type `api_error`. Such a response is
-  not sent again, leaves no state to continue from, and the proxy drops
+  that would exceed the limit is neither kept nor relayed, and the request
+  fails with a 502 `api_error` when nothing was relayed yet, or else the
+  stream ends with an SSE `error` event of type `api_error`. Such a response
+  is not sent again, leaves no state to continue from, and the proxy drops
   the WebSocket it kept for the conversation.
 - Under the default `auto` transport, a Codex request the WebSocket refused
   as too large is replayed over HTTP only under the ChatGPT account the
@@ -73,16 +75,15 @@
   When the Codex CLI's login leaves the account of one attempt or both
   unknown, the replay goes out only with the very access token the
   WebSocket attempt used, so a renewed token or another login is refused
-  then. Otherwise the proxy
-  sends nothing over HTTP, answers with the size refusal (413
-  `request_too_large`) and logs a `codex_websocket_size_fallback_refused`
-  warning with the request id only. A conversation's pooled WebSocket is
-  tied to its login too: one opened under a login with no account id is
-  reused only by a request that names no account either and carries the
-  very same access token, so after a renewed token or another login the
-  next request opens a connection of its own, and a continuation that
-  depended on the old socket is sent again with its full context. There is
-  no setting for this.
+  then. Otherwise the proxy sends nothing over HTTP, answers with the size
+  refusal (413 `request_too_large`) and logs a
+  `codex_websocket_size_fallback_refused` warning with the request id only.
+  A conversation's pooled WebSocket is tied to its login too: one opened
+  under a login with no account id is reused only by a request that names
+  no account either and carries the very same access token, so after a
+  renewed token or another login the next request opens a connection of its
+  own, and a continuation that depended on the old socket is sent again
+  with its full context. There is no setting for this.
 - The Kimi, Grok and Cursor providers now stop reading an upstream body once
   it passes a fixed size, instead of holding whatever the server sends: 1 MiB
   for a login, login poll, device or token refresh answer, 64 KiB for an

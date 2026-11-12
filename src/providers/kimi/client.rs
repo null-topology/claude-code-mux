@@ -213,8 +213,8 @@ fn read_response(
     }
 
     // An answer over the limit is an upstream failure: an empty body would
-    // reach the client as an empty successful message. A failed read keeps
-    // its old outcome, an empty body.
+    // reach the client as an empty successful message. A read that fails in
+    // transport counts as an empty body.
     let body_bytes = match read_blocking_body_capped(resp, max_response_bytes, deadline) {
         Ok(body) => body,
         Err(error @ BodyReadError::TooLarge { .. }) => {

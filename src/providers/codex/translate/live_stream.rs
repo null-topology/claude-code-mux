@@ -136,7 +136,8 @@ impl LiveStreamTranslator {
         }
     }
 
-    /// Sets how many bytes of strings the translator may keep for one stream.
+    /// Sets the limit of what the translator may keep for one stream: the
+    /// bytes of its strings plus a fixed charge for every entry.
     pub fn with_retained_limit(mut self, limit: usize) -> Self {
         self.retained_limit = limit;
         self
@@ -1166,8 +1167,8 @@ impl LiveStreamTranslator {
         );
     }
 
-    /// Counts `bytes` of a string about to be kept, or refuses it when that
-    /// would take the stream past its limit.
+    /// Counts `bytes` about to be kept, string data or entry charges, or
+    /// refuses them when that would take the stream past its limit.
     fn retain(&mut self, bytes: usize) -> Result<(), String> {
         reserve_retained(&mut self.retained_bytes, self.retained_limit, bytes)
     }
