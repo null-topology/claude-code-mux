@@ -147,11 +147,12 @@ Request path:
    surfaces gated by `AppFeatures`: `/v1/responses` and `/v1/chat/completions`
    (`CCP_CODEX_RESPONSES_API`; a buffered chat completion reads at most
    `MAX_PROVIDER_STREAM_BYTES`, 32 MiB, of the Codex answer; a streaming one
-   (`chat_completions/stream.rs`) fails with a 502 `api_error` SSE error and
-   reads no further once the bytes it holds without a complete SSE frame pass
-   `MAX_HTTP_SSE_FRAME_BYTES` (8 MiB) or a text delta would take the output
-   text it keeps (`CompletionState::text`) past `MAX_PROVIDER_STREAM_BYTES`,
-   that delta not appended; neither
+   (`chat_completions/stream.rs`) has already sent its 200 status line, so
+   it ends the stream with an SSE error event of type `api_error` followed
+   by `data: [DONE]` and reads no further once the bytes it holds without a
+   complete SSE frame pass `MAX_HTTP_SSE_FRAME_BYTES` (8 MiB) or a text
+   delta would take the output text it keeps (`CompletionState::text`) past
+   `MAX_PROVIDER_STREAM_BYTES`, that delta not appended; neither
    surface's error text names the request URL), `/v1/images/*` (`CCP_CODEX_IMAGES_API`),
    `/v1/audio/transcriptions` (`CCP_CODEX_TRANSCRIPTIONS_API`).
    `dispatch_request` handles the Anthropic routes: read the body, normalize
@@ -1290,11 +1291,18 @@ memory. The translator refuses the string or entry that would take the
 count past the limit before keeping it (`reserve_retained`), with
 `RETAINED_OUTPUT_TOO_LARGE`.
 After output that refusal ends the stream with an SSE `error` of type
-`api_error`, before output it answers a plain 502 `api_error`; either way
-`abort_refused_live_stream` drops the upstream stream, removes the turn's
-pooled socket (`invalidate_live_continuation_pool`) and then aborts the
-request state, in that order, so a socket the WebSocket task pooled on a
-`response.completed` the consumer never reached does not stay. Before
+`api_error`, before output it answers a plain 502 `api_error`. Either way
+`abort_refused_live_stream` then takes three steps in order. It drops the
+upstream stream, which closes the channel the WebSocket task sends on, so
+the task can no longer hand its answer on. It removes the socket the turn
+has pooled (`invalidate_live_continuation_pool`): the task pools it on a
+`response.completed` that arrived before the refusal, while the turn is
+still current (`pool_insert_for_turn`). It aborts the request state, which
+drops the turn's continuation, so the turn is no longer current and the
+task can pool nothing more for it. A socket the task pools between the
+removal and the abort belongs to a turn the backend completed and carries
+no continuation; the task removes it again when its final send finds the
+channel closed. Before
 output, the translated framing held in `pending_chunk` (`message_start` and
 pings) answers `buffered_response_too_large_error` the same way once the
 next chunk would pass the limit, and `spawn_http_event_stream` counts the
