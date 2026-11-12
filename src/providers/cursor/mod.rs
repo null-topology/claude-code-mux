@@ -458,10 +458,16 @@ impl CliHandlers for CursorCli {
         let auth = run_cursor_login()?.ok_or_else(|| anyhow::anyhow!("Cursor login timed out"))?;
         println!("Cursor auth saved in {}", auth.source);
         if let Some(ref user_id) = auth.user_id {
-            println!("User: {user_id}");
+            println!(
+                "User: {}",
+                crate::upstream_http::escape_control_chars(user_id)
+            );
         }
         if let Some(ref email) = auth.email {
-            println!("Email: {email}");
+            println!(
+                "Email: {}",
+                crate::upstream_http::escape_control_chars(email)
+            );
         }
         Ok(())
     }
@@ -475,10 +481,16 @@ impl CliHandlers for CursorCli {
             Some(auth) => {
                 println!("Auth source: {}", auth.source);
                 if let Some(ref user_id) = auth.user_id {
-                    println!("User: {user_id}");
+                    println!(
+                        "User: {}",
+                        crate::upstream_http::escape_control_chars(user_id)
+                    );
                 }
                 if let Some(ref email) = auth.email {
-                    println!("Email: {email}");
+                    println!(
+                        "Email: {}",
+                        crate::upstream_http::escape_control_chars(email)
+                    );
                 }
                 if let Some(expires) = auth.expires {
                     let remaining = expires.saturating_sub(now_ms()) / 1000;

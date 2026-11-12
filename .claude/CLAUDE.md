@@ -403,7 +403,12 @@ Request path:
      answer, 64 KiB for an error body, 8 MiB for a Kimi or Cursor response
      held whole, `MAX_METADATA_BYTES` (256 KiB) for Grok's OIDC metadata. A
      body over its cap fails as an unreadable one does at that place. The
-     passthrough's relayed body is streamed, not held, and has no cap.
+     passthrough's relayed body is streamed, not held, and has no cap. Their
+     login and status commands print provider-supplied text (verification
+     URL, user code, account id, email, error code or body) through
+     `upstream_http::escape_control_chars`, which escapes what
+     `char::is_control` matches (Cc only, so not U+202E); text the proxy
+     composes itself is printed as is.
 6. Cross-cutting: `session.rs` (in-memory sessions, 30 min idle TTL, provider
    affinity), `request_identity.rs` (Claude Code session and agent headers),
    `retry.rs` (backoff on 429 and 5xx), `monitor.rs` + `tui.rs`, `traffic.rs`

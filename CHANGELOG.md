@@ -52,6 +52,12 @@
   that cannot be read failed before: an error answer loses the upstream
   message, a login or refresh fails, a Cursor request fails with a read error
   and a Kimi response is treated as empty. The limits have no setting.
+- The Kimi, Grok and Cursor login and status commands now print control
+  characters in text that comes from the provider (a verification URL, a
+  user code, an account id, an email, an error code or message) as visible
+  escapes such as `\u{1b}`, so a server cannot move the cursor, clear the
+  screen or rewrite earlier lines of the terminal. Printable text, non-ASCII
+  letters included, is shown as before.
 
 ## v0.18.0 (2026-11-12)
 

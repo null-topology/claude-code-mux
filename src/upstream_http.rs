@@ -143,6 +143,22 @@ pub(crate) fn blocking_error_text(response: reqwest::blocking::Response, limit: 
         .unwrap_or_default()
 }
 
+/// `text` with every control character (`char::is_control`) replaced by its
+/// `escape_default` form, so an upstream-provided string printed to a
+/// terminal cannot move the cursor, rewrite the line or send an escape
+/// sequence.
+pub(crate) fn escape_control_chars(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
 /// Loopback servers for the provider tests.
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -454,5 +470,19 @@ mod tests {
             BodyReadError::Transport(text) => assert_no_url(&text),
             other => panic!("expected a transport error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn control_characters_are_escaped() {
+        assert_eq!(
+            escape_control_chars("a\u{1b}[2Jb\u{7}c\rd\ne\u{0}f\u{9b}g"),
+            "a\\u{1b}[2Jb\\u{7}c\\rd\\ne\\u{0}f\\u{9b}g"
+        );
+    }
+
+    #[test]
+    fn printable_text_is_kept_as_is() {
+        let text = "Visit https://example.test/device?code=AB-12 — код «ok» \\n";
+        assert_eq!(escape_control_chars(text), text);
     }
 }

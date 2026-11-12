@@ -116,12 +116,13 @@ fn run_device_flow_inner(
     let auth = request_device_code(client, issuer)?;
     let visit = auth
         .verification_uri_complete
-        .clone()
-        .or_else(|| auth.verification_uri.clone())
+        .as_deref()
+        .or(auth.verification_uri.as_deref())
+        .map(crate::upstream_http::escape_control_chars)
         .unwrap_or_else(|| format!("{issuer}/device"));
     println!(
         "\nOpen this URL on any device to authorize:\n\n  {visit}\n\nand enter the code:  {}\n",
-        auth.user_code
+        crate::upstream_http::escape_control_chars(&auth.user_code)
     );
 
     let mut interval = auth
@@ -204,7 +205,10 @@ fn poll_token(
     match body.get("error").and_then(|value| value.as_str()) {
         Some("authorization_pending") => Ok(DevicePoll::Pending),
         Some("slow_down") => Ok(DevicePoll::SlowDown),
-        Some(error) => anyhow::bail!("Grok device login failed: {error}"),
+        Some(error) => anyhow::bail!(
+            "Grok device login failed: {}",
+            crate::upstream_http::escape_control_chars(error)
+        ),
         None => anyhow::bail!("Grok device login failed with status {status}"),
     }
 }
@@ -341,6 +345,20 @@ mod tests {
         let error =
             run_device_flow_inner(&test_client(), &issuer, &TestRuntime::default()).unwrap_err();
         assert!(error.to_string().contains("access_denied"));
+    }
+
+    #[test]
+    fn device_flow_escapes_a_denial_code() {
+        let issuer = spawn_issuer(
+            r#"{"device_code":"dev-9","user_code":"FFFF-5555","interval":0}"#,
+            vec![(400, r#"{"error":"denied\u001b[2J\r"}"#.into())],
+        );
+        let error =
+            run_device_flow_inner(&test_client(), &issuer, &TestRuntime::default()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Grok device login failed: denied\\u{1b}[2J\\r"
+        );
     }
 
     #[test]

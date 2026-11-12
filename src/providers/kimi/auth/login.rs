@@ -49,7 +49,8 @@ fn device_login_at(
     headers: &std::collections::HashMap<String, String>,
 ) -> Result<TokenResponse, anyhow::Error> {
     use crate::upstream_http::{
-        blocking_error_text, read_blocking_body_capped, read_blocking_json_capped, url_free_error,
+        blocking_error_text, escape_control_chars, read_blocking_body_capped,
+        read_blocking_json_capped, url_free_error,
     };
 
     let init_resp = client
@@ -61,7 +62,7 @@ fn device_login_at(
 
     if !init_resp.status().is_success() {
         let status = init_resp.status();
-        let text = blocking_error_text(init_resp, MAX_ERROR_BODY_BYTES);
+        let text = escape_control_chars(&blocking_error_text(init_resp, MAX_ERROR_BODY_BYTES));
         anyhow::bail!("Device authorization failed: {status} {text}");
     }
 
@@ -69,8 +70,11 @@ fn device_login_at(
     let interval_ms = (auth.interval.unwrap_or(5).max(1)) * 1000;
 
     eprintln!();
-    eprintln!("Visit: {}", auth.verification_uri_complete);
-    eprintln!("Code:  {}", auth.user_code);
+    eprintln!(
+        "Visit: {}",
+        escape_control_chars(&auth.verification_uri_complete)
+    );
+    eprintln!("Code:  {}", escape_control_chars(&auth.user_code));
     eprintln!();
 
     loop {
@@ -117,11 +121,11 @@ fn device_login_at(
                 anyhow::bail!(
                     "Device token poll failed ({}): {}{}",
                     status,
-                    error,
+                    escape_control_chars(error),
                     if desc.is_empty() {
                         "".to_string()
                     } else {
-                        format!(" - {desc}")
+                        format!(" - {}", escape_control_chars(desc))
                     }
                 );
             }
@@ -219,6 +223,16 @@ mod tests {
     }
 
     #[test]
+    fn a_device_authorization_error_body_is_escaped() {
+        let host = serve_in_order(vec![(500, b"bad\x1b[31mred\r".to_vec())]);
+        let error = login(&host).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Device authorization failed: 500 Internal Server Error bad\\u{1b}[31mred\\r"
+        );
+    }
+
+    #[test]
     fn a_token_poll_error_body_is_read_up_to_the_limit() {
         let denied = r#"{"error":"access_denied"}"#;
         let host = serve_in_order(vec![
@@ -237,5 +251,19 @@ mod tests {
         ]);
         let error = login(&host).unwrap_err().to_string();
         assert_eq!(error, "Device token poll failed (400 Bad Request): unknown");
+    }
+
+    #[test]
+    fn a_token_poll_error_is_escaped() {
+        let denied = r#"{"error":"denied\u001b[2J","error_description":"line\nbreak\u0007"}"#;
+        let host = serve_in_order(vec![
+            (200, DEVICE.as_bytes().to_vec()),
+            (400, denied.as_bytes().to_vec()),
+        ]);
+        let error = login(&host).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Device token poll failed (400 Bad Request): denied\\u{1b}[2J - line\\nbreak\\u{7}"
+        );
     }
 }

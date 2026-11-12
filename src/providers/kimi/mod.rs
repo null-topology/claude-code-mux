@@ -352,7 +352,7 @@ impl CliHandlers for KimiCli {
         let saved = manager.persist_initial_tokens(&tokens)?;
         println!("Auth saved in {}", manager.store.auth_path());
         if let Some(ref uid) = saved.user_id {
-            println!("User: {uid}");
+            println!("User: {}", crate::upstream_http::escape_control_chars(uid));
         }
         println!("Authentication complete");
         Ok(())
@@ -370,10 +370,13 @@ impl CliHandlers for KimiCli {
                 println!("Auth path: {}", store.auth_path());
                 println!("Authenticated: true");
                 if let Some(ref uid) = auth.user_id {
-                    println!("User: {uid}");
+                    println!("User: {}", crate::upstream_http::escape_control_chars(uid));
                 }
                 if let Some(ref scope) = auth.scope {
-                    println!("Scope: {scope}");
+                    println!(
+                        "Scope: {}",
+                        crate::upstream_http::escape_control_chars(scope)
+                    );
                 }
                 let remaining = auth.expires.saturating_sub(now_ms()) / 1000;
                 println!("Expires in {remaining}s");
