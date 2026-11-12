@@ -8063,21 +8063,22 @@ mod tests {
     }
 
     /// An account that was unknown when the request went out and is known by
-    /// the replay, with the same access token, is the same credential.
+    /// the replay, with the same access token, is the same credential. Only
+    /// the live path meets this case: its replay loads the login afresh,
+    /// while the buffered one keeps the login of the refused attempt until a
+    /// 401 renews the token.
     #[tokio::test]
-    async fn a_size_refusal_is_replayed_under_the_same_token_once_the_account_is_known() {
-        for live in [true, false] {
-            let (result, counts, refreshes) = run_size_refusal_fallback_from(
-                unknown_account_initial_auth(),
-                live,
-                Some(http_test_auth()),
-                None,
-            )
-            .await;
-            result.unwrap();
-            assert_eq!(refreshes, 0);
-            assert_eq!(counts, (1, 1, 1), "live: {live}");
-        }
+    async fn a_live_size_refusal_is_replayed_under_the_same_token_once_the_account_is_known() {
+        let (result, counts, refreshes) = run_size_refusal_fallback_from(
+            unknown_account_initial_auth(),
+            true,
+            Some(http_test_auth()),
+            None,
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(refreshes, 0);
+        assert_eq!(counts, (1, 1, 1));
     }
 
     /// A conversation's socket pooled under a login with no account id is not
