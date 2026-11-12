@@ -102,7 +102,8 @@ const QUOTA_ERROR_CODES: [&str; 5] = [
 struct TerminalCode {
     code: &'static str,
     class: CodexErrorClass,
-    /// The statuses besides none the code names its class with.
+    /// The explicit statuses under which the code names its class; an absent
+    /// status always does.
     statuses: &'static [u16],
     /// The CLI's text for the code when its message is missing or blank.
     fallback: Option<&'static str>,

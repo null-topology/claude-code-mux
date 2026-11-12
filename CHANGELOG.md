@@ -3,12 +3,15 @@
 - The Codex backend's refusals by `content_policy_violation`,
   `invalid_access_program`, `unsupported_access_program`, `budget_reached`,
   `inference_hook_denied` and `access_program_not_enabled` are now answered
-  once and marked as not to be retried; the Codex CLI does not retry them
-  either. A refusal that arrived as a stream event with no status used to
-  come back as a retryable server error, 500 when buffered and 502 as the
-  first event of a live stream, so Claude Code retried a request that could
-  not succeed, and an HTTP 400 whose body names one of these codes came back
-  as a 400 `api_error`. A content policy or access program refusal is now a
+  as client errors, with the statuses listed below; the Codex CLI does not
+  retry them either. Under the default `auto` transport a rejected WebSocket
+  upgrade carrying one of them still falls back to HTTP like any other
+  refused upgrade, and the HTTP answer is classified on its own. A refusal
+  that arrived as a stream event with no status used to come back as a
+  retryable server error, 500 when buffered and 502 as the first event of a
+  live stream, an answer a client retries although the request cannot
+  succeed, and an HTTP 400 whose body names one of these codes came back as
+  a 400 `api_error`. A content policy or access program refusal is now a
   400 `invalid_request_error`, a spent budget a 429 `rate_limit_error` with
   `x-should-retry: false`, and an inference hook or access program that is
   not enabled a 403 `permission_error`. A code counts only with no status or
