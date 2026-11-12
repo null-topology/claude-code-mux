@@ -1684,7 +1684,7 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
-        transport: crate::config::CodexTransport,
+        mut transport: crate::config::CodexTransport,
     ) -> Result<OwnerAwareCodexResponse, CodexError> {
         use crate::config::CodexTransport;
 
@@ -1806,6 +1806,12 @@ impl CodexHttpClient {
                         {
                             // Fall back to HTTP only if WebSocket failed before sending
                             log_websocket_fallback_to_http(ctx, &err);
+                            if super::websocket::is_message_size_refusal(&err) {
+                                // The same frame would be refused again, so a
+                                // resend of this request (after a token refresh
+                                // or without its continuation) stays on HTTP.
+                                transport = CodexTransport::Http;
+                            }
                             let body_json =
                                 serde_json::to_string(body).map_err(|e| CodexError {
                                     status: 500,
@@ -3112,7 +3118,18 @@ fn unauthorized_event_needs_refresh(payload: &serde_json::Value) -> bool {
         && super::events::usage_limit_from_event_with_headers(payload, &[]).is_none()
 }
 
+/// A failed handshake falls back to HTTP, and so does a request the WebSocket
+/// refused for its size: one longer than the socket's advertised limit, never
+/// written, or one whose socket closed with code 1009 before any text frame of
+/// the response. A request already written goes over HTTP in two cases: that
+/// 1009 close, as the Codex CLI treats that close and sends it (`codex-rs/codex-api/src/endpoint/responses_websocket.rs`
+/// at `ed7ca22bb6`, HTTP fallback at `bc3ccba6e1`), and a resend the proxy
+/// makes anyway, such as the full-context one that repairs a continuation,
+/// whose frame is over the limit of the socket it would go to.
 fn should_fallback_to_http(err: &CodexError) -> bool {
+    if super::websocket::is_message_size_refusal(err) {
+        return true;
+    }
     err.origin == CodexErrorOrigin::WebSocketHandshake
         && err.status != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
         && !matches!(
@@ -3127,19 +3144,20 @@ fn should_fallback_to_http(err: &CodexError) -> bool {
 /// The longest `detail` a fallback log line carries, in characters.
 const FALLBACK_LOG_DETAIL_CHARS: usize = 300;
 
-/// Logs a WebSocket setup failure that `auto` answers over HTTP, so a refused
+/// Logs a WebSocket failure that `auto` answers over HTTP, so a refused
 /// WebSocket stays visible. The line carries only what the handshake itself
 /// returned: its status (0 when none came), class, usage-limit flag,
-/// `Retry-After` and the rejection text or connect error, cut short. It
-/// carries nothing from the request.
+/// `Retry-After` and the rejection text or connect error, cut short. For a
+/// request refused for its size the detail is a fixed text naming the frame
+/// length and the limit, or the 1009 close. It carries nothing from the
+/// request.
 fn log_websocket_fallback_to_http(ctx: &RequestContext, err: &CodexError) {
-    let detail: String = err
-        .detail
-        .as_deref()
-        .unwrap_or(&err.message)
-        .chars()
-        .take(FALLBACK_LOG_DETAIL_CHARS)
-        .collect();
+    let detail = if super::websocket::is_message_size_refusal(err) {
+        err.message.as_str()
+    } else {
+        err.detail.as_deref().unwrap_or(&err.message)
+    };
+    let detail: String = detail.chars().take(FALLBACK_LOG_DETAIL_CHARS).collect();
     let mut fields = serde_json::Map::from_iter([
         ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
         ("status".to_string(), serde_json::json!(err.status)),
@@ -6652,6 +6670,98 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_size_refusal_keeps_the_buffered_auto_request_on_http_after_a_refresh() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_tungstenite::tungstenite::{
+            Message,
+            protocol::{CloseFrame, frame::coding::CloseCode},
+        };
+
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        super::super::websocket::clear_codex_websocket_pool_for_tests();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}/responses"
+        )));
+        let upgrades = Arc::new(AtomicUsize::new(0));
+        let frames = Arc::new(AtomicUsize::new(0));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let server = {
+            let (client, upgrades, frames, posts) = (
+                client.clone(),
+                upgrades.clone(),
+                frames.clone(),
+                posts.clone(),
+            );
+            tokio::spawn(async move {
+                let mut sockets = Vec::new();
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut first = [0_u8; 1];
+                    if stream.peek(&mut first).await.unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    if first[0] == b'G' {
+                        // Every request frame is closed with 1009 before any text.
+                        let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                        upgrades.fetch_add(1, Ordering::SeqCst);
+                        let _request = next_websocket_json(&mut websocket).await;
+                        frames.fetch_add(1, Ordering::SeqCst);
+                        websocket
+                            .send(Message::Close(Some(CloseFrame {
+                                code: CloseCode::Size,
+                                reason: "".into(),
+                            })))
+                            .await
+                            .unwrap();
+                        sockets.push(websocket);
+                        continue;
+                    }
+                    let _request = read_http_request(&mut stream).await;
+                    let response = if posts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        // A 401 the refresh answers by picking up a rotated login.
+                        client.auth_manager().set_test_auth(rotated_test_auth());
+                        let body = r#"{"error":{"message":"Your token has expired."}}"#;
+                        format!(
+                            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        let body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http\"}}\n\n";
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            })
+        };
+
+        let (body, context) = (buffered_test_request(), http_test_context());
+        let request = client.post_codex_with_transport(
+            &body,
+            &context,
+            None,
+            crate::config::CodexTransport::Auto,
+        );
+        let result = tokio::time::timeout(MOCK_DEADLINE, request)
+            .await
+            .expect("the request did not finish");
+        server.abort();
+        let response = result.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.transport, ActualTransport::Http);
+        assert_eq!(client.auth_manager().forced_refreshes_for_tests(), 1);
+        // The one request frame the socket refused, then HTTP twice: the
+        // resend after the refresh does not go back to the WebSocket.
+        assert_eq!(upgrades.load(Ordering::SeqCst), 1);
+        assert_eq!(frames.load(Ordering::SeqCst), 1);
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
     }
 
     /// An error answer whose body never ends, `piece` bytes per chunk,

@@ -477,7 +477,7 @@ impl CodexProvider {
                 );
                 abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
                 abort_continuation_for_owner(&request_continuation);
-                return map_codex_error_to_response(&e);
+                return map_codex_transport_error_to_response(&e, configured_transport);
             }
         };
         log.info(
@@ -867,7 +867,7 @@ async fn live_stream_response(
             }
             Err(err) => {
                 cleanup.abort();
-                return map_codex_error_to_response(&err);
+                return map_codex_transport_error_to_response(&err, transport);
             }
         };
 
@@ -881,6 +881,7 @@ async fn live_stream_response(
             request_continuation.clone(),
             request_body.clone(),
             compaction,
+            transport,
         )
         .await
         {
@@ -900,7 +901,7 @@ async fn live_stream_response(
                     continue;
                 }
                 cleanup.abort();
-                return map_codex_error_to_response(&error);
+                return map_codex_transport_error_to_response(&error, transport);
             }
         }
     }
@@ -928,6 +929,7 @@ async fn live_stream_response_once(
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
     compaction: LiveStreamCompaction,
+    transport: config::CodexTransport,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
@@ -953,7 +955,9 @@ async fn live_stream_response_once(
                     &request_continuation,
                     compaction.attempt,
                 );
-                return LiveStreamStart::Response(map_codex_error_to_response(&err));
+                return LiveStreamStart::Response(map_codex_transport_error_to_response(
+                    &err, transport,
+                ));
             }
         };
         if !generation_started && codex_generation_event(&payload) {
@@ -1647,9 +1651,38 @@ fn usage_limit_response(limit: &events::CodexUsageLimit) -> Response {
         .into_response()
 }
 
+/// `map_codex_error_to_response` for a request sent on `transport`. Only the
+/// `websocket` transport's answer to a size refusal names another transport:
+/// under `auto` with its HTTP fallback disabled no other one is available.
+fn map_codex_transport_error_to_response(
+    err: &client::CodexError,
+    transport: config::CodexTransport,
+) -> Response {
+    if transport == config::CodexTransport::WebSocket && websocket::is_message_size_refusal(err) {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            format!(
+                "{}. The auto transport sends such a request over HTTP.",
+                err.message
+            ),
+        );
+    }
+    map_codex_error_to_response(err)
+}
+
 fn map_codex_error_to_response(err: &client::CodexError) -> Response {
     if let Some(limit) = err.usage_limit.as_ref() {
         return usage_limit_response(limit);
+    }
+    // A request the WebSocket refused for its size: the message says what
+    // happened, with the request's size and the limit when one was named.
+    if websocket::is_message_size_refusal(err) {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            err.message.clone(),
+        );
     }
     if let Some(class) = err.class {
         return classified_error_response(
@@ -3051,6 +3084,7 @@ mod tests {
                 compact_boundary: false,
                 attempt: None,
             },
+            config::CodexTransport::WebSocket,
         )
         .await
         {
@@ -3166,6 +3200,47 @@ mod tests {
             response.headers().get(http::header::RETRY_AFTER).unwrap(),
             "7"
         );
+    }
+
+    #[tokio::test]
+    async fn a_size_refusal_names_another_transport_only_under_websocket() {
+        for detail in [
+            websocket::WEBSOCKET_MESSAGE_TOO_LARGE_DETAIL,
+            websocket::WEBSOCKET_CLOSED_MESSAGE_TOO_LARGE_DETAIL,
+        ] {
+            let err = client::CodexError {
+                status: 413,
+                message: "The WebSocket request was refused for its size".to_string(),
+                detail: Some(detail.to_string()),
+                retry_after: None,
+                usage_limit: None,
+                class: None,
+                origin: client::CodexErrorOrigin::WebSocket,
+            };
+            for (transport, expected) in [
+                (
+                    Some(config::CodexTransport::WebSocket),
+                    "The WebSocket request was refused for its size. The auto transport sends such a request over HTTP.",
+                ),
+                (
+                    Some(config::CodexTransport::Auto),
+                    "The WebSocket request was refused for its size",
+                ),
+                (None, "The WebSocket request was refused for its size"),
+            ] {
+                let response = match transport {
+                    Some(transport) => map_codex_transport_error_to_response(&err, transport),
+                    None => map_codex_error_to_response(&err),
+                };
+                assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{detail}");
+                let body = error_body(response).await;
+                assert_eq!(body["error"]["type"], "request_too_large", "{detail}");
+                assert_eq!(
+                    body["error"]["message"], expected,
+                    "{detail}, {transport:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3752,6 +3827,7 @@ mod tests {
                     compact_boundary: false,
                     attempt: None,
                 },
+                config::CodexTransport::WebSocket,
             ),
         )
         .await
@@ -4119,6 +4195,7 @@ mod tests {
                 compact_boundary: false,
                 attempt: None,
             },
+            config::CodexTransport::WebSocket,
         )
         .await;
         let LiveStreamStart::Response(response) = start else {

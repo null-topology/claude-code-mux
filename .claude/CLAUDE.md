@@ -263,9 +263,49 @@ Request path:
      Transport (`CCP_CODEX_TRANSPORT` = `auto|websocket|http`)
      defaults to `auto`: a WebSocket from a per-conversation pool in
      `websocket.rs`, falling back to HTTP only when the handshake failed
-     before anything was sent (`should_fallback_to_http` in `client.rs`). A
-     request already sent over the WebSocket is never replayed over HTTP, and
-     `websocket` never falls back. WebSocket writes share the idle deadline
+     before anything was sent, or when the request was refused for its size
+     (`should_fallback_to_http` in `client.rs`). A request already sent over
+     the WebSocket is never replayed over HTTP, with two exceptions below,
+     and `websocket` never falls back. The size refusals follow the Codex
+     CLI (`codex-rs/codex-api/src/endpoint/responses_websocket.rs` at
+     `ed7ca22bb6`, the HTTP fallback at `bc3ccba6e1`); whether the backend
+     sends the header is not established. A successful handshake's
+     `x-codex-websocket-max-message-bytes` (a trimmed positive integer;
+     empty, zero or anything else means no limit) is kept on the
+     `PoolEntry` (`advertised_max_message_bytes`) and logged at info as
+     `codex_websocket_message_limit` with `reqId` and `maxMessageBytes` for
+     a new socket that carries one. A request frame longer than the limit
+     is never written (`PoolEntry::check_message_size`). A close with code
+     1009 (message too big) seen before any text frame of the response is
+     the same refusal, and the first exception: under `auto` that request
+     goes out again over HTTP, as the Codex CLI treats that close. Both refusals
+     carry status 413 and one of `WEBSOCKET_MESSAGE_TOO_LARGE_DETAIL` and
+     `WEBSOCKET_CLOSED_MESSAGE_TOO_LARGE_DETAIL`
+     (`is_message_size_refusal`); neither is a continuation retry. Either
+     drops the socket like any failed attempt, so the conversation's next
+     request opens a new socket and sends its full context. Under `auto`
+     the request is sent over HTTP with its full context, which like any
+     HTTP answer leaves no continuation state, and every later attempt of
+     that client request (a 401 refresh) stays on HTTP
+     (`post_codex_with_transport`); the next client request starts on the
+     WebSocket again. Under `websocket` it is answered once with 413
+     `request_too_large`, never resent, and the message adds that the
+     `auto` transport sends such a request over HTTP; any other 413 of a
+     size refusal (buffered `auto` whose HTTP fallback is off behind a
+     WebSocket proxy) states only what happened
+     (`map_codex_transport_error_to_response` in `mod.rs`). A 1009 after
+     response text and any other close keep their handling, including the
+     full-context resend that repairs a continuation
+     (`should_retry_without_continuation`), for example after a delta
+     (`previous_response_id`) ended with no terminal event. The second
+     exception is a resend the proxy makes anyway, such as that repair: it
+     is a new attempt, its frame is checked against the limit of the socket
+     it would go to, and under `auto` one over that limit goes over HTTP
+     instead of the WebSocket. In every other case a request already
+     written to the WebSocket is not sent over HTTP. A close frame
+     that ends a response logs `codex_websocket_closed` at info with
+     `reqId`, `closeCode` (0 without a frame) and `textStarted`, never the
+     reason text. WebSocket writes share the idle deadline
      of their path: the request frame (`send_request_frame`) and Pong
      replies that of the response wait, and the validation Ping that of the
      pooled-socket validation. A timed-out request frame or Pong answers as
@@ -276,8 +316,11 @@ Request path:
      buffered, logs a `codex_websocket_fallback_to_http` warning
      (`log_websocket_fallback_to_http`) with `reqId`, the handshake `status`
      (0 when none came), `class`, `usageLimit`, `retryAfter` and a `detail`
-     holding the rejection text or connect error cut to 300 characters, never
-     anything from the request. Claude Code's compaction summary goes over
+     holding the rejection text or connect error cut to 300 characters, or
+     for a size refusal a fixed text naming only the frame length and the
+     limit or the 1009 close, never anything from the request. For a size
+     refusal `status` is the proxy's own 413, not a status the backend
+     sent. Claude Code's compaction summary goes over
      HTTP whatever the setting (`transport_for_request` in `mod.rs`), and so
      does the opt-in server compaction call (`request_compaction` in
      `compaction.rs`).
@@ -1082,10 +1125,17 @@ appearing, compare against a fresh traffic capture before anything else.
 The proxy does not retry a failed Codex request: one attempt, then the error
 goes to the client, which owns the retry policy. The only resends left repair
 the proxy's own state (a forgotten `previous_response_id`, a 401 token refresh).
-The `auto` fallback to HTTP is not a resend: it happens only when the
-handshake failed, before the request went out. With `websocket` transport a
-429 on the WebSocket handshake reaches the client as a plain 429 unless its
-body names one of the codes above; under `auto` it falls back to HTTP.
+An `auto` fallback to HTTP after a failed handshake, before the request went
+out, or for a frame that was never written because it is over the limit the
+handshake advertised, sends nothing twice. Under `auto` a request already
+written to the socket goes out over HTTP in two cases only: a WebSocket seen
+closing with code 1009 before any text frame of the response, as the Codex CLI
+treats that close, and a resend the proxy makes anyway, such as the
+full-context one that repairs a continuation, when its frame is over the limit
+of the socket it would go to. With
+`websocket` transport either refusal is one 413 answer, and a 429 on the
+WebSocket handshake reaches the client as a plain 429 unless its body names
+one of the codes above; under `auto` it falls back to HTTP.
 
 ## Naming and distribution
 

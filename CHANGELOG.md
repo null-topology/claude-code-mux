@@ -22,6 +22,35 @@
   `Rate limited`. An opt-in server compaction refused by the inference hook
   or an access program that is not enabled no longer sends the normal
   request after it.
+- A Codex request too large for the WebSocket now goes over HTTP under the
+  default `auto` transport instead of failing. When the backend advertises
+  a WebSocket message size limit on the handshake
+  (`x-codex-websocket-max-message-bytes`), the proxy no longer writes a
+  request larger than that limit to the socket, and a WebSocket the backend
+  closes with code 1009 (message too big) before any response counts as the
+  same refusal. Before, every request went out on the WebSocket whatever
+  its size, and such a close ended it with a 502. Under `auto` the proxy
+  now sends the request over HTTP with its full context, keeps any further
+  attempt of that request (a resend after a token refresh) on HTTP, and
+  logs a `codex_websocket_fallback_to_http` warning whose detail names only
+  the frame size and the limit, or the 1009 close, and whose `status` is
+  the proxy's own 413. The refused socket is closed, so the conversation's
+  next request opens a new one and sends its full context. With
+  `CCP_CODEX_TRANSPORT=websocket` it answers once with 413
+  `request_too_large`, whose message adds that the `auto` transport sends
+  such a request over HTTP, and does not send the request again. A 1009
+  close after the response started, and a close with any other code, are
+  handled as before, with one difference: a resend the proxy already
+  makes, such as the full-context one that repairs a continuation
+  (`previous_response_id`) after such a close, now goes over HTTP under
+  `auto` when its frame is over the advertised limit, instead of over the
+  WebSocket. Apart from that resend and the 1009 close above, a request
+  already written to the WebSocket never goes out over HTTP. The
+  advertised limit is logged at info as
+  `codex_websocket_message_limit` for each new socket that carries one, and
+  a close that ends a response as `codex_websocket_closed` with the request
+  id and its numeric code, never its reason text. To keep such requests off
+  HTTP, set `CCP_CODEX_TRANSPORT=websocket`.
 
 ## v0.17.1 (2026-11-07)
 
