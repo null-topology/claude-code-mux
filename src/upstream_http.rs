@@ -486,9 +486,9 @@ mod tests {
 
     #[test]
     fn a_blocking_body_that_trickles_in_stops_at_its_deadline() {
-        // 80 bytes, one every 100 ms. Each read returns well within the
-        // client's 1 s timeout, which reqwest's `Read` starts again for every
-        // read, so only a deadline over the whole body ends the read before
+        // 80 bytes, one every 100 ms. The client's own timeout is far longer
+        // than the trickle, and reqwest's `Read` starts it again for every
+        // read, so only the deadline over the whole body ends the read before
         // the trickle does, 8 s in.
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -514,7 +514,7 @@ mod tests {
         let deadline = Duration::from_secs(1);
         let response = reqwest::blocking::Client::builder()
             .no_proxy()
-            .timeout(deadline)
+            .timeout(Duration::from_secs(30))
             .build()
             .unwrap()
             .get(format!("http://{addr}/"))
@@ -527,9 +527,10 @@ mod tests {
             result,
             Err(BodyReadError::Transport(BODY_READ_TIMEOUT_TEXT.to_string()))
         );
-        // The deadline plus one per-read timeout is 2 s; the rest is room for
-        // a loaded runner, still well short of the 8 s trickle.
-        assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
+        // The deadline is 1 s and a read under way returns with the next
+        // byte; the rest is room for a loaded runner, still short of the 8 s
+        // trickle.
+        assert!(elapsed < Duration::from_secs(6), "took {elapsed:?}");
     }
 
     #[test]
