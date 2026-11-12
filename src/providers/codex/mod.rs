@@ -4070,23 +4070,33 @@ mod tests {
         }
     }
 
+    /// A login whose account id is unknown.
+    fn test_login_without_account(access: &str) -> auth::token_store::StoredAuth {
+        auth::token_store::StoredAuth {
+            account_id: None,
+            ..test_login(access, "")
+        }
+    }
+
     /// What the mock backend of `second_turn_after_saving_login` saw: the
-    /// `ChatGPT-Account-Id` of each WebSocket handshake, and each request with
-    /// the index of the socket it came on.
+    /// `ChatGPT-Account-Id` and the bearer token of each WebSocket handshake,
+    /// and each request with the index of the socket it came on.
     struct SeenUpstream {
         handshakes: Vec<Option<String>>,
+        handshake_tokens: Vec<Option<String>>,
         requests: Vec<(usize, serde_json::Value)>,
     }
 
     /// Two turns of one conversation on the live WebSocket: the first under
-    /// `acct-a`, the second after `second_login` is saved. The mock backend
-    /// answers a request under the account of the socket it came on, with a
-    /// reading of that account's windows for `acct-a` and none for another.
-    /// Returns the second turn's response and what the backend saw.
+    /// `first_login`, the second after `second_login` is saved. The mock
+    /// backend answers a request under the account of the socket it came on,
+    /// with a reading of that account's windows for `acct-a` and none for
+    /// another. Returns the second turn's response and what the backend saw.
     // tungstenite's own callback type fixes the error response size.
     #[allow(clippy::result_large_err)]
     async fn second_turn_after_saving_login(
         session_id: &str,
+        first_login: auth::token_store::StoredAuth,
         second_login: auth::token_store::StoredAuth,
     ) -> (Response, SeenUpstream) {
         let owner = ConversationIdentity::Main(session_id.to_string());
@@ -4122,6 +4132,7 @@ mod tests {
             for socket_index in 0_usize..usize::MAX {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut account: Option<String> = None;
+                let mut token: Option<String> = None;
                 let mut websocket = tokio_tungstenite::accept_hdr_async(
                     socket,
                     |request: &http::Request<()>, response| {
@@ -4130,12 +4141,18 @@ mod tests {
                             .get("chatgpt-account-id")
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_owned);
+                        token = request
+                            .headers()
+                            .get(http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.strip_prefix("Bearer "))
+                            .map(str::to_owned);
                         Ok(response)
                     },
                 )
                 .await
                 .unwrap();
-                handshake_tx.send(account.clone()).unwrap();
+                handshake_tx.send((account.clone(), token)).unwrap();
                 let request_tx = request_tx.clone();
                 let reading = reading.clone();
                 tokio::spawn(async move {
@@ -4174,9 +4191,7 @@ mod tests {
         });
 
         let client = authenticated_live_test_client(format!("http://{addr}/responses"));
-        client
-            .auth_manager()
-            .set_test_auth(test_login("token-a", "acct-a"));
+        client.auth_manager().set_test_auth(first_login);
         let compaction = LiveStreamCompaction {
             compact_boundary: false,
             attempt: None,
@@ -4228,10 +4243,12 @@ mod tests {
 
         let mut seen = SeenUpstream {
             handshakes: Vec::new(),
+            handshake_tokens: Vec::new(),
             requests: Vec::new(),
         };
-        while let Ok(account) = handshake_rx.try_recv() {
+        while let Ok((account, token)) = handshake_rx.try_recv() {
             seen.handshakes.push(account);
+            seen.handshake_tokens.push(token);
         }
         while let Ok(request) = request_rx.try_recv() {
             seen.requests.push(request);
@@ -4256,6 +4273,7 @@ mod tests {
 
         let (response, seen) = second_turn_after_saving_login(
             "live-pooled-socket-other-account",
+            test_login("token-a", "acct-a"),
             test_login("token-b", "acct-b"),
         )
         .await;
@@ -4299,6 +4317,7 @@ mod tests {
 
         let (response, seen) = second_turn_after_saving_login(
             "live-pooled-socket-same-account",
+            test_login("token-a", "acct-a"),
             test_login("token-a-refreshed", "acct-a"),
         )
         .await;
@@ -4312,6 +4331,72 @@ mod tests {
             response.headers()
         );
         assert_eq!(seen.handshakes, [Some("acct-a".to_string())]);
+        let sockets: Vec<usize> = seen.requests.iter().map(|(socket, _)| *socket).collect();
+        assert_eq!(sockets, [0, 0]);
+        let continued = &seen.requests[1].1;
+        assert_eq!(continued["previous_response_id"], "resp-0-1");
+        assert_eq!(continued["input"].as_array().unwrap().len(), 1);
+        rate_limits::clear_for_tests();
+    }
+
+    /// A socket whose handshake named no account answers under the login its
+    /// token belongs to. Once the saved login has another token, still with
+    /// no account, the next turn does not go out on it: a socket of its own
+    /// is opened with the new token and the turn is sent with its full
+    /// context.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_pooled_socket_without_an_account_is_not_reused_under_another_token() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
+        rate_limits::clear_for_tests();
+
+        let (response, seen) = second_turn_after_saving_login(
+            "live-pooled-socket-no-account-other-token",
+            test_login_without_account("token-a"),
+            test_login_without_account("token-b"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.handshakes, [None, None]);
+        assert_eq!(
+            seen.handshake_tokens,
+            [Some("token-a".to_string()), Some("token-b".to_string())]
+        );
+        let sockets: Vec<usize> = seen.requests.iter().map(|(socket, _)| *socket).collect();
+        assert_eq!(
+            sockets,
+            [0, 1],
+            "nothing more may go out on token-a's socket"
+        );
+        let resent = &seen.requests[1].1;
+        assert!(resent.get("previous_response_id").is_none());
+        assert_eq!(resent["input"].as_array().unwrap().len(), 2);
+        rate_limits::clear_for_tests();
+    }
+
+    /// With no account on either side, the same token keeps the conversation
+    /// on its pooled socket.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_pooled_socket_without_an_account_is_reused_under_the_same_token() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
+        rate_limits::clear_for_tests();
+
+        let (response, seen) = second_turn_after_saving_login(
+            "live-pooled-socket-no-account-same-token",
+            test_login_without_account("token-a"),
+            test_login_without_account("token-a"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.handshakes, [None]);
+        assert_eq!(seen.handshake_tokens, [Some("token-a".to_string())]);
         let sockets: Vec<usize> = seen.requests.iter().map(|(socket, _)| *socket).collect();
         assert_eq!(sockets, [0, 0]);
         let continued = &seen.requests[1].1;

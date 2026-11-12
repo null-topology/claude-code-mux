@@ -433,6 +433,10 @@ struct PoolEntry {
     /// request on the socket under that account, whatever account a later
     /// request is built with.
     account_id: Option<String>,
+    /// The access token of the handshake, held in memory only so a socket
+    /// whose handshake named no account goes only to a request with the same
+    /// token. Never logged; `PoolEntry` has no `Debug`.
+    access_token: Option<String>,
     /// The message size limit the handshake response advertised, if any. A
     /// pooled socket keeps the limit of its own handshake.
     max_message_bytes: Option<usize>,
@@ -446,7 +450,20 @@ impl PoolEntry {
             created_at: now_ms(),
             last_activity: AtomicU64::new(next_pool_activity()),
             account_id: request_account_id(handshake_headers).map(str::to_owned),
+            access_token: request_access_token(handshake_headers).map(str::to_owned),
             max_message_bytes: connected.max_message_bytes,
+        }
+    }
+
+    /// Whether a request built with `headers` may go out on this socket: both
+    /// account ids are known and equal, so a renewed token of the same
+    /// account keeps the socket, or neither is known and the request's access
+    /// token is the one of the handshake.
+    fn serves_request(&self, headers: &HeaderMap) -> bool {
+        match (self.account_id.as_deref(), request_account_id(headers)) {
+            (Some(socket), Some(request)) => socket == request,
+            (None, None) => self.access_token.as_deref() == request_access_token(headers),
+            _ => false,
         }
     }
 
@@ -753,15 +770,17 @@ fn pool_take_for_turn(reservation: &ContinuationReservation) -> Option<Arc<PoolE
     .flatten()
 }
 
-/// The pooled socket a request may go out on. `account_id` is the
-/// `ChatGPT-Account-Id` the request is built with: a socket whose handshake
-/// named another account leaves the pool and counts as gone, since what the
-/// backend answers on it would be read as this account's. A request that
-/// needed it for its previous response then fails as one whose socket is
-/// gone; any other request opens a connection with its own headers.
+/// The pooled socket a request may go out on. `headers` are the ones the
+/// request is built with: a socket that does not serve them
+/// (`PoolEntry::serves_request`: another account, an account known on one
+/// side only, or, with no account on either side, another access token)
+/// leaves the pool and counts as gone, since what the backend answers on it
+/// would be read as this login's. A request that needed it for its previous
+/// response then fails as one whose socket is gone; any other request opens
+/// a connection with its own headers.
 fn take_pool_entry_for_request(
     reservation: Option<&ContinuationReservation>,
-    account_id: Option<&str>,
+    headers: &HeaderMap,
 ) -> Result<Option<Arc<PoolEntry>>, CodexError> {
     let candidate = reservation.map(ContinuationReservation::candidate);
     let requires_origin = candidate
@@ -772,7 +791,7 @@ fn take_pool_entry_for_request(
     let pooled = reservation
         .filter(|_| pool_owner.is_some())
         .and_then(pool_take_for_turn)
-        .filter(|entry| entry.account_id.as_deref() == account_id);
+        .filter(|entry| entry.serves_request(headers));
 
     if requires_origin
         && (pool_owner.is_none()
@@ -1127,7 +1146,7 @@ pub(super) async fn codex_websocket_request(
     let requires_origin = continuation
         .and_then(|candidate| candidate.previous_response_id.as_deref())
         .is_some();
-    let pooled = take_pool_entry_for_request(reservation, request_account_id(headers))?;
+    let pooled = take_pool_entry_for_request(reservation, headers)?;
     let mut used_pooled = pooled.is_some();
     let mut entry = if let Some(entry) = pooled {
         entry
@@ -1340,7 +1359,7 @@ pub(super) async fn prepare_codex_websocket(
     let requires_origin = continuation
         .and_then(|candidate| candidate.previous_response_id.as_deref())
         .is_some();
-    let pooled = take_pool_entry_for_request(reservation, request_account_id(headers))?;
+    let pooled = take_pool_entry_for_request(reservation, headers)?;
     let used_pooled = pooled.is_some();
     let entry = if let Some(entry) = pooled {
         entry
@@ -1725,6 +1744,14 @@ fn request_account_id(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("chatgpt-account-id")
         .and_then(|value| value.to_str().ok())
+}
+
+/// The access token of the request's `Authorization: Bearer` header.
+fn request_access_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
 }
 
 /// A rejected upgrade, built the same way on the direct and the tunneled path.
@@ -3763,8 +3790,48 @@ mod tests {
             created_at: now_ms(),
             last_activity: AtomicU64::new(next_pool_activity()),
             account_id: None,
+            access_token: None,
             max_message_bytes: None,
         })
+    }
+
+    fn login_headers(account: Option<&str>, token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        if let Some(account) = account {
+            headers.insert("chatgpt-account-id", account.parse().unwrap());
+        }
+        headers
+    }
+
+    /// A pooled socket goes to a request only under the login of its
+    /// handshake: the same known account, whatever the token, or, with no
+    /// account on either side, the same token. An account known on one side
+    /// only is another login.
+    #[tokio::test]
+    async fn a_pooled_socket_serves_only_the_login_of_its_handshake() {
+        let entry = |headers: HeaderMap| async move {
+            PoolEntry::opened_with(
+                ConnectedWebSocket {
+                    stream: create_dummy_stream_async().await,
+                    max_message_bytes: None,
+                },
+                &headers,
+            )
+        };
+        let known = entry(login_headers(Some("acct-a"), "token-a")).await;
+        assert!(known.serves_request(&login_headers(Some("acct-a"), "token-a")));
+        assert!(known.serves_request(&login_headers(Some("acct-a"), "token-renewed")));
+        assert!(!known.serves_request(&login_headers(Some("acct-b"), "token-a")));
+        assert!(!known.serves_request(&login_headers(None, "token-a")));
+
+        let unknown = entry(login_headers(None, "token-a")).await;
+        assert!(unknown.serves_request(&login_headers(None, "token-a")));
+        assert!(!unknown.serves_request(&login_headers(None, "token-b")));
+        assert!(!unknown.serves_request(&login_headers(Some("acct-a"), "token-a")));
     }
 
     #[tokio::test]

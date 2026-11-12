@@ -1067,18 +1067,27 @@ under another account replaces the held reading whole, and
 `with_rate_limit_headers` publishes it only for a request under the same
 account. A pooled WebSocket keeps the `ChatGPT-Account-Id` of its handshake
 (`PoolEntry::account_id`), since the backend answers every request on it
-under that account: `take_pool_entry_for_request` hands it only to a
-request built with the same account and otherwise drops it as gone, so a
+under that account, and the handshake's access token
+(`PoolEntry::access_token`, in memory only, in a type without `Debug`, never
+logged). `take_pool_entry_for_request` hands it only to a request it serves
+(`PoolEntry::serves_request`): both account ids are known and equal, or
+neither is known and the request's access token is the very string of the
+handshake. An account known on one side only is another login. Otherwise it
+drops the socket as gone, so a
 continuation that needed it takes the missing-socket path
 (`continuation_socket_missing_error`) and is sent again with full context,
-and any other request opens its own connection. A token of the same account
-renewed before it expires keeps the socket (a refresh forced by a 401 still
+and any other request opens its own connection. A token of the same known
+account renewed before it expires keeps the socket, while a renewed token
+with no account id does not (a refresh forced by a 401 still
 drops the conversation's socket, as before), whereas the Codex CLI resets its
 connection on any auth change (`codex-rs/core/src/client.rs` at
 rust-v0.166.0). The HTTP replay of a WebSocket size refusal likewise goes
 out only under the account of the WebSocket attempt it replaces, and, when
 an account id is unknown, only under that attempt's own access token
-(`refuse_size_fallback_under_another_account`). A reading whose
+(`refuse_size_fallback_under_another_account`). When the request's account
+id is unknown, the pool rule makes its token the one its socket was opened
+with (a pooled socket serves it only under the same token, else it opens
+its own), so the token that comparison reads is the socket's. A reading whose
 `metered_limit_name`, else `limit_name`, names a limit other than `codex`
 updates nothing, and its refusal marks no window (`reads_codex_limit`,
 `CodexUsageLimit::feeds_gauge`); one naming neither reads `codex`, as the

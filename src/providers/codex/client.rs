@@ -7967,6 +7967,194 @@ mod tests {
         assert_eq!(counts, (1, 1, 1));
     }
 
+    /// A conversation's socket pooled under a login with no account id is not
+    /// taken by the next turn once the saved login has another token, still
+    /// with no account. The turn goes out with its full context on a socket
+    /// opened with the new token, so the size refusal it gets and the HTTP
+    /// replay that follows are both under that token, and nothing more goes
+    /// out on the old socket.
+    // tungstenite's own callback type fixes the error response size.
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn a_size_refusal_after_a_login_change_is_not_sent_on_the_old_pooled_socket() {
+        use tokio_tungstenite::tungstenite::{
+            Message,
+            protocol::{CloseFrame, frame::coding::CloseCode},
+        };
+
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Agent(
+            "size-refusal-pool-session".to_string(),
+            "size-refusal-pool-agent".to_string(),
+        );
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // What the origin saw, in order: `upgrade <socket> <token>`,
+        // `frame <socket> <previous response> <inputs>`, `post <token>`.
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let server = tokio::spawn(async move {
+            let mut upgrades = 0_usize;
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut first = [0_u8; 1];
+                if stream.peek(&mut first).await.unwrap_or(0) == 0 {
+                    continue;
+                }
+                if first[0] != b'G' {
+                    let request = String::from_utf8(read_http_request(&mut stream).await).unwrap();
+                    let token = request
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("authorization")
+                                .then(|| value.trim().trim_start_matches("Bearer ").to_string())
+                        })
+                        .unwrap_or_default();
+                    seen_tx.send(format!("post {token}")).unwrap();
+                    let body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http\"}}\n\n";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    continue;
+                }
+                let socket = upgrades;
+                upgrades += 1;
+                let mut token = String::new();
+                let mut websocket = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    |request: &http::Request<()>, response| {
+                        token = request
+                            .headers()
+                            .get(http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.strip_prefix("Bearer "))
+                            .unwrap_or_default()
+                            .to_string();
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+                seen_tx.send(format!("upgrade {socket} {token}")).unwrap();
+                let seen_tx = seen_tx.clone();
+                tokio::spawn(async move {
+                    let mut frames = 0;
+                    while let Some(Ok(message)) = websocket.next().await {
+                        let Message::Text(text) = message else {
+                            continue;
+                        };
+                        let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        seen_tx
+                            .send(format!(
+                                "frame {socket} {} {}",
+                                request["previous_response_id"].as_str().unwrap_or("-"),
+                                request["input"].as_array().map_or(0, Vec::len)
+                            ))
+                            .unwrap();
+                        frames += 1;
+                        if socket == 0 && frames == 1 {
+                            send_completed_websocket_response(&mut websocket, "resp_a").await;
+                        } else {
+                            let _ = websocket
+                                .send(Message::Close(Some(CloseFrame {
+                                    code: CloseCode::Size,
+                                    reason: "".into(),
+                                })))
+                                .await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = Arc::new(http_test_client(format!("http://{addr}/responses"), 100));
+        client
+            .auth_manager()
+            .set_test_auth(unknown_account_initial_auth());
+        let context = http_test_context();
+        let first_request = buffered_request_with_texts(&["one"]);
+        let first_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &first_request,
+            true,
+        );
+        let first_response = tokio::time::timeout(
+            MOCK_DEADLINE,
+            client.post_codex_with_transport(
+                &first_request,
+                &context,
+                Some(&first_candidate),
+                crate::config::CodexTransport::Auto,
+            ),
+        )
+        .await
+        .expect("the first turn did not finish")
+        .unwrap();
+        assert_eq!(first_response.transport, ActualTransport::WebSocket);
+        super::super::update_continuation_from_upstream(
+            None,
+            &first_candidate,
+            None,
+            &first_request,
+            &first_response.body,
+            first_response.socket_id,
+            false,
+        );
+
+        client
+            .auth_manager()
+            .set_test_auth(unknown_account_test_auth());
+        let second_request = buffered_request_with_texts(&["one", "two"]);
+        let second_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &second_request,
+            true,
+        );
+        assert_eq!(
+            second_candidate.candidate().previous_response_id.as_deref(),
+            Some("resp_a")
+        );
+        let second_response = tokio::time::timeout(
+            MOCK_DEADLINE,
+            client.post_codex_with_transport(
+                &second_request,
+                &context,
+                Some(&second_candidate),
+                crate::config::CodexTransport::Auto,
+            ),
+        )
+        .await
+        .expect("the second turn did not finish")
+        .unwrap();
+        assert_eq!(second_response.status, 200);
+        assert_eq!(second_response.transport, ActualTransport::Http);
+        server.abort();
+
+        let mut seen = Vec::new();
+        while let Ok(event) = seen_rx.try_recv() {
+            seen.push(event);
+        }
+        assert_eq!(
+            seen,
+            [
+                "upgrade 0 test",
+                "frame 0 - 1",
+                "upgrade 1 rotated",
+                "frame 1 - 2",
+                "post rotated",
+            ]
+        );
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+    }
+
     #[test]
     fn the_size_fallback_refused_warning_names_only_the_request() {
         assert_eq!(
