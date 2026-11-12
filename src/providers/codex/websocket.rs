@@ -557,6 +557,12 @@ static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<ConversationIdentity, Arc<Po
 static WS_POOL_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 static WS_CONNECT_GATE: once_cell::sync::Lazy<WebSocketConnectGate> =
     once_cell::sync::Lazy::new(|| WebSocketConnectGate::new(WEBSOCKET_CONNECT_START_SPACING));
+#[cfg(test)]
+tokio::task_local! {
+    /// A gate that connects made in this task go through instead of
+    /// `WS_CONNECT_GATE`, so a test reads a gate no other test touches.
+    static TEST_CONNECT_GATE: Arc<WebSocketConnectGate>;
+}
 /// When the connect pause of each target ends, keyed by `connect_pause_key`.
 static WS_CONNECT_PAUSES: once_cell::sync::Lazy<Mutex<HashMap<String, Instant>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
@@ -851,6 +857,10 @@ fn cleanup_pool_before_connect() {
 struct WebSocketConnectGate {
     last_start: AsyncMutex<Option<tokio::time::Instant>>,
     start_spacing: Duration,
+    /// How many calls have entered `wait_to_start`, so a test can tell that a
+    /// connect reached the gate.
+    #[cfg(test)]
+    arrivals: AtomicU64,
 }
 
 impl WebSocketConnectGate {
@@ -858,15 +868,19 @@ impl WebSocketConnectGate {
         Self {
             last_start: AsyncMutex::new(None),
             start_spacing,
+            #[cfg(test)]
+            arrivals: AtomicU64::new(0),
         }
     }
 
-    /// A `before_start` that fails starts nothing, so the next start is spaced
-    /// from the previous one as before.
+    /// A `before_start` that fails starts nothing and leaves the last start as
+    /// it is, so the next start is spaced from that one.
     async fn wait_to_start<E>(
         &self,
         before_start: impl std::future::Future<Output = Result<(), E>>,
     ) -> Result<(), E> {
+        #[cfg(test)]
+        self.arrivals.fetch_add(1, Ordering::SeqCst);
         let mut last_start = self.last_start.lock().await;
         if let Some(previous) = *last_start {
             tokio::time::sleep_until(previous + self.start_spacing).await;
@@ -2082,8 +2096,9 @@ fn parse_connect_response_head(response: &[u8]) -> Result<(u16, Option<String>),
     Ok((status, retry_after))
 }
 
-/// `response_head` is set once the proxy's status line arrived and cleared
-/// again when the tunnel opens, as the destination has not answered yet.
+/// `response_head` is set once the proxy's status line is complete and
+/// cleared again when the tunnel opens, as the destination has not answered
+/// yet; it counts as answered once its handshake response is complete.
 async fn establish_connect_tunnel(
     mut stream: BoxedWebSocketIo,
     authority: &str,
@@ -2278,8 +2293,10 @@ fn tungstenite_handshake_error(
 enum ConnectAttemptError {
     Origin(CodexError),
     ProxyTunnel(CodexError),
-    /// No status arrived before the connect timeout, or the connection or the
-    /// TLS handshake failed. Only this starts a connect pause.
+    /// Nothing answered before the connect timeout (the upgrade's response
+    /// head, a proxy's status line or the tunneled destination's handshake
+    /// response was not complete), or the connection or the TLS handshake
+    /// failed. Only this starts a connect pause.
     Unreachable(CodexError),
     /// The target was paused when the attempt was about to start, so nothing
     /// was sent.
@@ -2440,8 +2457,9 @@ fn connect_timeout_error(connect_timeout: Duration) -> CodexError {
     ))
 }
 
-/// `connect` sets `response_head` once a status line arrived. An attempt that
-/// runs out of time after that has been answered and is not `Unreachable`.
+/// `connect` sets `response_head` once the upgrade's response head or the
+/// proxy's status line is complete. An attempt that runs out of time after
+/// that has been answered and is not `Unreachable`.
 async fn connect_with_policy<T, P, PFut, F, Fut>(
     gate: &WebSocketConnectGate,
     connect_timeout: Duration,
@@ -2572,8 +2590,14 @@ async fn connect_with_timeout(
         return Err(connect_paused_error());
     }
     let response_head = AtomicBool::new(false);
+    #[cfg(test)]
+    let test_gate = TEST_CONNECT_GATE.try_with(Arc::clone).ok();
+    #[cfg(test)]
+    let gate: &WebSocketConnectGate = test_gate.as_deref().unwrap_or(&*WS_CONNECT_GATE);
+    #[cfg(not(test))]
+    let gate: &WebSocketConnectGate = &WS_CONNECT_GATE;
     connect_with_policy(
-        &WS_CONNECT_GATE,
+        gate,
         Duration::from_millis(connect_timeout_ms),
         WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN,
         &response_head,
@@ -6389,8 +6413,11 @@ mod tests {
         });
         let url = format!("ws://{addr}/responses");
 
-        let gate = WS_CONNECT_GATE.last_start.lock().await;
-        let waiting = tokio::spawn({
+        // The request goes through a gate of its own, so no other test's
+        // connect passes or stamps it.
+        let gate = Arc::new(WebSocketConnectGate::new(WEBSOCKET_CONNECT_START_SPACING));
+        let held = gate.last_start.lock().await;
+        let waiting = tokio::spawn(TEST_CONNECT_GATE.scope(gate.clone(), {
             let url = url.clone();
             async move {
                 connect_error(
@@ -6401,13 +6428,18 @@ mod tests {
                 )
                 .await
             }
-        });
-        // The request passes the first check and waits at the gate.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        }));
+        // The request passed the first check and waits at the gate, which
+        // this test holds.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while gate.arrivals.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request never reached the gate");
         pause_codex_websocket_connects_for_tests(&url);
-        drop(gate);
+        drop(held);
 
         let error = waiting.await.unwrap();
         assert_eq!(
@@ -6415,6 +6447,8 @@ mod tests {
             Some(WEBSOCKET_CONNECT_PAUSED_DETAIL)
         );
         assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        assert_eq!(gate.arrivals.load(Ordering::SeqCst), 1);
+        assert_eq!(*gate.last_start.lock().await, None);
         expire_codex_websocket_connect_pause_for_tests(&url);
     }
 

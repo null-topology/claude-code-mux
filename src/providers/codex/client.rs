@@ -1988,7 +1988,8 @@ impl CodexHttpClient {
     }
 
     /// `http_fallback` says the caller answers a failed connect over HTTP, so
-    /// the connect pause applies (`OnConnectFailure::FallBackToHttp`).
+    /// the connect pause applies (`OnConnectFailure::FallBackToHttp`) until
+    /// the first item reached the caller; later connects use `Fail`.
     async fn stream_live_websocket_events(
         self: &Arc<Self>,
         body: &ResponsesRequest,
@@ -2046,21 +2047,25 @@ impl CodexHttpClient {
         socket_id_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
         http_fallback: bool,
     ) {
-        let on_connect_failure = if http_fallback {
-            super::websocket::OnConnectFailure::FallBackToHttp {
-                req_id: &ctx.req_id,
-            }
-        } else {
-            super::websocket::OnConnectFailure::Fail
-        };
         let mut auth_refresh_attempted = false;
         let mut continuation_retry_available = continuation
             .as_ref()
             .and_then(|reservation| reservation.candidate().previous_response_id.as_deref())
             .is_some();
         let mut forwarded_any = false;
+        // The caller falls back to HTTP only on the first item it receives,
+        // so once an item has reached it a later connect of this request
+        // fails on its own: the pause neither skips it nor starts from it.
+        let mut sent_any = false;
 
         'attempt: loop {
+            let on_connect_failure = if http_fallback && !sent_any {
+                super::websocket::OnConnectFailure::FallBackToHttp {
+                    req_id: &ctx.req_id,
+                }
+            } else {
+                super::websocket::OnConnectFailure::Fail
+            };
             socket_id_publisher.publish(None);
             socket_id_publisher.publish_account(auth.account_id.as_deref());
             let ws_headers = match build_codex_headers(
@@ -2281,6 +2286,7 @@ impl CodexHttpClient {
                     abort_abandoned_live_continuation(continuation.as_ref(), &socket_id_publisher);
                     return;
                 }
+                sent_any = true;
                 if terminal {
                     return;
                 }
@@ -6895,7 +6901,7 @@ mod tests {
         assert_eq!(posts.load(Ordering::SeqCst), 1);
 
         // Once the pause ended the next request tries the WebSocket again. A
-        // refused upgrade falls back as before and starts no pause.
+        // refused upgrade falls back to HTTP and starts no pause.
         super::super::websocket::expire_codex_websocket_connect_pause_for_tests(&url);
         for attempt in 1..=2 {
             let response = send().await.unwrap();
@@ -7020,6 +7026,150 @@ mod tests {
 
         super::super::websocket::expire_codex_websocket_connect_pause_for_tests(&url);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_live_auto_repair_after_a_forwarded_event_connects_despite_the_pause() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Main("live-repair-paused-target-session".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/responses");
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (first_socket, _) = listener.accept().await.unwrap();
+            let mut first_websocket = tokio_tungstenite::accept_async(first_socket).await.unwrap();
+            request_tx
+                .send(next_websocket_json(&mut first_websocket).await)
+                .unwrap();
+            send_completed_websocket_response(&mut first_websocket, "resp_repair_origin").await;
+
+            // The continuation goes over the pooled socket: an informational
+            // event, then a failure the full-context resend repairs.
+            request_tx
+                .send(next_websocket_json(&mut first_websocket).await)
+                .unwrap();
+            first_websocket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"type": "keepalive"}).to_string(),
+                ))
+                .await
+                .unwrap();
+            send_nested_previous_response_missing(&mut first_websocket).await;
+
+            let (repair_socket, _) = listener.accept().await.unwrap();
+            let mut repair_websocket = tokio_tungstenite::accept_async(repair_socket)
+                .await
+                .unwrap();
+            request_tx
+                .send(next_websocket_json(&mut repair_websocket).await)
+                .unwrap();
+            send_completed_websocket_response(&mut repair_websocket, "resp_repaired").await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                    .await
+                    .is_err(),
+                "the repaired request must not reach the target again"
+            );
+        });
+
+        let client = Arc::new(authenticated_http_test_client(url.clone()));
+        let context = http_test_context();
+        let first_request = buffered_request_with_texts(&["one"]);
+        let first_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &first_request,
+            true,
+        );
+        let first_response = tokio::time::timeout(
+            MOCK_DEADLINE,
+            client.post_codex_with_transport(
+                &first_request,
+                &context,
+                Some(&first_candidate),
+                crate::config::CodexTransport::WebSocket,
+            ),
+        )
+        .await
+        .expect("the first request did not finish")
+        .unwrap();
+        super::super::update_continuation_from_upstream(
+            None,
+            &first_candidate,
+            None,
+            &first_request,
+            &first_response.body,
+            first_response.socket_id,
+            false,
+        );
+
+        super::super::websocket::pause_codex_websocket_connects_for_tests(&url);
+        let second_request = buffered_request_with_texts(&["one", "two"]);
+        let second_candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &second_request,
+            true,
+        );
+        assert_eq!(
+            second_candidate.candidate().previous_response_id.as_deref(),
+            Some("resp_repair_origin")
+        );
+        let items = tokio::time::timeout(MOCK_DEADLINE, async {
+            let (mut events, http_headers) = client
+                .stream_codex_auto_events_for_owner(
+                    &second_request,
+                    &context,
+                    Some(&second_candidate),
+                )
+                .await
+                .expect("the live request did not start");
+            assert!(
+                http_headers.is_empty(),
+                "the request must stay on the WebSocket"
+            );
+            let mut items = Vec::new();
+            while let Some(item) = events.recv().await {
+                items.push(item);
+            }
+            items
+        })
+        .await
+        .expect("the live request did not finish");
+
+        let errors: Vec<_> = items
+            .iter()
+            .filter_map(|item| item.as_ref().err())
+            .map(|error| error.detail.clone())
+            .collect();
+        assert!(errors.is_empty(), "the client got errors: {errors:?}");
+        assert_eq!(items[0].as_ref().unwrap()["type"], "keepalive");
+        assert_eq!(
+            items.last().unwrap().as_ref().unwrap()["response"]["id"],
+            "resp_repaired"
+        );
+
+        let _first_payload = request_rx.recv().await.unwrap();
+        let continued_payload = request_rx.recv().await.unwrap();
+        let repaired_payload = request_rx.recv().await.unwrap();
+        assert_eq!(
+            continued_payload["previous_response_id"],
+            "resp_repair_origin"
+        );
+        assert!(repaired_payload.get("previous_response_id").is_none());
+        assert_eq!(repaired_payload["input"].as_array().unwrap().len(), 2);
+        tokio::time::timeout(MOCK_DEADLINE, server)
+            .await
+            .expect("the mock server did not finish")
+            .unwrap();
+
+        super::super::websocket::expire_codex_websocket_connect_pause_for_tests(&url);
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        super::super::continuation::abort_continuation_for_owner(&second_candidate);
     }
 
     /// An error answer whose body never ends, `piece` bytes per chunk,

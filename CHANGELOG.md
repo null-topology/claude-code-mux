@@ -51,9 +51,10 @@
   a close that ends a response as `codex_websocket_closed` with the request
   id and its numeric code, never its reason text. To keep such requests off
   HTTP, set `CCP_CODEX_TRANSPORT=websocket`.
-- After a WebSocket connect to the Codex backend got no answer (no status
-  arrived before the connect timeout, or the connection or its TLS
-  handshake failed), requests under the default `auto` transport now go
+- After a WebSocket connect to the Codex backend got no answer (the
+  backend's response head was not complete before the connect timeout, or
+  the connection or its TLS handshake failed), requests under the default
+  `auto` transport now go
   straight to HTTP for five minutes instead of each waiting up to 15 s for
   a connect of its own. Failing to reach a configured proxy (its TCP
   connection or TLS handshake, or a SOCKS connection) counts as no answer
@@ -63,7 +64,9 @@
   (`reqId`, `seconds`, `detail`), and each request it sends to HTTP logs
   the usual `codex_websocket_fallback_to_http` warning with the detail
   `websocket_connect_paused`. A conversation that still has an open
-  WebSocket keeps using it. A rejected upgrade (a 429, 403, 5xx or other
+  WebSocket keeps using it, and a request whose response has already
+  started still connects when it needs a new connection, such as to resend
+  its full context. A rejected upgrade (a 429, 403, 5xx or other
   status from the backend) starts no pause and falls back as before, also
   when the connect timeout ends while its body is still arriving. A
   successful connect to the address ends the pause early; otherwise, once
