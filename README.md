@@ -48,7 +48,8 @@ Code's own usage warnings and limit messages working for both.
 - **Relays the Claude route byte for byte**, on Claude Code's own subscription
   login, so Anthropic's prompt cache keeps working. [How it works](#how-it-works)
 - **Translates Anthropic Messages to the OpenAI Responses API** for Codex, over
-  a WebSocket by default, falling back to HTTP if the handshake fails.
+  a WebSocket by default, falling back to HTTP if the handshake fails or a
+  request is too large for the WebSocket.
   Reasoning survives a switch between backends. [How it works](#how-it-works)
 - **Lists the models your login can actually use.** `/v1/models` asks the Codex
   backend on every call instead of serving a list compiled into the binary,
@@ -535,8 +536,8 @@ flowchart LR
   it only reserializes a request that has one.
 - **The Codex route** maps the Messages API onto the Responses API over a
   WebSocket per conversation, falling back to HTTP when the WebSocket cannot
-  be opened (`CCP_CODEX_TRANSPORT` picks `auto`, the default, `websocket` or
-  `http`), and reads the ChatGPT login from the Codex CLI's
+  be opened or a request is too large for it (`CCP_CODEX_TRANSPORT` picks
+  `auto`, the default, `websocket` or `http`), and reads the ChatGPT login from the Codex CLI's
   `~/.codex/auth.json`. When the token is refreshed it is written back so the
   Codex CLI keeps working. `previous_response_id` continuation state is kept
   per conversation as well, but it is off unless
@@ -1048,7 +1049,7 @@ This is the complete list of variables the proxy reads.
 | `CCP_CODEX_ORIGINATOR` | built-in | The `originator` the ChatGPT backend sees. A compatibility contract; changing it changes what the server is told. |
 | `CCP_CODEX_USER_AGENT` | built-in | Same, for the `User-Agent`. |
 | `CCP_CODEX_FORWARD_HEADERS` | unset | Comma-separated names of client request headers to pass on to Codex, e.g. `x-gateway-token` for an authenticating gateway in front of the backend. Config key `codex.forwardHeaders` (a list). Each named header goes on every Codex call a `/v1/messages` request causes: the WebSocket handshake, HTTP, web search, and a model listing; a `/v1/models` or `/v1/models/{model_id}` listing carries them too. The OpenAI-compatible routes forward nothing. A pooled WebSocket keeps the values it was opened with. A header the proxy sets itself is never replaced, the client's connection headers (`host`, `content-length`, hop-by-hop) are never forwarded, and forwarded values are redacted in traffic captures. The listing at start has no client request and goes without them. |
-| `CCP_CODEX_TRANSPORT` | `auto` | `auto`, `websocket`, or `http`. `auto` uses a WebSocket and switches to HTTP only when the WebSocket could not be set up before the request was sent, for example a refused handshake; a request already sent over the WebSocket is never sent again over HTTP. `websocket` never falls back. Whatever the setting, Claude Code's compaction summary and the opt-in server compaction call go over HTTP. Rate-limit handling is the same on each. |
+| `CCP_CODEX_TRANSPORT` | `auto` | `auto`, `websocket`, or `http`. `auto` uses a WebSocket and sends a request over HTTP when the handshake failed, when its frame is over the message size limit the handshake advertised, when the socket closed with code 1009 (message too big) before any response text, and for a resend the proxy makes anyway (such as the full-context one that repairs a continuation) whose frame is over that limit; otherwise a request already written to the WebSocket is not sent over HTTP. `websocket` never falls back. Whatever the setting, Claude Code's compaction summary and the opt-in server compaction call go over HTTP. Rate-limit handling is the same on each. |
 | `CCP_CODEX_EFFORT` | unset | Reasoning effort sent to Codex, e.g. `high`. `none` is sent as is, and then no reasoning summary and no encrypted reasoning are requested. |
 | `CCP_COMPACT_EFFORT` | `low` | Effort cap for compaction turns only. It never raises an effort the request named, and a compaction turn that names no effort gets the cap. `off` disables the cap, `none` asks for no reasoning. |
 | `CCP_CODEX_SERVICE_TIER` | unset | Service tier for Anthropic Messages requests routed to Codex (`/v1/messages`, the `count_tokens` check, the auto-review classifier; not the OpenAI-compatible `/v1/responses` and `/v1/chat/completions`): `fast`, `priority`, `flex`, or `default` for no tier at all. It wins over every file setting, `codex.serviceTierByModel` included. Without a configured tier, a `-fast` id requests priority; otherwise the listing's default applies only when it is `priority` or `flex` and appears in the model's `service_tiers`, and never to the auto-review classifier. |
