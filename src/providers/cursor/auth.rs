@@ -259,22 +259,31 @@ pub fn wait_for_cursor_login(
     Ok(None)
 }
 
+/// The most of a token refresh answer read into memory.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
+
 fn refresh_cursor_auth(refresh_token: &str) -> anyhow::Result<Option<RefreshResponse>> {
+    refresh_cursor_auth_at(&config::cursor_base_url(), refresh_token)
+}
+
+fn refresh_cursor_auth_at(
+    base_url: &str,
+    refresh_token: &str,
+) -> anyhow::Result<Option<RefreshResponse>> {
     let client = reqwest::blocking::Client::new();
-    let url = format!(
-        "{}/auth/refresh",
-        config::cursor_base_url().trim_end_matches('/')
-    );
+    let url = format!("{}/auth/refresh", base_url.trim_end_matches('/'));
     let resp = client
         .post(url)
         .header("content-type", "application/json")
         .bearer_auth(refresh_token)
         .body("{}")
-        .send()?;
+        .send()
+        .map_err(|error| anyhow::anyhow!(crate::upstream_http::error_text(error)))?;
     if !resp.status().is_success() {
         return Ok(None);
     }
-    let parsed: serde_json::Value = resp.json()?;
+    let parsed: serde_json::Value =
+        crate::upstream_http::read_blocking_json_capped(resp, MAX_TOKEN_RESPONSE_BYTES)?;
     Ok(parse_cursor_auth_tokens(&parsed))
 }
 
@@ -457,6 +466,76 @@ mod tests {
         assert!(login.login_url.contains("&uuid="));
         assert!(login.login_url.contains("&mode=login&redirectTarget=cli"));
         assert!(!login.verifier.contains('='));
+    }
+
+    /// Answers one request with `body` and closes the connection.
+    fn serve_refresh(body: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+        });
+        format!("http://{addr}")
+    }
+
+    /// A refresh answer padded with JSON whitespace to exactly `size` bytes.
+    fn refresh_body(size: usize) -> Vec<u8> {
+        let mut body = br#"{"accessToken":"access-1","refreshToken":"refresh-1"}"#.to_vec();
+        body.resize(size, b' ');
+        body
+    }
+
+    #[test]
+    fn refresh_send_error_carries_no_url() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let error = refresh_cursor_auth_at(
+            &format!("http://127.0.0.1:{port}/toy-secret-path"),
+            "toy-refresh",
+        )
+        .unwrap_err();
+        let text = format!("{error:?}");
+        assert!(!text.is_empty());
+        for leaked in ["toy-secret-path", "127.0.0.1", "for url"] {
+            assert!(!text.contains(leaked), "{leaked} in {text}");
+        }
+    }
+
+    #[test]
+    fn refresh_answer_of_exactly_the_limit_is_read() {
+        let base = serve_refresh(refresh_body(MAX_TOKEN_RESPONSE_BYTES));
+        let refreshed = refresh_cursor_auth_at(&base, "toy-refresh")
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.access_token, "access-1");
+        assert_eq!(refreshed.refresh_token, "refresh-1");
+    }
+
+    #[test]
+    fn refresh_answer_over_the_limit_is_refused() {
+        let base = serve_refresh(refresh_body(MAX_TOKEN_RESPONSE_BYTES + 1));
+        let error = refresh_cursor_auth_at(&base, "toy-refresh").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("response body exceeded {MAX_TOKEN_RESPONSE_BYTES} bytes")
+        );
     }
 
     fn test_jwt(exp: u64, sub: Option<&str>, email: Option<&str>) -> String {

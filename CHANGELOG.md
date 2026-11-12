@@ -37,6 +37,21 @@
   answers with the size refusal (413 `request_too_large`) and logs a
   `codex_websocket_size_fallback_refused` warning. A renewed token of the
   same account replays as before.
+- Error messages from the Anthropic passthrough and the Kimi, Grok and Cursor
+  providers, their login and token refresh included, no longer end with
+  ` for url (...)`. A configured base URL or proxy URL can carry a credential
+  in its path or query, and these messages reach client error answers, the
+  terminal and `proxy.log`. The rest of each message is unchanged, and the
+  bytes the passthrough relays are untouched.
+- The Kimi, Grok and Cursor providers now stop reading an upstream body once
+  it passes a fixed size, instead of holding whatever the server sends: 1 MiB
+  for a login, device or token refresh answer, 64 KiB for an error body kept
+  for its message, 8 MiB for a Kimi or Cursor response held before it is
+  translated, and 256 KiB for Grok's login metadata, which used to be checked
+  only after the whole body had been read. A larger body fails the way one
+  that cannot be read failed before: an error answer loses the upstream
+  message, a login or refresh fails, a Cursor request fails with a read error
+  and a Kimi response is treated as empty. The limits have no setting.
 
 ## v0.18.0 (2026-11-12)
 

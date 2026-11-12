@@ -14,7 +14,9 @@ pub const CANONICAL_ISSUER: &str = "https://auth.x.ai";
 pub const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 pub(super) const SCOPES: &str = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
-const MAX_METADATA_BYTES: usize = 256 * 1024;
+pub(super) const MAX_METADATA_BYTES: usize = 256 * 1024;
+/// The most of a token answer read.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct Discovery {
@@ -77,20 +79,29 @@ fn client() -> anyhow::Result<reqwest::blocking::Client> {
 
 fn discover(client: &reqwest::blocking::Client) -> anyhow::Result<Discovery> {
     let url = format!("{CANONICAL_ISSUER}/.well-known/openid-configuration");
-    let response = client.get(url).send()?.error_for_status()?;
-    if response
-        .content_length()
-        .is_some_and(|size| size as usize > MAX_METADATA_BYTES)
-    {
-        anyhow::bail!("Grok OIDC metadata exceeds the size limit");
-    }
-    let bytes = response.bytes()?;
-    if bytes.len() > MAX_METADATA_BYTES {
-        anyhow::bail!("Grok OIDC metadata exceeds the size limit");
-    }
+    let bytes = read_metadata(client, &url)?;
     let discovery: Discovery = serde_json::from_slice(&bytes)?;
     validate_discovery(&discovery)?;
     Ok(discovery)
+}
+
+/// The metadata document at `url`, refused as soon as it passes
+/// `MAX_METADATA_BYTES`, declared or read.
+fn read_metadata(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<Vec<u8>> {
+    use crate::upstream_http::{BodyReadError, read_blocking_body_capped, url_free_error};
+    let response = client
+        .get(url)
+        .send()
+        .map_err(url_free_error)?
+        .error_for_status()
+        .map_err(url_free_error)?;
+    match read_blocking_body_capped(response, MAX_METADATA_BYTES) {
+        Ok(bytes) => Ok(bytes),
+        Err(BodyReadError::TooLarge { .. }) => {
+            anyhow::bail!("Grok OIDC metadata exceeds the size limit")
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn validate_discovery(discovery: &Discovery) -> anyhow::Result<()> {
@@ -164,14 +175,16 @@ fn exchange_code(
             ("code_verifier", pkce.verifier.as_str()),
             ("redirect_uri", redirect_uri),
         ])
-        .send()?;
+        .send()
+        .map_err(crate::upstream_http::url_free_error)?;
     if !response.status().is_success() {
         anyhow::bail!(
             "Grok token exchange failed with status {}",
             response.status()
         );
     }
-    let tokens: TokenResponse = response.json()?;
+    let tokens: TokenResponse =
+        crate::upstream_http::read_blocking_json_capped(response, MAX_TOKEN_RESPONSE_BYTES)?;
     validate_tokens(&tokens)?;
     Ok(tokens)
 }
@@ -343,6 +356,82 @@ mod tests {
         let mut value = metadata();
         value.token_endpoint = "https://example.com/token".into();
         assert!(validate_discovery(&value).is_err());
+    }
+
+    #[test]
+    fn metadata_send_and_status_failures_carry_no_url() {
+        use crate::upstream_http::test_support::{
+            assert_no_url, refused_secret_url, serve_in_order,
+        };
+        let client = client().unwrap();
+        let refused = read_metadata(&client, &refused_secret_url()).unwrap_err();
+        assert_no_url(&format!("{refused:#}"));
+        let url = serve_in_order(vec![(500, b"{}".to_vec())]);
+        let rejected =
+            read_metadata(&client, &format!("{url}?token=toy-secret-query")).unwrap_err();
+        assert_no_url(&format!("{rejected:#}"));
+    }
+
+    #[test]
+    fn metadata_is_read_up_to_its_limit() {
+        use crate::upstream_http::test_support::serve_in_order;
+        let client = client().unwrap();
+        let url = serve_in_order(vec![
+            (200, vec![b' '; MAX_METADATA_BYTES]),
+            (200, vec![b' '; MAX_METADATA_BYTES + 1]),
+        ]);
+        assert_eq!(
+            read_metadata(&client, &url).unwrap().len(),
+            MAX_METADATA_BYTES
+        );
+        let error = read_metadata(&client, &url).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Grok OIDC metadata exceeds the size limit"
+        );
+    }
+
+    #[test]
+    fn token_exchange_send_failure_carries_no_url() {
+        use crate::upstream_http::test_support::{assert_no_url, refused_secret_url};
+        let mut discovery = metadata();
+        discovery.token_endpoint = refused_secret_url();
+        let error = exchange_code(
+            &client().unwrap(),
+            &discovery,
+            "code",
+            &generate_pkce(),
+            "http://127.0.0.1:1234/callback",
+        )
+        .err()
+        .unwrap();
+        assert_no_url(&format!("{error:#}"));
+    }
+
+    #[test]
+    fn token_answer_is_read_up_to_its_limit() {
+        use crate::upstream_http::test_support::{padded_json, serve_in_order};
+        let tokens = r#"{"access_token":"toy-access","refresh_token":"toy-refresh","expires_in":3600,"token_type":"Bearer"}"#;
+        let mut discovery = metadata();
+        discovery.token_endpoint = serve_in_order(vec![
+            (200, padded_json(tokens, MAX_TOKEN_RESPONSE_BYTES)),
+            (200, padded_json(tokens, MAX_TOKEN_RESPONSE_BYTES + 1)),
+        ]);
+        let exchange = || {
+            exchange_code(
+                &client().unwrap(),
+                &discovery,
+                "code",
+                &generate_pkce(),
+                "http://127.0.0.1:1234/callback",
+            )
+        };
+        assert_eq!(exchange().ok().unwrap().access_token, "toy-access");
+        let error = exchange().err().unwrap();
+        assert!(
+            format!("{error:#}").contains("response body exceeded"),
+            "{error:#}"
+        );
     }
 
     #[test]

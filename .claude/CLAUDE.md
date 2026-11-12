@@ -394,7 +394,16 @@ Request path:
      `anthropic-ratelimit-unified-*` headers (see below). Auth reads the Codex
      CLI's `~/.codex/auth.json` (`CCP_CODEX_AUTH_FILE` overrides the path).
    - `kimi/`, `grok/`: Chat Completions / Responses translators with their own
-     OAuth. `cursor/`: Connect protocol over protobuf.
+     OAuth. `cursor/`: Connect protocol over protobuf. These three and the
+     Anthropic relay never pass on a `reqwest::Error`'s own text, which ends
+     with ` for url (...)` and may hold a credential from a configured URL:
+     they use `upstream_http::error_text`, or `url_free_error` where `?`
+     carries the error on. Each body they hold is read under a cap named in
+     its file, enforced while reading: 1 MiB for a token, device or refresh
+     answer, 64 KiB for an error body, 8 MiB for a Kimi or Cursor response
+     held whole, `MAX_METADATA_BYTES` (256 KiB) for Grok's OIDC metadata. A
+     body over its cap fails as an unreadable one does at that place. The
+     passthrough's relayed body is streamed, not held, and has no cap.
 6. Cross-cutting: `session.rs` (in-memory sessions, 30 min idle TTL, provider
    affinity), `request_identity.rs` (Claude Code session and agent headers),
    `retry.rs` (backoff on 429 and 5xx), `monitor.rs` + `tui.rs`, `traffic.rs`

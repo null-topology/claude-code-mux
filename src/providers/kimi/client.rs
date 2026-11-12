@@ -6,6 +6,7 @@ use crate::providers::kimi::auth::manager::KimiAuthManager;
 use crate::providers::kimi::auth::token_store::{StoredAuth, file_store};
 use crate::providers::kimi::translate::request::KimiChatRequest;
 use crate::retry::{MAX_RATE_LIMIT_RETRIES, compute_backoff_delay};
+use crate::upstream_http::blocking_error_text as error_body_text;
 
 #[derive(Debug)]
 pub struct KimiError {
@@ -137,62 +138,82 @@ impl KimiHttpClient {
                 return Err(KimiError {
                     status: 0,
                     message: "Network error".to_string(),
-                    detail: Some(e.to_string()),
+                    detail: Some(crate::upstream_http::error_text(e)),
                     retry_after: None,
                 });
             }
         };
 
-        let status = resp.status().as_u16();
-
-        if status == 429 {
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-            let text = resp.text().unwrap_or_default();
-            return Err(KimiError {
-                status: 429,
-                message: "Rate limited".to_string(),
-                detail: if text.is_empty() { None } else { Some(text) },
-                retry_after,
-            });
-        }
-
-        if status == 401 || status == 403 {
-            let text = resp.text().unwrap_or_default();
-            return Err(KimiError {
-                status,
-                message: if status == 401 {
-                    "Unauthorized"
-                } else {
-                    "Forbidden"
-                }
-                .to_string(),
-                detail: if text.is_empty() { None } else { Some(text) },
-                retry_after: None,
-            });
-        }
-
-        if !resp.status().is_success() {
-            let text = resp.text().unwrap_or_default();
-            return Err(KimiError {
-                status,
-                message: "Upstream error".to_string(),
-                detail: if text.is_empty() { None } else { Some(text) },
-                retry_after: None,
-            });
-        }
-
-        let body_bytes = resp.bytes().map(|b| b.to_vec()).unwrap_or_default();
-
-        Ok(KimiResponse {
-            body: body_bytes,
-            status,
+        read_response(
+            resp,
             request_start_time,
-        })
+            MAX_ERROR_BODY_BYTES,
+            MAX_RESPONSE_BYTES,
+        )
     }
+}
+
+/// The most of an error response kept for its message.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// The most of a successful response held in memory before it is translated.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+fn read_response(
+    resp: reqwest::blocking::Response,
+    request_start_time: u64,
+    max_error_bytes: usize,
+    max_response_bytes: usize,
+) -> Result<KimiResponse, KimiError> {
+    let status = resp.status().as_u16();
+
+    if status == 429 {
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let text = error_body_text(resp, max_error_bytes);
+        return Err(KimiError {
+            status: 429,
+            message: "Rate limited".to_string(),
+            detail: if text.is_empty() { None } else { Some(text) },
+            retry_after,
+        });
+    }
+
+    if status == 401 || status == 403 {
+        let text = error_body_text(resp, max_error_bytes);
+        return Err(KimiError {
+            status,
+            message: if status == 401 {
+                "Unauthorized"
+            } else {
+                "Forbidden"
+            }
+            .to_string(),
+            detail: if text.is_empty() { None } else { Some(text) },
+            retry_after: None,
+        });
+    }
+
+    if !resp.status().is_success() {
+        let text = error_body_text(resp, max_error_bytes);
+        return Err(KimiError {
+            status,
+            message: "Upstream error".to_string(),
+            detail: if text.is_empty() { None } else { Some(text) },
+            retry_after: None,
+        });
+    }
+
+    let body_bytes = crate::upstream_http::read_blocking_body_capped(resp, max_response_bytes)
+        .unwrap_or_default();
+
+    Ok(KimiResponse {
+        body: body_bytes,
+        status,
+        request_start_time,
+    })
 }
 
 fn now_ms() -> u64 {
@@ -200,4 +221,74 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Answers one request with `status` and a body of `size` bytes, then
+    /// closes the connection.
+    fn serve_body(status: u16, size: usize) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let mut response = format!(
+                "HTTP/1.1 {status} STATUS\r\ncontent-length: {size}\r\nconnection: close\r\n\r\n"
+            )
+            .into_bytes();
+            response.resize(response.len() + size, b'a');
+            let _ = stream.write_all(&response);
+        });
+        format!("http://{addr}/")
+    }
+
+    fn read_served(status: u16, size: usize) -> Result<KimiResponse, KimiError> {
+        let resp = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(serve_body(status, size))
+            .send()
+            .unwrap();
+        read_response(resp, 0, 16, 32)
+    }
+
+    #[test]
+    fn an_error_body_of_exactly_the_limit_is_kept() {
+        let error = read_served(500, 16).err().unwrap();
+        assert_eq!(error.status, 500);
+        assert_eq!(error.detail.as_deref(), Some("a".repeat(16).as_str()));
+    }
+
+    #[test]
+    fn an_error_body_over_the_limit_is_dropped() {
+        for status in [429, 401, 500] {
+            let error = read_served(status, 17).err().unwrap();
+            assert_eq!(error.status, status);
+            assert_eq!(error.detail, None, "status {status}");
+        }
+    }
+
+    #[test]
+    fn a_response_of_exactly_the_limit_is_kept() {
+        let response = read_served(200, 32).ok().unwrap();
+        assert_eq!(response.body, vec![b'a'; 32]);
+    }
+
+    #[test]
+    fn a_response_over_the_limit_is_dropped() {
+        let response = read_served(200, 33).ok().unwrap();
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_empty());
+    }
 }
