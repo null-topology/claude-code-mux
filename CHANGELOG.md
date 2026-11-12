@@ -14,6 +14,11 @@
   transient error, the search call fails without being sent again, and the
   chat completion answers 502. These limits sit far above what the backend
   sends and cannot be changed.
+- The `codex_upstream_request_failed` warning in `proxy.log` now has a
+  `detail` field: the failure's detail as the proxy recorded it, such as
+  `http_response_body` for an answer that could not be read or the start of
+  the backend's error answer, cut to 300 characters, or null when there is
+  none.
 
 ## v0.18.0 (2026-11-12)
 

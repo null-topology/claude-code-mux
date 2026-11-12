@@ -470,6 +470,10 @@ impl CodexProvider {
                         ),
                         ("error".to_string(), serde_json::json!(&e.message)),
                         (
+                            "detail".to_string(),
+                            serde_json::json!(failed_request_log_detail(&e)),
+                        ),
+                        (
                             "ms".to_string(),
                             serde_json::json!(upstream_started_at.elapsed().as_millis()),
                         ),
@@ -1439,6 +1443,21 @@ fn is_codex_terminal_event(payload: &serde_json::Value) -> bool {
             | Some("response.error")
             | Some("error")
     )
+}
+
+/// How many characters of an error's detail `codex_upstream_request_failed`
+/// logs, as many as `codex_websocket_fallback_to_http` keeps of its own.
+const FAILED_REQUEST_LOG_DETAIL_CHARS: usize = 300;
+
+/// The `detail` field of `codex_upstream_request_failed`: the error's detail cut
+/// to `FAILED_REQUEST_LOG_DETAIL_CHARS` characters, or `None` when it has none.
+fn failed_request_log_detail(err: &client::CodexError) -> Option<String> {
+    err.detail.as_deref().map(|detail| {
+        detail
+            .chars()
+            .take(FAILED_REQUEST_LOG_DETAIL_CHARS)
+            .collect()
+    })
 }
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
@@ -3348,6 +3367,39 @@ mod tests {
         };
 
         assert!(retryable_live_start_codex_error(&err));
+    }
+
+    #[test]
+    fn failed_request_log_detail_is_cut_to_300_characters() {
+        let err = |detail: Option<String>| client::CodexError {
+            status: 502,
+            message: "Upstream Codex request failed".to_string(),
+            detail,
+            retry_after: None,
+            usage_limit: None,
+            class: None,
+            origin: client::CodexErrorOrigin::Http,
+        };
+
+        assert_eq!(failed_request_log_detail(&err(None)), None);
+        assert_eq!(
+            failed_request_log_detail(&err(Some("http_response_body".to_string()))).as_deref(),
+            Some("http_response_body")
+        );
+        // Two bytes per character, so a cut by bytes would land mid-character.
+        let long = "é".repeat(FAILED_REQUEST_LOG_DETAIL_CHARS + 1);
+        let logged = failed_request_log_detail(&err(Some(long.clone()))).unwrap();
+        assert_eq!(logged.chars().count(), 300);
+        assert!(long.starts_with(&logged));
+        let exact = "é".repeat(FAILED_REQUEST_LOG_DETAIL_CHARS);
+        assert_eq!(
+            failed_request_log_detail(&err(Some(exact.clone()))),
+            Some(exact)
+        );
+        assert_eq!(
+            serde_json::json!(failed_request_log_detail(&err(None))),
+            serde_json::Value::Null
+        );
     }
 
     #[test]

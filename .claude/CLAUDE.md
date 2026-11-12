@@ -322,7 +322,11 @@ Request path:
      for a size refusal a fixed text naming only the frame length and the
      limit or the 1009 close, never anything from the request. For a size
      refusal `status` is the proxy's own 413, not a status the backend
-     sent. A connect that got no answer (`ConnectAttemptError::Unreachable`:
+     sent. A buffered request that fails logs a
+     `codex_upstream_request_failed` warning whose `detail` is the error's
+     `CodexError.detail` cut to 300 characters on a character boundary
+     (`failed_request_log_detail`), null when it has none. A connect that
+     got no answer (`ConnectAttemptError::Unreachable`:
      before the connect timeout the upgrade's response head, a proxy's
      status line or the tunneled destination's handshake response was not
      complete, or the connection or the TLS handshake failed) made for a
