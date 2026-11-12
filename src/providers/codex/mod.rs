@@ -886,6 +886,7 @@ async fn live_stream_response(
             request_body.clone(),
             compaction,
             transport,
+            client.buffered_response_limit(),
         )
         .await
         {
@@ -934,6 +935,7 @@ async fn live_stream_response_once(
     request_body: translate::request::ResponsesRequest,
     compaction: LiveStreamCompaction,
     transport: config::CodexTransport,
+    upstream_copy_limit: usize,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
@@ -941,7 +943,7 @@ async fn live_stream_response_once(
         model.to_string(),
         estimated_input_tokens,
     );
-    let mut upstream_sse_body = Vec::new();
+    let mut upstream_copy = LiveUpstreamCopy::new(upstream_copy_limit);
     // Keep protocol framing private until real output makes a transparent retry unsafe.
     // Every branch that consumes pending_chunk returns, so it is never flushed twice.
     let mut pending_chunk = Vec::new();
@@ -974,7 +976,7 @@ async fn live_stream_response_once(
             rate_limits::observe_event(upstream_events.account_id().as_deref(), &payload);
         }
         turn_state::observe_event(&ctx.req_id, &payload);
-        append_upstream_sse_payload(&mut upstream_sse_body, &payload);
+        upstream_copy.append(&ctx.req_id, &payload);
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, None)
         {
             Ok(result) => result,
@@ -1055,14 +1057,12 @@ async fn live_stream_response_once(
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
             record_live_stream_progress(&ctx, &mut translator, &pending_chunk);
             if terminal {
-                update_continuation_from_upstream(
+                upstream_copy.update_continuation(
                     ctx.session_id.as_deref(),
                     &request_continuation,
-                    compaction.attempt,
+                    compaction,
                     &request_body,
-                    &upstream_sse_body,
                     upstream_events.socket_id(),
-                    compaction.compact_boundary,
                 );
                 let outcome = live_stream_outcome(&translator);
                 return LiveStreamStart::Response(single_live_stream_response(
@@ -1078,19 +1078,17 @@ async fn live_stream_response_once(
                 ctx,
                 request_continuation,
                 request_body,
-                upstream_sse_body,
+                upstream_copy,
                 compaction,
             ));
         }
         if terminal {
-            update_continuation_from_upstream(
+            upstream_copy.update_continuation(
                 ctx.session_id.as_deref(),
                 &request_continuation,
-                compaction.attempt,
+                compaction,
                 &request_body,
-                &upstream_sse_body,
                 upstream_events.socket_id(),
-                compaction.compact_boundary,
             );
             let outcome = live_stream_outcome(&translator);
             if pending_chunk.is_empty() {
@@ -1211,7 +1209,7 @@ fn remaining_live_stream_response(
     ctx: RequestContext,
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
-    mut upstream_sse_body: Vec<u8>,
+    mut upstream_copy: LiveUpstreamCopy,
     compaction: LiveStreamCompaction,
 ) -> Response {
     let outcome = live_stream_outcome(&translator);
@@ -1270,7 +1268,7 @@ fn remaining_live_stream_response(
                         rate_limits::observe_event(account_id.as_deref(), &payload);
                     }
                     turn_state::observe_event(&ctx.req_id, &payload);
-                    append_upstream_sse_payload(&mut upstream_sse_body, &payload);
+                    upstream_copy.append(&ctx.req_id, &payload);
                     let (chunk, terminal) = match translate_live_stream_payload(
                         &mut translator,
                         &payload,
@@ -1334,14 +1332,12 @@ fn remaining_live_stream_response(
                     }
                     note_live_stream_outcome(&outcome, &translator);
                     if terminal {
-                        update_continuation_from_upstream(
+                        upstream_copy.update_continuation(
                             ctx.session_id.as_deref(),
                             &request_continuation,
-                            compaction.attempt,
+                            compaction,
                             &request_body,
-                            &upstream_sse_body,
                             upstream_events.socket_id(),
-                            compaction.compact_boundary,
                         );
                         return;
                     }
@@ -1409,6 +1405,82 @@ fn remaining_live_stream_response(
     let mut response = event_stream_response(stream);
     response.extensions_mut().insert(response_outcome);
     response
+}
+
+/// The copy of a live stream's upstream events that its continuation state is
+/// read from at the terminal event; the relay to the client does not use it.
+/// It holds at most `limit` bytes: the event that would take it past the
+/// limit releases it for good, and the stream then leaves no continuation
+/// state.
+struct LiveUpstreamCopy {
+    body: Option<Vec<u8>>,
+    limit: usize,
+}
+
+impl LiveUpstreamCopy {
+    fn new(limit: usize) -> Self {
+        Self {
+            body: Some(Vec::new()),
+            limit,
+        }
+    }
+
+    /// Adds one event. Returns true for the event that released the copy,
+    /// the only one that logs `codex_live_stream_copy_dropped`.
+    fn append(&mut self, req_id: &str, payload: &serde_json::Value) -> bool {
+        let Some(body) = self.body.as_mut() else {
+            return false;
+        };
+        let mut event = Vec::new();
+        append_upstream_sse_payload(&mut event, payload);
+        if body.len().saturating_add(event.len()) <= self.limit {
+            body.extend_from_slice(&event);
+            return false;
+        }
+        self.body = None;
+        create_logger("codex").warn(
+            "codex_live_stream_copy_dropped",
+            Some(live_stream_copy_dropped_fields(req_id, self.limit)),
+        );
+        true
+    }
+
+    /// Updates continuation state at the terminal event. Without the copy the
+    /// request's state is dropped, as for a response that leaves none usable,
+    /// so the conversation's next request sends its full context.
+    fn update_continuation(
+        &self,
+        session_id: Option<&str>,
+        continuation: &ContinuationReservation,
+        compaction: LiveStreamCompaction,
+        request_body: &translate::request::ResponsesRequest,
+        socket_id: Option<u64>,
+    ) {
+        match &self.body {
+            Some(body) => update_continuation_from_upstream(
+                session_id,
+                continuation,
+                compaction.attempt,
+                request_body,
+                body,
+                socket_id,
+                compaction.compact_boundary,
+            ),
+            None => abort_request_state(session_id, continuation, compaction.attempt),
+        }
+    }
+}
+
+/// The fields of `codex_live_stream_copy_dropped`: the request id and the
+/// limit in bytes, nothing from the stream.
+fn live_stream_copy_dropped_fields(
+    req_id: &str,
+    limit: usize,
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([
+        ("reqId".to_string(), serde_json::json!(req_id)),
+        ("limitBytes".to_string(), serde_json::json!(limit)),
+    ])
 }
 
 fn append_upstream_sse_payload(buffer: &mut Vec<u8>, payload: &serde_json::Value) {
@@ -3104,6 +3176,7 @@ mod tests {
                 attempt: None,
             },
             config::CodexTransport::WebSocket,
+            client::MAX_BUFFERED_RESPONSE_BYTES,
         )
         .await
         {
@@ -3880,6 +3953,7 @@ mod tests {
                     attempt: None,
                 },
                 config::CodexTransport::WebSocket,
+                client::MAX_BUFFERED_RESPONSE_BYTES,
             ),
         )
         .await
@@ -4176,6 +4250,181 @@ mod tests {
         rate_limits::clear_for_tests();
     }
 
+    #[test]
+    fn a_live_upstream_copy_is_released_once_by_the_event_that_passes_its_limit() {
+        let event = serde_json::json!({"type": "response.created", "response": {"id": "resp"}});
+        let mut encoded = Vec::new();
+        append_upstream_sse_payload(&mut encoded, &event);
+        let mut copy = LiveUpstreamCopy::new(encoded.len() * 2);
+
+        assert!(!copy.append("request-copy", &event));
+        assert!(!copy.append("request-copy", &event));
+        assert_eq!(copy.body, Some([encoded.clone(), encoded].concat()));
+        assert!(copy.append("request-copy", &event));
+        assert!(copy.body.is_none());
+        assert!(!copy.append("request-copy", &event));
+        assert!(copy.body.is_none());
+    }
+
+    #[test]
+    fn the_copy_dropped_warning_names_only_the_request_and_the_limit() {
+        assert_eq!(
+            serde_json::Value::Object(live_stream_copy_dropped_fields("request-copy", 4096)),
+            serde_json::json!({"reqId": "request-copy", "limitBytes": 4096})
+        );
+    }
+
+    /// A live stream whose copy went past the limit still reaches the client
+    /// whole, but leaves no continuation state: the next turn sends its full
+    /// context without `previous_response_id`.
+    #[tokio::test]
+    async fn a_live_stream_over_the_copy_limit_relays_whole_and_leaves_no_continuation() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let session_id = "live-copy-over-limit";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let request_tx = request_tx.clone();
+                tokio::spawn(async move {
+                    let mut answered = 0;
+                    while let Some(Ok(message)) = websocket.next().await {
+                        match message {
+                            Message::Ping(payload) => {
+                                let _ = websocket.send(Message::Pong(payload)).await;
+                            }
+                            Message::Text(text) => {
+                                let request: serde_json::Value =
+                                    serde_json::from_str(&text).unwrap();
+                                request_tx.send(request).unwrap();
+                                answered += 1;
+                                let id = format!("resp-copy-{answered}");
+                                for event in [
+                                    serde_json::json!({
+                                        "type": "response.created",
+                                        "response": {"id": id}
+                                    }),
+                                    serde_json::json!({
+                                        "type": "response.output_item.added",
+                                        "output_index": 0,
+                                        "item": {"type": "message", "id": "msg-copy"}
+                                    }),
+                                    serde_json::json!({
+                                        "type": "response.output_text.delta",
+                                        "output_index": 0,
+                                        "delta": "relayed in full"
+                                    }),
+                                    serde_json::json!({
+                                        "type": "response.output_item.done",
+                                        "output_index": 0,
+                                        "item": {"type": "message", "id": "msg-copy"}
+                                    }),
+                                    serde_json::json!({
+                                        "type": "response.completed",
+                                        "response": {
+                                            "id": id,
+                                            "status": "completed",
+                                            "output": []
+                                        }
+                                    }),
+                                ] {
+                                    emit_live_event(&mut websocket, &event).await;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        // A limit of one byte drops the copy at the first event.
+        let client = Arc::new(
+            Arc::into_inner(authenticated_live_test_client(format!(
+                "http://{addr}/responses"
+            )))
+            .unwrap()
+            .with_buffered_response_limit(1),
+        );
+        let compaction = LiveStreamCompaction {
+            compact_boundary: false,
+            attempt: None,
+        };
+        let first = live_test_request("one");
+        let first_turn = continuation_candidate_for_owner(Some(&owner), &first, true);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            live_stream_response(
+                client.clone(),
+                "message".to_string(),
+                &first.model,
+                live_test_context(session_id),
+                first.clone(),
+                first_turn,
+                compaction,
+                config::CodexTransport::WebSocket,
+            ),
+        )
+        .await
+        .expect("the first turn did not start");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the first turn did not finish")
+        .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("relayed in full"), "{body}");
+        assert!(body.contains("message_stop"), "{body}");
+        assert!(!continuation::has_continuation_for_owner_for_tests(&owner));
+
+        let mut second = live_test_request("one");
+        second.input.extend(live_test_request("two").input);
+        let second_turn = continuation_candidate_for_owner(Some(&owner), &second, true);
+        assert!(second_turn.candidate().previous_response_id.is_none());
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            live_stream_response(
+                client,
+                "message".to_string(),
+                &second.model,
+                live_test_context(session_id),
+                second.clone(),
+                second_turn,
+                compaction,
+                config::CodexTransport::WebSocket,
+            ),
+        )
+        .await
+        .expect("the second turn did not start");
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the second turn did not finish")
+        .unwrap();
+        server.abort();
+
+        let _first_sent = request_rx.recv().await.unwrap();
+        let second_sent = request_rx.recv().await.unwrap();
+        assert!(second_sent.get("previous_response_id").is_none());
+        assert_eq!(second_sent["input"].as_array().unwrap().len(), 2);
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+    }
+
     /// Once the response has started, the reader does not record again a
     /// reading the stream task recorded before queuing it: replaying a queued
     /// reading would take back a later one the task already recorded.
@@ -4248,6 +4497,7 @@ mod tests {
                 attempt: None,
             },
             config::CodexTransport::WebSocket,
+            client::MAX_BUFFERED_RESPONSE_BYTES,
         )
         .await;
         let LiveStreamStart::Response(response) = start else {

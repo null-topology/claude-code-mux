@@ -387,7 +387,9 @@ Request path:
      `compaction.rs`).
      `continuation.rs` keeps `previous_response_id` state keyed by
      `ConversationIdentity` (session plus agent headers) so subagents do not
-     clobber each other; `compaction.rs` does server-side compaction;
+     clobber each other (a live stream whose events went past
+     `MAX_BUFFERED_RESPONSE_BYTES` leaves none); `compaction.rs` does
+     server-side compaction;
      `events.rs` classifies stream failures and recognises the
      `usage_limit_reached` error; `rate_limits.rs` keeps the newest
      `codex.rate_limits` reading of one ChatGPT account and publishes it as
@@ -1195,7 +1197,20 @@ successful buffered Messages answer is held up to
 (`collect_http_response`) and WebSocket (`collect_ws_events`) alike; one
 byte more fails it with a 502 `api_error` whose detail is
 `BUFFERED_RESPONSE_TOO_LARGE_DETAIL`, drops the socket, and is neither
-refreshed, resent nor replayed over HTTP. Live streams have no such cap.
+refreshed, resent nor replayed over HTTP. A live stream is relayed as it
+arrives, and the copies of its events kept beside the relay stop at the
+client's same limit (`CodexHttpClient::buffered_response_limit`). The copy
+its continuation state is read from (`LiveUpstreamCopy` in `mod.rs`) is
+released for good by the event that would take it past the limit, with one
+`codex_live_stream_copy_dropped` warning (`reqId`, `limitBytes`); at the
+terminal event such a stream records no continuation state
+(`abort_request_state`), so the conversation's next request sends its full
+context without `previous_response_id`. The WebSocket reader's copy for the
+response-body capture (`LiveCaptureBody` in `websocket.rs`) exists only
+while a traffic capture is on and stops before the event that would pass
+the limit, so `032-upstream-response-body.sse` then holds the events up to
+that point. The client receives every event either way. The live HTTP
+reader keeps no copy of the stream; it captures event by event.
 Text built from a `reqwest::Error` in these paths goes through
 `upstream_http::error_text`, which leaves out the request URL. Under `auto` transport
 (the default) a handshake failure, classified or not, falls back to HTTP unless the

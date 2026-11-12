@@ -597,7 +597,9 @@ const IMAGE_HEADER_TIMEOUT_MS: u64 = 300_000;
 /// on a rejected WebSocket upgrade alike; the rest of the body is not read.
 pub(super) const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// The most of a buffered Codex answer's SSE body held in memory, over HTTP
-/// and WebSocket alike. A live stream is relayed as it arrives and has none.
+/// and WebSocket alike. A live stream is relayed as it arrives; the copies of
+/// its events kept beside the relay, the one its continuation state is read
+/// from and the one a traffic capture writes, stop at the same size.
 pub(super) const MAX_BUFFERED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// Marks a buffered answer whose body went past `MAX_BUFFERED_RESPONSE_BYTES`.
 /// The request is not sent again, refreshed or replayed over HTTP.
@@ -904,9 +906,15 @@ impl CodexHttpClient {
     /// The same client with a smaller buffered answer limit, so a test can
     /// reach it without a body of `MAX_BUFFERED_RESPONSE_BYTES`.
     #[cfg(test)]
-    fn with_buffered_response_limit(mut self, limit: usize) -> Self {
+    pub(super) fn with_buffered_response_limit(mut self, limit: usize) -> Self {
         self.buffered_response_limit = limit;
         self
+    }
+
+    /// The most bytes of upstream events this client holds for one answer:
+    /// a buffered body, or a live stream's copies of its events.
+    pub(super) fn buffered_response_limit(&self) -> usize {
+        self.buffered_response_limit
     }
 
     pub fn auth_manager(&self) -> &CodexAuthManager<DefaultCodexAuthStore> {
@@ -2216,6 +2224,7 @@ impl CodexHttpClient {
                 ctx.traffic.clone(),
                 super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                 super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
+                self.buffered_response_limit,
                 continuation.as_ref(),
                 on_connect_failure,
             );

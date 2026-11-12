@@ -1370,6 +1370,7 @@ pub(super) fn start_codex_websocket_events(
     headers: &HeaderMap,
     reservation: Option<&ContinuationReservation>,
     req_id: String,
+    capture_limit: usize,
 ) -> CodexWebSocketEventStream {
     if let Some(tc) = ready.traffic.as_deref() {
         write_websocket_metadata_capture(tc, &ready.ws_url, reservation, ready.used_pooled);
@@ -1416,8 +1417,15 @@ pub(super) fn start_codex_websocket_events(
             let _ = tx.send(Err(error)).await;
             return;
         }
-        let (reusable, terminal_item) =
-            stream_ws_events(&mut guard, idle_timeout_ms, traffic, &tx, &req_id).await;
+        let (reusable, terminal_item) = stream_ws_events(
+            &mut guard,
+            idle_timeout_ms,
+            traffic,
+            &tx,
+            &req_id,
+            capture_limit,
+        )
+        .await;
         drop(guard);
 
         let origin_reinserted = if reusable {
@@ -1453,6 +1461,7 @@ pub(super) async fn codex_websocket_event_stream(
     traffic: Option<Arc<TrafficCapture>>,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
+    capture_limit: usize,
     reservation: Option<&ContinuationReservation>,
     on_connect_failure: OnConnectFailure<'_>,
 ) -> Result<CodexWebSocketEventStream, CodexError> {
@@ -1487,6 +1496,7 @@ pub(super) async fn codex_websocket_event_stream(
         headers,
         reservation,
         ctx.req_id.clone(),
+        capture_limit,
     ))
 }
 
@@ -2899,18 +2909,51 @@ where
     Ok((sse_body, terminal_event))
 }
 
+/// The copy of a live stream's events that its traffic capture writes as the
+/// response body. It exists only while a capture is on, and holds at most
+/// `limit` bytes: the first event that would take it past the limit, and
+/// every event after it, stay out of it. The client gets them all the same.
+struct LiveCaptureBody {
+    bytes: Vec<u8>,
+    limit: usize,
+    full: bool,
+}
+
+impl LiveCaptureBody {
+    fn for_capture(traffic: Option<&TrafficCapture>, limit: usize) -> Option<Self> {
+        traffic.map(|_| Self {
+            bytes: Vec::new(),
+            limit,
+            full: false,
+        })
+    }
+
+    fn append(&mut self, text: &str) {
+        if self.full {
+            return;
+        }
+        let event = encode_sse(text);
+        if self.bytes.len().saturating_add(event.len()) > self.limit {
+            self.full = true;
+            return;
+        }
+        self.bytes.extend_from_slice(&event);
+    }
+}
+
 async fn stream_ws_events<S>(
     ws: &mut WebSocketStream<S>,
     idle_timeout_ms: u64,
     traffic: Option<Arc<TrafficCapture>>,
     tx: &mpsc::Sender<Result<serde_json::Value, CodexError>>,
     req_id: &str,
+    capture_limit: usize,
 ) -> (bool, Option<Result<serde_json::Value, CodexError>>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let started_at = Instant::now();
-    let mut sse_body: Vec<u8> = Vec::new();
+    let mut capture_body = LiveCaptureBody::for_capture(traffic.as_deref(), capture_limit);
     let response_event_budget = Duration::from_millis(idle_timeout_ms);
     let response_wait_started = tokio::time::Instant::now();
     let mut last_response_event_at = response_wait_started;
@@ -2984,12 +3027,16 @@ where
                                 }),
                             );
                         }
-                        sse_body.extend_from_slice(&encode_sse(&text));
+                        if let Some(body) = capture_body.as_mut() {
+                            body.append(&text);
+                        }
                         continue;
                     }
                 };
 
-                sse_body.extend_from_slice(&encode_sse(&text));
+                if let Some(body) = capture_body.as_mut() {
+                    body.append(&text);
+                }
                 if let Some(tc) = traffic.as_deref() {
                     tc.write_json_event("040-upstream-event", &parsed);
                 }
@@ -3082,8 +3129,8 @@ where
         }
     }
 
-    if let Some(tc) = traffic.as_deref() {
-        write_websocket_response_capture(tc, status, started_at.elapsed(), &sse_body);
+    if let (Some(tc), Some(body)) = (traffic.as_deref(), capture_body) {
+        write_websocket_response_capture(tc, status, started_at.elapsed(), &body.bytes);
     }
     (reusable, terminal_item)
 }
@@ -3413,6 +3460,7 @@ mod tests {
             &HeaderMap::new(),
             Some(&continuation),
             "test-request".to_string(),
+            MAX_BUFFERED_RESPONSE_BYTES,
         );
         let live = match tokio::time::timeout(Duration::from_secs(5), events.recv())
             .await
@@ -4609,6 +4657,7 @@ mod tests {
             None,
             1_000,
             1_000,
+            MAX_BUFFERED_RESPONSE_BYTES,
             Some(&continuation),
             OnConnectFailure::Fail,
         )
@@ -4703,6 +4752,7 @@ mod tests {
             &headers,
             Some(&continuation),
             "test-request".to_string(),
+            MAX_BUFFERED_RESPONSE_BYTES,
         );
 
         request_seen_rx.await.unwrap();
@@ -5632,6 +5682,56 @@ mod tests {
         assert!(terminal.is_some());
     }
 
+    #[test]
+    fn a_live_stream_without_a_capture_keeps_no_copy_of_its_events() {
+        assert!(LiveCaptureBody::for_capture(None, MAX_BUFFERED_RESPONSE_BYTES).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_live_capture_over_the_limit_stops_its_copy_and_relays_every_event() {
+        let created = encode_sse(LIMIT_CREATED_EVENT);
+        let limit = created.len() + encode_sse(LIMIT_COMPLETED_EVENT).len() - 1;
+        let temp = tempfile::tempdir().unwrap();
+        let traffic = Arc::new(crate::traffic::test_capture(temp.path().join("traffic")));
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let mut ws = connect_to_two_event_answer().await;
+        let (_, terminal_item) = stream_ws_events(
+            &mut ws,
+            1_000,
+            Some(traffic.clone()),
+            &tx,
+            "test-request",
+            limit,
+        )
+        .await;
+        drop(tx);
+
+        let mut relayed = Vec::new();
+        while let Some(item) = rx.recv().await {
+            relayed.push(item.expect("a relayed event")["type"].clone());
+        }
+        assert_eq!(relayed, [serde_json::json!("response.created")]);
+        let terminal = terminal_item
+            .expect("the terminal event must be returned")
+            .expect("the terminal event must not be an error");
+        assert_eq!(terminal["type"], "response.completed");
+
+        let body_path = std::fs::read_dir(traffic.root())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .ends_with("032-upstream-response-body.sse")
+                })
+            })
+            .expect("the response body must be captured");
+        let captured = std::fs::read(body_path).unwrap();
+        assert!(captured.len() <= limit);
+        assert_eq!(captured, created);
+    }
+
     #[tokio::test]
     async fn response_start_timeout_ignores_rate_limits_and_pings() {
         let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
@@ -5958,6 +6058,7 @@ mod tests {
             &headers,
             None,
             "test-request".to_string(),
+            MAX_BUFFERED_RESPONSE_BYTES,
         );
 
         let error = match tokio::time::timeout(Duration::from_secs(30), events.recv())
@@ -6050,7 +6151,14 @@ mod tests {
 
         let (reusable, terminal_item) = tokio::time::timeout(
             Duration::from_secs(600),
-            stream_ws_events(&mut client, 60_000, None, &tx, "test-request"),
+            stream_ws_events(
+                &mut client,
+                60_000,
+                None,
+                &tx,
+                "test-request",
+                MAX_BUFFERED_RESPONSE_BYTES,
+            ),
         )
         .await
         .expect("the Pong write must end within the read deadline");

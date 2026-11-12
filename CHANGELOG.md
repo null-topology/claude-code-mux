@@ -29,7 +29,15 @@
   fails with a 502 `api_error` instead of growing the proxy's memory without
   bound; it is not sent again, not retried after a token refresh and not
   replayed over HTTP, and its WebSocket is closed rather than kept for the
-  conversation. Streaming requests are not affected. The cap has no setting.
+  conversation. The cap has no setting.
+- A streaming Codex response is still relayed whole, but the copy of its
+  upstream events the proxy keeps beside the relay now stops at the same
+  64 MiB. A response past it leaves no state to continue from, so the
+  conversation's next request sends its full context instead of only what
+  it adds, and `proxy.log` gets a `codex_live_stream_copy_dropped` warning
+  with the request id and the limit. With a traffic capture on, the
+  captured WebSocket response body stops at that size too, and without a
+  capture the WebSocket reader no longer keeps that copy at all.
 - Under the default `auto` transport, a Codex request the WebSocket refused
   as too large is replayed over HTTP only under the ChatGPT account the
   WebSocket attempt used. When the Codex CLI's login has moved to another
