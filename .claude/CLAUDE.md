@@ -145,7 +145,9 @@ Request path:
    `/v1/messages/count_tokens`, `/v1/models`, `/v1/models/{model_id}`.
    Optional OpenAI-compatible
    surfaces gated by `AppFeatures`: `/v1/responses` and `/v1/chat/completions`
-   (`CCP_CODEX_RESPONSES_API`), `/v1/images/*` (`CCP_CODEX_IMAGES_API`),
+   (`CCP_CODEX_RESPONSES_API`; a buffered chat completion reads at most
+   `MAX_PROVIDER_STREAM_BYTES`, 32 MiB, of the Codex answer, and neither
+   surface's error text names the request URL), `/v1/images/*` (`CCP_CODEX_IMAGES_API`),
    `/v1/audio/transcriptions` (`CCP_CODEX_TRANSCRIPTIONS_API`).
    `dispatch_request` handles the Anthropic routes: read the body, normalize
    the model (strip `[1m]`), look up the session by `x-claude-code-session-id`,
@@ -945,7 +947,9 @@ byte-exact.
   at every `force_refresh` site there); any other failure answers 401. The
   model listing maps the same split to `ModelsError::Unreachable` and
   `Unauthorized` (`auth_models_error` in `models.rs`). No refresh error
-  carries the token endpoint's response body.
+  carries the token endpoint's response body. That answer is read up to
+  `MAX_TOKEN_RESPONSE_BYTES` (1 MiB); a longer one fails the refresh as an
+  unreadable one does, as a transient failure.
 
 ## Codex rate limits
 
@@ -1242,7 +1246,10 @@ else null; `max_tokens` null, as the translator sends no output cap;
 `capabilities` from `UpstreamModel::capabilities`, where a leaf is true only
 when the Codex translator carries that feature), keeps hidden entries, and
 remembers the slugs so
-routing and `assert_allowed_model` accept them. The other catalog fields stay
+routing and `assert_allowed_model` accept them. At most
+`MAX_MODELS_BODY_BYTES` (4 MiB) of the answer is read; a longer one fails the
+listing as an unreadable one does (`ModelsError::Unreachable`), and no
+listing error text names the request URL. The other catalog fields stay
 in `UpstreamModel` for the proxy's own use and are not in the rows. Under the
 `inventory` lane policy `use_responses_lite` from the listing overrides the compiled-in
 lane table, while under the default `full` policy the proxy forces the full
@@ -1343,7 +1350,9 @@ Hosted web search sits outside the policy: a request carrying the hosted
 lane table lists `gpt-6-luna`, `gpt-6-sol`, `gpt-6.1-sol` and `gpt-6.1-terra`
 beside the gpt-5.6 family and `gpt-6-astra`. The forced standalone `/alpha/search` path
 (`is_standalone_search_request`) builds a request of its own and keeps the
-model that was asked for. The rewrite rests on no reproducible capture of a
+model that was asked for. Its answer is read up to `MAX_SEARCH_BODY_BYTES`
+(8 MiB); a longer one fails as an unreadable body does (`detail:
+http_response_body`) and is not sent again. The rewrite rests on no reproducible capture of a
 Luna refusal on the full lane, and no live capability check has been run
 either way.
 

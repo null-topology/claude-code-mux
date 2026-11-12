@@ -1,3 +1,20 @@
+## Unreleased
+
+- Errors from the Codex model listing, the native Responses and chat
+  completions surfaces and the hosted search call no longer include the
+  request URL. A base URL or proxy URL that carries a credential in its path
+  or query used to show up in the client's error message, in the `models`
+  command's output and in `proxy.log`; the rest of the error text is
+  unchanged.
+- Some Codex answers are now read only up to a size limit: the model
+  listing up to 4 MiB, a token refresh answer up to 1 MiB, the hosted search
+  answer up to 8 MiB and a buffered chat completion up to 32 MiB. A larger
+  answer fails the way an answer that could not be read did before: the
+  listing reports the backend as unreachable, the token refresh fails as a
+  transient error, the search call fails without being sent again, and the
+  chat completion answers 502. These limits sit far above what the backend
+  sends and cannot be changed.
+
 ## v0.18.0 (2026-11-12)
 
 - The Codex backend's refusals by `content_policy_violation`,

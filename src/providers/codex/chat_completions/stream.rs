@@ -79,7 +79,8 @@ async fn next_frame(
             Ok(Some(Ok(chunk))) => state.observe_chunk(&chunk),
             Ok(Some(Err(error))) => {
                 state.fail(ChatError::upstream(format!(
-                    "Codex response body read failed: {error}"
+                    "Codex response body read failed: {}",
+                    crate::upstream_http::error_text(error)
                 )));
             }
             Ok(None) => {

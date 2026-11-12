@@ -370,6 +370,10 @@ fn header_value(name: &str, value: &str) -> Result<http::HeaderValue, CodexError
     })
 }
 
+/// The largest search answer read; a longer one fails as a body that could not
+/// be read does.
+const MAX_SEARCH_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 fn search_endpoint(base_url: &str) -> String {
     let base_url = base_url.trim_end_matches('/');
     match base_url.strip_suffix("/responses") {
@@ -1150,7 +1154,10 @@ impl CodexHttpClient {
         })?
         .map_err(|err| CodexError {
             status: 0,
-            message: format!("Native Responses transport error: {err}"),
+            message: format!(
+                "Native Responses transport error: {}",
+                crate::upstream_http::error_text(err)
+            ),
             detail: None,
             retry_after: None,
             usage_limit: None,
@@ -1182,6 +1189,16 @@ impl CodexHttpClient {
         body: &SearchRequest,
         ctx: &RequestContext,
     ) -> Result<SearchResponse, CodexError> {
+        self.post_search_capped(body, ctx, MAX_SEARCH_BODY_BYTES)
+            .await
+    }
+
+    async fn post_search_capped(
+        &self,
+        body: &SearchRequest,
+        ctx: &RequestContext,
+        body_limit: usize,
+    ) -> Result<SearchResponse, CodexError> {
         let mut auth = self
             .auth_manager
             .get_auth()
@@ -1199,7 +1216,9 @@ impl CodexHttpClient {
         let mut auth_refresh_attempted = false;
 
         loop {
-            let response = self.attempt_post_search(&auth, &body_json, ctx).await?;
+            let response = self
+                .attempt_post_search(&auth, &body_json, ctx, body_limit)
+                .await?;
             if !(200..300).contains(&response.status) {
                 let error = codex_status_error(response, auth.account_id.as_deref());
                 if !auth_refresh_attempted && unauthorized_needs_refresh(&error) {
@@ -2469,6 +2488,7 @@ impl CodexHttpClient {
         auth: &StoredAuth,
         body_json: &str,
         ctx: &RequestContext,
+        body_limit: usize,
     ) -> Result<CodexResponse, CodexError> {
         let url = search_endpoint(&self.base_url);
         let headers = build_codex_search_headers(auth, ctx)?;
@@ -2501,7 +2521,10 @@ impl CodexHttpClient {
         })?
         .map_err(|e| CodexError {
             status: 0,
-            message: format!("Codex search network error: {e}"),
+            message: format!(
+                "Codex search network error: {}",
+                crate::upstream_http::error_text(e)
+            ),
             detail: None,
             retry_after: None,
             usage_limit: None,
@@ -2552,7 +2575,10 @@ impl CodexHttpClient {
             })?
             .map_err(|e| CodexError {
                 status: 0,
-                message: format!("Transport error reading Codex search response body: {e}"),
+                message: format!(
+                    "Transport error reading Codex search response body: {}",
+                    crate::upstream_http::error_text(e)
+                ),
                 detail: Some("http_response_body".to_string()),
                 retry_after: None,
                 usage_limit: None,
@@ -2562,6 +2588,20 @@ impl CodexHttpClient {
             let Some(chunk) = chunk else {
                 break;
             };
+            if chunk.len() > body_limit - body.len() {
+                return Err(CodexError {
+                    status: 0,
+                    message: format!(
+                        "Transport error reading Codex search response body: {}",
+                        crate::upstream_http::BodyReadError::TooLarge { limit: body_limit }
+                    ),
+                    detail: Some("http_response_body".to_string()),
+                    retry_after: None,
+                    usage_limit: None,
+                    class: None,
+                    origin: CodexErrorOrigin::Http,
+                });
+            }
             if !response_started {
                 if let Some(monitor) = ctx.monitor.as_ref() {
                     monitor.generation_started(&ctx.req_id);
@@ -2642,7 +2682,10 @@ async fn read_error_body(
         while body.len() < MAX_ERROR_BODY_BYTES {
             let chunk = resp.chunk().await.map_err(|e| CodexError {
                 status: 0,
-                message: format!("Transport error reading {subject} response body: {e}"),
+                message: format!(
+                    "Transport error reading {subject} response body: {}",
+                    crate::upstream_http::error_text(e)
+                ),
                 detail: Some("http_response_body".to_string()),
                 retry_after: None,
                 usage_limit: None,
@@ -4267,6 +4310,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_responses_transport_error_leaves_out_the_url() {
+        // Nothing listens on port 1, so the send fails before any answer.
+        let client = authenticated_http_test_client(
+            "http://127.0.0.1:1/toy-secret-path/v1/responses?token=toy-secret-query".into(),
+        );
+        let error = client
+            .post_native_responses(
+                &serde_json::json!({"model":"gpt-5.4","input":"hello"}),
+                &http_test_context(),
+                false,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .message
+                .starts_with("Native Responses transport error: "),
+            "{error:?}"
+        );
+        let shown = format!("{} {:?}", error.message, error.detail);
+        for secret in [
+            "toy-secret-path",
+            "toy-secret-query",
+            "127.0.0.1",
+            "for url",
+        ] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+    }
+
+    #[tokio::test]
     async fn buffered_missing_origin_retries_full_context_and_rebinds_exact_socket() {
         let _registry_guard =
             super::super::continuation::lock_continuation_registry_for_async_tests().await;
@@ -5456,6 +5531,89 @@ mod tests {
         server.await.unwrap();
         assert_eq!(response.output, "search output");
         assert_eq!(response.results.unwrap().len(), 1);
+    }
+
+    /// A search answer of exactly the cap is read; one byte more fails the call
+    /// as an unreadable body does, and the call is not sent again.
+    #[tokio::test]
+    async fn standalone_search_body_is_read_up_to_its_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut answer = serde_json::to_vec(&serde_json::json!({
+            "encrypted_output": "opaque",
+            "output": "search output",
+            "results": []
+        }))
+        .unwrap();
+        answer.resize(answer.len() + 32, b' ');
+        let length = answer.len();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let served = attempts.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                served.fetch_add(1, Ordering::SeqCst);
+                read_http_request(&mut stream).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n"
+                );
+                // Over the cap the client stops reading, so a write may fail.
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&answer).await;
+            }
+        });
+
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"));
+        let response = client
+            .post_search_capped(&search_test_request(), &http_test_context(), length)
+            .await
+            .unwrap();
+        assert_eq!(response.output, "search output");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let error = client
+            .post_search_capped(&search_test_request(), &http_test_context(), length - 1)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 0);
+        assert_eq!(
+            error.message,
+            format!(
+                "Transport error reading Codex search response body: response body exceeded {} bytes",
+                length - 1
+            )
+        );
+        assert_eq!(error.detail.as_deref(), Some("http_response_body"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn standalone_search_network_error_leaves_out_the_url() {
+        // Nothing listens on port 1, so the send fails before any answer.
+        let client = authenticated_http_test_client(
+            "http://127.0.0.1:1/toy-secret-path/responses?token=toy-secret-query".into(),
+        );
+        let error = client
+            .post_search(&search_test_request(), &http_test_context())
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.starts_with("Codex search network error: "),
+            "{error:?}"
+        );
+        let shown = format!("{} {:?}", error.message, error.detail);
+        for secret in [
+            "toy-secret-path",
+            "toy-secret-query",
+            "127.0.0.1",
+            "for url",
+        ] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
     }
 
     #[tokio::test]

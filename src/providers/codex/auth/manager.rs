@@ -10,6 +10,7 @@ use super::jwt::{
 use super::token_store::{CodexTokenStore, RefreshedTokens, StoredAuth, WritebackError};
 use crate::auth::AuthStorage;
 use crate::logging::create_logger;
+use crate::upstream_http::read_body_capped;
 
 static CODEX_REFRESH_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
     LazyLock::new(|| Arc::new(AsyncMutex::new(())));
@@ -38,6 +39,10 @@ const TRANSIENT_REFRESH_BACKOFF: Duration = Duration::from_secs(60);
 
 /// How long tokens that could not be written back wait before the next write.
 const WRITEBACK_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The largest token endpoint answer read; a longer one fails the refresh as
+/// an unreadable answer does.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 
 struct RefreshFailure {
     access: String,
@@ -604,13 +609,15 @@ impl<S: AuthStorage<StoredAuth> + 'static> CodexAuthManager<S> {
             ));
         }
 
-        let body = resp.bytes().await.map_err(|_| {
-            TransientRefreshError::error(
-                "network",
-                status,
-                format!("Codex token refresh response could not be read (HTTP {status})"),
-            )
-        })?;
+        let body = read_body_capped(resp, MAX_TOKEN_RESPONSE_BYTES)
+            .await
+            .map_err(|_| {
+                TransientRefreshError::error(
+                    "network",
+                    status,
+                    format!("Codex token refresh response could not be read (HTTP {status})"),
+                )
+            })?;
         let tokens: TokenResponse = serde_json::from_slice(&body).map_err(|_| {
             PermanentRefreshError::error(
                 "response",
@@ -1318,6 +1325,43 @@ mod tests {
             let shown = format!("{err} {err:#} {err:?}");
             assert!(!shown.contains(MARKER), "{status}: {shown}");
             assert!(shown.contains(&status[..3]), "{status}: {shown}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    /// A token answer of exactly the cap is read; one byte more fails the
+    /// refresh as an answer that could not be read does.
+    #[tokio::test]
+    async fn a_token_answer_is_read_up_to_its_cap() {
+        for (length, fits) in [
+            (MAX_TOKEN_RESPONSE_BYTES, true),
+            (MAX_TOKEN_RESPONSE_BYTES + 1, false),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = auth_file(&dir, &jwt_expiring_in(-60), "refresh-old");
+            let before = std::fs::read(&path).unwrap();
+            let mut body = rotated_body();
+            body.push_str(&" ".repeat(length - body.len()));
+            let (endpoint, server) = token_endpoint("200 OK", body, || {});
+            let manager = file_manager(&path, endpoint);
+
+            let result = manager.get_auth().await;
+            // Over the cap the client stops reading, so the endpoint may fail
+            // to finish its write.
+            let _ = server.join();
+            if fits {
+                assert_eq!(result.unwrap().refresh, "refresh-new");
+                continue;
+            }
+            let err = result.unwrap_err();
+            assert!(
+                err.downcast_ref::<TransientRefreshError>().is_some(),
+                "{err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "Codex token refresh response could not be read (HTTP 200)"
+            );
             assert_eq!(std::fs::read(&path).unwrap(), before);
         }
     }
