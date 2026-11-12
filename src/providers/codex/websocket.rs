@@ -50,6 +50,10 @@ pub(super) const WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL: &str = "websocket_proxy
 /// Marks a write that ran out of time. Part of the frame may already be on
 /// the socket, so the request is neither resent nor replayed over HTTP.
 pub(super) const WEBSOCKET_WRITE_TIMEOUT_DETAIL: &str = "websocket_write_timeout";
+/// Marks a new connection that was not attempted because the connect pause of
+/// its target runs (`WEBSOCKET_CONNECT_PAUSE`). Nothing was sent, so the
+/// request goes over HTTP.
+pub(super) const WEBSOCKET_CONNECT_PAUSED_DETAIL: &str = "websocket_connect_paused";
 /// The handshake response header naming the largest request frame, in bytes,
 /// that the socket accepts. The Codex CLI reads it and keeps a longer request
 /// off the socket (`codex-rs/codex-api/src/endpoint/responses_websocket.rs`
@@ -72,6 +76,11 @@ const POOL_CONNECT_CLEANUP_TARGET: usize = 40;
 const MAX_CONNECT_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
 const WEBSOCKET_CONNECT_START_SPACING: Duration = Duration::from_secs(1);
 const WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN: Duration = Duration::from_secs(3);
+/// How long a request that falls back to HTTP skips new connections to a
+/// target after a connect to it got no answer. The Codex CLI stays on HTTP for
+/// the rest of its session once it fell back (`codex-rs/core/src/client.rs` at
+/// `4460449921`); the proxy outlives a session by far, so it pauses instead.
+const WEBSOCKET_CONNECT_PAUSE: Duration = Duration::from_secs(5 * 60);
 const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const WEBSOCKET_KEEPALIVE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -548,6 +557,15 @@ static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<ConversationIdentity, Arc<Po
 static WS_POOL_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 static WS_CONNECT_GATE: once_cell::sync::Lazy<WebSocketConnectGate> =
     once_cell::sync::Lazy::new(|| WebSocketConnectGate::new(WEBSOCKET_CONNECT_START_SPACING));
+#[cfg(test)]
+tokio::task_local! {
+    /// A gate that connects made in this task go through instead of
+    /// `WS_CONNECT_GATE`, so a test reads a gate no other test touches.
+    static TEST_CONNECT_GATE: Arc<WebSocketConnectGate>;
+}
+/// When the connect pause of each target ends, keyed by `connect_pause_key`.
+static WS_CONNECT_PAUSES: once_cell::sync::Lazy<Mutex<HashMap<String, Instant>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 /// Test override of the request frame's write budget in milliseconds; 0 means
 /// the path's idle budget.
 static REQUEST_WRITE_TIMEOUT_MS_FOR_TESTS: AtomicU64 = AtomicU64::new(0);
@@ -578,6 +596,25 @@ fn now_ms() -> u64 {
 pub fn clear_codex_websocket_pool_for_tests() {
     let mut guard = WS_POOL.lock().unwrap();
     guard.clear();
+}
+
+/// Ends the connect pause of `url`'s target, if one runs, as if its time had
+/// passed: the entry stays until the map is next touched.
+#[doc(hidden)]
+pub fn expire_codex_websocket_connect_pause_for_tests(url: &str) {
+    let now = Instant::now();
+    if let Some(ends_at) = lock_connect_pauses().get_mut(&connect_pause_key(url)) {
+        *ends_at = now;
+    }
+}
+
+/// Starts the connect pause of `url`'s target without a failed connect.
+#[cfg(test)]
+pub(super) fn pause_codex_websocket_connects_for_tests(url: &str) {
+    lock_connect_pauses().insert(
+        connect_pause_key(url),
+        Instant::now() + WEBSOCKET_CONNECT_PAUSE,
+    );
 }
 
 /// Shortens the deadline of a request frame's write, so a test can wait out a
@@ -820,6 +857,10 @@ fn cleanup_pool_before_connect() {
 struct WebSocketConnectGate {
     last_start: AsyncMutex<Option<tokio::time::Instant>>,
     start_spacing: Duration,
+    /// How many calls have entered `wait_to_start`, so a test can tell that a
+    /// connect reached the gate.
+    #[cfg(test)]
+    arrivals: AtomicU64,
 }
 
 impl WebSocketConnectGate {
@@ -827,16 +868,26 @@ impl WebSocketConnectGate {
         Self {
             last_start: AsyncMutex::new(None),
             start_spacing,
+            #[cfg(test)]
+            arrivals: AtomicU64::new(0),
         }
     }
 
-    async fn wait_to_start(&self, before_start: impl std::future::Future<Output = ()>) {
+    /// A `before_start` that fails starts nothing and leaves the last start as
+    /// it is, so the next start is spaced from that one.
+    async fn wait_to_start<E>(
+        &self,
+        before_start: impl std::future::Future<Output = Result<(), E>>,
+    ) -> Result<(), E> {
+        #[cfg(test)]
+        self.arrivals.fetch_add(1, Ordering::SeqCst);
         let mut last_start = self.last_start.lock().await;
         if let Some(previous) = *last_start {
             tokio::time::sleep_until(previous + self.start_spacing).await;
         }
-        before_start.await;
+        before_start.await?;
         *last_start = Some(tokio::time::Instant::now());
+        Ok(())
     }
 }
 
@@ -999,6 +1050,7 @@ pub(super) async fn codex_websocket_request(
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
     reservation: Option<&ContinuationReservation>,
+    on_connect_failure: OnConnectFailure<'_>,
 ) -> Result<OwnerAwareCodexResponse, CodexError> {
     let continuation = reservation.map(ContinuationReservation::candidate);
     let pool_owner = reservation_pool_owner(reservation);
@@ -1052,6 +1104,7 @@ pub(super) async fn codex_websocket_request(
                 &ws_url,
                 headers,
                 connect_timeout_ms,
+                on_connect_failure,
             )
             .await?,
             headers,
@@ -1078,6 +1131,7 @@ pub(super) async fn codex_websocket_request(
                 &ws_url,
                 headers,
                 connect_timeout_ms,
+                on_connect_failure,
             )
             .await?,
             headers,
@@ -1238,6 +1292,7 @@ pub(super) async fn prepare_codex_websocket(
     reservation: Option<&ContinuationReservation>,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
+    on_connect_failure: OnConnectFailure<'_>,
 ) -> Result<ReadyWebSocket, CodexError> {
     let pool_owner = reservation_pool_owner(reservation);
     let continuation = reservation.map(ContinuationReservation::candidate);
@@ -1264,6 +1319,7 @@ pub(super) async fn prepare_codex_websocket(
             &ws_url,
             headers,
             connect_timeout_ms,
+            on_connect_failure,
         )
         .await?;
         Arc::new(PoolEntry::opened_with(connected, headers))
@@ -1396,6 +1452,7 @@ pub(super) async fn codex_websocket_event_stream(
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
     reservation: Option<&ContinuationReservation>,
+    on_connect_failure: OnConnectFailure<'_>,
 ) -> Result<CodexWebSocketEventStream, CodexError> {
     let body_json = serde_json::to_string(body_value).map_err(|error| CodexError {
         status: 500,
@@ -1415,6 +1472,7 @@ pub(super) async fn codex_websocket_event_stream(
         reservation,
         connect_timeout_ms,
         idle_timeout_ms,
+        on_connect_failure,
     )
     .await?;
     if !ready.used_pooled {
@@ -1844,11 +1902,14 @@ fn error_chain_contains(error: &(dyn std::error::Error + 'static), expected: &st
     false
 }
 
-fn reqwest_handshake_error(error: reqwest::Error) -> CodexError {
+fn reqwest_handshake_error(error: reqwest::Error) -> ConnectAttemptError {
     let proxy_auth_required =
         error.is_connect() && error_chain_contains(&error, "proxy authorization required");
     let proxy_tunnel_rejected =
         error.is_connect() && error_chain_contains(&error, "tunnel error: unsuccessful");
+    let unreachable = (error.is_connect() || error.is_timeout())
+        && !proxy_auth_required
+        && !proxy_tunnel_rejected;
     let status = if proxy_auth_required {
         http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
     } else {
@@ -1865,7 +1926,7 @@ fn reqwest_handshake_error(error: reqwest::Error) -> CodexError {
     } else {
         "WebSocket upgrade request failed"
     };
-    CodexError {
+    let error = CodexError {
         status,
         message: message.to_string(),
         detail: proxy_tunnel_rejected.then(|| WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL.to_string()),
@@ -1873,6 +1934,11 @@ fn reqwest_handshake_error(error: reqwest::Error) -> CodexError {
         usage_limit: None,
         class: None,
         origin: CodexErrorOrigin::WebSocketHandshake,
+    };
+    if unreachable {
+        ConnectAttemptError::Unreachable(error)
+    } else {
+        ConnectAttemptError::Origin(error)
     }
 }
 
@@ -2030,10 +2096,14 @@ fn parse_connect_response_head(response: &[u8]) -> Result<(u16, Option<String>),
     Ok((status, retry_after))
 }
 
+/// `response_head` is set once the proxy's status line is complete and
+/// cleared again when the tunnel opens, as the destination has not answered
+/// yet; it counts as answered once its handshake response is complete.
 async fn establish_connect_tunnel(
     mut stream: BoxedWebSocketIo,
     authority: &str,
     basic_auth: Option<&http::HeaderValue>,
+    response_head: &AtomicBool,
 ) -> Result<BoxedWebSocketIo, CodexError> {
     let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n").into_bytes();
     if let Some(auth) = basic_auth {
@@ -2054,6 +2124,9 @@ async fn establish_connect_tunnel(
 
     let mut response = Vec::new();
     loop {
+        if response.starts_with(b"HTTP/") && response.windows(2).any(|pair| pair == b"\r\n") {
+            response_head.store(true, Ordering::Relaxed);
+        }
         if let Some(header_end) = connect_response_header_end(&response) {
             let (status, retry_after) = parse_connect_response_head(&response[..header_end])?;
             if (100..200).contains(&status) {
@@ -2061,6 +2134,7 @@ async fn establish_connect_tunnel(
                 continue;
             }
             if (200..300).contains(&status) {
+                response_head.store(false, Ordering::Relaxed);
                 let prefix = response.split_off(header_end);
                 return Ok(Box::new(PrefixedIo {
                     prefix,
@@ -2091,25 +2165,33 @@ async fn establish_connect_tunnel(
     }
 }
 
+/// A host name rustls does not accept fails as `invalid_host` builds it, the
+/// handshake itself as unreachable.
 async fn tls_connect(
     stream: BoxedWebSocketIo,
     host: &str,
     tls_config: Arc<rustls::ClientConfig>,
     peer: &str,
-) -> Result<BoxedWebSocketIo, CodexError> {
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|_| websocket_protocol_error("WebSocket TLS host name was invalid"))?;
+    invalid_host: fn(CodexError) -> ConnectAttemptError,
+) -> Result<BoxedWebSocketIo, ConnectAttemptError> {
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| {
+        invalid_host(websocket_protocol_error(
+            "WebSocket TLS host name was invalid",
+        ))
+    })?;
     let stream = tokio_rustls::TlsConnector::from(tls_config)
         .connect(server_name, stream)
         .await
-        .map_err(|_| CodexError {
-            status: 0,
-            message: format!("WebSocket TLS connection to {peer} failed"),
-            detail: None,
-            retry_after: None,
-            usage_limit: None,
-            class: None,
-            origin: CodexErrorOrigin::WebSocketHandshake,
+        .map_err(|_| {
+            ConnectAttemptError::Unreachable(CodexError {
+                status: 0,
+                message: format!("WebSocket TLS connection to {peer} failed"),
+                detail: None,
+                retry_after: None,
+                usage_limit: None,
+                class: None,
+                origin: CodexErrorOrigin::WebSocketHandshake,
+            })
         })?;
     Ok(Box::new(stream))
 }
@@ -2117,20 +2199,20 @@ async fn tls_connect(
 async fn connect_to_http_proxy(
     route: &WebSocketProxyRoute,
     tls_config: Arc<rustls::ClientConfig>,
-) -> Result<BoxedWebSocketIo, CodexError> {
+) -> Result<BoxedWebSocketIo, ConnectAttemptError> {
     let scheme = route.uri.scheme_str().unwrap_or_default();
-    let host = route
-        .uri
-        .host()
-        .ok_or_else(|| websocket_protocol_error("WebSocket proxy URL did not contain a host"))?;
+    let host = route.uri.host().ok_or_else(|| {
+        ConnectAttemptError::ProxyTunnel(websocket_protocol_error(
+            "WebSocket proxy URL did not contain a host",
+        ))
+    })?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let port = route
         .uri
         .port_u16()
         .unwrap_or(if scheme == "https" { 443 } else { 80 });
-    let stream = TcpStream::connect((host, port))
-        .await
-        .map_err(|_| CodexError {
+    let stream = TcpStream::connect((host, port)).await.map_err(|_| {
+        ConnectAttemptError::Unreachable(CodexError {
             status: 0,
             message: "WebSocket proxy connection failed".to_string(),
             detail: None,
@@ -2138,10 +2220,18 @@ async fn connect_to_http_proxy(
             usage_limit: None,
             class: None,
             origin: CodexErrorOrigin::WebSocketHandshake,
-        })?;
+        })
+    })?;
     let stream: BoxedWebSocketIo = Box::new(stream);
     if scheme == "https" {
-        tls_connect(stream, host, tls_config, "proxy").await
+        tls_connect(
+            stream,
+            host,
+            tls_config,
+            "proxy",
+            ConnectAttemptError::ProxyTunnel,
+        )
+        .await
     } else {
         Ok(stream)
     }
@@ -2203,6 +2293,14 @@ fn tungstenite_handshake_error(
 enum ConnectAttemptError {
     Origin(CodexError),
     ProxyTunnel(CodexError),
+    /// Nothing answered before the connect timeout (the upgrade's response
+    /// head, a proxy's status line or the tunneled destination's handshake
+    /// response was not complete), or the connection or the TLS handshake
+    /// failed. Only this starts a connect pause.
+    Unreachable(CodexError),
+    /// The target was paused when the attempt was about to start, so nothing
+    /// was sent.
+    Paused,
 }
 
 impl ConnectAttemptError {
@@ -2215,7 +2313,8 @@ impl ConnectAttemptError {
 
     fn into_error(self) -> CodexError {
         match self {
-            Self::Origin(error) | Self::ProxyTunnel(error) => error,
+            Self::Origin(error) | Self::ProxyTunnel(error) | Self::Unreachable(error) => error,
+            Self::Paused => connect_paused_error(),
         }
     }
 }
@@ -2225,22 +2324,22 @@ async fn connect_via_http_proxy_tunnel(
     route: WebSocketProxyRoute,
     url: &str,
     headers: &HeaderMap,
+    response_head: &AtomicBool,
 ) -> Result<ConnectedWebSocket, ConnectAttemptError> {
     let (host, authority) = websocket_destination(url).map_err(ConnectAttemptError::Origin)?;
-    let stream = connect_to_http_proxy(&route, proxy_config.tls_config.clone())
-        .await
-        .map_err(ConnectAttemptError::ProxyTunnel)?;
-    let stream = establish_connect_tunnel(stream, &authority, route.basic_auth.as_ref())
-        .await
-        .map_err(ConnectAttemptError::ProxyTunnel)?;
+    let stream = connect_to_http_proxy(&route, proxy_config.tls_config.clone()).await?;
+    let stream =
+        establish_connect_tunnel(stream, &authority, route.basic_auth.as_ref(), response_head)
+            .await
+            .map_err(ConnectAttemptError::ProxyTunnel)?;
     let stream = tls_connect(
         stream,
         &host,
         proxy_config.tls_config.clone(),
         "destination",
+        ConnectAttemptError::Origin,
     )
-    .await
-    .map_err(ConnectAttemptError::Origin)?;
+    .await?;
     let websocket_key = generate_key();
     let subprotocols = requested_subprotocols(headers);
     let request = tunneled_websocket_request(url, headers, &websocket_key)
@@ -2266,15 +2365,18 @@ async fn connect_via_http_upgrade(
     websocket_client: &reqwest::Client,
     url: &str,
     headers: &HeaderMap,
-) -> Result<ConnectedWebSocket, CodexError> {
-    let http_url = to_http_upgrade_url(url).map_err(|error| CodexError {
-        status: 0,
-        message: error.message,
-        detail: None,
-        retry_after: None,
-        usage_limit: None,
-        class: None,
-        origin: CodexErrorOrigin::WebSocketHandshake,
+    response_head: &AtomicBool,
+) -> Result<ConnectedWebSocket, ConnectAttemptError> {
+    let http_url = to_http_upgrade_url(url).map_err(|error| {
+        ConnectAttemptError::Origin(CodexError {
+            status: 0,
+            message: error.message,
+            detail: None,
+            retry_after: None,
+            usage_limit: None,
+            class: None,
+            origin: CodexErrorOrigin::WebSocketHandshake,
+        })
     })?;
     let websocket_key = generate_key();
     let subprotocols = requested_subprotocols(headers);
@@ -2294,6 +2396,7 @@ async fn connect_via_http_upgrade(
     }
 
     let response = request.send().await.map_err(reqwest_handshake_error)?;
+    response_head.store(true, Ordering::Relaxed);
     if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
         let status = response.status().as_u16();
         let response_headers = response.headers().clone();
@@ -2302,12 +2405,12 @@ async fn connect_via_http_upgrade(
         } else {
             Some(bounded_handshake_error_body(response).await)
         };
-        return Err(handshake_rejection_error(
+        return Err(ConnectAttemptError::Origin(handshake_rejection_error(
             status,
             &response_headers,
             body.as_deref(),
             request_account_id(headers),
-        ));
+        )));
     }
 
     validate_websocket_upgrade(
@@ -2315,12 +2418,14 @@ async fn connect_via_http_upgrade(
         response.headers(),
         &websocket_key,
         &subprotocols,
-    )?;
+    )
+    .map_err(ConnectAttemptError::Origin)?;
     let max_message_bytes = advertised_max_message_bytes(response.headers());
-    let upgraded = response
-        .upgrade()
-        .await
-        .map_err(|_| websocket_protocol_error("WebSocket upgrade stream was not available"))?;
+    let upgraded = response.upgrade().await.map_err(|_| {
+        ConnectAttemptError::Origin(websocket_protocol_error(
+            "WebSocket upgrade stream was not available",
+        ))
+    })?;
     let upgraded: BoxedWebSocketIo = Box::new(upgraded);
     Ok(ConnectedWebSocket {
         stream: WebSocketStream::from_raw_socket(upgraded, Role::Client, None).await,
@@ -2333,16 +2438,15 @@ async fn connect_once(
     proxy_config: &WebSocketProxyConfig,
     url: &str,
     headers: &HeaderMap,
+    response_head: &AtomicBool,
 ) -> Result<ConnectedWebSocket, ConnectAttemptError> {
     if let Some(route) = proxy_config
         .http_connect_route(url)
         .map_err(ConnectAttemptError::Origin)?
     {
-        connect_via_http_proxy_tunnel(proxy_config, route, url, headers).await
+        connect_via_http_proxy_tunnel(proxy_config, route, url, headers, response_head).await
     } else {
-        connect_via_http_upgrade(websocket_client, url, headers)
-            .await
-            .map_err(ConnectAttemptError::Origin)
+        connect_via_http_upgrade(websocket_client, url, headers, response_head).await
     }
 }
 
@@ -2353,27 +2457,35 @@ fn connect_timeout_error(connect_timeout: Duration) -> CodexError {
     ))
 }
 
+/// `connect` sets `response_head` once the upgrade's response head or the
+/// proxy's status line is complete. An attempt that runs out of time after
+/// that has been answered and is not `Unreachable`.
 async fn connect_with_policy<T, P, PFut, F, Fut>(
     gate: &WebSocketConnectGate,
     connect_timeout: Duration,
     forbidden_cooldown: Duration,
+    response_head: &AtomicBool,
     mut before_start: P,
     mut connect: F,
-) -> Result<T, CodexError>
+) -> Result<T, ConnectAttemptError>
 where
     P: FnMut() -> PFut,
-    PFut: std::future::Future<Output = ()>,
+    PFut: std::future::Future<Output = Result<(), ConnectAttemptError>>,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, ConnectAttemptError>>,
 {
     for attempt in 0..=1 {
-        gate.wait_to_start(before_start()).await;
+        gate.wait_to_start(before_start()).await?;
+        response_head.store(false, Ordering::Relaxed);
         let result = tokio::time::timeout(connect_timeout, connect())
             .await
             .unwrap_or_else(|_| {
-                Err(ConnectAttemptError::Origin(connect_timeout_error(
-                    connect_timeout,
-                )))
+                let error = connect_timeout_error(connect_timeout);
+                Err(if response_head.load(Ordering::Relaxed) {
+                    ConnectAttemptError::Origin(error)
+                } else {
+                    ConnectAttemptError::Unreachable(error)
+                })
             });
         if result
             .as_ref()
@@ -2383,9 +2495,86 @@ where
             retry_sleep(u64::try_from(forbidden_cooldown.as_millis()).unwrap_or(u64::MAX)).await;
             continue;
         }
-        return result.map_err(ConnectAttemptError::into_error);
+        return result;
     }
     unreachable!()
+}
+
+/// What a new connection that fails does to later ones.
+#[derive(Clone, Copy)]
+pub(super) enum OnConnectFailure<'a> {
+    /// The failure goes to the client: every request tries to connect.
+    Fail,
+    /// The request falls back to HTTP: a connect that got no answer pauses
+    /// new connections to its target for `WEBSOCKET_CONNECT_PAUSE`, and while
+    /// that runs none is attempted.
+    FallBackToHttp { req_id: &'a str },
+}
+
+/// One pause per connect target: the scheme, host and port of the WebSocket
+/// URL.
+fn connect_pause_key(url: &str) -> String {
+    let websocket_url = to_websocket_url(url).unwrap_or_else(|_| url.to_string());
+    url::Url::parse(&websocket_url)
+        .map(|parsed| parsed.origin().ascii_serialization())
+        .unwrap_or(websocket_url)
+}
+
+fn lock_connect_pauses() -> std::sync::MutexGuard<'static, HashMap<String, Instant>> {
+    WS_CONNECT_PAUSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn connect_paused(url: &str) -> bool {
+    let key = connect_pause_key(url);
+    let now = Instant::now();
+    let mut pauses = lock_connect_pauses();
+    pauses.retain(|_, ends_at| *ends_at > now);
+    pauses.contains_key(&key)
+}
+
+/// A target whose pause still runs keeps it: its end does not move and
+/// nothing is logged.
+fn start_connect_pause(url: &str, req_id: &str, error: &CodexError) {
+    let now = Instant::now();
+    {
+        let mut pauses = lock_connect_pauses();
+        pauses.retain(|_, ends_at| *ends_at > now);
+        let key = connect_pause_key(url);
+        if pauses.contains_key(&key) {
+            return;
+        }
+        pauses.insert(key, now + WEBSOCKET_CONNECT_PAUSE);
+    }
+    let fields = serde_json::Map::from_iter([
+        ("reqId".to_string(), serde_json::json!(req_id)),
+        (
+            "seconds".to_string(),
+            serde_json::json!(WEBSOCKET_CONNECT_PAUSE.as_secs()),
+        ),
+        (
+            "detail".to_string(),
+            serde_json::json!(super::client::websocket_fallback_log_detail(error)),
+        ),
+    ]);
+    create_logger("codex").warn("codex_websocket_connect_paused", Some(fields));
+}
+
+fn end_connect_pause(url: &str) {
+    lock_connect_pauses().remove(&connect_pause_key(url));
+}
+
+fn connect_paused_error() -> CodexError {
+    CodexError {
+        status: 0,
+        message: "WebSocket connect skipped while its target is paused".to_string(),
+        detail: Some(WEBSOCKET_CONNECT_PAUSED_DETAIL.to_string()),
+        retry_after: None,
+        usage_limit: None,
+        class: None,
+        origin: CodexErrorOrigin::WebSocketHandshake,
+    }
 }
 
 async fn connect_with_timeout(
@@ -2394,15 +2583,46 @@ async fn connect_with_timeout(
     url: &str,
     headers: &HeaderMap,
     connect_timeout_ms: u64,
+    on_failure: OnConnectFailure<'_>,
 ) -> Result<ConnectedWebSocket, CodexError> {
+    let falls_back = matches!(on_failure, OnConnectFailure::FallBackToHttp { .. });
+    if falls_back && connect_paused(url) {
+        return Err(connect_paused_error());
+    }
+    let response_head = AtomicBool::new(false);
+    #[cfg(test)]
+    let test_gate = TEST_CONNECT_GATE.try_with(Arc::clone).ok();
+    #[cfg(test)]
+    let gate: &WebSocketConnectGate = test_gate.as_deref().unwrap_or(&*WS_CONNECT_GATE);
+    #[cfg(not(test))]
+    let gate: &WebSocketConnectGate = &WS_CONNECT_GATE;
     connect_with_policy(
-        &WS_CONNECT_GATE,
+        gate,
         Duration::from_millis(connect_timeout_ms),
         WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN,
-        || async { cleanup_pool_before_connect() },
-        || connect_once(websocket_client, proxy_config, url, headers),
+        &response_head,
+        // The pause may have started while this request waited at the gate.
+        move || async move {
+            if falls_back && connect_paused(url) {
+                return Err(ConnectAttemptError::Paused);
+            }
+            cleanup_pool_before_connect();
+            Ok(())
+        },
+        || connect_once(websocket_client, proxy_config, url, headers, &response_head),
     )
     .await
+    .inspect(|_| end_connect_pause(url))
+    .map_err(|error| {
+        if let (
+            ConnectAttemptError::Unreachable(error),
+            OnConnectFailure::FallBackToHttp { req_id },
+        ) = (&error, on_failure)
+        {
+            start_connect_pause(url, req_id, error);
+        }
+        error.into_error()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3012,6 +3232,7 @@ mod tests {
                 &format!("ws://{addr}/"),
                 &HeaderMap::new(),
                 2_000,
+                OnConnectFailure::Fail,
             )
             .await
             .unwrap();
@@ -3090,6 +3311,7 @@ mod tests {
             &format!("ws://{addr}/responses"),
             &HeaderMap::new(),
             1_000,
+            OnConnectFailure::Fail,
         )
         .await
         .unwrap();
@@ -3137,6 +3359,7 @@ mod tests {
             1_000,
             2_000,
             Some(&continuation),
+            OnConnectFailure::Fail,
         )
         .await
         {
@@ -3160,6 +3383,7 @@ mod tests {
             Some(&continuation),
             1_000,
             2_000,
+            OnConnectFailure::Fail,
         )
         .await
         .unwrap();
@@ -3490,8 +3714,10 @@ mod tests {
                 .wait_to_start(async move {
                     first_preflight.notify_one();
                     tokio::time::sleep(Duration::from_secs(2)).await;
+                    Ok::<(), ()>(())
                 })
-                .await;
+                .await
+                .unwrap();
             first_tx.send(tokio::time::Instant::now()).unwrap();
             first_release.notified().await;
         });
@@ -3499,7 +3725,10 @@ mod tests {
 
         let second_gate = gate.clone();
         let second = tokio::spawn(async move {
-            second_gate.wait_to_start(async {}).await;
+            second_gate
+                .wait_to_start(async { Ok::<(), ()>(()) })
+                .await
+                .unwrap();
             started_tx.send(tokio::time::Instant::now()).unwrap();
         });
         let first_started = started_rx.recv().await.unwrap();
@@ -3522,7 +3751,8 @@ mod tests {
             &gate,
             Duration::from_secs(10),
             Duration::from_secs(3),
-            || async {},
+            &AtomicBool::new(false),
+            || async { Ok(()) },
             || {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 starts.lock().unwrap().push(tokio::time::Instant::now());
@@ -3534,7 +3764,8 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .into_error();
         assert_eq!(error.status, http::StatusCode::BAD_GATEWAY.as_u16());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
@@ -3542,13 +3773,15 @@ mod tests {
             &gate,
             Duration::from_secs(10),
             Duration::from_secs(3),
-            || async {},
+            &AtomicBool::new(false),
+            || async { Ok(()) },
             || {
                 starts.lock().unwrap().push(tokio::time::Instant::now());
                 async { Ok::<(), ConnectAttemptError>(()) }
             },
         )
         .await
+        .map_err(ConnectAttemptError::into_error)
         .unwrap();
 
         let starts = starts.lock().unwrap();
@@ -3565,7 +3798,8 @@ mod tests {
             &gate,
             Duration::from_secs(10),
             Duration::from_secs(3),
-            || async {},
+            &AtomicBool::new(false),
+            || async { Ok(()) },
             || {
                 let attempt = attempts.fetch_add(1, Ordering::SeqCst);
                 starts.lock().unwrap().push(tokio::time::Instant::now());
@@ -3587,7 +3821,8 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .into_error();
 
         assert_eq!(error.status, http::StatusCode::FORBIDDEN.as_u16());
         assert_eq!(error.message, "second forbidden");
@@ -3608,7 +3843,8 @@ mod tests {
             &gate,
             Duration::from_secs(10),
             Duration::from_secs(3),
-            || async {},
+            &AtomicBool::new(false),
+            || async { Ok(()) },
             || {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async {
@@ -3619,7 +3855,8 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .into_error();
 
         assert_eq!(error.status, http::StatusCode::FORBIDDEN.as_u16());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
@@ -3652,6 +3889,7 @@ mod tests {
             &proxy_config,
             "wss://codex.invalid/backend-api/codex/responses",
             &HeaderMap::new(),
+            &AtomicBool::new(false),
         )
         .await
         {
@@ -3669,6 +3907,10 @@ mod tests {
                 assert_eq!(error.origin, CodexErrorOrigin::WebSocketHandshake);
             }
             ConnectAttemptError::Origin(_) => panic!("proxy rejection was classified as origin"),
+            ConnectAttemptError::Unreachable(_) => {
+                panic!("proxy rejection was classified as unanswered")
+            }
+            ConnectAttemptError::Paused => panic!("proxy rejection was classified as paused"),
         }
         proxy.await.unwrap();
     }
@@ -3702,18 +3944,20 @@ mod tests {
         let url = format!("ws://{addr}/backend-api/codex/responses");
         let headers = HeaderMap::new();
         let gate = WebSocketConnectGate::new(Duration::ZERO);
+        let response_head = AtomicBool::new(false);
 
         let error = match connect_with_policy(
             &gate,
             Duration::from_secs(1),
             Duration::ZERO,
-            || async {},
-            || connect_once(&client, &proxy_config, &url, &headers),
+            &response_head,
+            || async { Ok(()) },
+            || connect_once(&client, &proxy_config, &url, &headers, &response_head),
         )
         .await
         {
             Ok(_) => panic!("spoofed origin rejection should fail after one retry"),
-            Err(error) => error,
+            Err(error) => error.into_error(),
         };
 
         assert_eq!(error.status, http::StatusCode::FORBIDDEN.as_u16());
@@ -3734,7 +3978,8 @@ mod tests {
             &gate,
             Duration::from_secs(2),
             Duration::from_secs(3),
-            || async {},
+            &AtomicBool::new(false),
+            || async { Ok(()) },
             || {
                 let attempt = attempts.fetch_add(1, Ordering::SeqCst);
                 async move {
@@ -3751,6 +3996,9 @@ mod tests {
         .await
         .unwrap_err();
 
+        // A connect that ran out of time got no answer.
+        assert!(matches!(error, ConnectAttemptError::Unreachable(_)));
+        let error = error.into_error();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(error.message, "WebSocket connect timeout after 2000ms");
         assert_eq!(started_at.elapsed(), Duration::from_secs(6));
@@ -4168,6 +4416,7 @@ mod tests {
             Some(&continuation),
             50,
             50,
+            OnConnectFailure::Fail,
         )
         .await
         {
@@ -4237,6 +4486,7 @@ mod tests {
             Some(&continuation),
             50,
             50,
+            OnConnectFailure::Fail,
         )
         .await
         {
@@ -4343,6 +4593,7 @@ mod tests {
             1_000,
             1_000,
             Some(&continuation),
+            OnConnectFailure::Fail,
         )
         .await
         .unwrap();
@@ -4423,6 +4674,7 @@ mod tests {
             Some(&continuation),
             1_000,
             1_000,
+            OnConnectFailure::Fail,
         )
         .await
         .unwrap();
@@ -4582,6 +4834,7 @@ mod tests {
             &format!("ws://{addr}/backend-api/codex/responses"),
             &HeaderMap::new(),
             1_000,
+            OnConnectFailure::Fail,
         )
         .await
         {
@@ -4680,6 +4933,7 @@ mod tests {
             &format!("ws://{addr}/backend-api/codex/responses"),
             &HeaderMap::new(),
             1_000,
+            OnConnectFailure::Fail,
         )
         .await
         {
@@ -4723,6 +4977,7 @@ mod tests {
             &format!("ws://{addr}/backend-api/codex/responses"),
             &HeaderMap::new(),
             1_000,
+            OnConnectFailure::Fail,
         )
         .await
         {
@@ -4750,6 +5005,7 @@ mod tests {
             &WebSocketProxyConfig::direct(),
             &format!("ws://{addr}/backend-api/codex/responses"),
             &HeaderMap::new(),
+            &AtomicBool::new(false),
         )
         .await
         {
@@ -5044,6 +5300,7 @@ mod tests {
             "ws://codex.invalid/backend-api/codex/responses",
             &HeaderMap::new(),
             2_000,
+            OnConnectFailure::Fail,
         )
         .await
         .unwrap()
@@ -5090,9 +5347,13 @@ mod tests {
         });
 
         let stream: BoxedWebSocketIo = Box::new(client);
-        let mut stream = establish_connect_tunnel(stream, "codex.invalid:4443", None)
-            .await
-            .unwrap();
+        let response_head = AtomicBool::new(false);
+        let mut stream =
+            establish_connect_tunnel(stream, "codex.invalid:4443", None, &response_head)
+                .await
+                .unwrap();
+        // The open tunnel waits on the destination, which has not answered.
+        assert!(!response_head.load(Ordering::Relaxed));
         let mut prefix = [0_u8; 8];
         stream.read_exact(&mut prefix).await.unwrap();
         assert_eq!(&prefix, b"prefixed");
@@ -5114,10 +5375,19 @@ mod tests {
         });
 
         let stream: BoxedWebSocketIo = Box::new(client);
-        let error = match establish_connect_tunnel(stream, "codex.invalid:4443", None).await {
+        let response_head = AtomicBool::new(false);
+        let error = match establish_connect_tunnel(
+            stream,
+            "codex.invalid:4443",
+            None,
+            &response_head,
+        )
+        .await
+        {
             Ok(_) => panic!("proxy authentication should be rejected"),
             Err(error) => error,
         };
+        assert!(response_head.load(Ordering::Relaxed));
         assert_eq!(
             error.status,
             http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
@@ -5198,6 +5468,7 @@ mod tests {
             "wss://codex.invalid:4443/backend-api/codex/responses",
             &HeaderMap::new(),
             2_000,
+            OnConnectFailure::Fail,
         )
         .await
         {
@@ -5510,6 +5781,7 @@ mod tests {
                 1_000,
                 60_000,
                 None,
+                OnConnectFailure::Fail,
             ),
         )
         .await
@@ -5550,6 +5822,7 @@ mod tests {
             None,
             1_000,
             60_000,
+            OnConnectFailure::Fail,
         )
         .await
         .unwrap();
@@ -5713,6 +5986,7 @@ mod tests {
             &url,
             &HeaderMap::new(),
             1_000,
+            OnConnectFailure::Fail,
         )
         .await
         .unwrap()
@@ -5870,5 +6144,507 @@ mod tests {
         .unwrap();
         let err = handshake_rejection_error(503, &headers, Some(&without_delay), None);
         assert_eq!(err.retry_after.as_deref(), Some("9"));
+    }
+
+    /// A loopback WebSocket URL nothing listens on, so a connect is refused.
+    async fn refused_websocket_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("ws://{addr}/responses")
+    }
+
+    async fn connect_error(url: &str, on_failure: OnConnectFailure<'_>) -> CodexError {
+        match connect_with_timeout(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            url,
+            &HeaderMap::new(),
+            1_000,
+            on_failure,
+        )
+        .await
+        {
+            Ok(_) => panic!("the connect to {url} must fail"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn the_connect_pause_is_keyed_by_scheme_host_and_port() {
+        assert_eq!(
+            connect_pause_key("http://127.0.0.1:1/backend-api/codex/responses"),
+            connect_pause_key("ws://127.0.0.1:1/other")
+        );
+        assert_ne!(
+            connect_pause_key("ws://127.0.0.1:1/responses"),
+            connect_pause_key("ws://127.0.0.1:2/responses")
+        );
+        assert_ne!(
+            connect_pause_key("ws://127.0.0.1:1/responses"),
+            connect_pause_key("wss://127.0.0.1:1/responses")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_connect_pauses_its_target_for_the_http_fallback() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let url = refused_websocket_url().await;
+        let fall_back = OnConnectFailure::FallBackToHttp {
+            req_id: "connect-pause-start",
+        };
+
+        let refused = connect_error(&url, fall_back).await;
+        assert_eq!(refused.status, 0);
+        assert_ne!(
+            refused.detail.as_deref(),
+            Some(WEBSOCKET_CONNECT_PAUSED_DETAIL)
+        );
+
+        let paused = connect_error(&url, fall_back).await;
+        assert_eq!(paused.status, 0);
+        assert_eq!(paused.origin, CodexErrorOrigin::WebSocketHandshake);
+        assert_eq!(
+            paused.detail.as_deref(),
+            Some(WEBSOCKET_CONNECT_PAUSED_DETAIL)
+        );
+
+        // A caller that does not fall back to HTTP still tries.
+        let attempted = connect_error(&url, OnConnectFailure::Fail).await;
+        assert_ne!(
+            attempted.detail.as_deref(),
+            Some(WEBSOCKET_CONNECT_PAUSED_DETAIL)
+        );
+
+        // Another target is not paused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _websocket = tokio_tungstenite::accept_async(socket).await;
+            futures_util::future::pending::<()>().await;
+        });
+        connect_with_timeout(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &format!("ws://{other}/responses"),
+            &HeaderMap::new(),
+            1_000,
+            fall_back,
+        )
+        .await
+        .unwrap();
+
+        // Once the pause ended the next request tries again, and another
+        // unanswered connect starts a new pause.
+        expire_codex_websocket_connect_pause_for_tests(&url);
+        let retried = connect_error(&url, fall_back).await;
+        assert_ne!(
+            retried.detail.as_deref(),
+            Some(WEBSOCKET_CONNECT_PAUSED_DETAIL)
+        );
+        assert!(connect_paused(&url));
+        expire_codex_websocket_connect_pause_for_tests(&url);
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_connect_without_the_http_fallback_starts_no_pause() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let url = refused_websocket_url().await;
+
+        let refused = connect_error(&url, OnConnectFailure::Fail).await;
+        assert_eq!(refused.status, 0);
+        assert!(!connect_paused(&url));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_upgrade_starts_no_connect_pause() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upgrades = Arc::new(AtomicUsize::new(0));
+        let counted = upgrades.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buf[..read]),
+                    }
+                }
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+        let url = format!("ws://{addr}/responses");
+        let fall_back = OnConnectFailure::FallBackToHttp {
+            req_id: "rejected-upgrade",
+        };
+
+        for attempt in 1..=2 {
+            let error = connect_error(&url, fall_back).await;
+            assert_eq!(error.status, 503);
+            assert_eq!(upgrades.load(Ordering::SeqCst), attempt);
+        }
+        assert!(!connect_paused(&url));
+    }
+
+    #[tokio::test]
+    async fn a_rejection_whose_body_runs_out_of_time_starts_no_connect_pause() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => request.extend_from_slice(&buf[..read]),
+                }
+            }
+            // The head arrives, the body it declares never does.
+            let _ = socket
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 64\r\n\r\n")
+                .await;
+            futures_util::future::pending::<()>().await;
+        });
+        let url = format!("ws://{addr}/responses");
+
+        let error = match connect_with_timeout(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &url,
+            &HeaderMap::new(),
+            300,
+            OnConnectFailure::FallBackToHttp {
+                req_id: "rejection-body-timeout",
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("the connect to {url} must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.message,
+            connect_timeout_error(Duration::from_millis(300)).message
+        );
+        assert!(!connect_paused(&url));
+    }
+
+    #[tokio::test]
+    async fn a_proxy_status_line_that_runs_out_of_time_starts_no_connect_pause() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = proxy.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while connect_response_header_end(&request).is_none() {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => request.extend_from_slice(&buf[..read]),
+                }
+            }
+            // The status line arrives, the rest of the head never does.
+            let _ = socket
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\n")
+                .await;
+            futures_util::future::pending::<()>().await;
+        });
+        let proxy_url = format!("http://{proxy_addr}");
+        let url = "wss://proxied-pause.invalid/backend-api/codex/responses";
+
+        let error = match connect_with_timeout(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::new(None, Some(&proxy_url), None, None),
+            url,
+            &HeaderMap::new(),
+            300,
+            OnConnectFailure::FallBackToHttp {
+                req_id: "proxy-status-timeout",
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("the connect to {url} must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.message,
+            connect_timeout_error(Duration::from_millis(300)).message
+        );
+        assert!(!connect_paused(url));
+    }
+
+    #[tokio::test]
+    async fn a_target_paused_while_its_request_waited_at_the_gate_is_skipped() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((_socket, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let url = format!("ws://{addr}/responses");
+
+        // The request goes through a gate of its own, so no other test's
+        // connect passes or stamps it.
+        let gate = Arc::new(WebSocketConnectGate::new(WEBSOCKET_CONNECT_START_SPACING));
+        let held = gate.last_start.lock().await;
+        let waiting = tokio::spawn(TEST_CONNECT_GATE.scope(gate.clone(), {
+            let url = url.clone();
+            async move {
+                connect_error(
+                    &url,
+                    OnConnectFailure::FallBackToHttp {
+                        req_id: "paused-at-the-gate",
+                    },
+                )
+                .await
+            }
+        }));
+        // The request passed the first check and waits at the gate, which
+        // this test holds.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while gate.arrivals.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request never reached the gate");
+        pause_codex_websocket_connects_for_tests(&url);
+        drop(held);
+
+        let error = waiting.await.unwrap();
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(WEBSOCKET_CONNECT_PAUSED_DETAIL)
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        assert_eq!(gate.arrivals.load(Ordering::SeqCst), 1);
+        assert_eq!(*gate.last_start.lock().await, None);
+        expire_codex_websocket_connect_pause_for_tests(&url);
+    }
+
+    #[tokio::test]
+    async fn a_successful_connect_ends_the_pause_of_its_target() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}/responses");
+        let paused_url = url.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                // A pause that starts while the connect is under way, as
+                // another request's unanswered connect would start it.
+                pause_codex_websocket_connects_for_tests(&paused_url);
+                tokio::spawn(async move {
+                    let _websocket = tokio_tungstenite::accept_async(socket).await;
+                    futures_util::future::pending::<()>().await;
+                });
+            }
+        });
+
+        for on_failure in [
+            OnConnectFailure::Fail,
+            OnConnectFailure::FallBackToHttp {
+                req_id: "connect-ends-pause",
+            },
+        ] {
+            connect_with_timeout(
+                &test_websocket_client(),
+                &WebSocketProxyConfig::direct(),
+                &url,
+                &HeaderMap::new(),
+                1_000,
+                on_failure,
+            )
+            .await
+            .unwrap();
+            assert!(!connect_paused(&url));
+        }
+    }
+
+    #[test]
+    fn an_ended_connect_pause_leaves_the_map_when_it_is_next_read() {
+        let ended = "ws://ended-pause.invalid/responses";
+        pause_codex_websocket_connects_for_tests(ended);
+        expire_codex_websocket_connect_pause_for_tests(ended);
+
+        assert!(!connect_paused("ws://another-target.invalid/responses"));
+        assert!(!lock_connect_pauses().contains_key(&connect_pause_key(ended)));
+    }
+
+    #[test]
+    fn a_second_unanswered_connect_leaves_a_running_pause_as_it_is() {
+        let url = "ws://running-pause.invalid/responses";
+        let error = connect_timeout_error(Duration::from_millis(1));
+        start_connect_pause(url, "first-unanswered", &error);
+        let ends_at = lock_connect_pauses().get(&connect_pause_key(url)).copied();
+        assert!(ends_at.is_some());
+
+        std::thread::sleep(Duration::from_millis(5));
+        start_connect_pause(url, "second-unanswered", &error);
+        let still_ends_at = lock_connect_pauses().get(&connect_pause_key(url)).copied();
+        assert_eq!(still_ends_at, ends_at);
+        expire_codex_websocket_connect_pause_for_tests(url);
+    }
+
+    #[test]
+    fn the_connect_pause_map_is_usable_after_a_holder_panicked() {
+        let url = "ws://poisoned-pause.invalid/responses";
+        let _ = std::thread::spawn(|| {
+            let _pauses = WS_CONNECT_PAUSES.lock().unwrap();
+            panic!("poison the connect pause map");
+        })
+        .join();
+
+        pause_codex_websocket_connects_for_tests(url);
+        assert!(connect_paused(url));
+        expire_codex_websocket_connect_pause_for_tests(url);
+        assert!(!connect_paused(url));
+        WS_CONNECT_PAUSES.clear_poison();
+    }
+
+    #[tokio::test]
+    async fn a_pooled_socket_still_serves_its_conversation_while_its_target_is_paused() {
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let owner = main_owner("paused-target-pooled-session");
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        invalidate_codex_websocket_pool_owner(&owner);
+
+        // An origin that counts its upgrades and completes every request.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upgrades = Arc::new(AtomicUsize::new(0));
+        let counted = upgrades.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let Ok(mut websocket) = tokio_tungstenite::accept_async(socket).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = websocket.next().await {
+                        if matches!(message, Message::Text(_)) {
+                            let completed = serde_json::json!({
+                                "type": "response.completed",
+                                "response": {"id": "resp_pooled"},
+                            })
+                            .to_string();
+                            if websocket.send(Message::Text(completed)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let url = format!("http://{addr}/responses");
+        let connected = connect_with_timeout(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &format!("ws://{addr}/responses"),
+            &HeaderMap::new(),
+            1_000,
+            OnConnectFailure::Fail,
+        )
+        .await
+        .unwrap();
+        let entry = Arc::new(PoolEntry::opened_with(connected, &HeaderMap::new()));
+        let reserved = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &continuation_request(),
+            true,
+        );
+        let continuation = test_continuation(
+            Some(owner.clone()),
+            reserved.turn_id(),
+            Some("resp_previous"),
+            Some(entry.socket_id),
+        );
+        pause_codex_websocket_connects_for_tests(&url);
+        let context = RequestContext {
+            req_id: "paused-target-pooled-request".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+            passthrough: None,
+        };
+        let fall_back = OnConnectFailure::FallBackToHttp {
+            req_id: &context.req_id,
+        };
+
+        pool_insert(owner.clone(), entry.clone());
+        let buffered = codex_websocket_request(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &url,
+            &HeaderMap::new(),
+            &serde_json::json!({"type": "response.create"}),
+            &context,
+            None,
+            1_000,
+            2_000,
+            Some(&continuation),
+            fall_back,
+        )
+        .await;
+        assert!(buffered.is_ok(), "the pooled socket must carry the request");
+
+        pool_insert(owner.clone(), entry.clone());
+        let ready = prepare_codex_websocket(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &url,
+            &HeaderMap::new(),
+            None,
+            Some(&continuation),
+            1_000,
+            2_000,
+            fall_back,
+        )
+        .await
+        .unwrap();
+        assert!(ready.used_pooled);
+        assert_eq!(upgrades.load(Ordering::SeqCst), 1);
+
+        drop(ready);
+        expire_codex_websocket_connect_pause_for_tests(&url);
+        invalidate_codex_websocket_pool_owner(&owner);
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
     }
 }
