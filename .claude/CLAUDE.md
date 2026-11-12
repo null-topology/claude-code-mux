@@ -1224,7 +1224,24 @@ tunnel's are normalised when they are read, so an unclassified 429 or 5xx
 passes them on in that form too. `CodexError.class` carries the class to `map_codex_error_to_response`
 (`classified_error_response`); a mid-stream error keeps its status and takes
 the class's error type. An unknown code keeps the old handling, and
-`usage_limit_reached` keeps precedence over all of these. An opt-in server
+`usage_limit_reached` keeps precedence over all of these. A live failure
+event before output, on the WebSocket or inside an HTTP stream, that is not
+a spent window, is not retryable by `classify_event_failure`
+(`retryable_live_start_payload`), has no class and names a 400-499 status of
+its own (the event's `status` or `status_code`, else its error's `status`)
+other than 408, 409 and 425, and is not a missing previous response
+(`websocket::is_previous_response_missing`, by code or by message), goes
+through `map_codex_error_to_response` as an HTTP error answer with that
+status does (`live_stream_response_once`): a context-window message is 413
+`request_too_large`, else 401 is `authentication_error`, 403
+`permission_error` and any other status `api_error`, each with the
+backend's message; only the live answer can also carry the gauge headers.
+The error it builds has origin `Http`, so a backend message equal to the
+proxy's own WebSocket size refusal text is not read as that refusal. Every
+other failure that reaches that point (not a spent window, not retryable,
+no class) gets `map_codex_failure_to_response`: 502 `api_error`, or 413 for
+a context-window message; a retryable one goes through `provider_retry` and
+keeps its own status. An opt-in server
 compaction refused as quota, `usage_not_included` or `PermissionDenied`
 answers the client with that class and does not send the normal request; any
 other compaction failure, a rejected one included, falls back to it. The

@@ -139,6 +139,21 @@
   lives in the Codex CLI's own directory and is not affected. The old state
   directory (`proxy.log`, `errors/`, traffic captures) is no longer read or
   written. macOS and Linux are unchanged.
+- A Codex failure event that arrives before any output on a streaming
+  request, on the WebSocket and inside an HTTP stream alike, is now answered
+  with the status it names and the backend's message when the proxy reads it
+  as a plain refusal: it names a status of its own from 400 to 499 other
+  than 408, 409 and 425, and it is not a spent usage window, not an error
+  the proxy answers by its code, and not one that reads as a rate limit, an
+  overload or a passing server or connection failure (for example, a refusal
+  of a parameter the model does not support). That is the answer an HTTP
+  error response with the same status already got: 401 as
+  `authentication_error`, 403 as `permission_error`, otherwise `api_error`.
+  Such a failure used to be answered 502 `api_error`, which a client
+  retries, so the same refusal was sent again. A context window overflow
+  stays 413 `request_too_large`, and a forgotten previous response and the
+  statuses 408, 409 and 425 keep the answer they had; every other failure is
+  answered as before. There is no setting for the old answer.
 
 ## v0.18.0 (2026-11-12)
 

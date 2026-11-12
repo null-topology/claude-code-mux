@@ -1055,7 +1055,7 @@ fn is_response_event(payload: &serde_json::Value) -> bool {
     }
 }
 
-fn is_previous_response_missing(payload: &serde_json::Value) -> bool {
+pub(super) fn is_previous_response_missing(payload: &serde_json::Value) -> bool {
     let error = super::events::event_error(payload);
     if error
         .and_then(|error| error.get("code"))
