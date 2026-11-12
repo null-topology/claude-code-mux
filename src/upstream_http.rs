@@ -594,7 +594,7 @@ mod tests {
 
     #[test]
     fn printable_text_is_kept_as_is() {
-        let text = "Visit https://example.test/device?code=AB-12 — код «ok» \\n";
+        let text = "Visit https://example.test/device?code=AB-12 — café «ok» \\n";
         assert_eq!(escape_control_chars(text), text);
     }
 }
