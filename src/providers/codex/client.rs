@@ -3771,7 +3771,8 @@ mod tests {
                         "output": []
                     }
                 })
-                .to_string(),
+                .to_string()
+                .into(),
             ))
             .await
             .unwrap();
@@ -3792,7 +3793,8 @@ mod tests {
                         }
                     }
                 })
-                .to_string(),
+                .to_string()
+                .into(),
             ))
             .await
             .unwrap();
@@ -5358,7 +5360,9 @@ mod tests {
                         let _request = next_websocket_json(&mut websocket).await;
                         for event in &events {
                             websocket
-                                .send(tokio_tungstenite::tungstenite::Message::Text(event.clone()))
+                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                    event.clone().into(),
+                                ))
                                 .await
                                 .unwrap();
                         }
@@ -7344,7 +7348,7 @@ mod tests {
             let event = serde_json::json!({"type": "error", "status": 401, "error": error});
             websocket
                 .send(tokio_tungstenite::tungstenite::Message::Text(
-                    event.to_string(),
+                    event.to_string().into(),
                 ))
                 .await
                 .unwrap();
@@ -8533,7 +8537,7 @@ mod tests {
                 .unwrap();
             first_websocket
                 .send(tokio_tungstenite::tungstenite::Message::Text(
-                    serde_json::json!({"type": "keepalive"}).to_string(),
+                    serde_json::json!({"type": "keepalive"}).to_string().into(),
                 ))
                 .await
                 .unwrap();

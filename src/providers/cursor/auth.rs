@@ -1,5 +1,5 @@
 use base64::Engine;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -179,7 +179,7 @@ pub fn expired_auth_message(auth: &CursorAuth) -> String {
 
 pub fn create_cursor_login() -> CursorLogin {
     let verifier = random_base64_url(32);
-    let challenge = base64_url(Sha256::digest(verifier.as_bytes()).as_ref());
+    let challenge = pkce_challenge(&verifier);
     let uuid = uuid::Uuid::new_v4().to_string();
     let login_url = format!(
         "{CURSOR_WEBSITE_URL}/loginDeepControl?challenge={challenge}&uuid={uuid}&mode=login&redirectTarget=cli"
@@ -390,12 +390,16 @@ fn open_cursor_login_url(url: &str) -> anyhow::Result<()> {
 
 fn random_base64_url(len: usize) -> String {
     let mut bytes = vec![0u8; len];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     base64_url(&bytes)
 }
 
 fn base64_url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    base64_url(Sha256::digest(verifier.as_bytes()).as_ref())
 }
 
 fn use_macos_keychain() -> bool {
@@ -492,6 +496,15 @@ mod tests {
         assert!(login.login_url.contains("&uuid="));
         assert!(login.login_url.contains("&mode=login&redirectTarget=cli"));
         assert!(!login.verifier.contains('='));
+    }
+
+    #[test]
+    fn pkce_challenge_matches_rfc_7636_example() {
+        // RFC 7636 Appendix B: the S256 challenge of its example verifier.
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
     }
 
     /// Answers one request with `body` and closes the connection.

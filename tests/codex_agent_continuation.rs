@@ -499,7 +499,7 @@ async fn handle_socket(
                 probes
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push((socket_ordinal, requests_seen, payload.clone()));
+                    .push((socket_ordinal, requests_seen, payload.to_vec()));
                 if websocket.send(Message::Pong(payload)).await.is_err() {
                     return;
                 }
@@ -557,7 +557,7 @@ async fn handle_socket(
                         acknowledged,
                     } => {
                         if websocket
-                            .send(Message::Text(event.to_string()))
+                            .send(Message::Text(event.to_string().into()))
                             .await
                             .is_err()
                         {
@@ -604,7 +604,9 @@ async fn emit_completion(
         }),
     ];
     for event in events {
-        websocket.send(Message::Text(event.to_string())).await?;
+        websocket
+            .send(Message::Text(event.to_string().into()))
+            .await?;
     }
     Ok(())
 }

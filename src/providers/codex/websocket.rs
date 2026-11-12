@@ -15,7 +15,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio_tungstenite::{
     WebSocketStream,
     tungstenite::{
-        Message,
+        Bytes, Message,
         client::IntoClientRequest,
         handshake::{client::generate_key, derive_accept_key},
         protocol::{CloseFrame, Role, frame::coding::CloseCode},
@@ -572,14 +572,14 @@ fn closed_message_too_large_error() -> CodexError {
 }
 
 /// The numeric code of a close frame, 0 when the frame carries none.
-fn close_code(frame: Option<&CloseFrame<'_>>) -> u16 {
+fn close_code(frame: Option<&CloseFrame>) -> u16 {
     frame.map_or(0, |frame| u16::from(frame.code))
 }
 
 /// True for a 1009 close that arrived before any text frame of the response,
 /// the case the Codex CLI answers as a message too large for the socket
 /// (`codex-rs/codex-api/src/endpoint/responses_websocket.rs` at `ed7ca22bb6`).
-fn closed_for_message_size(frame: Option<&CloseFrame<'_>>, text_received: bool) -> bool {
+fn closed_for_message_size(frame: Option<&CloseFrame>, text_received: bool) -> bool {
     !text_received && frame.is_some_and(|frame| frame.code == CloseCode::Size)
 }
 
@@ -1294,9 +1294,9 @@ async fn validate_pooled_websocket<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let nonce = next_monotonic_nonzero(&POOLED_VALIDATION_SEQUENCE, "pooled validation")
-        .to_be_bytes()
-        .to_vec();
+    let nonce = Bytes::copy_from_slice(
+        &next_monotonic_nonzero(&POOLED_VALIDATION_SEQUENCE, "pooled validation").to_be_bytes(),
+    );
     // The Ping is written under the validation deadline too, so a socket the
     // peer stopped reading fails validation instead of holding the request.
     tokio::time::timeout(Duration::from_millis(timeout_ms), async {
@@ -1635,7 +1635,7 @@ where
     };
     match tokio::time::timeout(
         Duration::from_millis(budget_ms),
-        websocket.send(Message::Text(body_json)),
+        websocket.send(Message::Text(body_json.into())),
     )
     .await
     {
@@ -2727,7 +2727,7 @@ where
             frame = ws.next() => return WebSocketRead::Frame(frame),
             _ = &mut timeout => return WebSocketRead::Timeout,
             _ = keepalive.tick() => {
-                let send = ws.send(Message::Ping(Vec::new()));
+                let send = ws.send(Message::Ping(Bytes::new()));
                 let send_timeout = tokio::time::sleep(WEBSOCKET_KEEPALIVE_SEND_TIMEOUT);
                 tokio::pin!(send_timeout);
                 tokio::select! {
@@ -2923,7 +2923,7 @@ where
                                 "040-upstream-event",
                                 &serde_json::json!({
                                     "unparseable": true,
-                                    "data": text,
+                                    "data": text.as_str(),
                                 }),
                             );
                         }
@@ -3141,7 +3141,7 @@ where
                                 "040-upstream-event",
                                 &serde_json::json!({
                                     "unparseable": true,
-                                    "data": text,
+                                    "data": text.as_str(),
                                 }),
                             );
                         }
@@ -4577,7 +4577,7 @@ mod tests {
                 other => panic!("unexpected first validation frame: {other:?}"),
             };
             assert_eq!(prior_nonce.len(), std::mem::size_of::<u64>());
-            assert_ne!(prior_nonce, 0_u64.to_be_bytes());
+            assert_ne!(prior_nonce, 0_u64.to_be_bytes().as_slice());
             websocket
                 .send(Message::Pong(prior_nonce.clone()))
                 .await
@@ -4595,7 +4595,7 @@ mod tests {
                 other => panic!("unexpected second validation frame: {other:?}"),
             };
             assert_ne!(current_nonce, prior_nonce);
-            assert_ne!(current_nonce, 0_u64.to_be_bytes());
+            assert_ne!(current_nonce, 0_u64.to_be_bytes().as_slice());
             release_peer_rx.await.unwrap();
         });
         let (mut websocket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
@@ -4804,7 +4804,8 @@ mod tests {
                                     "type": "response.completed",
                                     "response": {"id": "resp_terminal_order"}
                                 })
-                                .to_string(),
+                                .to_string()
+                                .into(),
                             ))
                             .await
                             .unwrap();
@@ -4895,7 +4896,8 @@ mod tests {
                                     "type": "response.completed",
                                     "response": {"id": "resp_dropped_receiver"}
                                 })
-                                .to_string(),
+                                .to_string()
+                                .into(),
                             ))
                             .await
                             .unwrap();
@@ -5141,7 +5143,7 @@ mod tests {
             .body(Some(body.as_bytes().to_vec()))
             .unwrap();
         let err = tungstenite_handshake_error(
-            tokio_tungstenite::tungstenite::Error::Http(rejected),
+            tokio_tungstenite::tungstenite::Error::Http(Box::new(rejected)),
             None,
         );
         assert_eq!(err.status, 407);
@@ -5521,10 +5523,10 @@ mod tests {
             let mut websocket = WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
             assert_eq!(
                 websocket.next().await.unwrap().unwrap(),
-                Message::Text("hello".to_string())
+                Message::Text("hello".into())
             );
             websocket
-                .send(Message::Text("proxy-ok".to_string()))
+                .send(Message::Text("proxy-ok".into()))
                 .await
                 .unwrap();
         });
@@ -5548,13 +5550,10 @@ mod tests {
         .await
         .unwrap()
         .stream;
-        websocket
-            .send(Message::Text("hello".to_string()))
-            .await
-            .unwrap();
+        websocket.send(Message::Text("hello".into())).await.unwrap();
         assert_eq!(
             websocket.next().await.unwrap().unwrap(),
-            Message::Text("proxy-ok".to_string())
+            Message::Text("proxy-ok".into())
         );
 
         let captured = captured_rx.await.unwrap();
@@ -5754,7 +5753,9 @@ mod tests {
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            ws.send(Message::Binary(vec![1, 2, 3])).await.unwrap();
+            ws.send(Message::Binary(vec![1, 2, 3].into()))
+                .await
+                .unwrap();
         });
 
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
@@ -6039,7 +6040,7 @@ mod tests {
             .await
             .unwrap();
             loop {
-                if ws.send(Message::Ping(Vec::new())).await.is_err() {
+                if ws.send(Message::Ping(Bytes::new())).await.is_err() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -6094,7 +6095,7 @@ mod tests {
             .await
             .unwrap();
             loop {
-                if ws.send(Message::Ping(Vec::new())).await.is_err() {
+                if ws.send(Message::Ping(Bytes::new())).await.is_err() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7082,7 +7083,11 @@ mod tests {
                                 "response": {"id": "resp_pooled"},
                             })
                             .to_string();
-                            if websocket.send(Message::Text(completed)).await.is_err() {
+                            if websocket
+                                .send(Message::Text(completed.into()))
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
                         }
