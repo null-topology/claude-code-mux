@@ -50,49 +50,125 @@ fn messages_fixture_and_sse_parsing() {
     assert_eq!(first_line["a"], json!(1));
 }
 
+fn resolver_env(platform: &str, home: &str, vars: &[(&str, &str)]) -> DirResolverEnv {
+    DirResolverEnv {
+        platform: platform.to_string(),
+        home: home.into(),
+        env: vars
+            .iter()
+            .map(|&(name, value)| (name.to_string(), value.into()))
+            .collect(),
+    }
+}
+
+fn resolved_dirs(deps: &DirResolverEnv) -> [String; 2] {
+    [
+        paths::resolve_config_dir(deps)
+            .to_string_lossy()
+            .into_owned(),
+        paths::resolve_state_dir(deps)
+            .to_string_lossy()
+            .into_owned(),
+    ]
+}
+
+const XDG_VARS: [(&str, &str); 2] = [
+    ("XDG_CONFIG_HOME", "/x/config"),
+    ("XDG_STATE_HOME", "/x/state"),
+];
+
+const ALL_DIR_VARS: [(&str, &str); 4] = [
+    ("APPDATA", "D:\\Roaming"),
+    ("LOCALAPPDATA", "D:\\Local"),
+    XDG_VARS[0],
+    XDG_VARS[1],
+];
+
 #[test]
 fn path_resolvers_cover_platform_rules() {
-    let mut env = HashMap::new();
-    env.insert("CCP_CONFIG_DIR".to_string(), "/tmp/ccp-config".into());
-    let deps = DirResolverEnv {
-        platform: "darwin".to_string(),
-        home: "/home/u".into(),
-        env: env.clone(),
-    };
+    // macOS follows the same XDG rule as Linux.
+    for platform in ["macos", "linux"] {
+        assert_eq!(
+            resolved_dirs(&resolver_env(platform, "/home/u", &[])),
+            [
+                "/home/u/.config/claude-code-proxy",
+                "/home/u/.local/state/claude-code-proxy"
+            ],
+            "{platform}"
+        );
+        assert_eq!(
+            resolved_dirs(&resolver_env(platform, "/home/u", &XDG_VARS)),
+            ["/x/config/claude-code-proxy", "/x/state/claude-code-proxy"],
+            "{platform}"
+        );
+    }
+
+    // Windows reads APPDATA and LOCALAPPDATA and ignores the XDG variables.
     assert_eq!(
-        paths::resolve_config_dir(&deps).to_string_lossy(),
-        "/tmp/ccp-config"
+        resolved_dirs(&resolver_env("windows", "C:\\Users\\u", &ALL_DIR_VARS)),
+        [
+            "D:\\Roaming/claude-code-proxy",
+            "D:\\Local/claude-code-proxy"
+        ]
+    );
+    assert_eq!(
+        resolved_dirs(&resolver_env("windows", "C:\\Users\\u", &[])),
+        [
+            "C:\\Users\\u\\AppData\\Roaming/claude-code-proxy",
+            "C:\\Users\\u\\AppData\\Local/claude-code-proxy"
+        ]
     );
 
-    let deps = DirResolverEnv {
-        platform: "darwin".to_string(),
-        home: "/home/u".into(),
-        env: HashMap::from([("XDG_CONFIG_HOME".into(), "/x".into())]),
-    };
-    assert_eq!(
-        paths::resolve_config_dir(&deps).to_string_lossy(),
-        "/home/u/.config/claude-code-proxy"
-    );
+    // CCP_CONFIG_DIR moves the config directory on every platform, and only it.
+    for (platform, state) in [
+        ("windows", "D:\\Local/claude-code-proxy"),
+        ("macos", "/x/state/claude-code-proxy"),
+        ("linux", "/x/state/claude-code-proxy"),
+    ] {
+        let mut vars = ALL_DIR_VARS.to_vec();
+        vars.push(("CCP_CONFIG_DIR", "/tmp/ccp-config"));
+        assert_eq!(
+            resolved_dirs(&resolver_env(platform, "/home/u", &vars)),
+            ["/tmp/ccp-config", state],
+            "{platform}"
+        );
+    }
+}
 
-    let deps = DirResolverEnv {
-        platform: "linux".to_string(),
-        home: "/home/u".into(),
-        env: HashMap::from([("XDG_CONFIG_HOME".into(), "/x".into())]),
-    };
-    assert_eq!(
-        paths::resolve_config_dir(&deps).to_string_lossy(),
-        "/x/claude-code-proxy"
-    );
+#[test]
+fn path_resolvers_key_on_std_env_consts_os() {
+    // The resolvers branch on `std::env::consts::OS` values. A branch keyed on a
+    // name it never reports would never run in a real build.
+    assert_eq!(DirResolverEnv::default().platform, std::env::consts::OS);
 
-    let deps = DirResolverEnv {
-        platform: "win32".to_string(),
-        home: "C:/Users/u".into(),
-        env: HashMap::from([("APPDATA".into(), "C:/Users/u/AppData/Roaming".into())]),
-    };
-    assert_eq!(
-        paths::resolve_config_dir(&deps).to_string_lossy(),
-        "C:/Users/u/AppData/Roaming/claude-code-proxy"
-    );
+    let host = resolved_dirs(&resolver_env(
+        std::env::consts::OS,
+        "/home/u",
+        &ALL_DIR_VARS,
+    ));
+    if cfg!(target_os = "windows") {
+        assert_eq!(
+            host,
+            [
+                "D:\\Roaming/claude-code-proxy",
+                "D:\\Local/claude-code-proxy"
+            ]
+        );
+    } else {
+        assert_eq!(
+            host,
+            ["/x/config/claude-code-proxy", "/x/state/claude-code-proxy"]
+        );
+    }
+
+    // Names `std::env::consts::OS` never reports get no rule of their own.
+    for platform in ["win32", "darwin"] {
+        assert_eq!(
+            resolved_dirs(&resolver_env(platform, "/home/u", &ALL_DIR_VARS)),
+            ["/x/config/claude-code-proxy", "/x/state/claude-code-proxy"],
+            "{platform}"
+        );
+    }
 }
 
 #[test]

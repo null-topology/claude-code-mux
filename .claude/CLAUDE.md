@@ -449,10 +449,14 @@ Request path:
    `MAX_LOG_BYTES` (20 MiB) the log is renamed to `proxy.<millis>`, and that
    file and the `MAX_ROTATED_LOGS - 1` (4) newest other rotated files of it
    are kept, the rest deleted), `paths.rs` (config
-   dir `~/.config/claude-code-proxy`, state dir
-   `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy`, `CCP_CONFIG_DIR`
-   overrides only the config dir; `CCP_CONFIG_DIR`, `XDG_CONFIG_HOME`,
-   `XDG_STATE_HOME`, `HOME` / `USERPROFILE` are read with `var_os`: a
+   dir `${XDG_CONFIG_HOME:-~/.config}/claude-code-proxy`, state dir
+   `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy`, macOS included; on
+   Windows, keyed on the `std::env::consts::OS` value `windows`,
+   `%APPDATA%\claude-code-proxy` and `%LOCALAPPDATA%\claude-code-proxy`, else
+   `<home>\AppData\Roaming` and `<home>\AppData\Local`; `CCP_CONFIG_DIR`
+   overrides only the config dir; `CCP_CONFIG_DIR`, `APPDATA`,
+   `XDG_CONFIG_HOME`, `LOCALAPPDATA`, `XDG_STATE_HOME`, `HOME` /
+   `USERPROFILE` are read with `var_os`: a
    non-UTF-8 path applies as set), `config.rs` (precedence: `CCP_*` env, then
    `config.json` in the config dir, then default; settings read as text come
    from `env_vars`, where a variable whose name or value is not valid

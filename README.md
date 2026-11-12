@@ -1192,7 +1192,7 @@ of them; there is no override for the state directory.
 
 | | config directory | state directory |
 | --- | --- | --- |
-| macOS | `~/.config/claude-code-proxy` | `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy` |
+| macOS | `${XDG_CONFIG_HOME:-~/.config}/claude-code-proxy` | `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy` |
 | Linux | `${XDG_CONFIG_HOME:-~/.config}/claude-code-proxy` | `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy` |
 | Windows | `%APPDATA%\claude-code-proxy` | `%LOCALAPPDATA%\claude-code-proxy` |
 

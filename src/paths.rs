@@ -15,6 +15,7 @@ pub const PATH_ENV_VARS: [&str; 5] = [
 
 #[derive(Debug, Clone)]
 pub struct DirResolverEnv {
+    /// A `std::env::consts::OS` value: `windows`, `macos`, `linux` and so on.
     pub platform: String,
     pub env: HashMap<String, OsString>,
     pub home: OsString,
@@ -40,7 +41,7 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
         return PathBuf::from(override_dir);
     }
 
-    if deps.platform == "win32" {
+    if deps.platform == "windows" {
         let appdata = deps.env.get("APPDATA").cloned().unwrap_or_else(|| {
             let mut appdata = deps.home.clone();
             appdata.push("\\AppData\\Roaming");
@@ -49,10 +50,7 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
         return join_with_sep(&appdata, &["claude-code-proxy"], true);
     }
 
-    if deps.platform == "darwin" {
-        return join_with_sep(&deps.home, &[".config", "claude-code-proxy"], false);
-    }
-
+    // Every other platform, macOS included, follows the XDG rule.
     let base = deps
         .env
         .get("XDG_CONFIG_HOME")
@@ -62,7 +60,7 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
 }
 
 pub fn resolve_state_dir(deps: &DirResolverEnv) -> PathBuf {
-    if deps.platform == "win32" {
+    if deps.platform == "windows" {
         let local = deps.env.get("LOCALAPPDATA").cloned().unwrap_or_else(|| {
             let mut local = deps.home.clone();
             local.push("\\AppData\\Local");
