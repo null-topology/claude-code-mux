@@ -4482,8 +4482,12 @@ mod tests {
         continuation::clear_continuation_for_owner(Some(&owner));
         websocket::invalidate_codex_websocket_pool_owner(&owner);
 
+        fn copy_limit_text() -> String {
+            format!("relayed in full {}", "y".repeat(1024))
+        }
+
         fn copy_limit_events(id: &str) -> Vec<serde_json::Value> {
-            let text = format!("relayed in full {}", "y".repeat(1024));
+            let text = copy_limit_text();
             vec![
                 serde_json::json!({
                     "type": "response.created",
@@ -4592,7 +4596,16 @@ mod tests {
         .expect("the first turn did not finish")
         .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("relayed in full"), "{body}");
+        let relayed_text: String = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .filter(|event| {
+                event["type"] == "content_block_delta" && event["delta"]["type"] == "text_delta"
+            })
+            .map(|event| event["delta"]["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(relayed_text, copy_limit_text(), "{body}");
         assert!(body.contains("message_stop"), "{body}");
         assert!(!continuation::has_continuation_for_owner_for_tests(&owner));
 
@@ -4888,9 +4901,12 @@ mod tests {
 
     /// Over HTTP, the events held until output starts count toward the same
     /// limit: past it the request is answered 502 `api_error` once, and none
-    /// of what was held reaches the client.
+    /// of what was held reaches the client. The held events are ones the
+    /// translator keeps nothing of, so only the reader's own count of what it
+    /// holds can refuse them.
     #[tokio::test]
     async fn a_live_http_answer_held_past_the_limit_answers_502_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
@@ -4898,22 +4914,19 @@ mod tests {
         let owner = ConversationIdentity::Main(session_id.to_string());
         continuation::clear_continuation_for_owner(Some(&owner));
 
-        let held = |id: &str| {
+        let held = |part: &str| {
             serde_json::json!({
-                "type": "response.output_item.added",
+                "type": "response.content_part.added",
                 "output_index": 0,
-                "item": {
-                    "type": "reasoning",
-                    "id": id,
-                    "encrypted_content": "h".repeat(HELD_LIMIT / 2)
-                }
+                "item_id": part,
+                "part": {"type": "output_text", "text": "h".repeat(HELD_LIMIT / 2)}
             })
         };
         let mut body = String::new();
         for event in [
             serde_json::json!({"type": "response.created", "response": {"id": "resp-held"}}),
-            held("rs_held_1"),
-            held("rs_held_2"),
+            held("part_held_1"),
+            held("part_held_2"),
             serde_json::json!({
                 "type": "response.output_text.delta",
                 "output_index": 0,
@@ -4927,14 +4940,15 @@ mod tests {
             body.push_str(&format!("data: {event}\n\n"));
         }
 
+        // The listener serves until the test ends it, so a request sent again
+        // at any point before the answer is read is counted.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&requests);
         let server = tokio::spawn(async move {
-            let mut requests = 0_usize;
-            while let Ok(Ok((mut stream, _))) =
-                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
-            {
-                requests += 1;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                served.fetch_add(1, Ordering::SeqCst);
                 let mut request = Vec::new();
                 let mut buf = [0_u8; 8192];
                 loop {
@@ -4962,7 +4976,6 @@ mod tests {
                 let _ = stream.write_all(head.as_bytes()).await;
                 let _ = stream.write_all(body.as_bytes()).await;
             }
-            requests
         });
 
         let client = Arc::new(
@@ -5002,7 +5015,8 @@ mod tests {
         assert_eq!(error["error"]["type"], "api_error", "{answer}");
         assert!(!answer.contains("after the limit"), "{answer}");
         assert!(!answer.contains("hhhhhhhh"), "{answer}");
-        assert_eq!(server.await.unwrap(), 1, "nothing is sent again");
+        server.abort();
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "nothing is sent again");
         assert!(!continuation::is_current_turn_for_owner(&turn_after));
         assert!(!continuation::has_continuation_for_owner_for_tests(&owner));
         continuation::clear_continuation_for_owner(Some(&owner));

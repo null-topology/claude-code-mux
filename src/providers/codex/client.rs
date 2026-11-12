@@ -7659,12 +7659,15 @@ mod tests {
     }
 
     /// An origin that closes every WebSocket request frame with 1009 before
-    /// any text and completes HTTP requests. When a request frame arrives the
-    /// login switches to `on_frame`, when given; with `on_first_post` the first
-    /// HTTP request is answered with a 401 after switching the login to it.
+    /// any text and completes HTTP requests. With `on_first_upgrade` the first
+    /// upgrade is answered with a 401 after switching the login to it. When a
+    /// request frame arrives the login switches to `on_frame`, when given; with
+    /// `on_first_post` the first HTTP request is answered with a 401 after
+    /// switching the login to it.
     fn spawn_size_refusing_origin(
         listener: TcpListener,
         client: Arc<CodexHttpClient>,
+        on_first_upgrade: Option<StoredAuth>,
         on_frame: Option<StoredAuth>,
         on_first_post: Option<StoredAuth>,
         counts: Arc<SizeRefusalCounts>,
@@ -7677,11 +7680,28 @@ mod tests {
 
         tokio::spawn(async move {
             let mut sockets = Vec::new();
+            let mut on_first_upgrade = on_first_upgrade;
             let mut on_first_post = on_first_post;
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut first = [0_u8; 1];
                 if stream.peek(&mut first).await.unwrap_or(0) == 0 {
+                    continue;
+                }
+                if first[0] == b'G'
+                    && let Some(auth) = on_first_upgrade.take()
+                {
+                    // A 401 the WebSocket task's own refresh answers by
+                    // picking up that login before it connects again.
+                    let _request = read_http_request(&mut stream).await;
+                    counts.upgrades.fetch_add(1, Ordering::SeqCst);
+                    client.auth_manager().set_test_auth(auth);
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
                     continue;
                 }
                 if first[0] == b'G' {
@@ -7742,6 +7762,18 @@ mod tests {
         on_frame: Option<StoredAuth>,
         on_first_post: Option<StoredAuth>,
     ) -> (Result<(), CodexError>, (usize, usize, usize), usize) {
+        run_size_refusal_fallback_with(initial, live, None, on_frame, on_first_post).await
+    }
+
+    /// `run_size_refusal_fallback_from` whose first upgrade, with
+    /// `on_first_upgrade`, is refused with a 401 that switches the login.
+    async fn run_size_refusal_fallback_with(
+        initial: StoredAuth,
+        live: bool,
+        on_first_upgrade: Option<StoredAuth>,
+        on_frame: Option<StoredAuth>,
+        on_first_post: Option<StoredAuth>,
+    ) -> (Result<(), CodexError>, (usize, usize, usize), usize) {
         let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
         super::super::websocket::clear_codex_websocket_pool_for_tests();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7752,6 +7784,7 @@ mod tests {
         let server = spawn_size_refusing_origin(
             listener,
             client.clone(),
+            on_first_upgrade,
             on_frame,
             on_first_post,
             counts.clone(),
@@ -7965,6 +7998,86 @@ mod tests {
         assert_size_refusal_answer(result);
         assert_eq!(refreshes, 1);
         assert_eq!(counts, (1, 1, 1));
+    }
+
+    /// A refresh the WebSocket task makes after a 401 upgrade sends the
+    /// request on a socket opened with the refreshed login, so the size
+    /// refusal it gets is replayed under that login: by its account, or by its
+    /// token when no account is known.
+    #[tokio::test]
+    async fn a_live_size_refusal_after_a_websocket_refresh_is_replayed_under_the_refreshed_login() {
+        let (result, counts, refreshes) = run_size_refusal_fallback_with(
+            http_test_auth(),
+            true,
+            Some(renewed_test_auth()),
+            None,
+            None,
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(refreshes, 1);
+        assert_eq!(counts, (2, 1, 1));
+
+        let (result, counts, refreshes) = run_size_refusal_fallback_with(
+            unknown_account_initial_auth(),
+            true,
+            Some(unknown_account_test_auth()),
+            None,
+            None,
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(refreshes, 1);
+        assert_eq!(counts, (2, 1, 1));
+    }
+
+    /// After the WebSocket task's own refresh, the replay is compared with the
+    /// login the refused request went out under, not the one before the
+    /// refresh: a change after the refusal sends nothing over HTTP, even back
+    /// to the token the first upgrade carried.
+    #[tokio::test]
+    async fn a_live_size_refusal_after_a_websocket_refresh_is_not_replayed_on_a_changed_login() {
+        let (result, counts, refreshes) = run_size_refusal_fallback_with(
+            http_test_auth(),
+            true,
+            Some(renewed_test_auth()),
+            Some(rotated_test_auth()),
+            None,
+        )
+        .await;
+        assert_size_refusal_answer(result);
+        assert_eq!(refreshes, 1);
+        assert_eq!(counts, (2, 1, 0));
+
+        let (result, counts, refreshes) = run_size_refusal_fallback_with(
+            unknown_account_initial_auth(),
+            true,
+            Some(unknown_account_test_auth()),
+            Some(unknown_account_initial_auth()),
+            None,
+        )
+        .await;
+        assert_size_refusal_answer(result);
+        assert_eq!(refreshes, 1);
+        assert_eq!(counts, (2, 1, 0));
+    }
+
+    /// An account that was unknown when the request went out and is known by
+    /// the replay, with the same access token, is the same credential.
+    #[tokio::test]
+    async fn a_size_refusal_is_replayed_under_the_same_token_once_the_account_is_known() {
+        for live in [true, false] {
+            let (result, counts, refreshes) = run_size_refusal_fallback_from(
+                unknown_account_initial_auth(),
+                live,
+                Some(http_test_auth()),
+                None,
+            )
+            .await;
+            result.unwrap();
+            assert_eq!(refreshes, 0);
+            assert_eq!(counts, (1, 1, 1), "live: {live}");
+        }
     }
 
     /// A conversation's socket pooled under a login with no account id is not
