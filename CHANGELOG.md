@@ -112,6 +112,14 @@
   escapes such as `\u{1b}`, so a server cannot move the cursor, clear the
   screen or rewrite earlier lines of the terminal. Printable text, non-ASCII
   letters included, is shown as before.
+- The Anthropic routes (`/v1/messages`, `/v1/messages/count_tokens` and
+  their `/messages` aliases) now accept request bodies up to 128 MiB instead
+  of 64 MiB, which covers the 128 MB request size limit Anthropic documents
+  for those endpoints, so the proxy no longer refuses a body the backend would
+  take. A larger body is still answered with 413 `request_too_large`. The
+  proxy holds a request in memory while it handles it, so a request of that
+  size costs that much memory several times over for as long as it runs.
+  There is no setting for the limit.
 
 ## v0.18.0 (2026-11-12)
 

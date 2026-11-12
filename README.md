@@ -859,7 +859,7 @@ Grok or Cursor id works on them too:
 
 Any other path answers 404 with an Anthropic-shaped `not_found` error.
 
-**Request body limits.** The Anthropic routes accept up to 64 MiB and answer a
+**Request body limits.** The Anthropic routes accept up to 128 MiB and answer a
 larger body with 413 and an Anthropic-shaped `request_too_large` error. The
 OpenAI-compatible responses and chat-completions routes accept up to 16 MiB and
 answer 413 with the OpenAI error shape (`error.code: "request_too_large"`).
@@ -1422,7 +1422,7 @@ backend was contacted.
 | Prompt-cache scope per subagent | the bare session id, so a subagent shares the main thread's scope and routing bucket | same | a derived id per conversation, sent as the request's `prompt_cache_key` and in the `session-id` and `thread-id` headers |
 | Responses lane policy | compiled-in table only | same | `CCP_CODEX_LANE_POLICY` / `CCP_CODEX_FULL_LANE`, with the backend listing able to decide |
 | Monitor accounting | request list and totals | same | cache read/write split, evidence marks, per-lane cache-miss detection, conversation tree |
-| Anthropic request body limit | 64 MiB, 413 `request_too_large` | 16 MiB, 400 | 64 MiB, 413 `request_too_large` |
+| Anthropic request body limit | 64 MiB, 413 `request_too_large` | 16 MiB, 400 | 128 MiB, 413 `request_too_large` |
 | Docs site / Nix | Astro docs site, `flake.nix` | no docs site, `flake.nix` | neither |
 | Crate name / `publish` key | `claude-code-proxy`, `publish = false` | `claude-codex`, no `publish` key | `claude-code-mux`, no `publish` key |
 | Release artifacts | prebuilt binaries, 6 targets | prebuilt binaries, 6 targets | prebuilt binaries, 6 targets |

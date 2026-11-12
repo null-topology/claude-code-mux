@@ -628,6 +628,21 @@ async fn an_anthropic_body_at_the_limit_is_read_whole() {
     assert!(message.starts_with("Missing \"model\""), "{message}");
 }
 
+/// Anthropic documents a 128 MB request size limit for the Messages and Token
+/// Counting endpoints. A body of that size is the backend's to answer, so the
+/// proxy reads it whole on both routes instead of refusing it first.
+#[tokio::test]
+async fn an_anthropic_body_at_the_documented_backend_limit_is_read_whole() {
+    const DOCUMENTED_BACKEND_LIMIT_BYTES: usize = 128_000_000;
+    for uri in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let (status, body) =
+            post_anthropic(uri, padded_messages_body(DOCUMENTED_BACKEND_LIMIT_BYTES)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        let message = body["error"]["message"].as_str().unwrap_or("");
+        assert!(message.starts_with("Missing \"model\""), "{uri}: {message}");
+    }
+}
+
 /// Past the limit the body is refused for its size, on both Anthropic routes,
 /// and says so in the shape an Anthropic client parses. Reporting it as invalid
 /// JSON would send the caller looking at the wrong thing.
