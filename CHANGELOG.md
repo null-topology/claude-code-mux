@@ -4,8 +4,8 @@
   ranges `Cargo.toml` already allows. This brings rustls 0.23.46, which fixes
   RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption
   levels), and h2 0.4.20, which fixes RUSTSEC-2026-0258 (unbounded empty
-  DATA frames). TLS still uses the ring crypto provider, and nothing changes
-  in configuration or behaviour.
+  DATA frames). TLS still uses the ring crypto provider, and this refresh
+  changes no configuration and no behaviour.
 - The monitor's terminal libraries are updated to ratatui 0.30 and
   crossterm 0.29. The monitor works as before and no setting changes.
 - The HTTP client library is updated to reqwest 0.13. The HTTP clients still
@@ -16,7 +16,10 @@
   bundled Mozilla anchors, which the HTTP client that performs its upgrade
   uses as well. One root that Mozilla limits to the domains of a single
   country is no longer trusted by the other HTTP clients, since they take
-  the roots as plain certificates and that limit cannot be applied there.
+  the roots as plain certificates and that limit cannot be applied there. An
+  HTTPS connection of those clients to a server whose certificate chain ends
+  only at that root now fails certificate verification; no setting brings
+  the root back.
 
 ## v0.18.1 (2026-11-12)
 
