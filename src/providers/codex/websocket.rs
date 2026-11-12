@@ -102,6 +102,9 @@ pub(crate) struct CodexWebSocketEventStream {
     provider_retry_handoff: Arc<AtomicBool>,
     auth_refresh: Arc<AtomicBool>,
     account_id: Arc<std::sync::Mutex<Option<String>>>,
+    /// The access token of the attempt, held only to tell whether a replay
+    /// goes out with the same credential. The type has no `Debug`.
+    access_token: Arc<std::sync::Mutex<Option<String>>>,
     rate_limits_observed: bool,
 }
 
@@ -112,6 +115,7 @@ pub(crate) struct CodexWebSocketSocketIdPublisher {
     provider_retry_handoff: Arc<AtomicBool>,
     auth_refresh: Arc<AtomicBool>,
     account_id: Arc<std::sync::Mutex<Option<String>>>,
+    access_token: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl CodexWebSocketEventStream {
@@ -123,6 +127,7 @@ impl CodexWebSocketEventStream {
         let provider_retry_handoff = Arc::new(AtomicBool::new(false));
         let auth_refresh = Arc::new(AtomicBool::new(false));
         let account_id = Arc::new(std::sync::Mutex::new(None));
+        let access_token = Arc::new(std::sync::Mutex::new(None));
         (
             Self {
                 receiver,
@@ -131,6 +136,7 @@ impl CodexWebSocketEventStream {
                 provider_retry_handoff: provider_retry_handoff.clone(),
                 auth_refresh: auth_refresh.clone(),
                 account_id: account_id.clone(),
+                access_token: access_token.clone(),
                 rate_limits_observed: false,
             },
             CodexWebSocketSocketIdPublisher {
@@ -139,6 +145,7 @@ impl CodexWebSocketEventStream {
                 provider_retry_handoff,
                 auth_refresh,
                 account_id,
+                access_token,
             },
         )
     }
@@ -153,6 +160,16 @@ impl CodexWebSocketEventStream {
     /// the quota gauge keys its readings by.
     pub(crate) fn account_id(&self) -> Option<String> {
         self.account_reader()()
+    }
+
+    /// The access token the stream's request was last sent with, which a
+    /// size refusal's replay compares its own with when an account id is
+    /// unknown. It is never logged.
+    pub(crate) fn access_token(&self) -> Option<String> {
+        self.access_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Reads the stream's account after the stream itself has been handed
@@ -228,6 +245,15 @@ impl CodexWebSocketSocketIdPublisher {
             .account_id
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = account_id.map(str::to_owned);
+    }
+
+    /// Publishes the access token of the attempt about to go out, beside its
+    /// account.
+    pub(super) fn publish_access_token(&self, access_token: &str) {
+        *self
+            .access_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(access_token.to_owned());
     }
 
     pub(super) fn is_provider_retry_handoff(&self) -> bool {

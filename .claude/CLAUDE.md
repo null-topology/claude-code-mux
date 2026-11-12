@@ -290,15 +290,21 @@ Request path:
      HTTP answer leaves no continuation state, and every later attempt of
      that client request (a 401 refresh) stays on HTTP
      (`post_codex_with_transport`); the next client request starts on the
-     WebSocket again. The HTTP replay goes out only under the ChatGPT
-     account of the WebSocket attempt
-     (`refuse_size_fallback_under_another_account`): when the account id of
-     that attempt and the one the HTTP attempt holds (the fresh credential
-     read of the live path, a 401 refresh on either path) are both known and
-     differ, nothing more is sent over HTTP, the size refusal itself is
-     answered, and one `codex_websocket_size_fallback_refused` warning
-     carries `reqId` only; a renewed token of the same account, or an id
-     unknown on either side, goes ahead. Under `websocket` it is answered
+     WebSocket again. The HTTP replay goes out only under a credential shown
+     to be the one of the WebSocket attempt
+     (`refuse_size_fallback_under_another_account`,
+     `SizeRefusalFallback::same_credential`): the account id of that attempt
+     and the one the HTTP attempt holds (the fresh credential read of the
+     live path, a 401 refresh on either path) are both known and equal, or,
+     with an id unknown on either side, the HTTP attempt's access token is
+     the very string the WebSocket attempt went out with. The live stream
+     publishes each attempt's token beside its account
+     (`CodexWebSocketEventStream::access_token`), held in memory for this
+     comparison only, in types without `Debug`. Otherwise nothing more is
+     sent over HTTP, the size refusal itself is answered, and one
+     `codex_websocket_size_fallback_refused` warning carries `reqId` only
+     (`size_fallback_refused_fields`); a renewed token of the same account
+     goes ahead. Under `websocket` it is answered
      once with 413 `request_too_large`, never resent, and the message adds
      that the `auto` transport sends such a request over HTTP; any other 413 of a
      size refusal (buffered `auto` whose HTTP fallback is off behind a
@@ -1064,7 +1070,8 @@ renewed before it expires keeps the socket (a refresh forced by a 401 still
 drops the conversation's socket, as before), whereas the Codex CLI resets its
 connection on any auth change (`codex-rs/core/src/client.rs` at
 rust-v0.166.0). The HTTP replay of a WebSocket size refusal likewise goes
-out only under the account of the WebSocket attempt it replaces
+out only under the account of the WebSocket attempt it replaces, and, when
+an account id is unknown, only under that attempt's own access token
 (`refuse_size_fallback_under_another_account`). A reading whose
 `metered_limit_name`, else `limit_name`, names a limit other than `codex`
 updates nothing, and its refusal marks no window (`reads_codex_limit`,

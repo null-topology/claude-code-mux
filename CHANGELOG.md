@@ -52,11 +52,15 @@
   capture the WebSocket reader no longer keeps that copy at all.
 - Under the default `auto` transport, a Codex request the WebSocket refused
   as too large is replayed over HTTP only under the ChatGPT account the
-  WebSocket attempt used. When the Codex CLI's login has moved to another
-  account between the two attempts, the proxy sends nothing over HTTP,
-  answers with the size refusal (413 `request_too_large`) and logs a
-  `codex_websocket_size_fallback_refused` warning. A renewed token of the
-  same account replays as before.
+  WebSocket attempt used. When both attempts name their account, the two
+  must match, so a renewed token of the same account replays as before.
+  When the Codex CLI's login leaves the account of one attempt or both
+  unknown, the replay goes out only with the very access token the
+  WebSocket attempt used, so
+  after a token refresh or a changed login it does not. Otherwise the proxy
+  sends nothing over HTTP, answers with the size refusal (413
+  `request_too_large`) and logs a `codex_websocket_size_fallback_refused`
+  warning with the request id only. There is no setting for this.
 - The Kimi, Grok and Cursor providers now stop reading an upstream body once
   it passes a fixed size, instead of holding whatever the server sends: 1 MiB
   for a login, login poll, device or token refresh answer, 64 KiB for an

@@ -1347,11 +1347,7 @@ impl CodexHttpClient {
             .get_auth()
             .await
             .map_err(|e| auth_error(e, "Auth error"))?;
-        refuse_size_fallback_under_another_account(
-            &mut size_fallback,
-            auth.account_id.as_deref(),
-            ctx,
-        )?;
+        refuse_size_fallback_under_another_account(&mut size_fallback, &auth, ctx)?;
         let body_json = serde_json::to_string(body).map_err(|e| CodexError {
             status: 500,
             message: "Failed to serialize request".to_string(),
@@ -1459,11 +1455,7 @@ impl CodexHttpClient {
                         .force_refresh(&auth.access)
                         .await
                         .map_err(auth_refresh_error)?;
-                    refuse_size_fallback_under_another_account(
-                        size_fallback,
-                        auth.account_id.as_deref(),
-                        ctx,
-                    )?;
+                    refuse_size_fallback_under_another_account(size_fallback, auth, ctx)?;
                     continue;
                 }
                 return Err(error);
@@ -1517,10 +1509,11 @@ impl CodexHttpClient {
         match websocket.recv().await {
             Some(Err(err)) if should_fallback_to_http(&err) => {
                 log_websocket_fallback_to_http(ctx, &err);
-                // The account the refused attempt went out under, which a
-                // size refusal's replay must not leave.
-                let size_fallback = super::websocket::is_message_size_refusal(&err)
-                    .then(|| SizeRefusalFallback::new(err, websocket.account_id()));
+                // The account and the access token the refused attempt went
+                // out with, which a size refusal's replay must not leave.
+                let size_fallback = super::websocket::is_message_size_refusal(&err).then(|| {
+                    SizeRefusalFallback::new(err, websocket.account_id(), websocket.access_token())
+                });
                 // One refresh per client request: when the WebSocket attempt
                 // already refreshed the token, the HTTP one does not again.
                 self.stream_codex_http_events_replaying(
@@ -1842,12 +1835,8 @@ impl CodexHttpClient {
             let result = match transport {
                 CodexTransport::Http => {
                     // A size refusal's replay after a token refresh stays
-                    // under the account of its WebSocket attempt.
-                    refuse_size_fallback_under_another_account(
-                        &mut size_fallback,
-                        auth.account_id.as_deref(),
-                        ctx,
-                    )?;
+                    // under the credential of its WebSocket attempt.
+                    refuse_size_fallback_under_another_account(&mut size_fallback, &auth, ctx)?;
                     let body_json = serde_json::to_string(body).map_err(|e| CodexError {
                         status: 500,
                         message: "Failed to serialize request".to_string(),
@@ -1961,8 +1950,11 @@ impl CodexHttpClient {
                                 // resend of this request (after a token refresh
                                 // or without its continuation) stays on HTTP.
                                 transport = CodexTransport::Http;
-                                size_fallback =
-                                    Some(SizeRefusalFallback::new(err, auth.account_id.clone()));
+                                size_fallback = Some(SizeRefusalFallback::new(
+                                    err,
+                                    auth.account_id.clone(),
+                                    Some(auth.access.clone()),
+                                ));
                             }
                             let body_json =
                                 serde_json::to_string(body).map_err(|e| CodexError {
@@ -2162,6 +2154,7 @@ impl CodexHttpClient {
             super::websocket::CodexWebSocketEventStream::pending(rx);
         rx.mark_rate_limits_observed();
         socket_id_publisher.publish_account(auth.account_id.as_deref());
+        socket_id_publisher.publish_access_token(&auth.access);
         tokio::spawn(async move {
             client
                 .coordinate_live_websocket_events(
@@ -2211,6 +2204,7 @@ impl CodexHttpClient {
             };
             socket_id_publisher.publish(None);
             socket_id_publisher.publish_account(auth.account_id.as_deref());
+            socket_id_publisher.publish_access_token(&auth.access);
             let ws_headers = match build_codex_headers(
                 &auth,
                 &ctx,
@@ -3409,42 +3403,61 @@ pub(super) fn websocket_fallback_log_detail(err: &CodexError) -> String {
 }
 
 /// A WebSocket attempt refused for its size whose request goes over HTTP
-/// instead, with the ChatGPT account that attempt went out under.
+/// instead, with the ChatGPT account and the access token that attempt went
+/// out with. The token is held only for `same_credential`; the type has no
+/// `Debug`.
 struct SizeRefusalFallback {
     refusal: CodexError,
     account_id: Option<String>,
+    access_token: Option<String>,
 }
 
 impl SizeRefusalFallback {
-    fn new(refusal: CodexError, account_id: Option<String>) -> Self {
+    fn new(refusal: CodexError, account_id: Option<String>, access_token: Option<String>) -> Self {
         Self {
             refusal,
             account_id,
+            access_token,
+        }
+    }
+
+    /// Whether a replay with `auth` is shown to go out under the WebSocket
+    /// attempt's account: both account ids are known and equal, or, when
+    /// either is unknown, the access token is the attempt's own.
+    fn same_credential(&self, auth: &StoredAuth) -> bool {
+        match (self.account_id.as_deref(), auth.account_id.as_deref()) {
+            (Some(before), Some(now)) => before == now,
+            _ => self.access_token.as_deref() == Some(auth.access.as_str()),
         }
     }
 }
 
-/// Refuses the HTTP replay of a size refusal under another ChatGPT account
-/// than the WebSocket attempt's: the request is not sent, and the client gets
-/// the size refusal itself. A renewed token of the same account passes, and so
-/// does a replay when either account id is unknown.
+/// Refuses the HTTP replay of a size refusal unless it goes out under the
+/// WebSocket attempt's credential: the request is not sent, and the client
+/// gets the size refusal itself. A replay passes when both account ids are
+/// known and equal, so a renewed token of the same account passes, or when
+/// either account id is unknown and the access token is the one the
+/// WebSocket attempt went out with. Every other case is refused, a new token
+/// under an unknown account included.
 fn refuse_size_fallback_under_another_account(
     fallback: &mut Option<SizeRefusalFallback>,
-    account_id: Option<&str>,
+    auth: &StoredAuth,
     ctx: &RequestContext,
 ) -> Result<(), CodexError> {
-    let Some(refused) = fallback.take_if(|pending| {
-        matches!(
-            (pending.account_id.as_deref(), account_id),
-            (Some(before), Some(now)) if before != now
-        )
-    }) else {
+    let Some(refused) = fallback.take_if(|pending| !pending.same_credential(auth)) else {
         return Ok(());
     };
-    let fields =
-        serde_json::Map::from_iter([("reqId".to_string(), serde_json::json!(&ctx.req_id))]);
-    create_logger("codex").warn("codex_websocket_size_fallback_refused", Some(fields));
+    create_logger("codex").warn(
+        "codex_websocket_size_fallback_refused",
+        Some(size_fallback_refused_fields(&ctx.req_id)),
+    );
     Err(refused.refusal)
+}
+
+/// The fields of `codex_websocket_size_fallback_refused`: the request id
+/// only, nothing of either credential.
+fn size_fallback_refused_fields(req_id: &str) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter([("reqId".to_string(), serde_json::json!(req_id))])
 }
 
 fn should_retry_without_continuation(
@@ -7686,13 +7699,22 @@ mod tests {
         on_frame: Option<StoredAuth>,
         on_first_post: Option<StoredAuth>,
     ) -> (Result<(), CodexError>, (usize, usize, usize), usize) {
+        run_size_refusal_fallback_from(http_test_auth(), live, on_frame, on_first_post).await
+    }
+
+    /// `run_size_refusal_fallback` starting from the login `initial`.
+    async fn run_size_refusal_fallback_from(
+        initial: StoredAuth,
+        live: bool,
+        on_frame: Option<StoredAuth>,
+        on_first_post: Option<StoredAuth>,
+    ) -> (Result<(), CodexError>, (usize, usize, usize), usize) {
         let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
         super::super::websocket::clear_codex_websocket_pool_for_tests();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let client = Arc::new(authenticated_http_test_client(format!(
-            "http://{addr}/responses"
-        )));
+        let client = Arc::new(http_test_client(format!("http://{addr}/responses"), 100));
+        client.auth_manager().set_test_auth(initial);
         let counts = Arc::new(SizeRefusalCounts::default());
         let server = spawn_size_refusing_origin(
             listener,
@@ -7748,6 +7770,15 @@ mod tests {
         }
     }
 
+    /// The login of `http_test_auth`, its access token included, with no
+    /// account id.
+    fn unknown_account_initial_auth() -> StoredAuth {
+        StoredAuth {
+            account_id: None,
+            ..http_test_auth()
+        }
+    }
+
     /// The answer a size refusal's replay refused under another account gets:
     /// the WebSocket's own 1009 refusal.
     fn assert_size_refusal_answer(result: Result<(), CodexError>) {
@@ -7782,13 +7813,29 @@ mod tests {
         assert_eq!(counts, (1, 1, 1));
     }
 
+    /// A refreshed login with no account id cannot be shown to be the
+    /// WebSocket attempt's account, and its token is new.
     #[tokio::test]
-    async fn a_buffered_size_refusal_is_replayed_when_the_refreshed_account_is_unknown() {
+    async fn a_buffered_size_refusal_is_not_replayed_when_the_refreshed_account_is_unknown() {
         let (result, counts, refreshes) =
             run_size_refusal_fallback(false, None, Some(unknown_account_test_auth())).await;
-        result.unwrap();
+        assert_size_refusal_answer(result);
         assert_eq!(refreshes, 1);
-        assert_eq!(counts, (1, 1, 2));
+        assert_eq!(counts, (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_buffered_size_refusal_is_not_replayed_after_a_refresh_when_no_account_is_known() {
+        let (result, counts, refreshes) = run_size_refusal_fallback_from(
+            unknown_account_initial_auth(),
+            false,
+            None,
+            Some(unknown_account_test_auth()),
+        )
+        .await;
+        assert_size_refusal_answer(result);
+        assert_eq!(refreshes, 1);
+        assert_eq!(counts, (1, 1, 1));
     }
 
     #[tokio::test]
@@ -7808,10 +7855,58 @@ mod tests {
         assert_eq!(counts, (1, 1, 1));
     }
 
+    /// A known account on one side and an unknown one on the other proves
+    /// nothing, so a new token is refused in either direction.
     #[tokio::test]
-    async fn a_live_size_refusal_is_replayed_when_an_account_is_unknown() {
-        let (result, counts, _) =
+    async fn a_live_size_refusal_is_not_replayed_under_a_new_token_when_an_account_is_unknown() {
+        let (result, counts, refreshes) =
             run_size_refusal_fallback(true, Some(unknown_account_test_auth()), None).await;
+        assert_size_refusal_answer(result);
+        assert_eq!(refreshes, 0);
+        assert_eq!(counts, (1, 1, 0));
+
+        let (result, counts, refreshes) = run_size_refusal_fallback_from(
+            unknown_account_initial_auth(),
+            true,
+            Some(rotated_test_auth()),
+            None,
+        )
+        .await;
+        assert_size_refusal_answer(result);
+        assert_eq!(refreshes, 0);
+        assert_eq!(counts, (1, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_live_size_refusal_is_not_replayed_under_a_new_token_when_no_account_is_known() {
+        let (result, counts, refreshes) = run_size_refusal_fallback_from(
+            unknown_account_initial_auth(),
+            true,
+            Some(unknown_account_test_auth()),
+            None,
+        )
+        .await;
+        assert_size_refusal_answer(result);
+        assert_eq!(refreshes, 0);
+        assert_eq!(counts, (1, 1, 0));
+    }
+
+    /// With an account id unknown, the WebSocket attempt's own access token
+    /// shows the credential did not change.
+    #[tokio::test]
+    async fn a_live_size_refusal_is_replayed_under_the_same_token_when_an_account_is_unknown() {
+        let (result, counts, _) = run_size_refusal_fallback_from(
+            unknown_account_initial_auth(),
+            true,
+            Some(unknown_account_initial_auth()),
+            None,
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(counts, (1, 1, 1));
+
+        let (result, counts, _) =
+            run_size_refusal_fallback(true, Some(unknown_account_initial_auth()), None).await;
         result.unwrap();
         assert_eq!(counts, (1, 1, 1));
     }
@@ -7823,6 +7918,28 @@ mod tests {
         assert_size_refusal_answer(result);
         assert_eq!(refreshes, 1);
         assert_eq!(counts, (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_live_size_refusal_is_not_replayed_after_a_refresh_when_no_account_is_known() {
+        let (result, counts, refreshes) = run_size_refusal_fallback_from(
+            unknown_account_initial_auth(),
+            true,
+            None,
+            Some(unknown_account_test_auth()),
+        )
+        .await;
+        assert_size_refusal_answer(result);
+        assert_eq!(refreshes, 1);
+        assert_eq!(counts, (1, 1, 1));
+    }
+
+    #[test]
+    fn the_size_fallback_refused_warning_names_only_the_request() {
+        assert_eq!(
+            serde_json::Value::Object(size_fallback_refused_fields("request-size")),
+            serde_json::json!({"reqId": "request-size"})
+        );
     }
 
     /// An origin that refuses every WebSocket upgrade with a 503 and
