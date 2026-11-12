@@ -4,8 +4,10 @@
   ranges `Cargo.toml` already allows. This brings rustls 0.23.46, which fixes
   RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption
   levels), and h2 0.4.20, which fixes RUSTSEC-2026-0258 (unbounded empty
-  DATA frames). TLS still uses the ring crypto provider, and this refresh
-  changes no configuration and no behaviour.
+  DATA frames). The bundled Mozilla root certificates move to the current
+  set (`webpki-roots` 1.0.12): four roots are added and ten that Mozilla
+  removed are no longer trusted. TLS still uses the ring crypto provider,
+  and no configuration changes.
 - The monitor's terminal libraries are updated to ratatui 0.30 and
   crossterm 0.29. The monitor works as before and no setting changes.
 - The HTTP client library is updated to reqwest 0.13. The HTTP clients still

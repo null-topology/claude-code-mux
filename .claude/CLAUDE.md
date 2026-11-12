@@ -1776,7 +1776,8 @@ Codex WebSocket connection is the exception: `WEBSOCKET_TLS_CONFIG` in
 `webpki-roots` anchors, and `websocket_http_client` in
 `src/providers/codex/client.rs` hands that same configuration to the client
 that performs the upgrade through `use_preconfigured_tls`. A bare
-`Client::builder()` would fall back to the platform verifier, so `clippy.toml`
+`Client::builder()` would use the platform verifier, or panic while no crypto
+provider is installed, so `clippy.toml`
 lists the reqwest client constructors, `reqwest::get` and the builder methods
 that replace the TLS setup (`use_preconfigured_tls`,
 `tls_backend_preconfigured`, async and blocking) under `disallowed-methods`,
