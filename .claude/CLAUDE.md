@@ -452,8 +452,12 @@ Request path:
    dir `${XDG_CONFIG_HOME:-~/.config}/claude-code-proxy`, state dir
    `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy`, macOS included; on
    Windows, keyed on the `std::env::consts::OS` value `windows`,
-   `%APPDATA%\claude-code-proxy` and `%LOCALAPPDATA%\claude-code-proxy`, else
-   `<home>\AppData\Roaming` and `<home>\AppData\Local`; `CCP_CONFIG_DIR`
+   `%APPDATA%\claude-code-proxy` and `%LOCALAPPDATA%\claude-code-proxy`, else,
+   for each variable unset or empty on its own,
+   `<home>\AppData\Roaming\claude-code-proxy` and
+   `<home>\AppData\Local\claude-code-proxy`, every separator added there a
+   `\`, and `\AppData\...` when the home is empty or only separators (the `/`
+   that stands in for no `HOME` or `USERPROFILE`); `CCP_CONFIG_DIR`
    overrides only the config dir; `CCP_CONFIG_DIR`, `APPDATA`,
    `XDG_CONFIG_HOME`, `LOCALAPPDATA`, `XDG_STATE_HOME`, `HOME` /
    `USERPROFILE` are read with `var_os`: a

@@ -122,8 +122,10 @@
   There is no setting for the limit.
 - On Windows the config directory is now `%APPDATA%\claude-code-proxy` and
   the state directory `%LOCALAPPDATA%\claude-code-proxy`, as documented.
-  Earlier builds did not recognise Windows and used
-  `%USERPROFILE%\.config\claude-code-proxy` and
+  When either variable is unset or empty, its directory is
+  `AppData\Roaming\claude-code-proxy` or `AppData\Local\claude-code-proxy`
+  under the home directory instead. Earlier builds did not recognise
+  Windows and used `%USERPROFILE%\.config\claude-code-proxy` and
   `%USERPROFILE%\.local\state\claude-code-proxy` (`HOME` in place of
   `USERPROFILE` when set, `XDG_CONFIG_HOME` and `XDG_STATE_HOME` when set).
   To keep a `config.json`, move it into the new config directory, or set
