@@ -1,4 +1,4 @@
-## Unreleased
+## v0.18.0 (2026-11-12)
 
 - The Codex backend's refusals by `content_policy_violation`,
   `invalid_access_program`, `unsupported_access_program`, `budget_reached`,
