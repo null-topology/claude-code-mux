@@ -43,6 +43,10 @@ pub enum CodexErrorClass {
     Overloaded,
     /// The backend does not serve the model the request named.
     ModelNotFound,
+    /// The workspace or the account may not make this request, such as a
+    /// workspace inference hook that blocked it or an access program that is
+    /// not enabled.
+    PermissionDenied,
 }
 
 impl CodexErrorClass {
@@ -50,7 +54,7 @@ impl CodexErrorClass {
     pub fn status(self) -> u16 {
         match self {
             Self::QuotaExceeded | Self::Throttled => 429,
-            Self::UsageNotIncluded => 403,
+            Self::UsageNotIncluded | Self::PermissionDenied => 403,
             Self::Rejected => 400,
             Self::ContextOverflow => 413,
             Self::Overloaded => 529,
@@ -62,7 +66,7 @@ impl CodexErrorClass {
     pub fn error_type(self) -> &'static str {
         match self {
             Self::QuotaExceeded | Self::Throttled => "rate_limit_error",
-            Self::UsageNotIncluded => "permission_error",
+            Self::UsageNotIncluded | Self::PermissionDenied => "permission_error",
             Self::Rejected => "invalid_request_error",
             Self::ContextOverflow => "request_too_large",
             Self::Overloaded => "overloaded_error",
@@ -78,7 +82,8 @@ impl CodexErrorClass {
             | Self::UsageNotIncluded
             | Self::Rejected
             | Self::ContextOverflow
-            | Self::ModelNotFound => CodexFailureKind::Permanent,
+            | Self::ModelNotFound
+            | Self::PermissionDenied => CodexFailureKind::Permanent,
         }
     }
 }
@@ -91,17 +96,100 @@ const QUOTA_ERROR_CODES: [&str; 5] = [
     "organization_usage_limit_exceeded",
 ];
 
+/// An error code the Codex CLI treats as terminal, never retried, only with no
+/// status or one of a few (`parse_terminal_provider_error` in
+/// `codex-rs/codex-api/src/error.rs` at rust-v0.169.0-alpha.9).
+struct TerminalCode {
+    code: &'static str,
+    class: CodexErrorClass,
+    /// The explicit statuses under which the code names its class; an absent
+    /// status always does.
+    statuses: &'static [u16],
+    /// The CLI's text for the code when its message is missing or blank.
+    fallback: Option<&'static str>,
+}
+
+/// Read by `code` only, never by `type`. The CLI reads the access program
+/// codes this way only with no status and leaves an HTTP 400 or 403 carrying
+/// them to its handling of that status; the proxy names the class under that
+/// status as well. It ends the turn on `budget_reached` and never retries it;
+/// the proxy answers it as spent credits.
+const TERMINAL_CODES: [TerminalCode; 6] = [
+    TerminalCode {
+        code: "content_policy_violation",
+        class: CodexErrorClass::Rejected,
+        statuses: &[400],
+        fallback: Some("The input was rejected by the content policy."),
+    },
+    TerminalCode {
+        code: "invalid_access_program",
+        class: CodexErrorClass::Rejected,
+        statuses: &[400],
+        fallback: Some("The requested access program cannot be used with this model."),
+    },
+    TerminalCode {
+        code: "unsupported_access_program",
+        class: CodexErrorClass::Rejected,
+        statuses: &[400],
+        fallback: Some("The requested access program cannot be used with this model."),
+    },
+    TerminalCode {
+        code: "budget_reached",
+        class: CodexErrorClass::QuotaExceeded,
+        statuses: &[400],
+        fallback: None,
+    },
+    TerminalCode {
+        code: "inference_hook_denied",
+        class: CodexErrorClass::PermissionDenied,
+        statuses: &[403],
+        fallback: Some("Your workspace inference hook blocked this request."),
+    },
+    TerminalCode {
+        code: "access_program_not_enabled",
+        class: CodexErrorClass::PermissionDenied,
+        statuses: &[403],
+        fallback: Some("The requested access program is not enabled."),
+    },
+];
+
+/// The terminal code an error object's `code` names, when it holds with
+/// `status`; under any other status it names none.
+fn terminal_code(error: &Value, status: Option<u16>) -> Option<&'static TerminalCode> {
+    let code = error.get("code").and_then(Value::as_str)?;
+    TERMINAL_CODES.iter().find(|terminal| {
+        terminal.code == code && status.is_none_or(|status| terminal.statuses.contains(&status))
+    })
+}
+
+/// The CLI's text for the terminal code a JSON error body names, when the code
+/// holds with `status`, the status the body came with. It stands in for a
+/// missing or blank message, as it does on a stream event.
+pub(crate) fn terminal_code_text_from_body(body: &[u8], status: u16) -> Option<&'static str> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let error = value.get("error")?;
+    // A spent subscription window keeps its own answer.
+    error_class(error, Some(status))?;
+    terminal_code(error, Some(status))?.fallback
+}
+
 /// The class an error object's `code` (or, for quota, plan, capacity and
-/// missing model errors, its `type`) names. A spent subscription window keeps its own handling, so an
-/// error typed `usage_limit_reached` has no class whatever its code says.
-pub(crate) fn error_class(error: &Value) -> Option<CodexErrorClass> {
+/// missing model errors, its `type`) names beside `status`, the status it came
+/// with, if any. A spent subscription window keeps its own handling, so an
+/// error typed `usage_limit_reached` has no class whatever its code says. A
+/// terminal code (`TERMINAL_CODES`) decides first when it holds with `status`;
+/// under any other status the error is read as if it carried no such code.
+pub(crate) fn error_class(error: &Value, status: Option<u16>) -> Option<CodexErrorClass> {
     let code = error.get("code").and_then(Value::as_str);
     let error_type = error.get("type").and_then(Value::as_str);
     if error_type == Some("usage_limit_reached") {
         return None;
     }
+    if let Some(terminal) = terminal_code(error, status) {
+        return Some(terminal.class);
+    }
     let names = |value: &str| code == Some(value) || error_type == Some(value);
-    if code == Some("context_length_exceeded") {
+    let class = if code == Some("context_length_exceeded") {
         Some(CodexErrorClass::ContextOverflow)
     } else if QUOTA_ERROR_CODES.into_iter().any(names) {
         Some(CodexErrorClass::QuotaExceeded)
@@ -123,7 +211,8 @@ pub(crate) fn error_class(error: &Value) -> Option<CodexErrorClass> {
         Some(CodexErrorClass::ModelNotFound)
     } else {
         None
-    }
+    };
+    class_with_status(class, status)
 }
 
 /// `class` as it stands beside `status`. A missing model is one only with no
@@ -150,7 +239,7 @@ fn class_with_status(
 /// (`classify_event_failure`).
 pub(crate) fn error_class_from_body(body: &[u8], status: u16) -> Option<CodexErrorClass> {
     match serde_json::from_slice::<Value>(body) {
-        Ok(value) => class_with_status(error_class(value.get("error")?), Some(status)),
+        Ok(value) => error_class(value.get("error")?, Some(status)),
         Err(_) => sse_payloads(body).find_map(|payload| classify_event_failure(&payload)?.class),
     }
 }
@@ -276,20 +365,23 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
                 .and_then(Value::as_u64)
         })
         .and_then(|status| u16::try_from(status).ok());
-    let class = class_with_status(error.and_then(error_class), explicit_status);
+    let class = error.and_then(|error| error_class(error, explicit_status));
     let native = error
         .and_then(|value| value.get("message"))
         .and_then(Value::as_str);
-    let message = match native {
-        // A missing model is named by its code when it comes with no message,
-        // as the Codex CLI names it.
-        _ if class == Some(CodexErrorClass::ModelNotFound)
-            && native.is_none_or(|text| text.trim().is_empty()) =>
-        {
-            "model_not_found"
-        }
-        Some(text) => text,
-        None => "Upstream error",
+    // A missing model is named by its code when it comes with no message, and
+    // a terminal code by the CLI's own text for it, as the Codex CLI names them.
+    let fallback = match class {
+        Some(CodexErrorClass::ModelNotFound) => Some("model_not_found"),
+        Some(_) => error
+            .and_then(|error| terminal_code(error, explicit_status))
+            .and_then(|terminal| terminal.fallback),
+        None => None,
+    };
+    let message = match (native, fallback) {
+        (_, Some(fallback)) if native.is_none_or(|text| text.trim().is_empty()) => fallback,
+        (Some(text), _) => text,
+        (None, _) => "Upstream error",
     }
     .to_string();
     let code = error
@@ -1489,6 +1581,180 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(spent_window.class, None);
+    }
+
+    #[test]
+    fn terminal_codes_name_their_class_only_under_the_statuses_they_hold_with() {
+        // (code, class, statuses it holds with besides none, statuses it does not)
+        let cases = [
+            (
+                "content_policy_violation",
+                CodexErrorClass::Rejected,
+                400,
+                [403, 500, 503],
+            ),
+            (
+                "invalid_access_program",
+                CodexErrorClass::Rejected,
+                400,
+                [403, 500, 503],
+            ),
+            (
+                "unsupported_access_program",
+                CodexErrorClass::Rejected,
+                400,
+                [403, 500, 503],
+            ),
+            (
+                "budget_reached",
+                CodexErrorClass::QuotaExceeded,
+                400,
+                [403, 500, 503],
+            ),
+            (
+                "inference_hook_denied",
+                CodexErrorClass::PermissionDenied,
+                403,
+                [400, 500, 503],
+            ),
+            (
+                "access_program_not_enabled",
+                CodexErrorClass::PermissionDenied,
+                403,
+                [400, 500, 503],
+            ),
+        ];
+        for (code, class, held, others) in cases {
+            for status in [None, Some(held)] {
+                let mut payload = serde_json::json!({
+                    "type": "error",
+                    "error": {"code": code, "message": "toy message"}
+                });
+                if let Some(status) = status {
+                    payload["status"] = serde_json::json!(status);
+                }
+                let failure = classify_event_failure(&payload).unwrap();
+                assert_eq!(failure.class, Some(class), "{code} {status:?}");
+                assert_eq!(failure.explicit_status, status, "{code} {status:?}");
+                assert_eq!(failure.status, class.status(), "{code} {status:?}");
+                assert_eq!(failure.message, "toy message", "{code} {status:?}");
+                assert!(!failure.retryable(), "{code} {status:?}");
+            }
+            let body = format!(r#"{{"error":{{"code":"{code}","message":"toy message"}}}}"#);
+            assert_eq!(
+                error_class_from_body(body.as_bytes(), held),
+                Some(class),
+                "{code}"
+            );
+
+            // Under any other status the failure is read as if it carried no
+            // such code.
+            for status in others {
+                let failure = classify_event_failure(&serde_json::json!({
+                    "type": "error",
+                    "status": status,
+                    "error": {"code": code, "message": "toy message"}
+                }))
+                .unwrap();
+                let without_code = classify_event_failure(&serde_json::json!({
+                    "type": "error",
+                    "status": status,
+                    "error": {"message": "toy message"}
+                }))
+                .unwrap();
+                assert_eq!(failure.class, None, "{code} {status}");
+                assert_eq!(failure, without_code, "{code} {status}");
+                assert_eq!(
+                    error_class_from_body(body.as_bytes(), status),
+                    None,
+                    "{code} {status}"
+                );
+            }
+
+            // Only the code names it, never the type.
+            let typed = classify_event_failure(&serde_json::json!({
+                "type": "error",
+                "error": {"type": code, "message": "toy message"}
+            }))
+            .unwrap();
+            assert_eq!(typed.class, None, "{code}");
+
+            // A spent window keeps precedence.
+            let spent_window = classify_event_failure(&serde_json::json!({
+                "type": "error",
+                "error": {"type": "usage_limit_reached", "code": code}
+            }))
+            .unwrap();
+            assert_eq!(spent_window.class, None, "{code}");
+            assert_eq!(
+                error_class_from_body(
+                    format!(r#"{{"error":{{"type":"usage_limit_reached","code":"{code}"}}}}"#)
+                        .as_bytes(),
+                    held
+                ),
+                None,
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_terminal_code_without_a_message_gets_the_cli_text_for_it() {
+        let cases = [
+            (
+                "content_policy_violation",
+                "The input was rejected by the content policy.",
+            ),
+            (
+                "invalid_access_program",
+                "The requested access program cannot be used with this model.",
+            ),
+            (
+                "unsupported_access_program",
+                "The requested access program cannot be used with this model.",
+            ),
+            (
+                "inference_hook_denied",
+                "Your workspace inference hook blocked this request.",
+            ),
+            (
+                "access_program_not_enabled",
+                "The requested access program is not enabled.",
+            ),
+        ];
+        for (code, text) in cases {
+            for error in [
+                serde_json::json!({"code": code}),
+                serde_json::json!({"code": code, "message": ""}),
+                serde_json::json!({"code": code, "message": "  "}),
+            ] {
+                let failure =
+                    classify_event_failure(&serde_json::json!({"type": "error", "error": error}))
+                        .unwrap();
+                assert_eq!(failure.message, text, "{error}");
+            }
+            // Under a status the code does not hold with, nothing stands in.
+            let unheld = classify_event_failure(&serde_json::json!({
+                "type": "error",
+                "status": 500,
+                "error": {"code": code}
+            }))
+            .unwrap();
+            assert_eq!(unheld.message, "Upstream error", "{code}");
+        }
+
+        // Spent credits keep the handling they have without a message.
+        let budget = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "error": {"code": "budget_reached"}
+        }))
+        .unwrap();
+        let quota = classify_event_failure(&serde_json::json!({
+            "type": "error",
+            "error": {"code": "insufficient_quota"}
+        }))
+        .unwrap();
+        assert_eq!(budget, quota);
     }
 
     /// A `codex.rate_limits` event that ends the request, with the five hour

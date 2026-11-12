@@ -1009,7 +1009,25 @@ The code decides over the status and the message heuristics:
   (`class_with_status`, after `codex-rs/codex-api/src/error.rs:83-94` at
   rust-v0.166.0): 404 `not_found_error` with the native text, else
   `model_not_found`, also on the committed stream branch and a rejected
-  upgrade; any other status keeps its old handling.
+  upgrade; any other status keeps its old handling;
+- the terminal codes of `TERMINAL_CODES` in `events.rs` (after
+  `parse_terminal_provider_error` in `codex-rs/codex-api/src/error.rs` at
+  rust-v0.169.0-alpha.9), read by `code` only and only with no status or the
+  one listed; under any other status the failure is read as if it carried no
+  such code. `content_policy_violation`, `invalid_access_program` and
+  `unsupported_access_program` (no status or 400) are 400
+  `invalid_request_error`; `budget_reached` (no status or 400) is quota, 429
+  with `x-should-retry: false`; `inference_hook_denied` and
+  `access_program_not_enabled` (no status or 403) are the `PermissionDenied`
+  class, 403 `permission_error` with no `Retry-After`. One of these codes
+  whose message is missing or blank takes the CLI's text for the code,
+  whether it came as a stream event (`classify_event_failure`), a JSON error
+  body (`codex_status_error`) or a rejected upgrade
+  (`handshake_rejection_error`), both of the latter through
+  `terminal_code_text_from_body`; `budget_reached` has no text of its own and
+  gets the quota class's short text. A message that is not blank is kept,
+  subject to the same client text rule as every other class. The CLI itself
+  reads the access program codes only with no status.
 
 `usage_limit_reached` keeps precedence over every class.
 
@@ -1036,11 +1054,12 @@ passes them on in that form too. `CodexError.class` carries the class to `map_co
 (`classified_error_response`); a mid-stream error keeps its status and takes
 the class's error type. An unknown code keeps the old handling, and
 `usage_limit_reached` keeps precedence over all of these. An opt-in server
-compaction refused as quota or `usage_not_included` answers the client with
-that class and does not send the normal request; any other compaction failure
-falls back to it. The WebSocket handshake reads the rejection body on both
-the direct upgrade and the HTTP CONNECT tunnel (on the tunnel only the bytes
-that arrived with the response head), never for a 407. It keeps up to
+compaction refused as quota, `usage_not_included` or `PermissionDenied`
+answers the client with that class and does not send the normal request; any
+other compaction failure, a rejected one included, falls back to it. The
+WebSocket handshake reads the rejection body on both the direct upgrade and
+the HTTP CONNECT tunnel (on the tunnel only the bytes that arrived with the
+response head), never for a 407. It keeps up to
 `MAX_ERROR_BODY_BYTES` (64 KiB, in `client.rs`) of the body to read the class
 and a spent window from, and at most 1 KiB of its message as the detail. A
 non-2xx HTTP answer (live and buffered Messages requests, the compaction

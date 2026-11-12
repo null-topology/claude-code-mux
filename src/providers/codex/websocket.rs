@@ -1437,17 +1437,19 @@ const MAX_HANDSHAKE_ERROR_DETAIL_BYTES: usize = 1024;
 const GENERIC_HANDSHAKE_ERROR_DETAIL: &str = "WebSocket upgrade was rejected";
 
 fn handshake_error_detail(body: Option<&[u8]>) -> String {
-    let Some(value) = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
-    else {
-        return GENERIC_HANDSHAKE_ERROR_DETAIL.to_string();
-    };
-    let Some(message) = value
+    body.and_then(handshake_error_message)
+        .unwrap_or_else(|| GENERIC_HANDSHAKE_ERROR_DETAIL.to_string())
+}
+
+/// The message a rejection body names, without control characters and cut to
+/// `MAX_HANDSHAKE_ERROR_DETAIL_BYTES`; `None` when the body is not JSON or
+/// names no message.
+fn handshake_error_message(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let message = value
         .pointer("/error/message")
         .or_else(|| value.get("message"))
-        .and_then(|value| value.as_str())
-    else {
-        return GENERIC_HANDSHAKE_ERROR_DETAIL.to_string();
-    };
+        .and_then(|value| value.as_str())?;
     let sanitized: String = message
         .chars()
         .filter(|ch| !ch.is_control() || matches!(ch, ' '))
@@ -1456,7 +1458,7 @@ fn handshake_error_detail(body: Option<&[u8]>) -> String {
     while !sanitized.is_char_boundary(end) {
         end -= 1;
     }
-    sanitized[..end].to_string()
+    Some(sanitized[..end].to_string())
 }
 
 /// The ChatGPT account an upgrade request is sent with (`build_codex_headers`).
@@ -1496,6 +1498,10 @@ fn handshake_rejection_error(
                 })
                 .collect();
             let class = super::events::error_class_from_body(body, status);
+            // Read from the body, since the detail of a body with no message
+            // is the generic text, which a body may also send as its message.
+            let blank_message =
+                handshake_error_message(body).is_none_or(|message| message.trim().is_empty());
             let detail = match handshake_error_detail(Some(body)) {
                 // A missing model with no message is named by its code, as
                 // on the stream.
@@ -1505,6 +1511,12 @@ fn handshake_rejection_error(
                             || detail == GENERIC_HANDSHAKE_ERROR_DETAIL) =>
                 {
                     "model_not_found".to_string()
+                }
+                // A terminal code with a missing or blank message takes the
+                // CLI's text for it, as on the stream.
+                detail if blank_message => {
+                    super::events::terminal_code_text_from_body(body, status)
+                        .map_or(detail, str::to_string)
                 }
                 detail => detail,
             };
@@ -4276,6 +4288,33 @@ mod tests {
         }
     }
 
+    /// The direct path's answer to one attempt, without the connect policy,
+    /// which tries an origin 403 again after a cooldown.
+    async fn direct_handshake_rejection_once(response: Vec<u8>) -> CodexError {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            socket.write_all(&response).await.unwrap();
+        });
+        match connect_once(
+            &test_websocket_client(),
+            &WebSocketProxyConfig::direct(),
+            &format!("ws://{addr}/backend-api/codex/responses"),
+            &HeaderMap::new(),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected websocket handshake to fail"),
+            Err(err) => err.into_error(),
+        }
+    }
+
     async fn tunneled_handshake_rejection(response: Vec<u8>) -> CodexError {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -5262,6 +5301,91 @@ mod tests {
             );
             assert_eq!(err.detail.as_deref(), Some("model_not_found"), "{error}");
         }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_rejected_upgrade_naming_a_terminal_code_without_a_message_gets_the_cli_text() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = super::super::rate_limits::lock_for_tests();
+        super::super::rate_limits::clear_for_tests();
+        // Status line, body, then the client's status, error type and message.
+        let cases = [
+            (
+                "400 Bad Request",
+                r#"{"error":{"code":"content_policy_violation"}}"#,
+                400,
+                "invalid_request_error",
+                "The input was rejected by the content policy.",
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":{"code":"content_policy_violation","message":"toy message"}}"#,
+                400,
+                "invalid_request_error",
+                "toy message",
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":{"code":"budget_reached","message":""}}"#,
+                429,
+                "rate_limit_error",
+                "Rate limited",
+            ),
+            (
+                "403 Forbidden",
+                r#"{"error":{"code":"inference_hook_denied","message":""}}"#,
+                403,
+                "permission_error",
+                "Your workspace inference hook blocked this request.",
+            ),
+        ];
+        for (status_line, body, status, error_type, message) in cases {
+            let raw = raw_rejection(status_line, &[], body);
+            let direct = direct_handshake_rejection_once(raw.clone()).await;
+            let tunneled = tunneled_handshake_rejection(raw).await;
+            for (path, err) in [("direct", direct), ("tunneled", tunneled)] {
+                let case = format!("{path} {status_line} {body}");
+                let response = super::super::map_codex_error_to_response(&err);
+                assert_eq!(response.status().as_u16(), status, "{case}");
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let answer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(answer["error"]["type"], error_type, "{case}");
+                assert_eq!(answer["error"]["message"], message, "{case}");
+            }
+        }
+        super::super::rate_limits::clear_for_tests();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_rejected_upgrade_keeps_a_message_that_reads_like_the_generic_detail() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = super::super::rate_limits::lock_for_tests();
+        super::super::rate_limits::clear_for_tests();
+        let body = serde_json::json!({
+            "error": {
+                "code": "content_policy_violation",
+                "message": GENERIC_HANDSHAKE_ERROR_DETAIL,
+            }
+        })
+        .to_string();
+        let err =
+            direct_handshake_rejection_once(raw_rejection("400 Bad Request", &[], &body)).await;
+        assert_eq!(err.detail.as_deref(), Some(GENERIC_HANDSHAKE_ERROR_DETAIL));
+        // The kept message names the transport, so the client gets the generic
+        // text of its error type rather than the content policy text.
+        let response = super::super::map_codex_error_to_response(&err);
+        assert_eq!(response.status().as_u16(), 400);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(answer["error"]["type"], "invalid_request_error");
+        assert_eq!(answer["error"]["message"], "Invalid request");
+        super::super::rate_limits::clear_for_tests();
     }
 
     #[test]

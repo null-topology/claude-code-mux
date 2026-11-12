@@ -1,3 +1,28 @@
+## Unreleased
+
+- The Codex backend's refusals by `content_policy_violation`,
+  `invalid_access_program`, `unsupported_access_program`, `budget_reached`,
+  `inference_hook_denied` and `access_program_not_enabled` are now answered
+  as client errors, with the statuses listed below; the Codex CLI does not
+  retry them either. Under the default `auto` transport a rejected WebSocket
+  upgrade carrying one of them still falls back to HTTP like any other
+  refused upgrade, and the HTTP answer is classified on its own. A refusal
+  that arrived as a stream event with no status used to come back as a
+  retryable server error, 500 when buffered and 502 as the first event of a
+  live stream, an answer a client retries although the request cannot
+  succeed, and an HTTP 400 whose body names one of these codes came back as
+  a 400 `api_error`. A content policy or access program refusal is now a
+  400 `invalid_request_error`, a spent budget a 429 `rate_limit_error` with
+  `x-should-retry: false`, and an inference hook or access program that is
+  not enabled a 403 `permission_error`. A code counts only with no status or
+  with 400 (403 for the last two); under any other status the failure is
+  handled as before. When a refusal carries no message, as a stream event,
+  an error body or a rejected WebSocket upgrade, the Codex CLI's own text for
+  the code is shown; a spent budget has no text of its own and reads
+  `Rate limited`. An opt-in server compaction refused by the inference hook
+  or an access program that is not enabled no longer sends the normal
+  request after it.
+
 ## v0.17.1 (2026-11-07)
 
 - Codex token refresh no longer writes over a login it did not start from.
