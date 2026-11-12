@@ -40,7 +40,13 @@
   `request_too_large`, whose message adds that the `auto` transport sends
   such a request over HTTP, and does not send the request again. A 1009
   close after the response started, and a close with any other code, are
-  handled as before. The advertised limit is logged at info as
+  handled as before, with one difference: a resend the proxy already
+  makes, such as the full-context one that repairs a continuation
+  (`previous_response_id`) after such a close, now goes over HTTP under
+  `auto` when its frame is over the advertised limit, instead of over the
+  WebSocket. Apart from that resend and the 1009 close above, a request
+  already written to the WebSocket never goes out over HTTP. The
+  advertised limit is logged at info as
   `codex_websocket_message_limit` for each new socket that carries one, and
   a close that ends a response as `codex_websocket_closed` with the request
   id and its numeric code, never its reason text. To keep such requests off

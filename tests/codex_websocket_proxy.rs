@@ -1650,3 +1650,89 @@ async fn codex_default_transport_keeps_its_handling_of_other_closes() {
     }
     clear_codex_websocket_pool_for_tests();
 }
+
+/// A delta that ends with a close before any response event is sent again
+/// with its full context, as it is without a limit. When that frame is over
+/// the limit the new socket advertises, it is not written and the resend
+/// goes over HTTP instead.
+#[tokio::test]
+async fn codex_default_transport_sends_an_oversized_continuation_repair_over_http() {
+    let _env = ENV_LOCK.lock().await;
+    let _retry_delay = ZeroRetryDelayGuard::new();
+    let config_dir = TempDir::new().unwrap();
+    write_codex_auth(config_dir.path());
+    // Each half fits the limit on its own; the two together do not.
+    let half = "oversized ".repeat(7_500);
+
+    for stream in [false, true] {
+        let label = format!("stream {stream}");
+        clear_codex_websocket_pool_for_tests();
+        clear_all_continuations_for_tests();
+        let origin = spawn_size_limited_origin(
+            Some(ADVERTISED_LIMIT),
+            vec![
+                WebSocketReply::Complete,
+                WebSocketReply::CloseBeforeText(1000),
+            ],
+        )
+        .await;
+        let state_dir = TempDir::new().unwrap();
+        let fallbacks = {
+            let mut guards = clear_proxy_environment();
+            guards.extend(configure_codex(config_dir.path(), &origin.url));
+            guards.push(EnvGuard::unset("CCP_CODEX_TRANSPORT"));
+            guards.push(EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1"));
+            guards.push(EnvGuard::set("XDG_STATE_HOME", state_dir.path()));
+            let turns = [
+                (
+                    json!([{"role": "user", "content": half}]),
+                    "websocket reply 1",
+                ),
+                (
+                    json!([
+                        {"role": "user", "content": half},
+                        {"role": "assistant", "content": "websocket reply 1"},
+                        {"role": "user", "content": half}
+                    ]),
+                    "transport fallback ok",
+                ),
+            ];
+            for (messages, reply) in turns {
+                let (status, body) = call_messages_with_history(
+                    &format!("size-limit-repair-{stream}"),
+                    stream,
+                    messages,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{label}: {body}");
+                assert!(body.contains(reply), "{label}: {body}");
+            }
+            fallback_log_lines()
+        };
+
+        // Turn two went out once over the WebSocket, as a delta on the pooled
+        // socket that closed before any response event. Its full-context
+        // resend was over the limit of the next socket, so it was not written
+        // there and went out once over HTTP.
+        assert_eq!(
+            transports(&origin.seen),
+            ["websocket", "websocket", "http"],
+            "{label}"
+        );
+        assert_eq!(origin.upgrades.load(Ordering::SeqCst), 2, "{label}");
+        let seen = origin.seen.lock().unwrap();
+        assert_eq!(seen[1].1["previous_response_id"], "resp_ws_1", "{label}");
+        let delta = seen[1].1["input"].to_string();
+        assert!(!delta.contains("websocket reply 1"), "{label}");
+        assert_eq!(delta.matches("oversized").count(), 7_500, "{label}");
+        assert!(seen[2].1["previous_response_id"].is_null(), "{label}");
+        let full = seen[2].1["input"].to_string();
+        assert!(full.contains("websocket reply 1"), "{label}");
+        assert_eq!(full.matches("oversized").count(), 15_000, "{label}");
+
+        assert_eq!(fallbacks.len(), 1, "{label}: {fallbacks:?}");
+        assert_oversized_fallback_logged(&fallbacks[0], &label);
+    }
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+}

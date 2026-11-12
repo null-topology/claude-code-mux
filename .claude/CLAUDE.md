@@ -265,7 +265,7 @@ Request path:
      `websocket.rs`, falling back to HTTP only when the handshake failed
      before anything was sent, or when the request was refused for its size
      (`should_fallback_to_http` in `client.rs`). A request already sent over
-     the WebSocket is never replayed over HTTP, with one exception below,
+     the WebSocket is never replayed over HTTP, with two exceptions below,
      and `websocket` never falls back. The size refusals follow the Codex
      CLI (`codex-rs/codex-api/src/endpoint/responses_websocket.rs` at
      `ed7ca22bb6`, the HTTP fallback at `bc3ccba6e1`); whether the backend
@@ -277,8 +277,8 @@ Request path:
      a new socket that carries one. A request frame longer than the limit
      is never written (`PoolEntry::check_message_size`). A close with code
      1009 (message too big) seen before any text frame of the response is
-     the same refusal, and the exception: under `auto` that request goes
-     out again over HTTP, as the Codex CLI treats that close. Both refusals
+     the same refusal, and the first exception: under `auto` that request
+     goes out again over HTTP, as the Codex CLI treats that close. Both refusals
      carry status 413 and one of `WEBSOCKET_MESSAGE_TOO_LARGE_DETAIL` and
      `WEBSOCKET_CLOSED_MESSAGE_TOO_LARGE_DETAIL`
      (`is_message_size_refusal`); neither is a continuation retry. Either
@@ -294,7 +294,15 @@ Request path:
      size refusal (buffered `auto` whose HTTP fallback is off behind a
      WebSocket proxy) states only what happened
      (`map_codex_transport_error_to_response` in `mod.rs`). A 1009 after
-     response text and any other close keep their handling. A close frame
+     response text and any other close keep their handling, including the
+     full-context resend that repairs a continuation
+     (`should_retry_without_continuation`), for example after a delta
+     (`previous_response_id`) ended with no terminal event. The second
+     exception is a resend the proxy makes anyway, such as that repair: it
+     is a new attempt, its frame is checked against the limit of the socket
+     it would go to, and under `auto` one over that limit goes over HTTP
+     instead of the WebSocket. In every other case a request already
+     written to the WebSocket is not sent over HTTP. A close frame
      that ends a response logs `codex_websocket_closed` at info with
      `reqId`, `closeCode` (0 without a frame) and `textStarted`, never the
      reason text. WebSocket writes share the idle deadline
@@ -1120,9 +1128,12 @@ the proxy's own state (a forgotten `previous_response_id`, a 401 token refresh).
 The `auto` fallback to HTTP is not a resend: it happens only when the
 handshake failed, before the request went out, or when the request was
 refused for its size. A frame over the limit the handshake advertised is
-never written; a WebSocket seen closing with code 1009 before any text frame
-of the response is the one case where a request already on the socket goes
-out again over HTTP, as the Codex CLI treats that close. With
+never written. Under `auto` a request already on the socket goes out over
+HTTP in two cases only: a WebSocket seen closing with code 1009 before any
+text frame of the response, as the Codex CLI treats that close, and a resend
+the proxy makes anyway, such as the full-context one that repairs a
+continuation, when its frame is over the limit of the socket it would go to.
+With
 `websocket` transport either refusal is one 413 answer, and a 429 on the
 WebSocket handshake reaches the client as a plain 429 unless its body names
 one of the codes above; under `auto` it falls back to HTTP.
