@@ -24,12 +24,34 @@
   the root back.
 
 - The WebSocket library is updated to tokio-tungstenite 0.30, and rand to
-  0.10, sha2 to 0.11, prost to 0.14 and base64 to 0.23. Nothing changes for
-  someone upgrading: Codex WebSocket requests, pings and closes go out as
-  before with the same message and frame limits, no compression extension
-  is offered, WebSocket TLS keeps the ring crypto provider and its trust
+  0.10, sha2 to 0.11, prost to 0.14 and base64 to 0.23. Codex WebSocket
+  requests, pings, pongs and closes go out as before, the limits stay at
+  64 MiB per message and 16 MiB per frame, no compression extension is
+  offered, WebSocket TLS keeps the ring crypto provider and its trust
   settings, and the Grok and Cursor logins and the Cursor protocol encode
-  as before.
+  as before. Four things differ on the Codex WebSocket. When it goes
+  through an HTTP proxy set in `HTTPS_PROXY` or `ALL_PROXY`, a header value
+  holding a byte outside ASCII, which can come from `codex.originator`,
+  `codex.userAgent` or a client header forwarded through
+  `codex.forwardHeaders` (or their `CCP_*` variables), no longer fails the
+  upgrade before it is sent: it goes out as its bytes, as it already did
+  without a proxy. Under the default `auto` transport such a setup used to
+  send every request over HTTP and now uses the WebSocket; under
+  `websocket` those requests used to fail. A `Sec-WebSocket-Protocol` offer
+  holding such a byte still fails. On the same proxied path, a forwarded
+  `Sec-WebSocket-Protocol` offer written with a space after the comma,
+  whose answer naming any but the first protocol was refused, is now
+  accepted, as it already was without a proxy. A text frame or close
+  reason that is not valid UTF-8 still ends the stream, and the client
+  still receives the same generic error text, but the error the proxy
+  records, for example in `proxy.log`, is longer: after `UTF-8 encoding
+  error` it names the position of the bad bytes, shows them as replacement
+  characters, or, for a message split across frames that ends inside a
+  character, lists up to three of its bytes as numbers. Finally, each
+  socket now reads into a 128 KiB buffer where it read 4 KiB at a time,
+  and reserves room for a frame's whole declared payload when the frame's
+  header arrives instead of growing as the bytes come in; a frame over the
+  16 MiB limit is still refused before anything is reserved.
 
 ## v0.18.1 (2026-11-12)
 
