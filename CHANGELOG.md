@@ -73,6 +73,20 @@
   the pause ends, the next request tries the WebSocket again. With
   `CCP_CODEX_TRANSPORT=websocket` a request that needs a new connection
   still connects every time.
+- `gpt-6.1-sol` and `gpt-6.1-terra` now route to Codex before the proxy's
+  first successful Codex model listing, including while the first attempts
+  fail, instead of costing a listing refresh or answering 400 for an unknown
+  model. A `-fast` suffix on either asks for the priority tier, as on the
+  other Codex ids. After a successful listing that listing decides which ids
+  route, as before; a later listing that fails or names no model keeps the
+  previous one in place. Under `CCP_CODEX_LANE_POLICY=inventory` the two run
+  on the Responses Lite lane until a listing says otherwise, as `gpt-6-sol`
+  does; the default `full` policy is unchanged.
+- The fallback `client_version` sent on the Codex model listing call is now
+  `0.167.2` (was `0.157.1`). It applies only when neither
+  `CCP_CODEX_CLIENT_VERSION`, `codex.clientVersion` in `config.json` nor the
+  Codex CLI's `models_cache.json` names a version; set either setting to send
+  another one.
 
 ## v0.17.1 (2026-11-07)
 

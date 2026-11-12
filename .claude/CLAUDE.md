@@ -1340,8 +1340,8 @@ Hosted web search sits outside the policy: a request carrying the hosted
 `web_search_20250305` tool is forced onto the full lane, and there a non-forced
 `gpt-5.6-luna` is rewritten to `gpt-5.6-sol` and `gpt-6-luna` to `gpt-6-sol`
 (`apply_model_lane_for_request`, `full_lane_web_search_model`). The compiled-in
-lane table lists `gpt-6-luna` and `gpt-6-sol` beside the gpt-5.6 family and
-`gpt-6-astra`. The forced standalone `/alpha/search` path
+lane table lists `gpt-6-luna`, `gpt-6-sol`, `gpt-6.1-sol` and `gpt-6.1-terra`
+beside the gpt-5.6 family and `gpt-6-astra`. The forced standalone `/alpha/search` path
 (`is_standalone_search_request`) builds a request of its own and keeps the
 model that was asked for. The rewrite rests on no reproducible capture of a
 Luna refusal on the full lane, and no live capability check has been run

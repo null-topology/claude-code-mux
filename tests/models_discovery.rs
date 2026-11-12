@@ -622,6 +622,38 @@ async fn models_endpoint_lists_codex_from_the_backend_and_routes_what_it_listed(
     clear_all_continuations_for_tests();
 }
 
+/// With no `CCP_CODEX_CLIENT_VERSION`, no `codex.clientVersion` and no Codex
+/// CLI `models_cache.json` next to `auth.json`, the listing call carries the
+/// compiled-in client version.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn models_listing_falls_back_to_the_compiled_in_client_version() {
+    let _guard = env_lock();
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    let (upstream, captured) = spawn_codex_upstream(StatusCode::OK, upstream_inventory()).await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _version_env = EnvGuard::unset("CCP_CODEX_CLIENT_VERSION");
+    assert!(!config.path().join("config.json").exists());
+    assert!(!config.path().join("models_cache.json").exists());
+
+    let (status, value) = get_models("/v1/models?provider=codex").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let seen = captured.lock().unwrap();
+    assert_eq!(seen.listings, 1);
+    assert_eq!(
+        seen.query.get("client_version").map(String::as_str),
+        Some("0.167.2")
+    );
+    drop(seen);
+
+    clear_discovered_models_for_tests();
+    clear_listed_models_for_tests();
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn models_endpoint_reports_codex_unauthorized_on_403_without_rows() {
