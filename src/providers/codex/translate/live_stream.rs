@@ -906,7 +906,8 @@ impl LiveStreamTranslator {
             .unwrap_or(url);
         // Kept once, and emitted once under every search already held.
         self.retain(
-            web_search_result_bytes(title, url).saturating_mul(self.web_searches.len().max(1)),
+            web_search_result_bytes(title, url)
+                .saturating_mul(self.web_searches.len().saturating_add(1)),
         )?;
         self.web_search_results.push(LiveWebSearchResult {
             title: title.to_string(),
