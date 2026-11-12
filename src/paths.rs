@@ -15,23 +15,32 @@ pub const PATH_ENV_VARS: [&str; 5] = [
 
 #[derive(Debug, Clone)]
 pub struct DirResolverEnv {
+    /// A `std::env::consts::OS` value: `windows`, `macos`, `linux` and so on.
     pub platform: String,
     pub env: HashMap<String, OsString>,
     pub home: OsString,
 }
 
-impl Default for DirResolverEnv {
-    fn default() -> Self {
+impl DirResolverEnv {
+    /// The resolver input for `platform`, with `var` answering for each
+    /// variable as `std::env::var_os` does for the process environment.
+    pub fn from_vars(platform: &str, var: impl Fn(&str) -> Option<OsString>) -> Self {
         Self {
-            platform: std::env::consts::OS.into(),
+            platform: platform.into(),
             env: PATH_ENV_VARS
                 .iter()
-                .filter_map(|&name| Some((name.to_string(), std::env::var_os(name)?)))
+                .filter_map(|&name| Some((name.to_string(), var(name)?)))
                 .collect(),
-            home: std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
+            home: var("HOME")
+                .or_else(|| var("USERPROFILE"))
                 .unwrap_or_else(|| "/".into()),
         }
+    }
+}
+
+impl Default for DirResolverEnv {
+    fn default() -> Self {
+        Self::from_vars(std::env::consts::OS, |name| std::env::var_os(name))
     }
 }
 
@@ -40,19 +49,11 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
         return PathBuf::from(override_dir);
     }
 
-    if deps.platform == "win32" {
-        let appdata = deps.env.get("APPDATA").cloned().unwrap_or_else(|| {
-            let mut appdata = deps.home.clone();
-            appdata.push("\\AppData\\Roaming");
-            appdata
-        });
-        return join_with_sep(&appdata, &["claude-code-proxy"], true);
+    if deps.platform == "windows" {
+        return windows_dir(deps, "APPDATA", "Roaming");
     }
 
-    if deps.platform == "darwin" {
-        return join_with_sep(&deps.home, &[".config", "claude-code-proxy"], false);
-    }
-
+    // Every other platform, macOS included, follows the XDG rule.
     let base = deps
         .env
         .get("XDG_CONFIG_HOME")
@@ -62,13 +63,8 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
 }
 
 pub fn resolve_state_dir(deps: &DirResolverEnv) -> PathBuf {
-    if deps.platform == "win32" {
-        let local = deps.env.get("LOCALAPPDATA").cloned().unwrap_or_else(|| {
-            let mut local = deps.home.clone();
-            local.push("\\AppData\\Local");
-            local
-        });
-        return join_with_sep(&local, &["claude-code-proxy"], true);
+    if deps.platform == "windows" {
+        return windows_dir(deps, "LOCALAPPDATA", "Local");
     }
 
     let base =
@@ -120,12 +116,46 @@ pub fn provider_legacy_auth_file(provider: &str) -> PathBuf {
     legacy_config_dir(&deps).join(provider).join("auth.json")
 }
 
-fn join_with_sep(base: &OsStr, parts: &[&str], win32: bool) -> PathBuf {
-    let sep = "/";
-    let _ = win32;
+/// `<name>\claude-code-proxy`, else `<home>\AppData\<fallback>\claude-code-proxy`.
+fn windows_dir(deps: &DirResolverEnv, name: &str, fallback: &str) -> PathBuf {
+    // An empty value counts as unset: used as given it is a relative path,
+    // which would put the directory under the working directory.
+    if let Some(base) = deps.env.get(name).filter(|base| !base.is_empty()) {
+        return join_with_sep(base, &["claude-code-proxy"], true);
+    }
+    // A home that is empty or made only of separators, such as the `/` that
+    // stands in for an unknown one, roots the directory at the current drive;
+    // an empty one joined as is would make it relative.
+    let home = if deps
+        .home
+        .as_encoded_bytes()
+        .iter()
+        .all(|&b| is_sep(b, true))
+    {
+        OsStr::new("\\")
+    } else {
+        deps.home.as_os_str()
+    };
+    join_with_sep(home, &["AppData", fallback, "claude-code-proxy"], true)
+}
+
+/// `/`, and on Windows `\` too.
+fn is_sep(byte: u8, windows: bool) -> bool {
+    byte == b'/' || (windows && byte == b'\\')
+}
+
+/// Joins `parts` onto `base`, adding no separator after one that is already
+/// there. On Windows the added separator is `\`, as a verbatim (`\\?\`) path
+/// does not read `/` as one.
+fn join_with_sep(base: &OsStr, parts: &[&str], windows: bool) -> PathBuf {
+    let sep = if windows { "\\" } else { "/" };
     let mut out = OsString::new();
     for part in std::iter::once(base).chain(parts.iter().map(OsStr::new)) {
-        if !out.is_empty() && !out.as_encoded_bytes().ends_with(sep.as_bytes()) {
+        let ends_with_sep = out
+            .as_encoded_bytes()
+            .last()
+            .is_some_and(|&b| is_sep(b, windows));
+        if !out.is_empty() && !ends_with_sep {
             out.push(sep);
         }
         out.push(part);

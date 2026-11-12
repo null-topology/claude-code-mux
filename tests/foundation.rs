@@ -50,49 +50,424 @@ fn messages_fixture_and_sse_parsing() {
     assert_eq!(first_line["a"], json!(1));
 }
 
+fn resolver_env(platform: &str, home: &str, vars: &[(&str, &str)]) -> DirResolverEnv {
+    DirResolverEnv {
+        platform: platform.to_string(),
+        home: home.into(),
+        env: vars
+            .iter()
+            .map(|&(name, value)| (name.to_string(), value.into()))
+            .collect(),
+    }
+}
+
+fn resolved_dirs(deps: &DirResolverEnv) -> [String; 2] {
+    [
+        paths::resolve_config_dir(deps)
+            .to_string_lossy()
+            .into_owned(),
+        paths::resolve_state_dir(deps)
+            .to_string_lossy()
+            .into_owned(),
+    ]
+}
+
+const XDG_VARS: [(&str, &str); 2] = [
+    ("XDG_CONFIG_HOME", "/x/config"),
+    ("XDG_STATE_HOME", "/x/state"),
+];
+
+const ALL_DIR_VARS: [(&str, &str); 4] = [
+    ("APPDATA", "D:\\Roaming"),
+    ("LOCALAPPDATA", "D:\\Local"),
+    XDG_VARS[0],
+    XDG_VARS[1],
+];
+
 #[test]
 fn path_resolvers_cover_platform_rules() {
-    let mut env = HashMap::new();
-    env.insert("CCP_CONFIG_DIR".to_string(), "/tmp/ccp-config".into());
-    let deps = DirResolverEnv {
-        platform: "darwin".to_string(),
-        home: "/home/u".into(),
-        env: env.clone(),
-    };
+    // macOS follows the same XDG rule as Linux.
+    for platform in ["macos", "linux"] {
+        assert_eq!(
+            resolved_dirs(&resolver_env(platform, "/home/u", &[])),
+            [
+                "/home/u/.config/claude-code-proxy",
+                "/home/u/.local/state/claude-code-proxy"
+            ],
+            "{platform}"
+        );
+        assert_eq!(
+            resolved_dirs(&resolver_env(platform, "/home/u", &XDG_VARS)),
+            ["/x/config/claude-code-proxy", "/x/state/claude-code-proxy"],
+            "{platform}"
+        );
+    }
+
+    // Windows reads APPDATA and LOCALAPPDATA and ignores the XDG variables.
     assert_eq!(
-        paths::resolve_config_dir(&deps).to_string_lossy(),
-        "/tmp/ccp-config"
+        resolved_dirs(&resolver_env("windows", "C:\\Users\\u", &ALL_DIR_VARS)),
+        [
+            "D:\\Roaming\\claude-code-proxy",
+            "D:\\Local\\claude-code-proxy"
+        ]
+    );
+    assert_eq!(
+        resolved_dirs(&resolver_env("windows", "C:\\Users\\u", &[])),
+        [
+            "C:\\Users\\u\\AppData\\Roaming\\claude-code-proxy",
+            "C:\\Users\\u\\AppData\\Local\\claude-code-proxy"
+        ]
     );
 
-    let deps = DirResolverEnv {
-        platform: "darwin".to_string(),
-        home: "/home/u".into(),
-        env: HashMap::from([("XDG_CONFIG_HOME".into(), "/x".into())]),
-    };
-    assert_eq!(
-        paths::resolve_config_dir(&deps).to_string_lossy(),
-        "/home/u/.config/claude-code-proxy"
-    );
+    // CCP_CONFIG_DIR moves the config directory on every platform, and only it.
+    for (platform, state) in [
+        ("windows", "D:\\Local\\claude-code-proxy"),
+        ("macos", "/x/state/claude-code-proxy"),
+        ("linux", "/x/state/claude-code-proxy"),
+    ] {
+        let mut vars = ALL_DIR_VARS.to_vec();
+        vars.push(("CCP_CONFIG_DIR", "/tmp/ccp-config"));
+        assert_eq!(
+            resolved_dirs(&resolver_env(platform, "/home/u", &vars)),
+            ["/tmp/ccp-config", state],
+            "{platform}"
+        );
+    }
+}
 
-    let deps = DirResolverEnv {
-        platform: "linux".to_string(),
-        home: "/home/u".into(),
-        env: HashMap::from([("XDG_CONFIG_HOME".into(), "/x".into())]),
-    };
-    assert_eq!(
-        paths::resolve_config_dir(&deps).to_string_lossy(),
-        "/x/claude-code-proxy"
-    );
+#[test]
+fn path_resolvers_key_on_std_env_consts_os() {
+    // The resolvers branch on `std::env::consts::OS` values. A branch keyed on a
+    // name it never reports would never run in a real build.
+    assert_eq!(DirResolverEnv::default().platform, std::env::consts::OS);
 
-    let deps = DirResolverEnv {
-        platform: "win32".to_string(),
-        home: "C:/Users/u".into(),
-        env: HashMap::from([("APPDATA".into(), "C:/Users/u/AppData/Roaming".into())]),
-    };
+    let host = resolved_dirs(&resolver_env(
+        std::env::consts::OS,
+        "/home/u",
+        &ALL_DIR_VARS,
+    ));
+    if cfg!(target_os = "windows") {
+        assert_eq!(
+            host,
+            [
+                "D:\\Roaming\\claude-code-proxy",
+                "D:\\Local\\claude-code-proxy"
+            ]
+        );
+    } else {
+        assert_eq!(
+            host,
+            ["/x/config/claude-code-proxy", "/x/state/claude-code-proxy"]
+        );
+    }
+
+    // Names `std::env::consts::OS` never reports get no rule of their own.
+    for platform in ["win32", "darwin"] {
+        assert_eq!(
+            resolved_dirs(&resolver_env(platform, "/home/u", &ALL_DIR_VARS)),
+            ["/x/config/claude-code-proxy", "/x/state/claude-code-proxy"],
+            "{platform}"
+        );
+    }
+}
+
+/// Resolver input derived from `vars` as from a process environment, home included.
+fn resolver_env_from(platform: &str, vars: &[(&str, &str)]) -> DirResolverEnv {
+    DirResolverEnv::from_vars(platform, |name| {
+        vars.iter()
+            .find(|&&(key, _)| key == name)
+            .map(|&(_, value)| value.into())
+    })
+}
+
+#[test]
+fn windows_dirs_treat_an_empty_appdata_as_unset() {
+    // Used as given, an empty value is the relative directory `claude-code-proxy`.
     assert_eq!(
-        paths::resolve_config_dir(&deps).to_string_lossy(),
-        "C:/Users/u/AppData/Roaming/claude-code-proxy"
+        resolved_dirs(&resolver_env("windows", "C:\\Users\\u", &[("APPDATA", "")])),
+        [
+            "C:\\Users\\u\\AppData\\Roaming\\claude-code-proxy",
+            "C:\\Users\\u\\AppData\\Local\\claude-code-proxy"
+        ]
     );
+    assert_eq!(
+        resolved_dirs(&resolver_env(
+            "windows",
+            "C:\\Users\\u",
+            &[("APPDATA", ""), ("LOCALAPPDATA", "D:\\Local")]
+        )),
+        [
+            "C:\\Users\\u\\AppData\\Roaming\\claude-code-proxy",
+            "D:\\Local\\claude-code-proxy"
+        ]
+    );
+}
+
+#[test]
+fn windows_dirs_treat_an_empty_localappdata_as_unset() {
+    assert_eq!(
+        resolved_dirs(&resolver_env(
+            "windows",
+            "C:\\Users\\u",
+            &[("LOCALAPPDATA", "")]
+        )),
+        [
+            "C:\\Users\\u\\AppData\\Roaming\\claude-code-proxy",
+            "C:\\Users\\u\\AppData\\Local\\claude-code-proxy"
+        ]
+    );
+    assert_eq!(
+        resolved_dirs(&resolver_env(
+            "windows",
+            "C:\\Users\\u",
+            &[("APPDATA", "D:\\Roaming"), ("LOCALAPPDATA", "")]
+        )),
+        [
+            "D:\\Roaming\\claude-code-proxy",
+            "C:\\Users\\u\\AppData\\Local\\claude-code-proxy"
+        ]
+    );
+}
+
+#[test]
+fn windows_dirs_read_each_variable_on_its_own() {
+    assert_eq!(
+        resolved_dirs(&resolver_env(
+            "windows",
+            "C:\\Users\\u",
+            &[("APPDATA", "D:\\Roaming")]
+        )),
+        [
+            "D:\\Roaming\\claude-code-proxy",
+            "C:\\Users\\u\\AppData\\Local\\claude-code-proxy"
+        ]
+    );
+    assert_eq!(
+        resolved_dirs(&resolver_env(
+            "windows",
+            "C:\\Users\\u",
+            &[("LOCALAPPDATA", "D:\\Local")]
+        )),
+        [
+            "C:\\Users\\u\\AppData\\Roaming\\claude-code-proxy",
+            "D:\\Local\\claude-code-proxy"
+        ]
+    );
+}
+
+#[test]
+fn windows_dirs_take_home_before_userprofile() {
+    let both = [("HOME", "C:\\Users\\h"), ("USERPROFILE", "C:\\Users\\p")];
+    assert_eq!(
+        resolved_dirs(&resolver_env_from("windows", &both)),
+        [
+            "C:\\Users\\h\\AppData\\Roaming\\claude-code-proxy",
+            "C:\\Users\\h\\AppData\\Local\\claude-code-proxy"
+        ]
+    );
+    assert_eq!(
+        resolved_dirs(&resolver_env_from(
+            "windows",
+            &[("USERPROFILE", "C:\\Users\\p")]
+        )),
+        [
+            "C:\\Users\\p\\AppData\\Roaming\\claude-code-proxy",
+            "C:\\Users\\p\\AppData\\Local\\claude-code-proxy"
+        ]
+    );
+    // An empty HOME is still a set one and wins over USERPROFILE; the
+    // directories are then rooted at the current drive, not relative.
+    assert_eq!(
+        resolved_dirs(&resolver_env_from(
+            "windows",
+            &[("HOME", ""), ("USERPROFILE", "C:\\Users\\p")]
+        )),
+        [
+            "\\AppData\\Roaming\\claude-code-proxy",
+            "\\AppData\\Local\\claude-code-proxy"
+        ]
+    );
+}
+
+#[test]
+fn windows_dirs_without_any_home_are_rooted_at_the_current_drive() {
+    // `/` stands in for the unknown home, as on Linux. The Windows resolver
+    // turns it into `\`, which roots both directories at the current drive.
+    let deps = resolver_env_from("windows", &[]);
+    assert_eq!(deps.home, "/");
+    assert_eq!(
+        resolved_dirs(&deps),
+        [
+            "\\AppData\\Roaming\\claude-code-proxy",
+            "\\AppData\\Local\\claude-code-proxy"
+        ]
+    );
+}
+
+#[test]
+fn windows_dirs_keep_a_verbatim_appdata() {
+    // A verbatim path does not read `/` as a separator.
+    assert_eq!(
+        resolved_dirs(&resolver_env(
+            "windows",
+            "C:\\Users\\x",
+            &[
+                ("APPDATA", "\\\\?\\C:\\Users\\x\\AppData\\Roaming"),
+                ("LOCALAPPDATA", "\\\\?\\C:\\Users\\x\\AppData\\Local")
+            ]
+        )),
+        [
+            "\\\\?\\C:\\Users\\x\\AppData\\Roaming\\claude-code-proxy",
+            "\\\\?\\C:\\Users\\x\\AppData\\Local\\claude-code-proxy"
+        ]
+    );
+}
+
+#[test]
+fn windows_dirs_add_no_second_separator() {
+    assert_eq!(
+        resolved_dirs(&resolver_env(
+            "windows",
+            "C:\\Users\\u",
+            &[("APPDATA", "D:\\Roaming\\"), ("LOCALAPPDATA", "D:/Local/")]
+        )),
+        [
+            "D:\\Roaming\\claude-code-proxy",
+            "D:/Local/claude-code-proxy"
+        ]
+    );
+    assert_eq!(
+        resolved_dirs(&resolver_env("windows", "C:\\", &[])),
+        [
+            "C:\\AppData\\Roaming\\claude-code-proxy",
+            "C:\\AppData\\Local\\claude-code-proxy"
+        ]
+    );
+    // A UNC value keeps the two separators it starts with.
+    assert_eq!(
+        resolved_dirs(&resolver_env(
+            "windows",
+            "\\\\server\\share\\u",
+            &[("APPDATA", "\\\\server\\share\\Roaming")]
+        )),
+        [
+            "\\\\server\\share\\Roaming\\claude-code-proxy",
+            "\\\\server\\share\\u\\AppData\\Local\\claude-code-proxy"
+        ]
+    );
+    // The old directory keeps the joins earlier Windows builds resolved it with.
+    assert_eq!(
+        paths::legacy_config_dir(&resolver_env("windows", "C:\\Users\\u", &[])).to_string_lossy(),
+        "C:\\Users\\u/.config/claude-code-proxy"
+    );
+}
+
+/// Environment variables and the expected config and state directories.
+type ResolverCase = (&'static [(&'static str, &'static str)], [&'static str; 2]);
+
+#[test]
+fn path_resolvers_keep_macos_and_linux_results() {
+    let cases: [ResolverCase; 11] = [
+        (
+            &[],
+            [
+                "/.config/claude-code-proxy",
+                "/.local/state/claude-code-proxy",
+            ],
+        ),
+        (
+            &[("HOME", "/home/u")],
+            [
+                "/home/u/.config/claude-code-proxy",
+                "/home/u/.local/state/claude-code-proxy",
+            ],
+        ),
+        (
+            &[("HOME", "/home/u/")],
+            [
+                "/home/u/.config/claude-code-proxy",
+                "/home/u/.local/state/claude-code-proxy",
+            ],
+        ),
+        (
+            &[("USERPROFILE", "/home/p")],
+            [
+                "/home/p/.config/claude-code-proxy",
+                "/home/p/.local/state/claude-code-proxy",
+            ],
+        ),
+        (
+            &[("HOME", "/home/u"), ("USERPROFILE", "/home/p")],
+            [
+                "/home/u/.config/claude-code-proxy",
+                "/home/u/.local/state/claude-code-proxy",
+            ],
+        ),
+        // Empty values are used as given.
+        (
+            &[("HOME", ""), ("USERPROFILE", "/home/p")],
+            [
+                ".config/claude-code-proxy",
+                ".local/state/claude-code-proxy",
+            ],
+        ),
+        (
+            &[
+                ("HOME", "/home/u"),
+                ("XDG_CONFIG_HOME", ""),
+                ("XDG_STATE_HOME", ""),
+            ],
+            ["claude-code-proxy", "claude-code-proxy"],
+        ),
+        (
+            &[("HOME", "/home/u"), ("CCP_CONFIG_DIR", "")],
+            ["", "/home/u/.local/state/claude-code-proxy"],
+        ),
+        (
+            &[
+                ("HOME", "/home/u"),
+                ("XDG_CONFIG_HOME", "/x/config/"),
+                ("XDG_STATE_HOME", "/x/state/"),
+            ],
+            ["/x/config/claude-code-proxy", "/x/state/claude-code-proxy"],
+        ),
+        (
+            &[
+                ("HOME", "/home/u"),
+                ("APPDATA", "D:\\Roaming"),
+                ("LOCALAPPDATA", "D:\\Local"),
+            ],
+            [
+                "/home/u/.config/claude-code-proxy",
+                "/home/u/.local/state/claude-code-proxy",
+            ],
+        ),
+        (
+            &[
+                ("HOME", "/home/u"),
+                ("CCP_CONFIG_DIR", "/c"),
+                ("XDG_CONFIG_HOME", "/x/config"),
+                ("XDG_STATE_HOME", "/x/state"),
+            ],
+            ["/c", "/x/state/claude-code-proxy"],
+        ),
+    ];
+    for platform in ["macos", "linux"] {
+        for (vars, expected) in &cases {
+            let deps = resolver_env_from(platform, vars);
+            assert_eq!(resolved_dirs(&deps), *expected, "{platform} {vars:?}");
+            let legacy = paths::legacy_config_dir(&deps);
+            let home = deps.home.to_string_lossy();
+            assert_eq!(
+                legacy.to_string_lossy(),
+                match home.as_ref() {
+                    "" => ".config/claude-code-proxy".to_string(),
+                    home => format!("{}/.config/claude-code-proxy", home.trim_end_matches('/')),
+                },
+                "{platform} {vars:?}"
+            );
+        }
+    }
 }
 
 #[test]

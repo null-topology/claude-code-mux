@@ -11,12 +11,8 @@ fn device_id_path() -> PathBuf {
 }
 
 fn legacy_device_id_path() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/".to_string());
-    std::path::Path::new(&home)
-        .join(".config")
-        .join("claude-code-proxy")
+    let deps = paths::DirResolverEnv::default();
+    paths::legacy_config_dir(&deps)
         .join("kimi")
         .join("device_id")
 }

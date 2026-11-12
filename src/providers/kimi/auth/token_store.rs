@@ -43,16 +43,9 @@ impl<S: AuthStorage<StoredAuth>> KimiTokenStore<S> {
 pub fn file_store() -> KimiTokenStore<FileAuthStore<StoredAuth>> {
     let deps = paths::DirResolverEnv::default();
     let primary = paths::kimi_auth_file(&deps);
-    let legacy = {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "/".to_string());
-        std::path::Path::new(&home)
-            .join(".config")
-            .join("claude-code-proxy")
-            .join("kimi")
-            .join("auth.json")
-    };
+    let legacy = paths::legacy_config_dir(&deps)
+        .join("kimi")
+        .join("auth.json");
     let store = FileAuthStore::new(
         primary.to_string_lossy().to_string(),
         legacy.to_string_lossy().to_string(),

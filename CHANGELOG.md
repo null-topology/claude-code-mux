@@ -120,6 +120,25 @@
   proxy holds a request in memory while it handles it, so a request of that
   size costs that much memory several times over for as long as it runs.
   There is no setting for the limit.
+- On Windows the config directory is now `%APPDATA%\claude-code-proxy` and
+  the state directory `%LOCALAPPDATA%\claude-code-proxy`, as documented.
+  When either variable is unset or empty, its directory is
+  `AppData\Roaming\claude-code-proxy` or `AppData\Local\claude-code-proxy`
+  under the home directory instead. Earlier builds did not recognise
+  Windows and used `%USERPROFILE%\.config\claude-code-proxy` and
+  `%USERPROFILE%\.local\state\claude-code-proxy` (`HOME` in place of
+  `USERPROFILE` when set, `XDG_CONFIG_HOME` and `XDG_STATE_HOME` when set).
+  To keep a `config.json`, move it into the new config directory, or set
+  `CCP_CONFIG_DIR` to the old one, which keeps everything there as it was.
+  Saved Kimi, Grok and Cursor logins in the old `.config\claude-code-proxy`
+  directory are still found, as each backend reads its `auth.json` there
+  when the new directory has none (Kimi its device id too); a login or
+  token refresh from now on is saved in the new directory. Logins saved
+  under `XDG_CONFIG_HOME` are not found: move the `kimi`, `grok` or `cursor`
+  folder into the new config directory or log in again. The Codex login
+  lives in the Codex CLI's own directory and is not affected. The old state
+  directory (`proxy.log`, `errors/`, traffic captures) is no longer read or
+  written. macOS and Linux are unchanged.
 
 ## v0.18.0 (2026-11-12)
 
