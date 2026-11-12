@@ -1066,6 +1066,17 @@ mod tests {
         body: String,
         during: impl FnOnce() + Send + 'static,
     ) -> (String, thread::JoinHandle<()>) {
+        token_endpoint_framed(status, body, during, false)
+    }
+
+    /// [`token_endpoint`] that, when `chunked`, sends `body` with no declared
+    /// length, as two chunks of chunked transfer encoding.
+    fn token_endpoint_framed(
+        status: &'static str,
+        body: String,
+        during: impl FnOnce() + Send + 'static,
+        chunked: bool,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -1095,10 +1106,19 @@ mod tests {
             }
             assert!(!request.is_empty());
             during();
-            let response = format!(
-                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
+            let response = if chunked {
+                let (first, second) = body.split_at(body.len() / 2);
+                format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+                    first.len(),
+                    second.len()
+                )
+            } else {
+                format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
             stream.write_all(response.as_bytes()).unwrap();
         });
         (format!("http://{addr}/oauth/token"), server)
@@ -1330,19 +1350,23 @@ mod tests {
     }
 
     /// A token answer of exactly the cap is read; one byte more fails the
-    /// refresh as an answer that could not be read does.
+    /// refresh as an answer that could not be read does. Sent chunked, the
+    /// answer declares no length and each chunk fits on its own, so only the
+    /// count of the bytes read refuses it.
     #[tokio::test]
     async fn a_token_answer_is_read_up_to_its_cap() {
-        for (length, fits) in [
-            (MAX_TOKEN_RESPONSE_BYTES, true),
-            (MAX_TOKEN_RESPONSE_BYTES + 1, false),
+        for (length, fits, chunked) in [
+            (MAX_TOKEN_RESPONSE_BYTES, true, false),
+            (MAX_TOKEN_RESPONSE_BYTES + 1, false, false),
+            (MAX_TOKEN_RESPONSE_BYTES, true, true),
+            (MAX_TOKEN_RESPONSE_BYTES + 1, false, true),
         ] {
             let dir = tempfile::TempDir::new().unwrap();
             let path = auth_file(&dir, &jwt_expiring_in(-60), "refresh-old");
             let before = std::fs::read(&path).unwrap();
             let mut body = rotated_body();
             body.push_str(&" ".repeat(length - body.len()));
-            let (endpoint, server) = token_endpoint("200 OK", body, || {});
+            let (endpoint, server) = token_endpoint_framed("200 OK", body, || {}, chunked);
             let manager = file_manager(&path, endpoint);
 
             let result = manager.get_auth().await;

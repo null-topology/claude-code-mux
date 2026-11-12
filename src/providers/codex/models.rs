@@ -864,6 +864,16 @@ mod tests {
         /// Answer one request with `status` and a JSON `body`. Accepting and reading
         /// give up after `MOCK_DEADLINE`.
         async fn answer_once(status: &'static str, body: &'static str) -> (String, Self) {
+            Self::answer_once_framed(status, body, false).await
+        }
+
+        /// [`Self::answer_once`] that, when `chunked`, sends `body` with no
+        /// declared length, as two chunks of chunked transfer encoding.
+        async fn answer_once_framed(
+            status: &'static str,
+            body: &'static str,
+            chunked: bool,
+        ) -> (String, Self) {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -897,10 +907,19 @@ mod tests {
                 tokio::time::timeout(MOCK_DEADLINE, read)
                     .await
                     .expect("mock server: the request did not finish arriving");
-                let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
+                let response = if chunked {
+                    let (first, second) = body.split_at(body.len() / 2);
+                    format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+                        first.len(),
+                        second.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
                 let _ = tokio::time::timeout(MOCK_DEADLINE, stream.write_all(response.as_bytes()))
                     .await;
             });
@@ -923,14 +942,22 @@ mod tests {
     }
 
     /// A listing body of exactly the cap is read; one byte more fails the
-    /// listing as unreachable, as an unreadable body does.
+    /// listing as unreachable, as an unreadable body does. Sent chunked, the
+    /// body declares no length and each chunk fits on its own, so only the
+    /// count of the bytes read refuses it.
     #[tokio::test]
     async fn a_listing_body_is_read_up_to_its_cap() {
         use super::super::auth::token_store::{CodexCliAuthStore, CodexTokenStore};
         // A listing naming no model, so the remembered inventory stays as it was.
         let body: &'static str = format!("{:<64}", r#"{"models":[]}"#).leak();
-        for (limit, fits) in [(body.len(), true), (body.len() - 1, false)] {
-            let (backend, backend_server) = MockServer::answer_once("200 OK", body).await;
+        for (limit, fits, chunked) in [
+            (body.len(), true, false),
+            (body.len() - 1, false, false),
+            (body.len(), true, true),
+            (body.len() - 1, false, true),
+        ] {
+            let (backend, backend_server) =
+                MockServer::answer_once_framed("200 OK", body, chunked).await;
             let dir = tempfile::tempdir().unwrap();
             let manager = CodexAuthManager::new_with_token_endpoint(
                 CodexTokenStore::codex_cli(CodexCliAuthStore::new(dir.path().join("auth.json"))),
