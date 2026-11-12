@@ -58,12 +58,14 @@
   captured WebSocket response body stops at that size too, and without a
   capture the WebSocket reader no longer keeps that copy at all. The text,
   tool call arguments, reasoning and web search results the proxy keeps
-  while it translates the response stop at 64 MiB too: the piece that would
-  pass that is neither kept nor relayed, and the request fails with a 502
-  `api_error` when nothing was relayed yet, or else the stream ends with an
-  SSE `error` event of type `api_error`. Such a response is not sent again,
-  leaves no state to continue from, and its WebSocket is closed rather than
-  kept for the conversation.
+  while it translates the response stop at 64 MiB too, counted as their
+  bytes plus a fixed charge for every piece kept, with each web search
+  result counted once for every search it is reported under: the piece
+  that would pass that is neither kept nor relayed, and the request fails
+  with a 502 `api_error` when nothing was relayed yet, or else the stream
+  ends with an SSE `error` event of type `api_error`. Such a response is
+  not sent again, leaves no state to continue from, and its WebSocket is
+  closed rather than kept for the conversation.
 - Under the default `auto` transport, a Codex request the WebSocket refused
   as too large is replayed over HTTP only under the ChatGPT account the
   WebSocket attempt used. When both attempts name their account, the two

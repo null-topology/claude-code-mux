@@ -19,6 +19,13 @@ const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
 /// client reads it as written.
 pub(crate) const RETAINED_OUTPUT_TOO_LARGE: &str =
     "Streamed response exceeded the size limit for the output held while it streams";
+/// What every entry the translator keeps in one of its collections adds to
+/// its count, on top of the strings it holds: a block, an id lookup, a
+/// pending reasoning item, a deferred text, a web search, a web search
+/// result, and each result once more for every web search it is emitted
+/// under. No smaller than the largest of those entries' own size, so an
+/// entry that holds no string still moves the count.
+const RETAINED_ENTRY_BYTES: usize = 128;
 
 enum LiveBlock {
     Text {
@@ -82,10 +89,13 @@ pub struct LiveStreamTranslator {
     /// shape requires on every finish: the request's own estimate opens it, and
     /// only counts the backend itself reported close it.
     usage_report: UsageReport,
-    /// Bytes of every string kept for this stream so far: text and tool
+    /// Bytes of every string kept for this stream so far (text and tool
     /// arguments as they grow, ids, names, reasoning items, web searches and
-    /// their results. A replacement adds its new length and a removal takes
-    /// nothing off, so the count only rises.
+    /// their results) plus `RETAINED_ENTRY_BYTES` for every entry kept, and
+    /// a web search result once more for every web search it will be emitted
+    /// under. A replacement adds its new length and a removal takes nothing
+    /// off, so the count only rises. It is a count, not a measure of process
+    /// memory.
     retained_bytes: usize,
     /// The most `retained_bytes` may reach. A string that would take it past
     /// this ends the stream with `RETAINED_OUTPUT_TOO_LARGE` before it is kept.
@@ -364,22 +374,26 @@ impl LiveStreamTranslator {
 
         match item_type {
             "reasoning" => {
-                self.retain(reasoning_capture_bytes(item))?;
+                self.retain_reasoning(output_index, item)?;
                 self.reasoning_by_output_index
                     .entry(output_index)
                     .or_default()
                     .capture(item);
             }
             "message" => {
-                self.retain(item.get("id").and_then(|v| v.as_str()).map_or(0, str::len))?;
+                let deferred = !self.web_searches.is_empty();
+                let id = item.get("id").and_then(|v| v.as_str());
+                self.retain(
+                    id.map_or(0, |id| id.len() + RETAINED_ENTRY_BYTES)
+                        + text_block_entry_bytes(deferred),
+                )?;
                 self.close_thinking(traffic, out);
                 let index = self.anthropic_index;
                 self.anthropic_index += 1;
-                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                if let Some(id) = id {
                     self.item_id_to_output_index
                         .insert(id.to_string(), output_index);
                 }
-                let deferred = !self.web_searches.is_empty();
                 self.blocks_by_output_index.insert(
                     output_index,
                     LiveBlock::Text {
@@ -405,7 +419,7 @@ impl LiveStreamTranslator {
             "function_call" => {
                 let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                 let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                self.retain(call_id.len() + name.len())?;
+                self.retain(call_id.len() + name.len() + RETAINED_ENTRY_BYTES)?;
                 self.close_thinking(traffic, out);
                 self.saw_tool_use = true;
                 self.semantic_output_started = true;
@@ -518,13 +532,13 @@ impl LiveStreamTranslator {
             .unwrap_or(0);
         // A delta lands in a text block, an existing one or one made for it,
         // unless a tool block holds that output index.
-        if !delta.is_empty()
-            && !matches!(
-                self.blocks_by_output_index.get(&output_index),
-                Some(LiveBlock::Tool { .. })
-            )
-        {
-            self.retain(delta.len())?;
+        if !delta.is_empty() {
+            match self.blocks_by_output_index.get(&output_index) {
+                Some(LiveBlock::Tool { .. }) => {}
+                Some(LiveBlock::Text { .. }) => self.retain(delta.len())?,
+                None => self
+                    .retain(delta.len() + text_block_entry_bytes(!self.web_searches.is_empty()))?,
+            }
         }
         self.close_thinking(traffic, out);
         if delta.is_empty() {
@@ -722,7 +736,7 @@ impl LiveStreamTranslator {
             .filter(|item_type| *item_type == "reasoning")
             .and_then(|_| payload.get("item"))
         {
-            self.retain(reasoning_capture_bytes(item))?;
+            self.retain_reasoning(output_index, item)?;
             self.reasoning_by_output_index
                 .entry(output_index)
                 .or_default()
@@ -747,7 +761,16 @@ impl LiveStreamTranslator {
             let raw_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let id = super::web_search_compat::server_tool_use_id_from_codex_web_search_id(raw_id);
             let query = web_search_query(item);
-            self.retain(id.len() + query.len())?;
+            // The end of the stream emits every result held under every
+            // search, so a new search also takes the results already held.
+            let results_bytes = self
+                .web_search_results
+                .iter()
+                .map(|result| web_search_result_bytes(&result.title, &result.url))
+                .fold(0usize, usize::saturating_add);
+            self.retain(
+                (id.len() + query.len() + RETAINED_ENTRY_BYTES).saturating_add(results_bytes),
+            )?;
             self.close_thinking(traffic, out);
             self.semantic_output_started = true;
             let index = self.anthropic_index;
@@ -764,7 +787,9 @@ impl LiveStreamTranslator {
         }
 
         // The arguments a tool block ends with, worked out and counted before
-        // the block is taken out, so a refusal leaves it as it was.
+        // the block is taken out, so a refusal leaves it as it was. Only the
+        // string that is kept is counted, and only when it differs from the
+        // arguments already held.
         let tool_args = match self.blocks_by_output_index.get(&output_index) {
             Some(LiveBlock::Tool {
                 name,
@@ -783,11 +808,11 @@ impl LiveStreamTranslator {
                 let args = final_args.unwrap_or(args_accum);
                 let sanitized = (!args.is_empty())
                     .then(|| sanitize_read_args(name, args, Some(call_id.as_str())));
-                reserve_retained(
-                    &mut self.retained_bytes,
-                    self.retained_limit,
-                    final_args.map_or(0, str::len) + sanitized.as_ref().map_or(0, String::len),
-                )?;
+                let replaced = sanitized
+                    .as_ref()
+                    .filter(|sanitized| *sanitized != args_accum)
+                    .map_or(0, String::len);
+                reserve_retained(&mut self.retained_bytes, self.retained_limit, replaced)?;
                 sanitized
             }
             _ => None,
@@ -879,7 +904,10 @@ impl LiveStreamTranslator {
             .and_then(|v| v.as_str())
             .filter(|title| !title.is_empty())
             .unwrap_or(url);
-        self.retain(title.len() + url.len())?;
+        // Kept once, and emitted once under every search already held.
+        self.retain(
+            web_search_result_bytes(title, url).saturating_mul(self.web_searches.len().max(1)),
+        )?;
         self.web_search_results.push(LiveWebSearchResult {
             title: title.to_string(),
             url: url.to_string(),
@@ -1143,6 +1171,21 @@ impl LiveStreamTranslator {
         reserve_retained(&mut self.retained_bytes, self.retained_limit, bytes)
     }
 
+    /// Counts what capturing a reasoning item keeps: its strings, and an
+    /// entry when no item is pending at that output index yet.
+    fn retain_reasoning(
+        &mut self,
+        output_index: usize,
+        item: &serde_json::Value,
+    ) -> Result<(), String> {
+        let entry = if self.reasoning_by_output_index.contains_key(&output_index) {
+            0
+        } else {
+            RETAINED_ENTRY_BYTES
+        };
+        self.retain(reasoning_capture_bytes(item) + entry)
+    }
+
     fn close_thinking(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
         let Some(thinking) = self.thinking.take() else {
             return;
@@ -1187,6 +1230,22 @@ fn reserve_retained(retained: &mut usize, limit: usize, bytes: usize) -> Result<
         }
         _ => Err(RETAINED_OUTPUT_TOO_LARGE.to_string()),
     }
+}
+
+/// The entries a new text block takes: the block, and when it is deferred
+/// behind a web search, the deferred text it later becomes.
+fn text_block_entry_bytes(deferred: bool) -> usize {
+    if deferred {
+        2 * RETAINED_ENTRY_BYTES
+    } else {
+        RETAINED_ENTRY_BYTES
+    }
+}
+
+/// What one web search result adds each time it is counted: its title and
+/// url, and an entry.
+fn web_search_result_bytes(title: &str, url: &str) -> usize {
+    title.len() + url.len() + RETAINED_ENTRY_BYTES
 }
 
 /// The bytes `PendingReasoning::capture` keeps of a reasoning item: its id
@@ -1442,7 +1501,8 @@ mod tests {
     /// is kept.
     #[test]
     fn a_string_past_the_retained_limit_is_refused_before_it_is_kept() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5").with_retained_limit(16);
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5")
+            .with_retained_limit(RETAINED_ENTRY_BYTES + 16);
         let delta = |text: &str| {
             json!({
                 "type": "response.output_text.delta",
@@ -1454,15 +1514,152 @@ mod tests {
 
         let error = translator.accept(&delta("0123456"), None).unwrap_err();
         assert_eq!(error, RETAINED_OUTPUT_TOO_LARGE);
-        assert_eq!(translator.retained_bytes, 10);
+        assert_eq!(translator.retained_bytes, RETAINED_ENTRY_BYTES + 10);
 
         let out = translator.accept(&delta("012345"), None).unwrap();
         assert!(String::from_utf8(out).unwrap().contains("012345"));
-        assert_eq!(translator.retained_bytes, 16);
+        assert_eq!(translator.retained_bytes, RETAINED_ENTRY_BYTES + 16);
         let Some(LiveBlock::Text { text, .. }) = translator.blocks_by_output_index.get(&0) else {
             panic!("the text block is open");
         };
         assert_eq!(text, "0123456789012345");
+    }
+
+    /// The fixed charge per entry is no smaller than any entry the
+    /// translator keeps.
+    #[test]
+    fn the_entry_charge_covers_every_kept_entry() {
+        use std::mem::size_of;
+        for size in [
+            size_of::<(usize, LiveBlock)>(),
+            size_of::<(String, usize)>(),
+            size_of::<(usize, PendingReasoning)>(),
+            size_of::<(usize, String)>(),
+            size_of::<LiveWebSearch>(),
+            size_of::<LiveWebSearchResult>(),
+        ] {
+            assert!(
+                size <= RETAINED_ENTRY_BYTES,
+                "{size} > {RETAINED_ENTRY_BYTES}"
+            );
+        }
+    }
+
+    /// Entries that hold no string still move the count, so items at new
+    /// output indices cannot pile up while it stands still.
+    #[test]
+    fn entries_without_strings_reach_the_retained_limit() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5")
+            .with_retained_limit(10 * RETAINED_ENTRY_BYTES);
+        let item = |output_index: usize| {
+            let item = if output_index.is_multiple_of(2) {
+                json!({"type": "reasoning"})
+            } else {
+                json!({"type": "function_call", "call_id": "", "name": ""})
+            };
+            json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": item
+            })
+        };
+        for output_index in 0..10 {
+            translator.accept(&item(output_index), None).unwrap();
+        }
+        assert_eq!(translator.retained_bytes, 10 * RETAINED_ENTRY_BYTES);
+
+        let error = translator.accept(&item(10), None).unwrap_err();
+        assert_eq!(error, RETAINED_OUTPUT_TOO_LARGE);
+        assert_eq!(
+            translator.reasoning_by_output_index.len() + translator.blocks_by_output_index.len(),
+            10
+        );
+    }
+
+    /// Arguments that `function_call_arguments.done` stored and the finished
+    /// item repeats are counted once: finishing the call keeps no new string.
+    #[test]
+    fn finished_tool_arguments_already_held_are_counted_once() {
+        let args = r#"{"command":"ls -la"}"#;
+        let held = RETAINED_ENTRY_BYTES + "call_1".len() + "Bash".len() + args.len();
+        let mut translator =
+            LiveStreamTranslator::new("msg_1", "gpt-5.5").with_retained_limit(held);
+        let mut out = Vec::new();
+        for event in [
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "Bash"}
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": args
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "function_call", "call_id": "call_1", "name": "Bash",
+                         "arguments": args}
+            }),
+        ] {
+            out.extend(translator.accept(&event, None).unwrap());
+        }
+        assert_eq!(translator.retained_bytes, held);
+        let partial: String = parse_sse_events(&out)
+            .iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+            .filter(|event| event["delta"]["type"] == "input_json_delta")
+            .filter_map(|event| event["delta"]["partial_json"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(partial, args);
+    }
+
+    /// The end of the stream emits every result under every search, so the
+    /// count takes each pair once: searches and results that each stay far
+    /// below the limit still reach it together.
+    #[test]
+    fn web_search_results_count_once_for_every_search() {
+        let limit = 8 * 1024;
+        let search = |n: usize| {
+            json!({
+                "type": "response.output_item.done",
+                "output_index": n,
+                "item": {"type": "web_search_call", "id": format!("ws_{n}"),
+                         "action": {"query": "q"}}
+            })
+        };
+        let citation = |n: usize| {
+            json!({
+                "type": "response.output_text.annotation.added",
+                "annotation": {"type": "url_citation",
+                               "url": format!("https://example.com/{n}")}
+            })
+        };
+
+        let mut searches = LiveStreamTranslator::new("msg_1", "gpt-5.5").with_retained_limit(limit);
+        for n in 0..8 {
+            searches.accept(&search(n), None).unwrap();
+        }
+        assert!(searches.retained_bytes * 4 < limit);
+        let mut results = LiveStreamTranslator::new("msg_1", "gpt-5.5").with_retained_limit(limit);
+        for n in 0..8 {
+            results.accept(&citation(n), None).unwrap();
+        }
+        assert!(results.retained_bytes * 4 < limit);
+
+        let mut translator =
+            LiveStreamTranslator::new("msg_1", "gpt-5.5").with_retained_limit(limit);
+        let events = (0..4)
+            .map(search)
+            .chain((0..8).map(citation))
+            .chain((4..8).map(search));
+        let error = events
+            .into_iter()
+            .find_map(|event| translator.accept(&event, None).err())
+            .expect("the pairs pass the limit");
+        assert_eq!(error, RETAINED_OUTPUT_TOO_LARGE);
+        assert!(translator.retained_bytes <= limit);
     }
 
     #[test]

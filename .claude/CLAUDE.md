@@ -1271,13 +1271,24 @@ a writer that stops at the room left. The live HTTP
 reader keeps no copy of the stream; it captures event by event. What a live
 stream holds is bounded by the same limit too. The translator
 (`LiveStreamTranslator`, built `with_retained_limit` from it in
-`live_stream_response_once`) keeps a running count of the bytes of every
-string it appends or stores (text, tool call arguments and their
-replacements, reasoning ids and `encrypted_content`, message and call ids,
-tool names, web search ids, queries and result titles and URLs; a
-replacement adds its length and subtracts nothing, a move into
-`deferred_text` adds nothing) and refuses the one that would pass the limit
-before keeping it (`reserve_retained`), with `RETAINED_OUTPUT_TOO_LARGE`.
+`live_stream_response_once`) keeps a running count: the bytes of every
+string it appends or stores (text, tool call arguments and the sanitized
+replacement of a finished call's arguments when it differs from what was
+held, reasoning ids and `encrypted_content`, message and call ids, tool
+names, web search ids, queries and result titles and URLs; a replacement
+adds its length and subtracts nothing, a move into `deferred_text` adds
+nothing), plus a fixed `RETAINED_ENTRY_BYTES` for every entry it inserts
+into a collection it keeps (a block, a message id lookup, a pending
+reasoning item, the `deferred_text` slot of a deferred text block, a web
+search, a web search result), charged before the entry goes in, so entries
+that hold no string still move the count. `emit_web_searches` emits every
+held result under every search, so each pair of a search and a result is
+charged once, when the later of the two arrives: a new search adds the
+results already held, a new result its own bytes once for every search
+already held, and at least once. It is a count, not a measure of process
+memory. The translator refuses the string or entry that would take the
+count past the limit before keeping it (`reserve_retained`), with
+`RETAINED_OUTPUT_TOO_LARGE`.
 After output that refusal ends the stream with an SSE `error` of type
 `api_error`, before output it answers a plain 502 `api_error`; either way
 `abort_refused_live_stream` drops the upstream stream, removes the turn's
