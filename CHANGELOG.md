@@ -1,4 +1,4 @@
-## Unreleased
+## v0.19.0 (2026-11-12)
 
 - Dependencies are refreshed to their newest releases within the version
   ranges `Cargo.toml` already allows. This brings rustls 0.23.46, which fixes
@@ -22,7 +22,6 @@
   HTTPS connection of those clients to a server whose certificate chain ends
   only at that root now fails certificate verification; no setting brings
   the root back.
-
 - The WebSocket library is updated to tokio-tungstenite 0.30, and rand to
   0.10, sha2 to 0.11, prost to 0.14 and base64 to 0.23. Codex WebSocket
   requests, pings, pongs and closes go out as before, the limits stay at
