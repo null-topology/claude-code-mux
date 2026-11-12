@@ -1,11 +1,21 @@
 ## Unreleased
 
-- Errors from the Codex model listing, the native Responses and chat
-  completions surfaces and the hosted search call no longer include the
-  request URL. A base URL or proxy URL that carries a credential in its path
-  or query used to show up in the client's error message, in the `models`
-  command's output and in `proxy.log`; the rest of the error text is
-  unchanged.
+- Error messages no longer include the request URL. A base URL or proxy URL
+  that carries a credential in its path or query used to show up in client
+  error answers, in the terminal (the `models` command and the login
+  commands) and in `proxy.log`. This covers the Codex provider (Messages
+  requests, live and buffered, the model listing, the native Responses and
+  chat completions surfaces, the hosted search call, and the transcription
+  and image endpoints), the Anthropic passthrough, whose relayed bytes are
+  untouched, and the Kimi, Grok and Cursor providers with their login and
+  token refresh. In a Kimi, Grok or Cursor login or token refresh two more
+  things change in that text. A request that cannot be sent, or an answer
+  that cannot be read, now reports only the first line of the error, so the
+  `Caused by:` lines that used to follow it, such as a refused connection,
+  are gone. A connection that breaks while the answer is being read now
+  reports `request or response body error` instead of `error decoding
+  response body`, and an answer still arriving when the client's timeout
+  has run out reports `timed out reading the response body`.
 - Some Codex answers are now read only up to a size limit: the model
   listing up to 4 MiB, a token refresh answer up to 1 MiB, the hosted search
   answer up to 8 MiB and a buffered chat completion up to 32 MiB. A larger
@@ -18,11 +28,6 @@
   `http_response_body` for an answer that could not be read or the start of
   the backend's error answer, cut to 300 characters, or null when there is
   none.
-- A Codex request that fails while it is sent, or while its answer is read,
-  no longer repeats the request URL in its error text, so a base URL that
-  carries a credential in its path or query stays out of the answer and the
-  proxy's error messages. This covers Messages requests, live and buffered,
-  and the transcription and image endpoints.
 - A buffered (non-streaming) Codex answer is now capped at 64 MiB of
   upstream events, over HTTP and over the WebSocket alike. A larger answer
   fails with a 502 `api_error` instead of growing the proxy's memory without
@@ -50,19 +55,6 @@
   answers with the size refusal (413 `request_too_large`) and logs a
   `codex_websocket_size_fallback_refused` warning. A renewed token of the
   same account replays as before.
-- Error messages from the Anthropic passthrough and the Kimi, Grok and Cursor
-  providers, their login and token refresh included, no longer end with
-  ` for url (...)`. A configured base URL or proxy URL can carry a credential
-  in its path or query, and these messages reach client error answers, the
-  terminal and `proxy.log`. The bytes the passthrough relays are untouched.
-  Two more things change in that text. A request that cannot be sent, or an
-  answer that cannot be read, in a login or token refresh now reports only
-  the first line of the error, so the `Caused by:` lines that used to follow
-  it, such as a refused connection, are gone. A connection that breaks while a login or token
-  refresh answer is being read now reports `request or response body error`
-  instead of `error decoding response body`, and an answer still arriving
-  when the client's timeout has run out reports `timed out reading the
-  response body`.
 - The Kimi, Grok and Cursor providers now stop reading an upstream body once
   it passes a fixed size, instead of holding whatever the server sends: 1 MiB
   for a login, login poll, device or token refresh answer, 64 KiB for an
