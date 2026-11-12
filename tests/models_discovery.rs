@@ -1501,7 +1501,7 @@ async fn spawn_websocket_upstream(captured: Arc<Mutex<Option<Value>>>) -> String
                 r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
                 r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":2}}}"#,
             ] {
-                let _ = sender.send(Message::Text(event.to_string())).await;
+                let _ = sender.send(Message::Text(event.to_string().into())).await;
             }
         }
     });

@@ -88,7 +88,7 @@ async fn websocket_concurrent_requests() {
                     "input": [{"role":"user","content":[{"type":"input_text","text":format!("msg {i}")}]}]
                 });
                 let _ = writer
-                    .send(Message::Text(serde_json::to_string(&req).unwrap()))
+                    .send(Message::Text(serde_json::to_string(&req).unwrap().into()))
                     .await;
             }
         }));
@@ -142,7 +142,7 @@ async fn websocket_request_serializes_response_create() {
         "text": {"verbosity": "low"},
     });
     writer
-        .send(Message::Text(serde_json::to_string(&req).unwrap()))
+        .send(Message::Text(serde_json::to_string(&req).unwrap().into()))
         .await
         .unwrap();
 }
@@ -179,7 +179,7 @@ async fn websocket_collects_sse_events_until_terminal() {
 
     let req = serde_json::json!({"type": "response.create", "model": "gpt-5.5", "input": []});
     writer
-        .send(Message::Text(serde_json::to_string(&req).unwrap()))
+        .send(Message::Text(serde_json::to_string(&req).unwrap().into()))
         .await
         .unwrap();
     drop(writer);
@@ -235,7 +235,7 @@ async fn websocket_idle_timeout_no_events() {
 
     let req = serde_json::json!({"type": "response.create", "model": "gpt-5.5", "input": []});
     writer
-        .send(Message::Text(serde_json::to_string(&req).unwrap()))
+        .send(Message::Text(serde_json::to_string(&req).unwrap().into()))
         .await
         .unwrap();
     drop(writer);
@@ -270,7 +270,7 @@ async fn websocket_invalidation_on_error() {
 
     let req = serde_json::json!({"type": "response.create", "model": "gpt-5.5", "input": []});
     writer
-        .send(Message::Text(serde_json::to_string(&req).unwrap()))
+        .send(Message::Text(serde_json::to_string(&req).unwrap().into()))
         .await
         .unwrap();
     drop(writer);
@@ -329,7 +329,7 @@ async fn websocket_soak_concurrent_requests() {
                     "input": [{"role":"user","content":[{"type":"input_text","text":format!("soak {i}")}]}]
                 });
                 let _ = writer
-                    .send(Message::Text(serde_json::to_string(&req).unwrap()))
+                    .send(Message::Text(serde_json::to_string(&req).unwrap().into()))
                     .await;
                 drop(writer);
                 let _ = tokio::time::timeout(Duration::from_millis(500), reader.next()).await;

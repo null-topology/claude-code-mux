@@ -2942,7 +2942,7 @@ mod tests {
         event: &serde_json::Value,
     ) {
         websocket
-            .send(Message::Text(event.to_string()))
+            .send(Message::Text(event.to_string().into()))
             .await
             .unwrap();
     }
@@ -4743,7 +4743,9 @@ mod tests {
                                 {
                                     // The proxy may close the socket while the
                                     // answer is still being written.
-                                    let _ = websocket.send(Message::Text(event.to_string())).await;
+                                    let _ = websocket
+                                        .send(Message::Text(event.to_string().into()))
+                                        .await;
                                 }
                             }
                             _ => {}

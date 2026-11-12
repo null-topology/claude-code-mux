@@ -511,7 +511,7 @@ async fn spawn_websocket_upstream_with_handshake(
             ];
 
             for event in &events {
-                let _ = sender.send(Message::Text(event.to_string())).await;
+                let _ = sender.send(Message::Text(event.to_string().into())).await;
             }
         }
     });
@@ -529,7 +529,9 @@ async fn spawn_websocket_usage_limit_upstream(attempts: Arc<AtomicUsize>) -> Str
             let _ = websocket.next().await;
             attempts.fetch_add(1, Ordering::SeqCst);
             let event = codex_usage_limit_event("usage_limit_reached");
-            let _ = websocket.send(Message::Text(event.to_string())).await;
+            let _ = websocket
+                .send(Message::Text(event.to_string().into()))
+                .await;
         }
     });
     format!("http://{addr}")
@@ -556,7 +558,9 @@ async fn spawn_counting_websocket_failure_upstream(
             if let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await {
                 let _ = websocket.next().await;
                 attempts.fetch_add(1, Ordering::SeqCst);
-                let _ = websocket.send(Message::Text(event.to_string())).await;
+                let _ = websocket
+                    .send(Message::Text(event.to_string().into()))
+                    .await;
             }
         }
     });
@@ -585,7 +589,7 @@ async fn spawn_websocket_credited_rate_limit_upstream() -> String {
             ];
 
             for event in &events {
-                let _ = ws.send(Message::Text(event.to_string())).await;
+                let _ = ws.send(Message::Text(event.to_string().into())).await;
             }
         }
     });
@@ -608,7 +612,7 @@ async fn spawn_websocket_delayed_terminal_upstream() -> String {
                 r#"{"type":"response.output_text.delta","output_index":0,"delta":"early chunk"}"#,
             ];
             for event in &early_events {
-                let _ = ws.send(Message::Text(event.to_string())).await;
+                let _ = ws.send(Message::Text(event.to_string().into())).await;
             }
 
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -618,7 +622,7 @@ async fn spawn_websocket_delayed_terminal_upstream() -> String {
                 r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":5,"output_tokens":2}}}"#,
             ];
             for event in &terminal_events {
-                let _ = ws.send(Message::Text(event.to_string())).await;
+                let _ = ws.send(Message::Text(event.to_string().into())).await;
             }
         }
     });
@@ -645,7 +649,7 @@ async fn spawn_websocket_error_upstream(message: &'static str) -> String {
                     "message": message
                 }
             });
-            let _ = ws.send(Message::Text(event.to_string())).await;
+            let _ = ws.send(Message::Text(event.to_string().into())).await;
         }
     });
 
@@ -673,7 +677,7 @@ async fn spawn_websocket_reset_upstream(
             attempts.fetch_add(1, Ordering::SeqCst);
             let _ = ws.next().await;
             for event in events {
-                let _ = ws.send(Message::Text((*event).to_string())).await;
+                let _ = ws.send(Message::Text((*event).into())).await;
             }
             // No response.completed, no close frame: the socket simply goes.
             drop(ws);
@@ -770,7 +774,7 @@ async fn spawn_websocket_sequence_upstream(captured: Arc<Mutex<Vec<Value>>>) -> 
                 ];
 
                 for event in &events {
-                    let _ = sender.send(Message::Text(event.to_string())).await;
+                    let _ = sender.send(Message::Text(event.to_string().into())).await;
                 }
                 handled += 1;
             }
@@ -821,7 +825,9 @@ async fn spawn_websocket_previous_missing_then_retry_upstream(
                         "type": "codex.rate_limits",
                         "rate_limits": {"limit_reached": false}
                     });
-                    let _ = sender.send(Message::Text(rate_limits.to_string())).await;
+                    let _ = sender
+                        .send(Message::Text(rate_limits.to_string().into()))
+                        .await;
                     let event = json!({
                         "type": "error",
                         "error": {
@@ -830,7 +836,7 @@ async fn spawn_websocket_previous_missing_then_retry_upstream(
                             "status": 400
                         }
                     });
-                    let _ = sender.send(Message::Text(event.to_string())).await;
+                    let _ = sender.send(Message::Text(event.to_string().into())).await;
                     handled += 1;
                     break;
                 }
@@ -860,7 +866,7 @@ async fn spawn_websocket_previous_missing_then_retry_upstream(
                 ];
 
                 for event in &events {
-                    let _ = sender.send(Message::Text(event.to_string())).await;
+                    let _ = sender.send(Message::Text(event.to_string().into())).await;
                 }
                 handled += 1;
             }
@@ -935,7 +941,7 @@ async fn spawn_websocket_close_then_retry_upstream(captured: Arc<Mutex<Vec<Value
                 ];
 
                 for event in &events {
-                    let _ = sender.send(Message::Text(event.to_string())).await;
+                    let _ = sender.send(Message::Text(event.to_string().into())).await;
                 }
                 handled += 1;
             }
@@ -979,7 +985,11 @@ async fn spawn_websocket_always_empty_completion_upstream(
                                     "usage": {"input_tokens": 5, "output_tokens": 0}
                                 }
                             });
-                            if sender.send(Message::Text(event.to_string())).await.is_err() {
+                            if sender
+                                .send(Message::Text(event.to_string().into()))
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -6030,7 +6040,7 @@ async fn spawn_turn_state_websocket_upstream(
                     });
                     let events = std::iter::once(metadata).chain(turn_state_response_events(index));
                     for event in events {
-                        let _ = sender.send(Message::Text(event.to_string())).await;
+                        let _ = sender.send(Message::Text(event.to_string().into())).await;
                     }
                 }
             });

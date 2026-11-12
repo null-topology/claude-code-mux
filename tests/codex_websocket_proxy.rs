@@ -174,7 +174,7 @@ async fn send_codex_response(websocket: &mut tokio_tungstenite::WebSocketStream<
         r#"{"type":"response.completed","response":{"id":"resp_proxy","usage":{"input_tokens":5,"output_tokens":2}}}"#,
     ] {
         websocket
-            .send(Message::Text(event.to_string()))
+            .send(Message::Text(event.to_string().into()))
             .await
             .unwrap();
     }
@@ -490,7 +490,7 @@ async fn spawn_dual_transport_origin() -> (String, SeenRequests) {
                     let number = record_websocket_request(&seen, &text);
                     for event in websocket_reply_events(number) {
                         if websocket
-                            .send(Message::Text(event.to_string()))
+                            .send(Message::Text(event.to_string().into()))
                             .await
                             .is_err()
                         {
@@ -670,12 +670,12 @@ async fn spawn_size_limited_origin(
                     let frames: Vec<Message> = match reply {
                         WebSocketReply::Complete => events
                             .iter()
-                            .map(|event| Message::Text(event.to_string()))
+                            .map(|event| Message::Text(event.to_string().into()))
                             .collect(),
                         WebSocketReply::CloseBeforeText(code) => vec![close(code)],
                         WebSocketReply::CloseWithoutFrame => vec![Message::Close(None)],
                         WebSocketReply::CloseAfterText(code) => {
-                            vec![Message::Text(events[0].to_string()), close(code)]
+                            vec![Message::Text(events[0].to_string().into()), close(code)]
                         }
                     };
                     for frame in frames {
