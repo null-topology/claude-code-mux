@@ -1,5 +1,5 @@
 use base64::Engine;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
@@ -14,7 +14,7 @@ fn encode(bytes: &[u8]) -> String {
 
 pub fn generate_pkce() -> PkceCodes {
     let mut bytes = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let verifier = encode(&bytes);
     let challenge = encode(&Sha256::digest(verifier.as_bytes()));
     PkceCodes {
@@ -25,7 +25,7 @@ pub fn generate_pkce() -> PkceCodes {
 
 pub fn generate_state() -> String {
     let mut bytes = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     encode(&bytes)
 }
 

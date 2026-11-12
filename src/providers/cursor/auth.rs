@@ -1,5 +1,5 @@
 use base64::Engine;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -390,7 +390,7 @@ fn open_cursor_login_url(url: &str) -> anyhow::Result<()> {
 
 fn random_base64_url(len: usize) -> String {
     let mut bytes = vec![0u8; len];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     base64_url(&bytes)
 }
 
