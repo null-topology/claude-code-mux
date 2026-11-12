@@ -1224,7 +1224,13 @@ tunnel's are normalised when they are read, so an unclassified 429 or 5xx
 passes them on in that form too. `CodexError.class` carries the class to `map_codex_error_to_response`
 (`classified_error_response`); a mid-stream error keeps its status and takes
 the class's error type. An unknown code keeps the old handling, and
-`usage_limit_reached` keeps precedence over all of these. An opt-in server
+`usage_limit_reached` keeps precedence over all of these. A live failure
+event before output that is not retried, has no class and names a 400-499
+status of its own (the event's `status` or `status_code`, else its error's
+`status`) is answered by `map_codex_error_to_response` as the same status
+over HTTP is (`live_stream_response_once`), so a WebSocket refusal and its
+HTTP form get one answer; any other unclassified one is 502 `api_error`
+(`map_codex_failure_to_response`). An opt-in server
 compaction refused as quota, `usage_not_included` or `PermissionDenied`
 answers the client with that class and does not send the normal request; any
 other compaction failure, a rejected one included, falls back to it. The

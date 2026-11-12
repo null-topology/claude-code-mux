@@ -1069,6 +1069,24 @@ async fn live_stream_response_once(
                         class, native, None,
                     ));
                 }
+                // A refusal that names a 4xx status of its own describes the
+                // request, so it is answered as the same refusal over HTTP is,
+                // not as a gateway failure the client would retry.
+                if let Some(failure) = failure.as_ref()
+                    && let Some(status @ 400..=499) = failure.explicit_status
+                {
+                    return LiveStreamStart::Response(map_codex_error_to_response(
+                        &client::CodexError {
+                            status,
+                            message: message.clone(),
+                            detail: Some(message),
+                            retry_after: failure.retry_after.clone(),
+                            usage_limit: None,
+                            class: None,
+                            origin: client::CodexErrorOrigin::WebSocket,
+                        },
+                    ));
+                }
                 return LiveStreamStart::Response(map_codex_failure_to_response(&message));
             }
         };
@@ -5231,6 +5249,255 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[http::header::RETRY_AFTER], "31");
+    }
+
+    /// A refusal of a parameter the model does not take, as the first event of
+    /// a live stream, with its status under `status_key`.
+    fn parameter_refusal_event(status_key: &str, status: u16) -> serde_json::Value {
+        let mut event = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_parameter",
+                "param": "toy_param",
+                "message": "toy_param is not supported on this model"
+            }
+        });
+        event[status_key] = status.into();
+        event
+    }
+
+    #[tokio::test]
+    async fn a_live_refusal_answers_with_the_client_status_it_names() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let response = run_live_failure_case(
+            "live-refusal-status-cleanup",
+            parameter_refusal_event("status", 400),
+            1,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(
+            body["error"]["message"],
+            "toy_param is not supported on this model"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_refusal_is_answered_as_the_same_refusal_over_http() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let live = run_live_failure_case(
+            "live-refusal-parity-cleanup",
+            parameter_refusal_event("status", 400),
+            1,
+        )
+        .await;
+        let http = response_to_error_body(
+            400,
+            serde_json::json!({"error": {
+                "message": "toy_param is not supported on this model",
+                "type": "invalid_request_error",
+                "param": "toy_param",
+                "code": "invalid_parameter"
+            }}),
+        );
+
+        assert_eq!(http.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(live.status(), http.status());
+        let (live, http) = (error_body(live).await, error_body(http).await);
+        assert_eq!(live["error"]["type"], http["error"]["type"]);
+        assert_eq!(live["error"]["message"], http["error"]["message"]);
+    }
+
+    #[tokio::test]
+    async fn a_live_refusal_reads_its_status_under_status_code_too() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let response = run_live_failure_case(
+            "live-refusal-status-code-cleanup",
+            parameter_refusal_event("status_code", 422),
+            1,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(
+            body["error"]["message"],
+            "toy_param is not supported on this model"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_refusal_over_the_context_window_stays_request_too_large() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let response = run_live_failure_case(
+            "live-refusal-overflow-cleanup",
+            serde_json::json!({
+                "type": "error",
+                "status": 400,
+                "error": {"message": "toy prompt is over the context window"}
+            }),
+            1,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "request_too_large");
+        assert_eq!(
+            body["error"]["message"],
+            "toy prompt is over the context window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_refusal_naming_403_is_a_permission_error() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let response = run_live_failure_case(
+            "live-refusal-forbidden-cleanup",
+            serde_json::json!({
+                "type": "error",
+                "status": 403,
+                "error": {"message": "toy_model is not available to this account"}
+            }),
+            1,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "permission_error");
+        assert_eq!(
+            body["error"]["message"],
+            "toy_model is not available to this account"
+        );
+    }
+
+    /// `run_live_failure_case` over the HTTP transport: the backend answers
+    /// 200 with an event stream whose only event is `event`. Returns the
+    /// answer and how many requests the backend received.
+    async fn run_live_http_failure_case(
+        session_id: &str,
+        event: serde_json::Value,
+    ) -> (Response, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        let request = live_test_request("one");
+        let continuation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        let body = format!("data: {event}\n\n");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                served.fetch_add(1, Ordering::SeqCst);
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 8192];
+                loop {
+                    let read = stream.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+            }
+        });
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            live_stream_response(
+                authenticated_live_test_client(format!("http://{addr}/responses")),
+                "message".to_string(),
+                &request.model,
+                live_test_context(session_id),
+                request.clone(),
+                continuation.clone(),
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+                config::CodexTransport::Http,
+            ),
+        )
+        .await
+        .expect("live HTTP failure case timed out");
+        server.abort();
+
+        assert!(!continuation::is_current_turn_for_owner(&continuation));
+        (response, requests.load(Ordering::SeqCst))
+    }
+
+    /// On the WebSocket a 401 event with no class first refreshes the token
+    /// and resends; on a live HTTP stream it is answered as it came.
+    #[tokio::test]
+    async fn a_live_refusal_naming_401_is_an_authentication_error() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let (response, requests) = run_live_http_failure_case(
+            "live-http-refusal-unauthorized-cleanup",
+            serde_json::json!({
+                "type": "error",
+                "status": 401,
+                "error": {"message": "toy token was rejected"}
+            }),
+        )
+        .await;
+
+        assert_eq!(requests, 1);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "authentication_error");
+        assert_eq!(body["error"]["message"], "toy token was rejected");
+    }
+
+    #[tokio::test]
+    async fn a_live_failure_naming_a_status_outside_4xx_stays_a_gateway_error() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let response = run_live_failure_case(
+            "live-refusal-not-implemented-cleanup",
+            serde_json::json!({
+                "type": "error",
+                "status": 501,
+                "error": {"message": "toy feature is not implemented"}
+            }),
+            1,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "api_error");
     }
 
     #[tokio::test]

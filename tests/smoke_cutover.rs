@@ -3985,6 +3985,60 @@ async fn smoke_codex_websocket_terminal_code_before_output_is_answered_once() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_refusal_with_a_client_status_is_answered_with_it() {
+    let _guard = env_lock();
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let connections = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_counting_websocket_failure_upstream(
+        json!({
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_parameter",
+                "param": "toy_param",
+                "message": "toy_param is not supported on this model"
+            }
+        }),
+        attempts.clone(),
+        connections.clone(),
+    )
+    .await;
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "auto");
+
+    let response = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{"role":"user","content":"hello"}]
+    }))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(
+        body["error"]["message"],
+        "toy_param is not supported on this model"
+    );
+    // One request over the WebSocket, and no HTTP request after it.
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_terminal_code_after_output_ends_the_stream() {
     let _guard = env_lock();
     clear_all_continuations_for_tests();

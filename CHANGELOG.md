@@ -139,6 +139,16 @@
   lives in the Codex CLI's own directory and is not affected. The old state
   directory (`proxy.log`, `errors/`, traffic captures) is no longer read or
   written. macOS and Linux are unchanged.
+- A streaming Codex request that the backend refuses before any output with
+  a 4xx status of its own (for example a parameter the model does not
+  support) now reaches the client with that status and the backend's
+  message on the WebSocket too, as it already did over HTTP. It used to be
+  answered 502 `api_error`, which a client retries, so the same refusal was
+  sent again. A 401 is answered as `authentication_error`, a 403 as
+  `permission_error`, a context window overflow still as 413
+  `request_too_large`, and any other 4xx as `api_error`. A refusal that
+  names no status, or a status outside 4xx, is still answered 502. There is
+  no setting for the old answer.
 
 ## v0.18.0 (2026-11-12)
 
