@@ -1625,8 +1625,8 @@ async fn codex_default_transport_keeps_its_handling_of_other_closes() {
                     log_lines_named("codex_upstream_request_started"),
                 )
             };
-            // Sent once, not over HTTP, and answered as a response that never
-            // finished, as before.
+            // Sent once over the WebSocket, not over HTTP, and answered 502 as a
+            // response that never finished, with no size refusal and no fallback.
             assert_eq!(transports(&origin.seen), ["websocket"], "{label}: {body}");
             assert_eq!(status, StatusCode::BAD_GATEWAY, "{label}: {body}");
             assert!(body.contains("api_error"), "{label}: {body}");

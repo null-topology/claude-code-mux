@@ -1125,15 +1125,14 @@ appearing, compare against a fresh traffic capture before anything else.
 The proxy does not retry a failed Codex request: one attempt, then the error
 goes to the client, which owns the retry policy. The only resends left repair
 the proxy's own state (a forgotten `previous_response_id`, a 401 token refresh).
-The `auto` fallback to HTTP is not a resend: it happens only when the
-handshake failed, before the request went out, or when the request was
-refused for its size. A frame over the limit the handshake advertised is
-never written. Under `auto` a request already on the socket goes out over
-HTTP in two cases only: a WebSocket seen closing with code 1009 before any
-text frame of the response, as the Codex CLI treats that close, and a resend
-the proxy makes anyway, such as the full-context one that repairs a
-continuation, when its frame is over the limit of the socket it would go to.
-With
+An `auto` fallback to HTTP after a failed handshake, before the request went
+out, or for a frame that was never written because it is over the limit the
+handshake advertised, sends nothing twice. Under `auto` a request already
+written to the socket goes out over HTTP in two cases only: a WebSocket seen
+closing with code 1009 before any text frame of the response, as the Codex CLI
+treats that close, and a resend the proxy makes anyway, such as the
+full-context one that repairs a continuation, when its frame is over the limit
+of the socket it would go to. With
 `websocket` transport either refusal is one 413 answer, and a 429 on the
 WebSocket handshake reaches the client as a plain 429 unless its body names
 one of the codes above; under `auto` it falls back to HTTP.

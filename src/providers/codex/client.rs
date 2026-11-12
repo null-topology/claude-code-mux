@@ -3121,9 +3121,11 @@ fn unauthorized_event_needs_refresh(payload: &serde_json::Value) -> bool {
 /// A failed handshake falls back to HTTP, and so does a request the WebSocket
 /// refused for its size: one longer than the socket's advertised limit, never
 /// written, or one whose socket closed with code 1009 before any text frame of
-/// the response. The latter is the one request already written that goes over
-/// HTTP, as the Codex CLI treats that close and sends it (`codex-rs/codex-api/src/endpoint/responses_websocket.rs`
-/// at `ed7ca22bb6`, HTTP fallback at `bc3ccba6e1`).
+/// the response. A request already written goes over HTTP in two cases: that
+/// 1009 close, as the Codex CLI treats that close and sends it (`codex-rs/codex-api/src/endpoint/responses_websocket.rs`
+/// at `ed7ca22bb6`, HTTP fallback at `bc3ccba6e1`), and a resend the proxy
+/// makes anyway, such as the full-context one that repairs a continuation,
+/// whose frame is over the limit of the socket it would go to.
 fn should_fallback_to_http(err: &CodexError) -> bool {
     if super::websocket::is_message_size_refusal(err) {
         return true;
