@@ -458,7 +458,10 @@ impl PoolEntry {
     /// Whether a request built with `headers` may go out on this socket: both
     /// account ids are known and equal, so a renewed token of the same
     /// account keeps the socket, or neither is known and the request's access
-    /// token is the one of the handshake.
+    /// token is the one of the handshake. Every request the client builds
+    /// carries a bearer token (`build_codex_headers`), so two tokens that
+    /// both cannot be read, which compare equal here, meet only where a test
+    /// builds a socket and a request without headers.
     fn serves_request(&self, headers: &HeaderMap) -> bool {
         match (self.account_id.as_deref(), request_account_id(headers)) {
             (Some(socket), Some(request)) => socket == request,

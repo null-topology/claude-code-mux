@@ -60,12 +60,12 @@
   tool call arguments, reasoning and web search results the proxy keeps
   while it translates the response stop at 64 MiB too, counted as their
   bytes plus a fixed charge for every piece kept, with each web search
-  result counted once for every search it is reported under: the piece
+  result counted again for every search it is reported under: the piece
   that would pass that is neither kept nor relayed, and the request fails
   with a 502 `api_error` when nothing was relayed yet, or else the stream
   ends with an SSE `error` event of type `api_error`. Such a response is
-  not sent again, leaves no state to continue from, and its WebSocket is
-  closed rather than kept for the conversation.
+  not sent again, leaves no state to continue from, and the proxy drops
+  the WebSocket it kept for the conversation.
 - Under the default `auto` transport, a Codex request the WebSocket refused
   as too large is replayed over HTTP only under the ChatGPT account the
   WebSocket attempt used. When both attempts name their account, the two
@@ -76,12 +76,13 @@
   then. Otherwise the proxy
   sends nothing over HTTP, answers with the size refusal (413
   `request_too_large`) and logs a `codex_websocket_size_fallback_refused`
-  warning with the request id only. A conversation's pooled WebSocket
-  follows the same rule: one opened under a login with no account id is
-  reused only by a request with the very same access token, so after a
-  renewed token or another login with no account id the next request opens
-  a connection of its own, and a continuation that depended on the old
-  socket is sent again with its full context. There is no setting for this.
+  warning with the request id only. A conversation's pooled WebSocket is
+  tied to its login too: one opened under a login with no account id is
+  reused only by a request that names no account either and carries the
+  very same access token, so after a renewed token or another login the
+  next request opens a connection of its own, and a continuation that
+  depended on the old socket is sent again with its full context. There is
+  no setting for this.
 - The Kimi, Grok and Cursor providers now stop reading an upstream body once
   it passes a fixed size, instead of holding whatever the server sends: 1 MiB
   for a login, login poll, device or token refresh answer, 64 KiB for an

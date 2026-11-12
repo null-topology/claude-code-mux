@@ -1285,8 +1285,8 @@ search, a web search result), charged before the entry goes in, so entries
 that hold no string still move the count. `emit_web_searches` emits every
 held result under every search, so each pair of a search and a result is
 charged once, when the later of the two arrives: a new search adds the
-results already held, a new result its own bytes once for every search
-already held, and at least once. It is a count, not a measure of process
+results already held, a new result its own bytes once for itself and once
+more for every search already held. It is a count, not a measure of process
 memory. The translator refuses the string or entry that would take the
 count past the limit before keeping it (`reserve_retained`), with
 `RETAINED_OUTPUT_TOO_LARGE`.
@@ -1302,7 +1302,8 @@ drops the turn's continuation, so the turn is no longer current and the
 task can pool nothing more for it. A socket the task pools between the
 removal and the abort belongs to a turn the backend completed and carries
 no continuation; the task removes it again when its final send finds the
-channel closed. Before
+channel closed, and one whose final send was still accepted stays pooled.
+Before
 output, the translated framing held in `pending_chunk` (`message_start` and
 pings) answers `buffered_response_too_large_error` the same way once the
 next chunk would pass the limit, and `spawn_http_event_stream` counts the
