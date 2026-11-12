@@ -448,6 +448,8 @@ struct HttpSseDecoder {
 struct DecodedHttpSseEvent {
     event: Option<String>,
     payload: Option<serde_json::Value>,
+    /// The length of the frame's joined `data` lines.
+    data_bytes: usize,
 }
 
 struct HttpEventStreamState {
@@ -539,6 +541,7 @@ fn decode_http_sse_frame(frame: &[u8]) -> Result<Option<DecodedHttpSseEvent>, Co
         return Ok(Some(DecodedHttpSseEvent {
             event,
             payload: None,
+            data_bytes: data.len(),
         }));
     }
     let payload = serde_json::from_str(&data)
@@ -546,6 +549,7 @@ fn decode_http_sse_frame(frame: &[u8]) -> Result<Option<DecodedHttpSseEvent>, Co
     Ok(Some(DecodedHttpSseEvent {
         event,
         payload: Some(payload),
+        data_bytes: data.len(),
     }))
 }
 
@@ -1558,6 +1562,7 @@ impl CodexHttpClient {
             account_id,
         } = state;
         let body_idle_timeout_ms = self.body_idle_timeout_ms;
+        let buffered_response_limit = self.buffered_response_limit;
         let req_id = ctx.req_id.clone();
         let traffic = ctx.traffic.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -1583,6 +1588,8 @@ impl CodexHttpClient {
                 let mut body_chunks = 0_u64;
                 let mut event_count = 0_u64;
                 let mut pending_events = Vec::new();
+                // The data length of the events held until output starts.
+                let mut pending_bytes = 0_usize;
 
                 let stream_error = 'read_attempt: loop {
                     let chunk = tokio::select! {
@@ -1713,6 +1720,7 @@ impl CodexHttpClient {
                     };
 
                     for event in events {
+                        let data_bytes = event.data_bytes;
                         let Some(payload) = event.payload else {
                             continue;
                         };
@@ -1755,6 +1763,7 @@ impl CodexHttpClient {
                         let terminal = event_closes_http_stream(&payload);
                         if !semantic_output_forwarded && failure.is_some() {
                             pending_events.clear();
+                            pending_bytes = 0;
                             if tx.send(Ok(payload)).await.is_err() {
                                 return;
                             }
@@ -1762,6 +1771,7 @@ impl CodexHttpClient {
                             && http_event_starts_semantic_output(&payload)
                         {
                             semantic_output_forwarded = true;
+                            pending_bytes = 0;
                             for pending in pending_events.drain(..) {
                                 if tx.send(Ok(pending)).await.is_err() {
                                     return;
@@ -1775,6 +1785,29 @@ impl CodexHttpClient {
                                 return;
                             }
                         } else {
+                            // Nothing of these events has reached the client,
+                            // so holding more of them than a buffered answer
+                            // may hold ends the stream here, with nothing sent
+                            // again.
+                            let held = pending_bytes.saturating_add(data_bytes);
+                            if held > buffered_response_limit {
+                                pending_events.clear();
+                                let error =
+                                    buffered_response_too_large_error(CodexErrorOrigin::Http);
+                                log_http_stream_end(
+                                    &log,
+                                    "codex_http_stream_failed",
+                                    &req_id,
+                                    started_at,
+                                    body_bytes,
+                                    body_chunks,
+                                    event_count,
+                                    Some(&error.message),
+                                );
+                                let _ = tx.send(Err(error)).await;
+                                return;
+                            }
+                            pending_bytes = held;
                             pending_events.push(payload);
                         }
 
@@ -3495,7 +3528,7 @@ fn abort_abandoned_live_continuation(
     }
 }
 
-fn invalidate_live_continuation_pool(
+pub(super) fn invalidate_live_continuation_pool(
     continuation: Option<&super::continuation::ContinuationReservation>,
 ) {
     let Some(continuation) = continuation else {

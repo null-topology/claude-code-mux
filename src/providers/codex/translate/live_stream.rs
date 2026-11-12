@@ -14,6 +14,11 @@ use super::reducer::{
 
 const BUFFERED_READ_REPAIR_TRAILING_WHITESPACE_BYTES: usize = 1_024;
 const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
+/// Why a live answer ended when the strings the translator keeps of it would
+/// pass its limit. It names neither the backend nor the transport, so the
+/// client reads it as written.
+pub(crate) const RETAINED_OUTPUT_TOO_LARGE: &str =
+    "Streamed response exceeded the size limit for the output held while it streams";
 
 enum LiveBlock {
     Text {
@@ -77,6 +82,14 @@ pub struct LiveStreamTranslator {
     /// shape requires on every finish: the request's own estimate opens it, and
     /// only counts the backend itself reported close it.
     usage_report: UsageReport,
+    /// Bytes of every string kept for this stream so far: text and tool
+    /// arguments as they grow, ids, names, reasoning items, web searches and
+    /// their results. A replacement adds its new length and a removal takes
+    /// nothing off, so the count only rises.
+    retained_bytes: usize,
+    /// The most `retained_bytes` may reach. A string that would take it past
+    /// this ends the stream with `RETAINED_OUTPUT_TOO_LARGE` before it is kept.
+    retained_limit: usize,
 }
 
 impl LiveStreamTranslator {
@@ -108,7 +121,15 @@ impl LiveStreamTranslator {
             finished: false,
             terminal_emitted: false,
             usage_report: UsageReport::default(),
+            retained_bytes: 0,
+            retained_limit: crate::providers::codex::client::MAX_BUFFERED_RESPONSE_BYTES,
         }
+    }
+
+    /// Sets how many bytes of strings the translator may keep for one stream.
+    pub fn with_retained_limit(mut self, limit: usize) -> Self {
+        self.retained_limit = limit;
+        self
     }
 
     pub fn accept(
@@ -150,7 +171,7 @@ impl LiveStreamTranslator {
             | "response.web_search_call.searching"
             | "response.web_search_call.completed" => {}
             "response.output_item.added" => {
-                self.output_item_added(payload, traffic, &mut out);
+                self.output_item_added(payload, traffic, &mut out)?;
             }
             "response.reasoning_summary_part.added" => {
                 let output_index = output_index(payload);
@@ -174,19 +195,19 @@ impl LiveStreamTranslator {
                 self.reasoning_delta(payload, traffic, &mut out);
             }
             "response.output_text.delta" => {
-                self.text_delta(payload, traffic, &mut out);
+                self.text_delta(payload, traffic, &mut out)?;
             }
             "response.output_text.annotation.added" => {
-                self.web_search_annotation(payload);
+                self.web_search_annotation(payload)?;
             }
             "response.function_call_arguments.delta" => {
                 self.tool_delta(payload, traffic, &mut out)?;
             }
             "response.function_call_arguments.done" => {
-                self.tool_arguments_done(payload);
+                self.tool_arguments_done(payload)?;
             }
             "response.output_item.done" => {
-                self.output_item_done(payload, traffic, &mut out);
+                self.output_item_done(payload, traffic, &mut out)?;
             }
             "response.completed" | "response.incomplete" | "response.done" => {
                 self.finish(payload, traffic, &mut out);
@@ -334,21 +355,23 @@ impl LiveStreamTranslator {
         payload: &serde_json::Value,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), String> {
         let Some(item) = payload.get("item") else {
-            return;
+            return Ok(());
         };
         let output_index = output_index(payload);
         let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         match item_type {
             "reasoning" => {
+                self.retain(reasoning_capture_bytes(item))?;
                 self.reasoning_by_output_index
                     .entry(output_index)
                     .or_default()
                     .capture(item);
             }
             "message" => {
+                self.retain(item.get("id").and_then(|v| v.as_str()).map_or(0, str::len))?;
                 self.close_thinking(traffic, out);
                 let index = self.anthropic_index;
                 self.anthropic_index += 1;
@@ -380,21 +403,16 @@ impl LiveStreamTranslator {
                 }
             }
             "function_call" => {
+                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                self.retain(call_id.len() + name.len())?;
                 self.close_thinking(traffic, out);
                 self.saw_tool_use = true;
                 self.semantic_output_started = true;
                 let index = self.anthropic_index;
                 self.anthropic_index += 1;
-                let call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let call_id = call_id.to_string();
+                let name = name.to_string();
                 self.blocks_by_output_index.insert(
                     output_index,
                     LiveBlock::Tool {
@@ -429,6 +447,7 @@ impl LiveStreamTranslator {
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn reasoning_delta(
@@ -484,14 +503,8 @@ impl LiveStreamTranslator {
         payload: &serde_json::Value,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
-    ) {
-        self.close_thinking(traffic, out);
+    ) -> Result<(), String> {
         let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-        if delta.is_empty() {
-            return;
-        }
-        self.semantic_output_started = true;
-
         let output_index = payload
             .get("output_index")
             .and_then(|v| v.as_u64())
@@ -503,6 +516,21 @@ impl LiveStreamTranslator {
                     .and_then(|id| self.item_id_to_output_index.get(id).copied())
             })
             .unwrap_or(0);
+        // A delta lands in a text block, an existing one or one made for it,
+        // unless a tool block holds that output index.
+        if !delta.is_empty()
+            && !matches!(
+                self.blocks_by_output_index.get(&output_index),
+                Some(LiveBlock::Tool { .. })
+            )
+        {
+            self.retain(delta.len())?;
+        }
+        self.close_thinking(traffic, out);
+        if delta.is_empty() {
+            return Ok(());
+        }
+        self.semantic_output_started = true;
 
         if !self.blocks_by_output_index.contains_key(&output_index) {
             let index = self.anthropic_index;
@@ -537,11 +565,11 @@ impl LiveStreamTranslator {
             deferred,
         }) = self.blocks_by_output_index.get_mut(&output_index)
         else {
-            return;
+            return Ok(());
         };
         text.push_str(delta);
         if *deferred {
-            return;
+            return Ok(());
         }
         let index = *index;
         self.emit(
@@ -554,6 +582,7 @@ impl LiveStreamTranslator {
                 "delta": {"type": "text_delta", "text": delta}
             }),
         );
+        Ok(())
     }
 
     fn tool_delta(
@@ -587,6 +616,7 @@ impl LiveStreamTranslator {
         else {
             return Ok(());
         };
+        reserve_retained(&mut self.retained_bytes, self.retained_limit, delta.len())?;
         args_accum.push_str(delta);
         *had_delta = true;
         if *buffer_until_done {
@@ -598,6 +628,11 @@ impl LiveStreamTranslator {
             if let Some(repaired) =
                 repair_whitespace_stalled_read_args(name, args_accum, Some(call_id.as_str()))
             {
+                reserve_retained(
+                    &mut self.retained_bytes,
+                    self.retained_limit,
+                    repaired.len(),
+                )?;
                 *args_accum = repaired.clone();
                 *emitted_args = true;
                 repaired_read = Some((*index, repaired));
@@ -650,25 +685,27 @@ impl LiveStreamTranslator {
         Ok(())
     }
 
-    fn tool_arguments_done(&mut self, payload: &serde_json::Value) {
+    fn tool_arguments_done(&mut self, payload: &serde_json::Value) -> Result<(), String> {
         let Some(output_index) = payload
             .get("output_index")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
         else {
-            return;
+            return Ok(());
         };
         let Some(args) = payload.get("arguments").and_then(|v| v.as_str()) else {
-            return;
+            return Ok(());
         };
         let Some(LiveBlock::Tool { args_accum, .. }) =
             self.blocks_by_output_index.get_mut(&output_index)
         else {
-            return;
+            return Ok(());
         };
         if args_accum.is_empty() {
+            reserve_retained(&mut self.retained_bytes, self.retained_limit, args.len())?;
             *args_accum = args.to_string();
         }
+        Ok(())
     }
 
     fn output_item_done(
@@ -676,7 +713,7 @@ impl LiveStreamTranslator {
         payload: &serde_json::Value,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), String> {
         let output_index = output_index(payload);
         if let Some(item) = payload
             .get("item")
@@ -685,6 +722,7 @@ impl LiveStreamTranslator {
             .filter(|item_type| *item_type == "reasoning")
             .and_then(|_| payload.get("item"))
         {
+            self.retain(reasoning_capture_bytes(item))?;
             self.reasoning_by_output_index
                 .entry(output_index)
                 .or_default()
@@ -696,7 +734,7 @@ impl LiveStreamTranslator {
             if !had_active_summary {
                 self.emit_signature_only_reasoning(output_index, traffic, out);
             }
-            return;
+            return Ok(());
         }
 
         if payload
@@ -705,25 +743,58 @@ impl LiveStreamTranslator {
             .and_then(|v| v.as_str())
             == Some("web_search_call")
         {
+            let item = &payload["item"];
+            let raw_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let id = super::web_search_compat::server_tool_use_id_from_codex_web_search_id(raw_id);
+            let query = web_search_query(item);
+            self.retain(id.len() + query.len())?;
             self.close_thinking(traffic, out);
             self.semantic_output_started = true;
-            let item = &payload["item"];
             let index = self.anthropic_index;
             self.anthropic_index += 1;
             let result_index = self.anthropic_index;
             self.anthropic_index += 1;
-            let raw_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
             self.web_searches.push(LiveWebSearch {
                 index,
                 result_index,
-                id: super::web_search_compat::server_tool_use_id_from_codex_web_search_id(raw_id),
-                query: web_search_query(item),
+                id,
+                query,
             });
-            return;
+            return Ok(());
         }
 
+        // The arguments a tool block ends with, worked out and counted before
+        // the block is taken out, so a refusal leaves it as it was.
+        let tool_args = match self.blocks_by_output_index.get(&output_index) {
+            Some(LiveBlock::Tool {
+                name,
+                call_id,
+                args_accum,
+                had_delta,
+                emitted_args,
+                ..
+            }) => {
+                let final_args = payload
+                    .get("item")
+                    .and_then(|item| item.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .filter(|_| args_accum.is_empty() || (!*had_delta && !*emitted_args));
+                let args = final_args.unwrap_or(args_accum);
+                let sanitized = (!args.is_empty())
+                    .then(|| sanitize_read_args(name, args, Some(call_id.as_str())));
+                reserve_retained(
+                    &mut self.retained_bytes,
+                    self.retained_limit,
+                    final_args.map_or(0, str::len) + sanitized.as_ref().map_or(0, String::len),
+                )?;
+                sanitized
+            }
+            _ => None,
+        };
+
         let Some(mut state) = self.blocks_by_output_index.remove(&output_index) else {
-            return;
+            return Ok(());
         };
 
         match &mut state {
@@ -748,25 +819,13 @@ impl LiveStreamTranslator {
             }
             LiveBlock::Tool {
                 index,
-                name,
-                call_id,
                 args_accum,
-                had_delta,
                 buffer_until_done,
                 emitted_args,
                 ..
             } => {
-                if let Some(final_args) = payload
-                    .get("item")
-                    .and_then(|item| item.get("arguments"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    && (args_accum.is_empty() || (!*had_delta && !*emitted_args))
-                {
-                    *args_accum = final_args.to_string();
-                }
-                if !args_accum.is_empty() {
-                    *args_accum = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
+                if let Some(args) = tool_args {
+                    *args_accum = args;
                     if *buffer_until_done || !*emitted_args {
                         *emitted_args = true;
                         self.emit(
@@ -795,34 +854,37 @@ impl LiveStreamTranslator {
                 );
             }
         }
+        Ok(())
     }
 
-    fn web_search_annotation(&mut self, payload: &serde_json::Value) {
+    fn web_search_annotation(&mut self, payload: &serde_json::Value) -> Result<(), String> {
         let Some(annotation) = payload.get("annotation") else {
-            return;
+            return Ok(());
         };
         if annotation.get("type").and_then(|v| v.as_str()) != Some("url_citation") {
-            return;
+            return Ok(());
         }
         let Some(url) = annotation.get("url").and_then(|v| v.as_str()) else {
-            return;
+            return Ok(());
         };
         if self
             .web_search_results
             .iter()
             .any(|result| result.url == url)
         {
-            return;
+            return Ok(());
         }
         let title = annotation
             .get("title")
             .and_then(|v| v.as_str())
             .filter(|title| !title.is_empty())
             .unwrap_or(url);
+        self.retain(title.len() + url.len())?;
         self.web_search_results.push(LiveWebSearchResult {
             title: title.to_string(),
             url: url.to_string(),
         });
+        Ok(())
     }
 
     fn emit_web_searches(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
@@ -1075,6 +1137,12 @@ impl LiveStreamTranslator {
         );
     }
 
+    /// Counts `bytes` of a string about to be kept, or refuses it when that
+    /// would take the stream past its limit.
+    fn retain(&mut self, bytes: usize) -> Result<(), String> {
+        reserve_retained(&mut self.retained_bytes, self.retained_limit, bytes)
+    }
+
     fn close_thinking(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
         let Some(thinking) = self.thinking.take() else {
             return;
@@ -1106,6 +1174,29 @@ impl LiveStreamTranslator {
             }),
         );
     }
+}
+
+/// Adds `bytes` to the running count, or refuses without changing it when the
+/// sum would pass `limit`. It takes the count's field rather than the
+/// translator, so a caller holding one of the translator's blocks can call it.
+fn reserve_retained(retained: &mut usize, limit: usize, bytes: usize) -> Result<(), String> {
+    match retained.checked_add(bytes) {
+        Some(total) if total <= limit => {
+            *retained = total;
+            Ok(())
+        }
+        _ => Err(RETAINED_OUTPUT_TOO_LARGE.to_string()),
+    }
+}
+
+/// The bytes `PendingReasoning::capture` keeps of a reasoning item: its id
+/// and its encrypted content.
+fn reasoning_capture_bytes(item: &serde_json::Value) -> usize {
+    ["id", "encrypted_content"]
+        .iter()
+        .filter_map(|key| item.get(*key).and_then(|v| v.as_str()))
+        .map(str::len)
+        .sum()
 }
 
 fn web_search_query(item: &serde_json::Value) -> String {
@@ -1344,6 +1435,34 @@ mod tests {
         assert!(out.contains("hello"));
         assert!(!out.contains("message_stop"));
         assert!(translator.has_semantic_output());
+    }
+
+    /// A string that would take what the translator holds past its limit is
+    /// refused before any of it is kept; one that reaches the limit exactly
+    /// is kept.
+    #[test]
+    fn a_string_past_the_retained_limit_is_refused_before_it_is_kept() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5").with_retained_limit(16);
+        let delta = |text: &str| {
+            json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": text
+            })
+        };
+        translator.accept(&delta("0123456789"), None).unwrap();
+
+        let error = translator.accept(&delta("0123456"), None).unwrap_err();
+        assert_eq!(error, RETAINED_OUTPUT_TOO_LARGE);
+        assert_eq!(translator.retained_bytes, 10);
+
+        let out = translator.accept(&delta("012345"), None).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("012345"));
+        assert_eq!(translator.retained_bytes, 16);
+        let Some(LiveBlock::Text { text, .. }) = translator.blocks_by_output_index.get(&0) else {
+            panic!("the text block is open");
+        };
+        assert_eq!(text, "0123456789012345");
     }
 
     #[test]

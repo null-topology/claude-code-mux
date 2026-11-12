@@ -45,15 +45,25 @@
   are read, so a refusal that comes after them still answers 502. Either way
   the request is not sent again, not retried after a token refresh and not
   replayed over HTTP, and its WebSocket is closed rather than kept for the
-  conversation. The cap has no setting.
-- A streaming Codex response is still relayed whole, but the copy of its
-  upstream events the proxy keeps beside the relay now stops at the same
-  64 MiB. A response past it leaves no state to continue from, so the
+  conversation. A streaming Codex response is held to the same cap until its
+  output starts: one that would pass it before then fails with the same 502,
+  over either transport, and is not sent again either. The cap has no
+  setting.
+- A streaming Codex response is now bounded as well. The copy of its
+  upstream events the proxy keeps beside the relay stops at the same
+  64 MiB: the response goes on, but leaves no state to continue from, so the
   conversation's next request sends its full context instead of only what
   it adds, and `proxy.log` gets a `codex_live_stream_copy_dropped` warning
   with the request id and the limit. With a traffic capture on, the
   captured WebSocket response body stops at that size too, and without a
-  capture the WebSocket reader no longer keeps that copy at all.
+  capture the WebSocket reader no longer keeps that copy at all. The text,
+  tool call arguments, reasoning and web search results the proxy keeps
+  while it translates the response stop at 64 MiB too: the piece that would
+  pass that is neither kept nor relayed, and the request fails with a 502
+  `api_error` when nothing was relayed yet, or else the stream ends with an
+  SSE `error` event of type `api_error`. Such a response is not sent again,
+  leaves no state to continue from, and its WebSocket is closed rather than
+  kept for the conversation.
 - Under the default `auto` transport, a Codex request the WebSocket refused
   as too large is replayed over HTTP only under the ChatGPT account the
   WebSocket attempt used. When both attempts name their account, the two

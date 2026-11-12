@@ -398,8 +398,9 @@ Request path:
      `compaction.rs`).
      `continuation.rs` keeps `previous_response_id` state keyed by
      `ConversationIdentity` (session plus agent headers) so subagents do not
-     clobber each other (a live stream whose events went past
-     `MAX_BUFFERED_RESPONSE_BYTES` leaves none); `compaction.rs` does
+     clobber each other (a live stream whose events, or whose output held
+     for translation, went past `MAX_BUFFERED_RESPONSE_BYTES` leaves none);
+     `compaction.rs` does
      server-side compaction;
      `events.rs` classifies stream failures and recognises the
      `usage_limit_reached` error; `rate_limits.rs` keeps the newest
@@ -1258,7 +1259,30 @@ that point. The client receives every event either way. No copy is built
 before it is known to fit: `encoded_sse_len` gives `encode_sse`'s framed
 length without allocating, and `append_upstream_sse_payload` serialises into
 a writer that stops at the room left. The live HTTP
-reader keeps no copy of the stream; it captures event by event.
+reader keeps no copy of the stream; it captures event by event. What a live
+stream holds is bounded by the same limit too. The translator
+(`LiveStreamTranslator`, built `with_retained_limit` from it in
+`live_stream_response_once`) keeps a running count of the bytes of every
+string it appends or stores (text, tool call arguments and their
+replacements, reasoning ids and `encrypted_content`, message and call ids,
+tool names, web search ids, queries and result titles and URLs; a
+replacement adds its length and subtracts nothing, a move into
+`deferred_text` adds nothing) and refuses the one that would pass the limit
+before keeping it (`reserve_retained`), with `RETAINED_OUTPUT_TOO_LARGE`.
+After output that refusal ends the stream with an SSE `error` of type
+`api_error`, before output it answers a plain 502 `api_error`; either way
+`abort_refused_live_stream` drops the upstream stream, removes the turn's
+pooled socket (`invalidate_live_continuation_pool`) and then aborts the
+request state, in that order, so a socket the WebSocket task pooled on a
+`response.completed` the consumer never reached does not stay. Before
+output, the translated framing held in `pending_chunk` (`message_start` and
+pings) answers `buffered_response_too_large_error` the same way once the
+next chunk would pass the limit, and `spawn_http_event_stream` counts the
+SSE data length (`DecodedHttpSseEvent::data_bytes`) of the events it holds
+in `pending_events` and, when the next one would pass the limit, drops them
+and fails the stream with that error, which is neither resent, refreshed
+nor replayed. The live WebSocket coordinator holds nothing before output: it
+forwards each event as it arrives over a bounded channel.
 Text built from a `reqwest::Error` in these paths goes through
 `upstream_http::error_text`, which leaves out the request URL. Under `auto` transport
 (the default) a handshake failure, classified or not, falls back to HTTP unless the

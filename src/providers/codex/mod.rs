@@ -755,6 +755,22 @@ fn abort_request_state(
     abort_continuation_for_owner(continuation);
 }
 
+/// Ends a live stream the proxy refused to go on with: the stream first, then
+/// the socket the turn may already have pooled, then the request state. The
+/// stream task pools the socket when the backend finished its answer before
+/// the refusal; a socket pooled after the removal goes again when the answer
+/// it carries can no longer be handed on.
+fn abort_refused_live_stream(
+    upstream_events: websocket::CodexWebSocketEventStream,
+    session_id: Option<&str>,
+    continuation: &ContinuationReservation,
+    compaction_attempt: Option<CompactionAttempt>,
+) {
+    drop(upstream_events);
+    client::invalidate_live_continuation_pool(Some(continuation));
+    abort_request_state(session_id, continuation, compaction_attempt);
+}
+
 struct LiveRequestStateCleanup {
     continuation: ContinuationReservation,
     session_id: Option<String>,
@@ -938,11 +954,14 @@ async fn live_stream_response_once(
     upstream_copy_limit: usize,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
+    // The strings the translator keeps of the answer share the client's limit
+    // for a buffered one; past it the stream ends with an error.
     let mut translator = LiveStreamTranslator::with_estimated_input_tokens(
         message_id,
         model.to_string(),
         estimated_input_tokens,
-    );
+    )
+    .with_retained_limit(upstream_copy_limit);
     let mut upstream_copy = LiveUpstreamCopy::new(upstream_copy_limit);
     // Keep protocol framing private until real output makes a transparent retry unsafe.
     // Every branch that consumes pending_chunk returns, so it is never flushed twice.
@@ -1033,7 +1052,8 @@ async fn live_stream_response_once(
                         },
                     );
                 }
-                abort_request_state(
+                abort_refused_live_stream(
+                    upstream_events,
                     ctx.session_id.as_deref(),
                     &request_continuation,
                     compaction.attempt,
@@ -1052,6 +1072,22 @@ async fn live_stream_response_once(
                 return LiveStreamStart::Response(map_codex_failure_to_response(&message));
             }
         };
+        // Until output starts the answer is held here, and only the message
+        // start and keepalive pings add to it, so a backend that keeps a
+        // response open with no output cannot grow it past the limit.
+        if !translator.has_semantic_output()
+            && pending_chunk.len().saturating_add(chunk.len()) > upstream_copy_limit
+        {
+            abort_refused_live_stream(
+                upstream_events,
+                ctx.session_id.as_deref(),
+                &request_continuation,
+                compaction.attempt,
+            );
+            return LiveStreamStart::Response(map_codex_error_to_response(
+                &client::buffered_response_too_large_error(client::CodexErrorOrigin::WebSocket),
+            ));
+        }
         pending_chunk.extend_from_slice(&chunk);
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
@@ -1276,7 +1312,8 @@ fn remaining_live_stream_response(
                     ) {
                         Ok(result) => result,
                         Err(message) => {
-                            abort_request_state(
+                            abort_refused_live_stream(
+                                upstream_events,
                                 ctx.session_id.as_deref(),
                                 &request_continuation,
                                 compaction.attempt,
@@ -4360,6 +4397,39 @@ mod tests {
         continuation::clear_continuation_for_owner(Some(&owner));
         websocket::invalidate_codex_websocket_pool_owner(&owner);
 
+        fn copy_limit_events(id: &str) -> Vec<serde_json::Value> {
+            let text = format!("relayed in full {}", "y".repeat(1024));
+            vec![
+                serde_json::json!({
+                    "type": "response.created",
+                    "response": {"id": id}
+                }),
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "message", "id": "msg-copy"}
+                }),
+                serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "delta": text
+                }),
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {"type": "message", "id": "msg-copy"}
+                }),
+                serde_json::json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": id,
+                        "status": "completed",
+                        "output": []
+                    }
+                }),
+            ]
+        }
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -4381,35 +4451,7 @@ mod tests {
                                 request_tx.send(request).unwrap();
                                 answered += 1;
                                 let id = format!("resp-copy-{answered}");
-                                for event in [
-                                    serde_json::json!({
-                                        "type": "response.created",
-                                        "response": {"id": id}
-                                    }),
-                                    serde_json::json!({
-                                        "type": "response.output_item.added",
-                                        "output_index": 0,
-                                        "item": {"type": "message", "id": "msg-copy"}
-                                    }),
-                                    serde_json::json!({
-                                        "type": "response.output_text.delta",
-                                        "output_index": 0,
-                                        "delta": "relayed in full"
-                                    }),
-                                    serde_json::json!({
-                                        "type": "response.output_item.done",
-                                        "output_index": 0,
-                                        "item": {"type": "message", "id": "msg-copy"}
-                                    }),
-                                    serde_json::json!({
-                                        "type": "response.completed",
-                                        "response": {
-                                            "id": id,
-                                            "status": "completed",
-                                            "output": []
-                                        }
-                                    }),
-                                ] {
+                                for event in copy_limit_events(&id) {
                                     emit_live_event(&mut websocket, &event).await;
                                 }
                             }
@@ -4420,13 +4462,20 @@ mod tests {
             }
         });
 
-        // A limit of one byte drops the copy at the first event.
+        // One byte short of the answer's JSON, so the copy, which adds SSE
+        // framing to it, is dropped. The translator holds only the message id
+        // and the text, and before output only the message start, all well
+        // within it, so the stream itself is relayed whole.
+        let answer_bytes: usize = copy_limit_events("resp-copy-1")
+            .iter()
+            .map(|event| serde_json::to_vec(event).unwrap().len())
+            .sum();
         let client = Arc::new(
             Arc::into_inner(authenticated_live_test_client(format!(
                 "http://{addr}/responses"
             )))
             .unwrap()
-            .with_buffered_response_limit(1),
+            .with_buffered_response_limit(answer_bytes - 1),
         );
         let compaction = LiveStreamCompaction {
             compact_boundary: false,
@@ -4497,6 +4546,381 @@ mod tests {
         assert_eq!(second_sent["input"].as_array().unwrap().len(), 2);
         continuation::clear_continuation_for_owner(Some(&owner));
         websocket::invalidate_codex_websocket_pool_owner(&owner);
+    }
+
+    /// The size limit the refused-stream tests give the client: above the
+    /// message start held before output, below what each test sends.
+    const HELD_LIMIT: usize = 4096;
+
+    /// What a live turn the proxy refused left behind.
+    struct RefusedLiveStream {
+        status: StatusCode,
+        body: String,
+        requests: usize,
+        turn_current: bool,
+        continuation_kept: bool,
+        socket_pooled: bool,
+    }
+
+    /// Runs one live WebSocket turn under `HELD_LIMIT` against a backend that
+    /// answers with `response.created`, then `events`, then a completed
+    /// response, and returns what the turn left once its socket has closed.
+    /// A socket that stays open was pooled, and fails the wait.
+    async fn refused_live_websocket_turn(
+        session_id: &str,
+        events: Vec<serde_json::Value>,
+    ) -> RefusedLiveStream {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let request_tx = request_tx.clone();
+                let closed_tx = closed_tx.clone();
+                let events = events.clone();
+                tokio::spawn(async move {
+                    while let Some(Ok(message)) = websocket.next().await {
+                        match message {
+                            Message::Ping(payload) => {
+                                let _ = websocket.send(Message::Pong(payload)).await;
+                            }
+                            Message::Text(_) => {
+                                request_tx.send(()).unwrap();
+                                let created = serde_json::json!({
+                                    "type": "response.created",
+                                    "response": {"id": "resp-refused"}
+                                });
+                                let completed = serde_json::json!({
+                                    "type": "response.completed",
+                                    "response": {
+                                        "id": "resp-refused",
+                                        "status": "completed",
+                                        "output": []
+                                    }
+                                });
+                                for event in std::iter::once(&created)
+                                    .chain(&events)
+                                    .chain(std::iter::once(&completed))
+                                {
+                                    // The proxy may close the socket while the
+                                    // answer is still being written.
+                                    let _ = websocket.send(Message::Text(event.to_string())).await;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let _ = closed_tx.send(());
+                });
+            }
+        });
+
+        let client = Arc::new(
+            Arc::into_inner(authenticated_live_test_client(format!(
+                "http://{addr}/responses"
+            )))
+            .unwrap()
+            .with_buffered_response_limit(HELD_LIMIT),
+        );
+        let request = live_test_request("refused");
+        let turn = continuation_candidate_for_owner(Some(&owner), &request, true);
+        let turn_after = turn.clone();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            live_stream_response(
+                client,
+                "message".to_string(),
+                &request.model,
+                live_test_context(session_id),
+                request.clone(),
+                turn,
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+                config::CodexTransport::WebSocket,
+            ),
+        )
+        .await
+        .expect("the turn did not start");
+        let status = response.status();
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the turn did not finish")
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), closed_rx.recv())
+            .await
+            .expect("the refused turn's socket stayed open");
+        server.abort();
+        let mut requests = 0;
+        while request_rx.try_recv().is_ok() {
+            requests += 1;
+        }
+
+        let refused = RefusedLiveStream {
+            status,
+            body: String::from_utf8(body.to_vec()).unwrap(),
+            requests,
+            turn_current: continuation::is_current_turn_for_owner(&turn_after),
+            continuation_kept: continuation::has_continuation_for_owner_for_tests(&owner),
+            socket_pooled: websocket::pooled_socket_id_for_tests(&owner).is_some(),
+        };
+        continuation::clear_continuation_for_owner(Some(&owner));
+        websocket::invalidate_codex_websocket_pool_owner(&owner);
+        refused
+    }
+
+    /// The events that start output before each refused-after-output case.
+    fn output_before_the_limit() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "id": "msg-held"}
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": "relayed before the limit"
+            }),
+        ]
+    }
+
+    /// Output that started is ended with an SSE error event, before the
+    /// string that would pass the limit is kept or relayed, and the turn
+    /// leaves nothing behind: no continuation, no pooled socket, no resend.
+    fn assert_refused_after_output(refused: &RefusedLiveStream, refused_marker: &str) {
+        let body = &refused.body;
+        assert_eq!(refused.status, StatusCode::OK, "{body}");
+        assert!(body.contains("relayed before the limit"), "{body}");
+        assert!(body.contains("event: error"), "{body}");
+        assert!(
+            body.contains(translate::live_stream::RETAINED_OUTPUT_TOO_LARGE),
+            "{body}"
+        );
+        assert!(!body.contains("message_stop"), "{body}");
+        assert!(!body.contains(refused_marker), "{body}");
+        assert_eq!(refused.requests, 1, "nothing is sent again");
+        assert!(!refused.turn_current, "the request state is dropped");
+        assert!(!refused.continuation_kept);
+        assert!(!refused.socket_pooled);
+    }
+
+    #[tokio::test]
+    async fn a_live_text_delta_past_the_held_limit_ends_the_stream_and_its_state() {
+        let mut events = output_before_the_limit();
+        events.push(serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": "x".repeat(HELD_LIMIT)
+        }));
+        let refused = refused_live_websocket_turn("live-held-text", events).await;
+        assert_refused_after_output(&refused, &"x".repeat(64));
+    }
+
+    /// Streamed arguments, which are relayed as they arrive rather than held
+    /// until the call is done, count toward the same limit.
+    #[tokio::test]
+    async fn live_tool_arguments_past_the_held_limit_end_the_stream_and_its_state() {
+        let mut events = output_before_the_limit();
+        events.extend([
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {"type": "function_call", "call_id": "call_held", "name": "Bash"}
+            }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 1,
+                "delta": "{\"command\":"
+            }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 1,
+                "delta": "z".repeat(HELD_LIMIT)
+            }),
+        ]);
+        let refused = refused_live_websocket_turn("live-held-tool", events).await;
+        assert!(
+            refused.body.contains("input_json_delta"),
+            "{}",
+            refused.body
+        );
+        assert_refused_after_output(&refused, &"z".repeat(64));
+    }
+
+    /// Reasoning kept for the next turn counts toward the limit like text.
+    #[tokio::test]
+    async fn live_reasoning_past_the_held_limit_ends_the_stream_and_its_state() {
+        let mut events = output_before_the_limit();
+        events.push(serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "type": "reasoning",
+                "id": "rs_held",
+                "encrypted_content": "r".repeat(HELD_LIMIT)
+            }
+        }));
+        let refused = refused_live_websocket_turn("live-held-reasoning", events).await;
+        assert_refused_after_output(&refused, &"r".repeat(64));
+    }
+
+    /// Before output starts the translated answer is held, and only the
+    /// message start and keepalive pings add to it: a response kept open with
+    /// progress events alone is answered 502 once it would pass the limit,
+    /// and leaves nothing behind.
+    #[tokio::test]
+    async fn a_live_answer_held_past_the_limit_before_output_answers_502_once() {
+        let progress = serde_json::json!({
+            "type": "response.in_progress",
+            "response": {"id": "resp-refused"}
+        });
+        let refused =
+            refused_live_websocket_turn("live-held-before-output", vec![progress; HELD_LIMIT / 16])
+                .await;
+        let body = &refused.body;
+        assert_eq!(refused.status, StatusCode::BAD_GATEWAY, "{body}");
+        let error: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(error["error"]["type"], "api_error", "{body}");
+        assert_eq!(refused.requests, 1, "nothing is sent again");
+        assert!(!refused.turn_current, "the request state is dropped");
+        assert!(!refused.continuation_kept);
+        assert!(!refused.socket_pooled);
+    }
+
+    /// Over HTTP, the events held until output starts count toward the same
+    /// limit: past it the request is answered 502 `api_error` once, and none
+    /// of what was held reaches the client.
+    #[tokio::test]
+    async fn a_live_http_answer_held_past_the_limit_answers_502_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let session_id = "live-http-held";
+        let owner = ConversationIdentity::Main(session_id.to_string());
+        continuation::clear_continuation_for_owner(Some(&owner));
+
+        let held = |id: &str| {
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": id,
+                    "encrypted_content": "h".repeat(HELD_LIMIT / 2)
+                }
+            })
+        };
+        let mut body = String::new();
+        for event in [
+            serde_json::json!({"type": "response.created", "response": {"id": "resp-held"}}),
+            held("rs_held_1"),
+            held("rs_held_2"),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": "after the limit"
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "resp-held", "status": "completed", "output": []}
+            }),
+        ] {
+            body.push_str(&format!("data: {event}\n\n"));
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = 0_usize;
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                requests += 1;
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 8192];
+                loop {
+                    let read = stream.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+            }
+            requests
+        });
+
+        let client = Arc::new(
+            Arc::into_inner(authenticated_live_test_client(format!(
+                "http://{addr}/responses"
+            )))
+            .unwrap()
+            .with_buffered_response_limit(HELD_LIMIT),
+        );
+        let request = live_test_request("held over http");
+        let turn = continuation_candidate_for_owner(Some(&owner), &request, true);
+        let turn_after = turn.clone();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            live_stream_response(
+                client,
+                "message".to_string(),
+                &request.model,
+                live_test_context(session_id),
+                request.clone(),
+                turn,
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                },
+                config::CodexTransport::Http,
+            ),
+        )
+        .await
+        .expect("the turn did not start");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let answer = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let answer = String::from_utf8(answer.to_vec()).unwrap();
+        let error: serde_json::Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(error["error"]["type"], "api_error", "{answer}");
+        assert!(!answer.contains("after the limit"), "{answer}");
+        assert!(!answer.contains("hhhhhhhh"), "{answer}");
+        assert_eq!(server.await.unwrap(), 1, "nothing is sent again");
+        assert!(!continuation::is_current_turn_for_owner(&turn_after));
+        assert!(!continuation::has_continuation_for_owner_for_tests(&owner));
+        continuation::clear_continuation_for_owner(Some(&owner));
     }
 
     /// Once the response has started, the reader does not record again a
