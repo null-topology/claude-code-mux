@@ -6838,13 +6838,22 @@ mod tests {
         })
     }
 
-    /// A loopback address nothing listens on yet.
-    async fn released_loopback_addr() -> std::net::SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        addr
+    /// A loopback port held without listening, so a connect to it fails until
+    /// the test calls `listen`, and no other socket can take it meanwhile.
+    /// Linux refuses such a connect; macOS leaves it unanswered until it times
+    /// out, which `UNLISTENED_CONNECT_DEADLINE` allows for.
+    fn unlistened_loopback_socket() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        (socket, addr)
     }
+
+    /// How long a request to an unlistened port may take: up to the WebSocket
+    /// connect timeout, then the HTTP request after it.
+    const UNLISTENED_CONNECT_DEADLINE: Duration = Duration::from_millis(
+        super::super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS + MOCK_DEADLINE.as_millis() as u64,
+    );
 
     #[tokio::test]
     async fn an_unanswered_connect_sends_the_next_buffered_auto_requests_straight_to_http() {
@@ -6852,7 +6861,7 @@ mod tests {
 
         let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
         super::super::websocket::clear_codex_websocket_pool_for_tests();
-        let addr = released_loopback_addr().await;
+        let (socket, addr) = unlistened_loopback_socket();
         let url = format!("http://{addr}/responses");
         let client = Arc::new(authenticated_http_test_client(url.clone()));
         let (body, context) = (buffered_test_request(), http_test_context());
@@ -6864,16 +6873,16 @@ mod tests {
                 crate::config::CodexTransport::Auto,
             );
             async move {
-                tokio::time::timeout(MOCK_DEADLINE, request)
+                tokio::time::timeout(UNLISTENED_CONNECT_DEADLINE, request)
                     .await
                     .expect("the request did not finish")
             }
         };
 
-        // Nothing listens: the connect is refused, and so is the HTTP request.
+        // Nothing listens: the connect fails, and so does the HTTP request.
         assert!(send().await.is_err());
 
-        let listener = TcpListener::bind(addr).await.unwrap();
+        let listener = socket.listen(1024).unwrap();
         let upgrades = Arc::new(AtomicUsize::new(0));
         let posts = Arc::new(AtomicUsize::new(0));
         let server = spawn_upgrade_refusing_origin(listener, upgrades.clone(), posts.clone());
@@ -6903,14 +6912,14 @@ mod tests {
 
         let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
         super::super::websocket::clear_codex_websocket_pool_for_tests();
-        let addr = released_loopback_addr().await;
+        let (socket, addr) = unlistened_loopback_socket();
         let url = format!("http://{addr}/responses");
         let client = Arc::new(authenticated_http_test_client(url.clone()));
         let (body, context) = (buffered_test_request(), http_test_context());
         let send = || {
             let request = client.stream_codex_auto_events_for_owner(&body, &context, None);
             async move {
-                let started = tokio::time::timeout(MOCK_DEADLINE, request)
+                let started = tokio::time::timeout(UNLISTENED_CONNECT_DEADLINE, request)
                     .await
                     .expect("the request did not start");
                 let (mut events, _) = started?;
@@ -6925,10 +6934,10 @@ mod tests {
             }
         };
 
-        // Nothing listens: the connect is refused, and so is the HTTP request.
+        // Nothing listens: the connect fails, and so does the HTTP request.
         assert!(send().await.is_err());
 
-        let listener = TcpListener::bind(addr).await.unwrap();
+        let listener = socket.listen(1024).unwrap();
         let upgrades = Arc::new(AtomicUsize::new(0));
         let posts = Arc::new(AtomicUsize::new(0));
         let server = spawn_upgrade_refusing_origin(listener, upgrades.clone(), posts.clone());

@@ -320,25 +320,44 @@ Request path:
      for a size refusal a fixed text naming only the frame length and the
      limit or the 1009 close, never anything from the request. For a size
      refusal `status` is the proxy's own 413, not a status the backend
-     sent. A connect that got no answer (the connect timeout, a refused or
-     failed connection, a failed TLS handshake:
-     `ConnectAttemptError::Unreachable`) made for a request that falls back
+     sent. A connect that got no answer (`ConnectAttemptError::Unreachable`:
+     no status arrived before the connect timeout, or the connection or the
+     TLS handshake failed) made for a request that falls back
      to HTTP pauses new connections to its target (scheme, host and port,
      `connect_pause_key`) for `WEBSOCKET_CONNECT_PAUSE` (5 min) in the
      process-wide `WS_CONNECT_PAUSES`, and logs one
      `codex_websocket_connect_paused` warning with `reqId`, `seconds` and
-     the connect error as `detail`. While it runs, such a request that would
+     the connect error as `detail`. Whether a status arrived is the
+     `response_head` flag `connect_with_policy` hands each attempt: the
+     upgrade sets it once reqwest returned the response head, the CONNECT
+     tunnel once the proxy's status line arrived, cleared again when the
+     tunnel opened. So a timeout while a rejection body or a proxy's
+     response head is still being read starts no pause, and the caller gets
+     the same timeout error. Failing to reach a configured proxy (its TCP
+     connection or TLS handshake, or a SOCKS connection, which reqwest
+     hands to `reqwest_handshake_error` as a connect error) counts as no
+     answer and pauses the backend's target; a proxy that answers with a
+     status (a 407, a refused CONNECT tunnel) does not. While it runs, such a request that would
      open a new connection there, a reconnect after a pooled socket failed
      validation included, makes no connect attempt and fails as a handshake
      with status 0 and `WEBSOCKET_CONNECT_PAUSED_DETAIL`, which the usual
      fallback sends to HTTP at once (`connect_with_timeout`,
      `OnConnectFailure::FallBackToHttp`); a usable pooled socket still
-     serves its conversation. Those requests are the live `auto` path and
-     the buffered one whose HTTP fallback is on; `websocket` transport and a
-     buffered `auto` with the fallback off connect every time and start no
-     pause. A rejected upgrade with a status, a 407, a refused proxy tunnel,
-     a write timeout and a size refusal start none either. Once the pause
-     ends the next request tries again. The Codex CLI instead keeps its
+     serves its conversation. The pause is checked before the connect gate
+     and again after the gate's wait, right before the attempt
+     (`ConnectAttemptError::Paused`, which leaves the gate unstamped), so a
+     request that waited while another one started the pause is skipped
+     the same way. Those requests are the live `auto` path and
+     the buffered one whose HTTP fallback is on; under `websocket` transport
+     and a buffered `auto` with the fallback off a request that needs a new
+     connection still connects every time and starts no pause. A rejected
+     upgrade with a status, a 407, a refused proxy tunnel, a write timeout
+     and a size refusal start none either, and a pause already running is
+     left as it is, with no second warning. A successful connect to the
+     target, from any of those paths, ends its pause
+     (`end_connect_pause`); between that and an unanswered connect the one
+     that finishes last decides. Once the pause ends the next request tries
+     again. The Codex CLI instead keeps its
      fallback for the rest of the session (`codex-rs/core/src/client.rs` at
      `4460449921`). Claude Code's compaction summary goes over
      HTTP whatever the setting (`transport_for_request` in `mod.rs`), and so
@@ -1152,10 +1171,12 @@ written to the socket goes out over HTTP in two cases only: a WebSocket seen
 closing with code 1009 before any text frame of the response, as the Codex CLI
 treats that close, and a resend the proxy makes anyway, such as the
 full-context one that repairs a continuation, when its frame is over the limit
-of the socket it would go to. After a connect that got no answer, `auto`
-requests to that target skip the connect and go to HTTP at once for five
-minutes (the connect pause in the transport paragraph); `websocket` transport
-still connects every time. With
+of the socket it would go to. After a connect that got no answer, a request
+whose HTTP fallback is on and that would open a new connection to that target
+goes to HTTP at once for five minutes, while a pooled socket still serves its
+conversation; under `websocket` transport a request that needs a new
+connection still connects every time (the connect pause in the transport
+paragraph names the paths). With
 `websocket` transport either refusal is one 413 answer, and a 429 on the
 WebSocket handshake reaches the client as a plain 429 unless its body names
 one of the codes above; under `auto` it falls back to HTTP.
