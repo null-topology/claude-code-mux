@@ -5,7 +5,8 @@
   `inference_hook_denied` and `access_program_not_enabled` are now answered
   once and marked as not to be retried; the Codex CLI does not retry them
   either. A refusal that arrived as a stream event with no status used to
-  come back as a retryable 500, so Claude Code retried a request that could
+  come back as a retryable server error, 500 when buffered and 502 as the
+  first event of a live stream, so Claude Code retried a request that could
   not succeed, and an HTTP 400 whose body names one of these codes came back
   as a 400 `api_error`. A content policy or access program refusal is now a
   400 `invalid_request_error`, a spent budget a 429 `rate_limit_error` with
