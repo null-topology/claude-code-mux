@@ -1,4 +1,4 @@
-## Unreleased
+## v0.18.1 (2026-11-12)
 
 - Error messages about a failed upstream call no longer include the request
   URL. A base URL or proxy URL that carries a credential in its path or
