@@ -252,7 +252,10 @@ fn passthrough_response(
                 Some((Ok::<Bytes, io::Error>(chunk), Some(state)))
             }
             Ok(Some(Err(error))) => {
-                let message = format!("Native Responses body read failed: {error}");
+                let message = format!(
+                    "Native Responses body read failed: {}",
+                    crate::upstream_http::error_text(error)
+                );
                 state.observer.finish("read_error");
                 Some((Err(io::Error::other(message)), None))
             }

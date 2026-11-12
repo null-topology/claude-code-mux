@@ -1107,6 +1107,38 @@ async fn smoke_kimi_messages_uses_mock_upstream() {
     assert!(!sent.to_string().contains("compaction_trigger"));
 }
 
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_kimi_send_failure_does_not_echo_the_base_url() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    write_kimi_auth(config.path());
+
+    // The listener stays bound, so no other process can take the port; each
+    // connection is closed without an answer and the request fails to send.
+    let unanswered = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = unanswered.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in unanswered.incoming().flatten() {
+            let mut request = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+        }
+    });
+    let base_url = format!("http://127.0.0.1:{port}/toy-secret-path?token=toy-secret-query");
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_KIMI_BASE_URL", &base_url);
+    let response = call_messages("kimi-for-coding").await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(!text.contains("toy-secret"), "{text}");
+    assert!(!text.contains(&port.to_string()), "{text}");
+}
+
 // ---------------------------------------------------------------------------
 // Codex HTTP smoke: mock upstream verifies request shape and returns
 // Responses SSE events.

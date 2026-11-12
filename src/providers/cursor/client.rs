@@ -131,58 +131,95 @@ impl CursorHttpClient {
             .await
             .map_err(CursorError::from_reqwest)?;
 
-        let status = response.status().as_u16();
-        let headers = response.headers().clone();
-        let error_detail = response
-            .headers()
-            .get("grpc-message")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let mut stream = response.bytes_stream();
-        let mut body_bytes = Vec::new();
-        let mut received_data = false;
+        let result = read_run_response(response).await;
+        sender.abort();
+        result
+    }
+}
 
-        loop {
-            let timeout = if received_data {
-                std::time::Duration::from_secs(5)
-            } else {
-                std::time::Duration::from_secs(60)
-            };
-            match tokio::time::timeout(timeout, stream.next()).await {
-                Ok(Some(Ok(chunk))) => {
-                    received_data = true;
-                    body_bytes.extend_from_slice(&chunk);
-                    if contains_end_frame(&body_bytes) {
-                        break;
-                    }
+/// Reads a Run response. An error status comes from the response head, so a
+/// body over the limit or one that cannot be read costs only its message.
+async fn read_run_response(
+    response: reqwest::Response,
+) -> Result<CursorUpstreamResponse, CursorError> {
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let error_detail = response
+        .headers()
+        .get("grpc-message")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let limit = if status >= 400 {
+        MAX_ERROR_BODY_BYTES
+    } else {
+        MAX_RESPONSE_BYTES
+    };
+    let body_bytes = read_run_body(response.bytes_stream(), limit).await;
+
+    if status >= 400 {
+        let detail = body_bytes
+            .ok()
+            .and_then(|body| parse_error_body(&body, &headers));
+        return Err(CursorError::new(status, "Cursor upstream error", detail));
+    }
+
+    Ok(CursorUpstreamResponse {
+        status,
+        body: body_bytes?,
+        error_detail,
+    })
+}
+
+/// The most of a successful Run response held in memory.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// The most of an error response kept to read its message from.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Collects the Run response frames until the end frame, the end of the body
+/// or the idle timeout, refusing a body that grows past `limit` bytes.
+async fn read_run_body<S>(mut stream: S, limit: usize) -> Result<Vec<u8>, CursorError>
+where
+    S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    let mut body_bytes = Vec::new();
+    let mut received_data = false;
+
+    loop {
+        let timeout = if received_data {
+            std::time::Duration::from_secs(5)
+        } else {
+            std::time::Duration::from_secs(60)
+        };
+        match tokio::time::timeout(timeout, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                received_data = true;
+                if chunk.len() > limit - body_bytes.len() {
+                    return Err(CursorError::internal(format!(
+                        "read body: {}",
+                        crate::upstream_http::BodyReadError::TooLarge { limit }
+                    )));
                 }
-                Ok(Some(Err(error))) => {
-                    sender.abort();
-                    return Err(CursorError::internal(format!("read body: {error}")));
-                }
-                Ok(None) => break,
-                Err(_) if received_data => break,
-                Err(_) => {
-                    sender.abort();
-                    return Err(CursorError::internal(
-                        "Cursor upstream timed out before sending a response",
-                    ));
+                body_bytes.extend_from_slice(&chunk);
+                if contains_end_frame(&body_bytes) {
+                    break;
                 }
             }
+            Ok(Some(Err(error))) => {
+                return Err(CursorError::internal(format!(
+                    "read body: {}",
+                    crate::upstream_http::error_text(error)
+                )));
+            }
+            Ok(None) => break,
+            Err(_) if received_data => break,
+            Err(_) => {
+                return Err(CursorError::internal(
+                    "Cursor upstream timed out before sending a response",
+                ));
+            }
         }
-        sender.abort();
-
-        if status >= 400 {
-            let detail = parse_error_body(&body_bytes, &headers);
-            return Err(CursorError::new(status, "Cursor upstream error", detail));
-        }
-
-        Ok(CursorUpstreamResponse {
-            status,
-            body: body_bytes,
-            error_detail,
-        })
     }
+    Ok(body_bytes)
 }
 
 fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
@@ -436,7 +473,7 @@ impl CursorError {
         let status = e.status().map(|s| s.as_u16()).unwrap_or(502);
         Self {
             status,
-            message: e.to_string(),
+            message: crate::upstream_http::error_text(e),
             detail: None,
             retry_after: None,
         }
@@ -450,3 +487,150 @@ impl std::fmt::Display for CursorError {
 }
 
 impl std::error::Error for CursorError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn assert_no_url(text: &str) {
+        for leaked in [
+            "toy-secret-path",
+            "toy-secret-query",
+            "127.0.0.1",
+            "for url",
+        ] {
+            assert!(!text.contains(leaked), "{leaked} in {text:?}");
+        }
+    }
+
+    /// Answers one HTTP/1.1 request with a body of `size` bytes and no end
+    /// frame, then closes the connection.
+    async fn serve_body(size: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let mut response =
+                format!("HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {size}\r\n\r\n")
+                    .into_bytes();
+            response.resize(response.len() + size, b'a');
+            stream.write_all(&response).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    async fn read_served_body(size: usize, limit: usize) -> Result<Vec<u8>, CursorError> {
+        let url = serve_body(size).await;
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap();
+        read_run_body(response.bytes_stream(), limit).await
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_carries_no_url() {
+        let client = CursorHttpClient {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            base_url: crate::upstream_http::test_support::unanswered_secret_url(),
+        };
+        let error = match client
+            .run_agent("toy-token", "hi", "cursor:auto", &[])
+            .await
+        {
+            Ok(_) => panic!("the send must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, 502);
+        assert!(!error.message.is_empty());
+        assert_no_url(&error.message);
+        assert_no_url(&error.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_run_body_of_exactly_the_limit_is_kept() {
+        let body = read_served_body(16, 16).await.unwrap();
+        assert_eq!(body, vec![b'a'; 16]);
+    }
+
+    #[tokio::test]
+    async fn a_run_body_over_the_limit_is_refused() {
+        let error = read_served_body(17, 16).await.unwrap_err();
+        assert_eq!(error.status, 502);
+        assert_eq!(error.message, "read body: response body exceeded 16 bytes");
+    }
+
+    /// The error a Run response with `status` and `body` turns into, served
+    /// with and without a declared length.
+    async fn run_errors(status: u16, body: Vec<u8>) -> Vec<CursorError> {
+        use crate::upstream_http::test_support::{serve_in_order, serve_in_order_undeclared};
+        let mut errors = Vec::new();
+        for serve in [serve_in_order, serve_in_order_undeclared] {
+            let url = serve(vec![(status, body.clone())]);
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(url)
+                .send()
+                .await
+                .unwrap();
+            match read_run_response(response).await {
+                Ok(_) => panic!("status {status} must fail"),
+                Err(error) => errors.push(error),
+            }
+        }
+        errors
+    }
+
+    async fn error_type(response: axum::response::Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        value["error"]["type"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn an_error_body_of_exactly_the_limit_keeps_its_message() {
+        for error in run_errors(401, vec![b'e'; MAX_ERROR_BODY_BYTES]).await {
+            assert_eq!(error.status, 401);
+            assert_eq!(error.detail, Some("e".repeat(MAX_ERROR_BODY_BYTES)));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unauthorized_answer_over_the_limit_keeps_its_status() {
+        for error in run_errors(401, vec![b'e'; MAX_ERROR_BODY_BYTES + 1]).await {
+            assert_eq!(error.status, 401);
+            assert_eq!(error.detail, None);
+            let response = super::super::map_cursor_error_to_response(&error);
+            assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+            assert_eq!(error_type(response).await, "authentication_error");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_answer_over_the_limit_keeps_its_status() {
+        for error in run_errors(429, vec![b'e'; MAX_ERROR_BODY_BYTES + 1]).await {
+            assert_eq!(error.status, 429);
+            assert_eq!(error.detail, None);
+            let response = super::super::map_cursor_error_to_response(&error);
+            assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()[http::header::RETRY_AFTER], "5");
+            assert_eq!(error_type(response).await, "rate_limit_error");
+        }
+    }
+}

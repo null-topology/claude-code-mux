@@ -16,6 +16,7 @@ pub mod server;
 pub mod session;
 pub mod traffic;
 pub mod tui;
+mod upstream_http;
 
 pub use crate::anthropic::error::{ErrorDetail, ErrorEnvelope, json_error};
 pub use crate::anthropic::schema::MessagesRequest;

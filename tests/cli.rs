@@ -164,6 +164,26 @@ fn cursor_logout_runs_inside_an_isolated_home() -> Result<(), Box<dyn std::error
 }
 
 #[test]
+fn cursor_auth_status_escapes_control_characters() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let env = isolated_auth_env(&temp);
+    // Unsigned toy token whose claims are
+    // {"sub":"user\u001b[2J","email":"me\r@example.com","exp":4102444800}.
+    let token = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJ1c2VyXHUwMDFiWzJKIiwiZW1haWwiOiJtZVxyQGV4YW1wbGUuY29tIiwiZXhwIjo0MTAyNDQ0ODAwfQ.toy";
+    let mut cmd = Command::cargo_bin("claude-code-mux")?;
+    cmd.args(["cursor", "auth", "status"]);
+    isolate_auth(&mut cmd, &env);
+    cmd.env("CCP_CURSOR_AUTH_TOKEN", token);
+    let output = cmd.output()?;
+    assert!(output.status.success());
+    let out = String::from_utf8(output.stdout)?;
+    assert!(out.contains("User: user\\u{1b}[2J\n"), "{out}");
+    assert!(out.contains("Email: me\\r@example.com\n"), "{out}");
+    assert!(!out.contains('\u{1b}') && !out.contains('\r'), "{out}");
+    Ok(())
+}
+
+#[test]
 fn models_output_is_stable_order() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
     let mut cmd = Command::cargo_bin("claude-code-mux")?;
@@ -192,5 +212,27 @@ fn kimi_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>
     cmd.args(["kimi", "auth", "status"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
     cmd.assert().success().stdout(contains("User: u"));
+    Ok(())
+}
+
+#[test]
+fn kimi_auth_status_escapes_control_characters() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let env = isolated_auth_env(&temp);
+    let auth_dir = temp.path().join("config").join("kimi");
+    std::fs::create_dir_all(&auth_dir)?;
+    std::fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"access":"a","refresh":"r","expires":4102444800000,"scope":"openid\r","userId":"u\u001b[2J"}"#,
+    )?;
+    let mut cmd = Command::cargo_bin("claude-code-mux")?;
+    cmd.args(["kimi", "auth", "status"]);
+    isolate_auth(&mut cmd, &env);
+    let output = cmd.output()?;
+    assert!(output.status.success());
+    let out = String::from_utf8(output.stdout)?;
+    assert!(out.contains("User: u\\u{1b}[2J\n"), "{out}");
+    assert!(out.contains("Scope: openid\\r\n"), "{out}");
+    assert!(!out.contains('\u{1b}') && !out.contains('\r'), "{out}");
     Ok(())
 }

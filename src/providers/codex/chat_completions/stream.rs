@@ -6,12 +6,31 @@ use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, StatusCode};
 use serde_json::{Value, json};
 
+use crate::openai_compat::MAX_PROVIDER_STREAM_BYTES;
 use crate::providers::codex::native::NativeResponseOutcome;
 use crate::{provider::RequestContext, traffic::MAX_SSE_CAPTURE_BYTES};
 
+use super::super::client::MAX_HTTP_SSE_FRAME_BYTES;
 use super::{ChatError, response::CompletionState};
 
 type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
+const SSE_FRAME_TOO_LARGE: &str = "Codex SSE frame exceeds the size limit";
+
+/// The most a stream holds of the backend's answer: the bytes of an SSE
+/// frame not yet complete, and the output text kept until it ends.
+#[derive(Clone, Copy)]
+struct StreamLimits {
+    frame_bytes: usize,
+    text_bytes: usize,
+}
+
+impl StreamLimits {
+    const DEFAULT: Self = Self {
+        frame_bytes: MAX_HTTP_SSE_FRAME_BYTES,
+        text_bytes: MAX_PROVIDER_STREAM_BYTES,
+    };
+}
 
 pub fn streaming_response(
     upstream: reqwest::Response,
@@ -20,12 +39,31 @@ pub fn streaming_response(
     include_usage: bool,
     body_idle_timeout_ms: u64,
 ) -> Response {
+    streaming_response_with_limits(
+        upstream,
+        ctx,
+        model,
+        include_usage,
+        body_idle_timeout_ms,
+        StreamLimits::DEFAULT,
+    )
+}
+
+fn streaming_response_with_limits(
+    upstream: reqwest::Response,
+    ctx: RequestContext,
+    model: String,
+    include_usage: bool,
+    body_idle_timeout_ms: u64,
+    limits: StreamLimits,
+) -> Response {
     let outcome = NativeResponseOutcome::default();
     let state = StreamState {
         upstream: Box::pin(upstream.bytes_stream()),
         pending: Vec::new(),
+        frame_limit: limits.frame_bytes,
         output: VecDeque::new(),
-        completion: CompletionState::new(&model),
+        completion: CompletionState::new(&model).with_text_limit(limits.text_bytes),
         role_sent: false,
         include_usage,
         ended: false,
@@ -79,7 +117,8 @@ async fn next_frame(
             Ok(Some(Ok(chunk))) => state.observe_chunk(&chunk),
             Ok(Some(Err(error))) => {
                 state.fail(ChatError::upstream(format!(
-                    "Codex response body read failed: {error}"
+                    "Codex response body read failed: {}",
+                    crate::upstream_http::error_text(error)
                 )));
             }
             Ok(None) => {
@@ -104,6 +143,8 @@ async fn next_frame(
 struct StreamState {
     upstream: UpstreamStream,
     pending: Vec<u8>,
+    /// The most `pending` holds without a complete frame.
+    frame_limit: usize,
     output: VecDeque<Bytes>,
     completion: CompletionState,
     role_sent: bool,
@@ -149,6 +190,12 @@ impl StreamState {
             if self.ended {
                 break;
             }
+        }
+        // What is left holds no complete frame; past the limit the stream
+        // fails and nothing more is read.
+        if !self.ended && self.pending.len() > self.frame_limit {
+            self.pending = Vec::new();
+            self.fail(ChatError::upstream(SSE_FRAME_TOO_LARGE));
         }
         if let Some(monitor) = self.ctx.monitor.as_ref() {
             monitor.stream_progress(
@@ -321,5 +368,109 @@ mod tests {
         assert_eq!(find_boundary(b"data: {}\n\nnext"), Some((8, 2)));
         assert_eq!(find_boundary(b"data: {}\r\n\r\nnext"), Some((8, 4)));
         assert_eq!(find_boundary(b"data: {}"), None);
+    }
+
+    /// An upstream body made of `pieces`, counting how many of them the
+    /// stream has read.
+    fn counted_upstream(
+        pieces: Vec<&'static [u8]>,
+    ) -> (
+        reqwest::Response,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = reads.clone();
+        let chunks = futures_util::stream::iter(pieces).map(move |piece| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::io::Error>(piece)
+        });
+        let response = http::Response::new(reqwest::Body::wrap_stream(chunks)).into();
+        (response, reads)
+    }
+
+    async fn stream_body(upstream: reqwest::Response, limits: StreamLimits) -> String {
+        let ctx = RequestContext {
+            req_id: "chat-stream-test".into(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".into(),
+            traffic: None,
+            monitor: None,
+            passthrough: None,
+        };
+        let response = streaming_response_with_limits(
+            upstream,
+            ctx,
+            "gpt-5.6-sol".into(),
+            false,
+            1_000,
+            limits,
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn assert_ends_with_error(body: &str, message: &str) {
+        let tail = body
+            .strip_suffix("data: [DONE]\n\n")
+            .unwrap_or_else(|| panic!("{body}"));
+        let error = tail
+            .rsplit("data: ")
+            .next()
+            .and_then(|last| serde_json::from_str::<Value>(last.trim_end()).ok())
+            .unwrap_or_else(|| panic!("{body}"));
+        assert_eq!(error["error"]["message"], message, "{body}");
+        assert_eq!(error["error"]["type"], "api_error", "{body}");
+    }
+
+    /// A complete frame larger than the limit passes; bytes past it held
+    /// without a complete frame end the stream, and nothing more is read.
+    #[tokio::test]
+    async fn an_unterminated_frame_past_the_limit_ends_the_stream() {
+        let (upstream, reads) = counted_upstream(vec![
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            b"data: {\"type\":\"resp",
+            b"onse.output_text.delta\",\"delta\":\"x\"}",
+            b"\n\n",
+        ]);
+        let body = stream_body(
+            upstream,
+            StreamLimits {
+                frame_bytes: 32,
+                text_bytes: MAX_PROVIDER_STREAM_BYTES,
+            },
+        )
+        .await;
+        assert_ends_with_error(&body, SSE_FRAME_TOO_LARGE);
+        assert!(!body.contains("\"content\""), "{body}");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// Text deltas are relayed up to the limit; the delta that would pass
+    /// it ends the stream instead, and nothing more is read.
+    #[tokio::test]
+    async fn output_text_past_the_limit_ends_the_stream() {
+        let (upstream, reads) = counted_upstream(vec![
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n\n",
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n",
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"!\"}\n\n",
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+        ]);
+        let body = stream_body(
+            upstream,
+            StreamLimits {
+                frame_bytes: MAX_HTTP_SSE_FRAME_BYTES,
+                text_bytes: 5,
+            },
+        )
+        .await;
+        assert!(body.contains(r#""delta":{"content":"hel"}"#), "{body}");
+        assert!(body.contains(r#""delta":{"content":"lo"}"#), "{body}");
+        assert!(!body.contains(r#""content":"!""#), "{body}");
+        assert!(!body.contains("finish_reason\":\"stop"), "{body}");
+        assert_ends_with_error(&body, "Codex output text exceeds the size limit");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 }

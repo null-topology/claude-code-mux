@@ -12,6 +12,10 @@ const GRANT_DEVICE_CODE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
 const MAX_DEVICE_POLL_WAIT: Duration = Duration::from_secs(600);
+/// The most of a device or token answer read.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
+/// The most of a refused poll's body read for its error code.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 struct DeviceAuthResponse {
@@ -97,10 +101,13 @@ fn device_login_inner<S: AuthStorage<StoredAuth>>(
     Ok(())
 }
 
+/// The timeout of the device-flow client, and the deadline for reading a body.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn client() -> anyhow::Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
+        .timeout(HTTP_TIMEOUT)
         .build()?)
 }
 
@@ -112,12 +119,13 @@ fn run_device_flow_inner(
     let auth = request_device_code(client, issuer)?;
     let visit = auth
         .verification_uri_complete
-        .clone()
-        .or_else(|| auth.verification_uri.clone())
+        .as_deref()
+        .or(auth.verification_uri.as_deref())
+        .map(crate::upstream_http::escape_control_chars)
         .unwrap_or_else(|| format!("{issuer}/device"));
     println!(
         "\nOpen this URL on any device to authorize:\n\n  {visit}\n\nand enter the code:  {}\n",
-        auth.user_code
+        crate::upstream_http::escape_control_chars(&auth.user_code)
     );
 
     let mut interval = auth
@@ -163,14 +171,19 @@ fn request_device_code(
     let response = client
         .post(format!("{issuer}/oauth2/device/code"))
         .form(&[("client_id", CLIENT_ID), ("scope", SCOPES)])
-        .send()?;
+        .send()
+        .map_err(crate::upstream_http::url_free_error)?;
     if !response.status().is_success() {
         anyhow::bail!(
             "Grok device authorization failed with status {}",
             response.status()
         );
     }
-    Ok(response.json()?)
+    crate::upstream_http::read_blocking_json_capped(
+        response,
+        MAX_TOKEN_RESPONSE_BYTES,
+        HTTP_TIMEOUT,
+    )
 }
 
 fn poll_token(
@@ -185,16 +198,31 @@ fn poll_token(
             ("device_code", device_code),
             ("client_id", CLIENT_ID),
         ])
-        .send()?;
+        .send()
+        .map_err(crate::upstream_http::url_free_error)?;
     if response.status().is_success() {
-        return Ok(DevicePoll::Tokens(response.json()?));
+        return Ok(DevicePoll::Tokens(
+            crate::upstream_http::read_blocking_json_capped(
+                response,
+                MAX_TOKEN_RESPONSE_BYTES,
+                HTTP_TIMEOUT,
+            )?,
+        ));
     }
     let status = response.status();
-    let body: serde_json::Value = response.json().unwrap_or_else(|_| serde_json::json!({}));
+    let body: serde_json::Value = crate::upstream_http::read_blocking_json_capped(
+        response,
+        MAX_ERROR_BODY_BYTES,
+        HTTP_TIMEOUT,
+    )
+    .unwrap_or_else(|_| serde_json::json!({}));
     match body.get("error").and_then(|value| value.as_str()) {
         Some("authorization_pending") => Ok(DevicePoll::Pending),
         Some("slow_down") => Ok(DevicePoll::SlowDown),
-        Some(error) => anyhow::bail!("Grok device login failed: {error}"),
+        Some(error) => anyhow::bail!(
+            "Grok device login failed: {}",
+            crate::upstream_http::escape_control_chars(error)
+        ),
         None => anyhow::bail!("Grok device login failed with status {status}"),
     }
 }
@@ -334,12 +362,95 @@ mod tests {
     }
 
     #[test]
+    fn device_flow_escapes_a_denial_code() {
+        let issuer = spawn_issuer(
+            r#"{"device_code":"dev-9","user_code":"FFFF-5555","interval":0}"#,
+            vec![(400, r#"{"error":"denied\u001b[2J\r"}"#.into())],
+        );
+        let error =
+            run_device_flow_inner(&test_client(), &issuer, &TestRuntime::default()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Grok device login failed: denied\\u{1b}[2J\\r"
+        );
+    }
+
+    #[test]
     fn device_flow_reports_init_failure() {
         let issuer = spawn_issuer(r#"{"error":"invalid_client"}"#, vec![]);
         // device/code returns 200 with a body missing required fields -> parse error.
         let error =
             run_device_flow_inner(&test_client(), &issuer, &TestRuntime::default()).unwrap_err();
         assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn device_flow_send_failures_carry_no_url() {
+        use crate::upstream_http::test_support::{assert_no_url, unanswered_secret_url};
+        let issuer = unanswered_secret_url();
+        let init = request_device_code(&test_client(), &issuer).err().unwrap();
+        assert_no_url(&format!("{init:#}"));
+        let poll = poll_token(&test_client(), &issuer, "dev").err().unwrap();
+        assert_no_url(&format!("{poll:#}"));
+    }
+
+    #[test]
+    fn device_answer_is_read_up_to_its_limit() {
+        use crate::upstream_http::test_support::{padded_json, serve_in_order};
+        let device = r#"{"device_code":"dev-6","user_code":"EEEE-4444"}"#;
+        let issuer = serve_in_order(vec![
+            (200, padded_json(device, MAX_TOKEN_RESPONSE_BYTES)),
+            (200, padded_json(device, MAX_TOKEN_RESPONSE_BYTES + 1)),
+        ]);
+        let auth = request_device_code(&test_client(), &issuer).ok().unwrap();
+        assert_eq!(auth.user_code, "EEEE-4444");
+        let error = request_device_code(&test_client(), &issuer).err().unwrap();
+        assert!(
+            format!("{error:#}").contains("response body exceeded"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn token_answer_is_read_up_to_its_limit() {
+        use crate::upstream_http::test_support::{
+            padded_json, serve_in_order, serve_in_order_undeclared,
+        };
+        let tokens = r#"{"access_token":"access-7","refresh_token":"refresh-7","expires_in":3600,"token_type":"Bearer"}"#;
+        for serve in [serve_in_order, serve_in_order_undeclared] {
+            let issuer = serve(vec![
+                (200, padded_json(tokens, MAX_TOKEN_RESPONSE_BYTES)),
+                (200, padded_json(tokens, MAX_TOKEN_RESPONSE_BYTES + 1)),
+            ]);
+            assert!(matches!(
+                poll_token(&test_client(), &issuer, "dev-7").ok().unwrap(),
+                DevicePoll::Tokens(tokens) if tokens.access_token == "access-7"
+            ));
+            let error = poll_token(&test_client(), &issuer, "dev-7").err().unwrap();
+            assert!(
+                format!("{error:#}").contains("response body exceeded"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_poll_body_is_read_up_to_its_limit() {
+        use crate::upstream_http::test_support::{padded_json, serve_in_order};
+        let slow_down = r#"{"error":"slow_down"}"#;
+        let issuer = serve_in_order(vec![
+            (400, padded_json(slow_down, MAX_ERROR_BODY_BYTES)),
+            (400, padded_json(slow_down, MAX_ERROR_BODY_BYTES + 1)),
+        ]);
+        assert!(matches!(
+            poll_token(&test_client(), &issuer, "dev-8").ok().unwrap(),
+            DevicePoll::SlowDown
+        ));
+        let error = poll_token(&test_client(), &issuer, "dev-8").err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "Grok device login failed with status 400 Bad Request"
+        );
     }
 
     #[test]

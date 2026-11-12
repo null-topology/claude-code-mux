@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::auth::AuthStorage;
 use crate::config;
 use crate::provider::{ModelCapabilities, model_info};
+use crate::upstream_http::{error_text, read_body_capped};
 
 use super::auth::constants::{CODEX_CLIENT_VERSION, ORIGINATOR};
 use super::auth::manager::{CodexAuthManager, TransientRefreshError};
@@ -32,6 +33,10 @@ use super::translate::request::to_codex_effort;
 /// Upper bound for one listing round-trip; Claude Code's own gateway
 /// discovery gives up after five seconds, so the proxy must answer sooner.
 pub const MODELS_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// The largest listing body read. A listing is a few hundred KiB; a longer
+/// body fails the listing as an unreadable one does.
+const MAX_MODELS_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Wire format
@@ -360,6 +365,24 @@ pub async fn fetch_models<S: AuthStorage<StoredAuth> + 'static>(
     base_url: &str,
     client_headers: Option<&http::HeaderMap>,
 ) -> Result<ModelInventory, ModelsError> {
+    fetch_models_capped(
+        client,
+        auth_manager,
+        base_url,
+        client_headers,
+        MAX_MODELS_BODY_BYTES,
+    )
+    .await
+}
+
+/// [`fetch_models`] reading at most `body_limit` bytes of the listing body.
+async fn fetch_models_capped<S: AuthStorage<StoredAuth> + 'static>(
+    client: &reqwest::Client,
+    auth_manager: &CodexAuthManager<S>,
+    base_url: &str,
+    client_headers: Option<&http::HeaderMap>,
+    body_limit: usize,
+) -> Result<ModelInventory, ModelsError> {
     let url = format!(
         "{}?client_version={}",
         models_endpoint(base_url),
@@ -369,14 +392,13 @@ pub async fn fetch_models<S: AuthStorage<StoredAuth> + 'static>(
     let mut refresh_attempted = false;
     loop {
         let request = build_request(client, &url, &auth, client_headers)
-            .map_err(|error| ModelsError::Unreachable(error.to_string()))?;
+            .map_err(|error| ModelsError::Unreachable(error_text(error)))?;
         let response = client
             .execute(request)
             .await
-            .map_err(|error| ModelsError::Unreachable(error.to_string()))?;
+            .map_err(|error| ModelsError::Unreachable(error_text(error)))?;
         let status = response.status();
-        let body = response
-            .bytes()
+        let body = read_body_capped(response, body_limit)
             .await
             .map_err(|error| ModelsError::Unreachable(error.to_string()))?;
         if status == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
@@ -800,6 +822,38 @@ mod tests {
         }
     }
 
+    /// A listing that cannot reach the backend is unreachable with text that
+    /// leaves out the URL, which may carry a credential in its path or query.
+    #[tokio::test]
+    async fn a_listing_transport_error_leaves_out_the_url() {
+        use super::super::auth::token_store::{CodexCliAuthStore, CodexTokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        let manager = CodexAuthManager::new_with_token_endpoint(
+            CodexTokenStore::codex_cli(CodexCliAuthStore::new(dir.path().join("auth.json"))),
+            "http://127.0.0.1:1/oauth/token".to_string(),
+        );
+        manager.set_test_auth(StoredAuth {
+            access: "access-test".to_string(),
+            refresh: "refresh-test".to_string(),
+            expires: u64::MAX,
+            account_id: Some("acct".to_string()),
+        });
+        // Nothing listens on port 1.
+        let error = fetch_models(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &manager,
+            "http://127.0.0.1:1/toy-secret-path/responses",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ModelsError::Unreachable(_)), "{error:?}");
+        let text = format!("{error} {error:?}");
+        for leaked in ["toy-secret-path", "127.0.0.1", "for url"] {
+            assert!(!text.contains(leaked), "{leaked} in {text}");
+        }
+    }
+
     /// How long a one-shot mock server waits for its request, and a test for it.
     const MOCK_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -810,6 +864,16 @@ mod tests {
         /// Answer one request with `status` and a JSON `body`. Accepting and reading
         /// give up after `MOCK_DEADLINE`.
         async fn answer_once(status: &'static str, body: &'static str) -> (String, Self) {
+            Self::answer_once_framed(status, body, false).await
+        }
+
+        /// [`Self::answer_once`] that, when `chunked`, sends `body` with no
+        /// declared length, as two chunks of chunked transfer encoding.
+        async fn answer_once_framed(
+            status: &'static str,
+            body: &'static str,
+            chunked: bool,
+        ) -> (String, Self) {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -843,10 +907,19 @@ mod tests {
                 tokio::time::timeout(MOCK_DEADLINE, read)
                     .await
                     .expect("mock server: the request did not finish arriving");
-                let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
+                let response = if chunked {
+                    let (first, second) = body.split_at(body.len() / 2);
+                    format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+                        first.len(),
+                        second.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
                 let _ = tokio::time::timeout(MOCK_DEADLINE, stream.write_all(response.as_bytes()))
                     .await;
             });
@@ -866,6 +939,58 @@ mod tests {
         fn drop(&mut self) {
             self.0.abort();
         }
+    }
+
+    /// A listing body of exactly the cap is read; one byte more fails the
+    /// listing as unreachable, as an unreadable body does. Sent chunked, the
+    /// body declares no length and each chunk fits on its own, so only the
+    /// count of the bytes read refuses it.
+    #[tokio::test]
+    async fn a_listing_body_is_read_up_to_its_cap() {
+        use super::super::auth::token_store::{CodexCliAuthStore, CodexTokenStore};
+        // A listing naming no model, so the remembered inventory stays as it was.
+        let body: &'static str = format!("{:<64}", r#"{"models":[]}"#).leak();
+        for (limit, fits, chunked) in [
+            (body.len(), true, false),
+            (body.len() - 1, false, false),
+            (body.len(), true, true),
+            (body.len() - 1, false, true),
+        ] {
+            let (backend, backend_server) =
+                MockServer::answer_once_framed("200 OK", body, chunked).await;
+            let dir = tempfile::tempdir().unwrap();
+            let manager = CodexAuthManager::new_with_token_endpoint(
+                CodexTokenStore::codex_cli(CodexCliAuthStore::new(dir.path().join("auth.json"))),
+                "http://127.0.0.1:1/oauth/token".to_string(),
+            );
+            manager.set_test_auth(StoredAuth {
+                access: "access-test".to_string(),
+                refresh: "refresh-test".to_string(),
+                expires: u64::MAX,
+                account_id: Some("acct".to_string()),
+            });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let base_url = format!("{backend}/responses");
+            let listing = fetch_models_capped(&client, &manager, &base_url, None, limit);
+            let result = tokio::time::timeout(MOCK_DEADLINE, listing)
+                .await
+                .expect("the listing did not finish");
+            backend_server.join().await;
+            match result {
+                Ok(inventory) => {
+                    assert!(fits, "a body over the cap must fail");
+                    assert!(inventory.models.is_empty());
+                }
+                Err(error) => {
+                    assert!(!fits, "a body at the cap must be read: {error:?}");
+                    assert_eq!(
+                        error,
+                        ModelsError::Unreachable(format!("response body exceeded {limit} bytes"))
+                    );
+                }
+            }
+        }
+        assert_eq!(MAX_MODELS_BODY_BYTES, 4 * 1024 * 1024);
     }
 
     /// The listing rejected with 401 forces a token refresh: one the endpoint cannot

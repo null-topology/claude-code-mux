@@ -220,10 +220,21 @@ pub fn run_cursor_login() -> anyhow::Result<Option<CursorAuth>> {
 pub fn wait_for_cursor_login(
     login: &CursorLogin,
     max_attempts: usize,
+    on_progress: impl FnMut(usize),
+) -> anyhow::Result<Option<RefreshResponse>> {
+    wait_for_cursor_login_at(&config::cursor_base_url(), login, max_attempts, on_progress)
+}
+
+fn wait_for_cursor_login_at(
+    base_url: &str,
+    login: &CursorLogin,
+    max_attempts: usize,
     mut on_progress: impl FnMut(usize),
 ) -> anyhow::Result<Option<RefreshResponse>> {
-    let client = reqwest::blocking::Client::new();
-    let base = config::cursor_base_url().trim_end_matches('/').to_string();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()?;
+    let base = base_url.trim_end_matches('/').to_string();
     let mut consecutive_errors = 0usize;
 
     for attempt in 0..max_attempts {
@@ -244,7 +255,11 @@ pub fn wait_for_cursor_login(
                 std::thread::sleep(delay);
             }
             Ok(resp) if resp.status().is_success() => {
-                let parsed: serde_json::Value = resp.json()?;
+                let parsed: serde_json::Value = crate::upstream_http::read_blocking_json_capped(
+                    resp,
+                    MAX_TOKEN_RESPONSE_BYTES,
+                    HTTP_TIMEOUT,
+                )?;
                 return Ok(parse_cursor_auth_tokens(&parsed));
             }
             Ok(_) | Err(_) => {
@@ -259,22 +274,39 @@ pub fn wait_for_cursor_login(
     Ok(None)
 }
 
+/// The most of a login poll or token refresh answer read into memory.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
+/// The timeout of the login poll and refresh clients, and the deadline for
+/// reading a body: the 30 s reqwest's blocking client applies by default.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn refresh_cursor_auth(refresh_token: &str) -> anyhow::Result<Option<RefreshResponse>> {
-    let client = reqwest::blocking::Client::new();
-    let url = format!(
-        "{}/auth/refresh",
-        config::cursor_base_url().trim_end_matches('/')
-    );
+    refresh_cursor_auth_at(&config::cursor_base_url(), refresh_token)
+}
+
+fn refresh_cursor_auth_at(
+    base_url: &str,
+    refresh_token: &str,
+) -> anyhow::Result<Option<RefreshResponse>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()?;
+    let url = format!("{}/auth/refresh", base_url.trim_end_matches('/'));
     let resp = client
         .post(url)
         .header("content-type", "application/json")
         .bearer_auth(refresh_token)
         .body("{}")
-        .send()?;
+        .send()
+        .map_err(|error| anyhow::anyhow!(crate::upstream_http::error_text(error)))?;
     if !resp.status().is_success() {
         return Ok(None);
     }
-    let parsed: serde_json::Value = resp.json()?;
+    let parsed: serde_json::Value = crate::upstream_http::read_blocking_json_capped(
+        resp,
+        MAX_TOKEN_RESPONSE_BYTES,
+        HTTP_TIMEOUT,
+    )?;
     Ok(parse_cursor_auth_tokens(&parsed))
 }
 
@@ -457,6 +489,102 @@ mod tests {
         assert!(login.login_url.contains("&uuid="));
         assert!(login.login_url.contains("&mode=login&redirectTarget=cli"));
         assert!(!login.verifier.contains('='));
+    }
+
+    /// Answers one request with `body` and closes the connection.
+    fn serve_refresh(body: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+        });
+        format!("http://{addr}")
+    }
+
+    /// A refresh answer padded with JSON whitespace to exactly `size` bytes.
+    fn refresh_body(size: usize) -> Vec<u8> {
+        let mut body = br#"{"accessToken":"access-1","refreshToken":"refresh-1"}"#.to_vec();
+        body.resize(size, b' ');
+        body
+    }
+
+    #[test]
+    fn refresh_send_error_carries_no_url() {
+        let base = crate::upstream_http::test_support::unanswered_secret_url();
+        let error = refresh_cursor_auth_at(&base, "toy-refresh").unwrap_err();
+        let text = format!("{error:?}");
+        assert!(!text.is_empty());
+        for leaked in ["toy-secret-path", "127.0.0.1", "for url"] {
+            assert!(!text.contains(leaked), "{leaked} in {text}");
+        }
+    }
+
+    #[test]
+    fn refresh_answer_of_exactly_the_limit_is_read() {
+        let base = serve_refresh(refresh_body(MAX_TOKEN_RESPONSE_BYTES));
+        let refreshed = refresh_cursor_auth_at(&base, "toy-refresh")
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.access_token, "access-1");
+        assert_eq!(refreshed.refresh_token, "refresh-1");
+    }
+
+    #[test]
+    fn refresh_answer_over_the_limit_is_refused() {
+        use crate::upstream_http::test_support::serve_in_order_undeclared;
+        let over = refresh_body(MAX_TOKEN_RESPONSE_BYTES + 1);
+        for base in [
+            serve_refresh(over.clone()),
+            serve_in_order_undeclared(vec![(200, over)]),
+        ] {
+            let error = refresh_cursor_auth_at(&base, "toy-refresh").unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("response body exceeded {MAX_TOKEN_RESPONSE_BYTES} bytes")
+            );
+        }
+    }
+
+    fn poll_once(base: &str) -> anyhow::Result<Option<RefreshResponse>> {
+        wait_for_cursor_login_at(base, &create_cursor_login(), 1, |_| {})
+    }
+
+    #[test]
+    fn login_poll_answer_is_read_up_to_the_limit() {
+        use crate::upstream_http::test_support::{serve_in_order, serve_in_order_undeclared};
+        for serve in [serve_in_order, serve_in_order_undeclared] {
+            let base = serve(vec![
+                (200, refresh_body(MAX_TOKEN_RESPONSE_BYTES)),
+                (200, refresh_body(MAX_TOKEN_RESPONSE_BYTES + 1)),
+            ]);
+            let polled = poll_once(&base).unwrap().unwrap();
+            assert_eq!(polled.access_token, "access-1");
+            let error = poll_once(&base).unwrap_err();
+            assert_eq!(
+                format!("{error:#}"),
+                format!("response body exceeded {MAX_TOKEN_RESPONSE_BYTES} bytes")
+            );
+        }
+    }
+
+    #[test]
+    fn a_login_poll_that_cannot_connect_ends_without_an_error() {
+        let base = crate::upstream_http::test_support::unanswered_secret_url();
+        assert!(poll_once(&base).unwrap().is_none());
     }
 
     fn test_jwt(exp: u64, sub: Option<&str>, email: Option<&str>) -> String {

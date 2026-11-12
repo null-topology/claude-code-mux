@@ -10,6 +10,8 @@ use super::token_store::{GrokTokenStore, StoredAuth};
 use crate::auth::AuthStorage;
 
 const REFRESH_SKEW_MS: u64 = 5 * 60 * 1000;
+/// The most of a refresh answer read.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Deserialize)]
 struct Discovery {
@@ -84,14 +86,11 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
         }
         let issuer = Url::parse(CANONICAL_ISSUER)?;
         let discovery_url = issuer.join("/.well-known/openid-configuration")?;
-        let discovery: Discovery = self
-            .client
-            .get(discovery_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let discovery: Discovery = fetch_json(
+            self.client.get(discovery_url),
+            super::login::MAX_METADATA_BYTES,
+        )
+        .await?;
         if discovery.issuer != CANONICAL_ISSUER {
             anyhow::bail!("OIDC discovery issuer mismatch");
         }
@@ -99,19 +98,15 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
         if endpoint.scheme() != "https" || endpoint.origin() != issuer.origin() {
             anyhow::bail!("OIDC token endpoint is outside the canonical issuer");
         }
-        let refreshed: RefreshResponse = self
-            .client
-            .post(endpoint)
-            .form(&[
+        let refreshed: RefreshResponse = fetch_json(
+            self.client.post(endpoint).form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", auth.refresh.as_str()),
                 ("client_id", auth.client_id.as_str()),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+            ]),
+            MAX_TOKEN_RESPONSE_BYTES,
+        )
+        .await?;
         if refreshed.access_token.is_empty() || refreshed.expires_in == 0 {
             anyhow::bail!("Invalid token refresh response");
         }
@@ -128,6 +123,22 @@ impl<S: AuthStorage<StoredAuth>> GrokAuthManager<S> {
         self.store.save_auth(updated.clone())?;
         Ok(updated)
     }
+}
+
+/// Sends `request` and parses its 2xx JSON answer, read up to `limit` bytes.
+/// Send and status failures carry no URL.
+async fn fetch_json<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    limit: usize,
+) -> anyhow::Result<T> {
+    use crate::upstream_http::{read_json_capped, url_free_error};
+    let response = request
+        .send()
+        .await
+        .map_err(url_free_error)?
+        .error_for_status()
+        .map_err(url_free_error)?;
+    read_json_capped(response, limit).await
 }
 
 fn now_ms() -> u64 {
@@ -163,6 +174,61 @@ mod tests {
         .unwrap();
 
         assert_eq!(discovery.issuer, CANONICAL_ISSUER);
+    }
+
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn refresh_send_and_status_failures_carry_no_url() {
+        use crate::upstream_http::test_support::{
+            assert_no_url, serve_in_order, unanswered_secret_url,
+        };
+        let refused = fetch_json::<RefreshResponse>(
+            test_client().post(unanswered_secret_url()),
+            MAX_TOKEN_RESPONSE_BYTES,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_no_url(&format!("{refused:#}"));
+        let url = serve_in_order(vec![(400, b"{}".to_vec())]);
+        let rejected = fetch_json::<RefreshResponse>(
+            test_client().post(format!("{url}?token=toy-secret-query")),
+            MAX_TOKEN_RESPONSE_BYTES,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_no_url(&format!("{rejected:#}"));
+    }
+
+    #[tokio::test]
+    async fn refresh_answers_are_read_up_to_their_limits() {
+        use super::super::login::MAX_METADATA_BYTES;
+        use crate::upstream_http::test_support::{padded_json, serve_in_order};
+        let discovery =
+            r#"{"issuer":"https://auth.x.ai","token_endpoint":"https://auth.x.ai/oauth2/token"}"#;
+        let refreshed = r#"{"access_token":"synthetic-access","expires_in":3600}"#;
+        let url = serve_in_order(vec![
+            (200, padded_json(discovery, MAX_METADATA_BYTES)),
+            (200, padded_json(discovery, MAX_METADATA_BYTES + 1)),
+            (200, padded_json(refreshed, MAX_TOKEN_RESPONSE_BYTES)),
+            (200, padded_json(refreshed, MAX_TOKEN_RESPONSE_BYTES + 1)),
+        ]);
+        let metadata = || fetch_json::<Discovery>(test_client().get(&url), MAX_METADATA_BYTES);
+        assert_eq!(metadata().await.ok().unwrap().issuer, CANONICAL_ISSUER);
+        let error = metadata().await.err().unwrap();
+        assert!(format!("{error:#}").contains("response body exceeded"));
+        let refresh =
+            || fetch_json::<RefreshResponse>(test_client().post(&url), MAX_TOKEN_RESPONSE_BYTES);
+        assert_eq!(
+            refresh().await.ok().unwrap().access_token,
+            "synthetic-access"
+        );
+        let error = refresh().await.err().unwrap();
+        assert!(format!("{error:#}").contains("response body exceeded"));
     }
 
     #[tokio::test]

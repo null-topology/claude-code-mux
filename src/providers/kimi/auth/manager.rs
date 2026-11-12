@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::constants::{CLIENT_ID, REFRESH_MARGIN_MS, oauth_host};
 use super::headers::common_headers;
@@ -10,6 +10,13 @@ use crate::auth::AuthStorage;
 
 const MAX_REFRESH_ATTEMPTS: u32 = 3;
 const RETRYABLE_STATUSES: &[u16] = &[429, 500, 502, 503, 504];
+/// The most of a refresh answer read.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
+/// The most of a refusal kept for its message.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// The timeout of the refresh client, and the deadline for reading a body:
+/// the 30 s reqwest's blocking client applies by default.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct KimiAuthManager<S: AuthStorage<StoredAuth>> {
     pub store: KimiTokenStore<S>,
@@ -81,8 +88,19 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
         }
 
         let headers = common_headers()?;
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .build()?;
+        self.refresh_at(&client, &oauth_host(), &headers, current)
+    }
 
+    fn refresh_at(
+        &self,
+        client: &reqwest::blocking::Client,
+        oauth_host: &str,
+        headers: &std::collections::HashMap<String, String>,
+        current: &StoredAuth,
+    ) -> Result<StoredAuth, anyhow::Error> {
         for attempt in 0..MAX_REFRESH_ATTEMPTS {
             let form = [
                 ("client_id", CLIENT_ID.to_string()),
@@ -91,8 +109,8 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
             ];
 
             let resp = match client
-                .post(format!("{}/api/oauth/token", oauth_host()))
-                .headers(build_headers_map(&headers))
+                .post(format!("{oauth_host}/api/oauth/token"))
+                .headers(build_headers_map(headers))
                 .form(&form)
                 .send()
             {
@@ -103,12 +121,17 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
                         std::thread::sleep(std::time::Duration::from_millis(ms));
                         continue;
                     }
+                    let err = crate::upstream_http::error_text(err);
                     anyhow::bail!("refresh network error: {err}");
                 }
             };
 
             if resp.status().as_u16() == 200 {
-                let tokens: TokenResponse = resp.json()?;
+                let tokens: TokenResponse = crate::upstream_http::read_blocking_json_capped(
+                    resp,
+                    MAX_TOKEN_RESPONSE_BYTES,
+                    HTTP_TIMEOUT,
+                )?;
                 let expires = Self::now_ms() + (tokens.expires_in.unwrap_or(900) as u64 * 1000);
                 let next = StoredAuth {
                     access: tokens.access_token.clone(),
@@ -135,9 +158,13 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
                     *guard = None;
                 }
                 let _ = self.store.clear_auth();
-                let err_msg = resp
-                    .text()
-                    .unwrap_or_else(|_| "Token refresh unauthorized".to_string());
+                let err_msg = crate::upstream_http::read_blocking_body_capped(
+                    resp,
+                    MAX_ERROR_BODY_BYTES,
+                    HTTP_TIMEOUT,
+                )
+                .map(|body| String::from_utf8_lossy(&body).into_owned())
+                .unwrap_or_else(|_| "Token refresh unauthorized".to_string());
                 anyhow::bail!("{err_msg}");
             }
 
@@ -226,5 +253,68 @@ mod tests {
         let store = test_store();
         let manager = KimiAuthManager::new(store);
         assert!(manager.get_auth().is_err());
+    }
+
+    fn stale_auth() -> StoredAuth {
+        StoredAuth {
+            access: "toy-old-access".into(),
+            refresh: "toy-refresh".into(),
+            expires: 0,
+            scope: None,
+            user_id: None,
+        }
+    }
+
+    fn refresh_from(host: &str) -> Result<StoredAuth, anyhow::Error> {
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        KimiAuthManager::new(test_store()).refresh_at(
+            &client,
+            host,
+            &std::collections::HashMap::new(),
+            &stale_auth(),
+        )
+    }
+
+    #[test]
+    fn a_refresh_that_cannot_connect_carries_no_url() {
+        let url = crate::upstream_http::test_support::unanswered_secret_url();
+        let error = refresh_from(&url).unwrap_err();
+        crate::upstream_http::test_support::assert_no_url(&format!("{error:?}"));
+    }
+
+    #[test]
+    fn a_refresh_answer_is_read_up_to_the_limit() {
+        use crate::upstream_http::test_support::{
+            padded_json, serve_in_order, serve_in_order_undeclared,
+        };
+        let token = r#"{"access_token":"toy-new-access"}"#;
+
+        for serve in [serve_in_order, serve_in_order_undeclared] {
+            let host = serve(vec![(200, padded_json(token, MAX_TOKEN_RESPONSE_BYTES))]);
+            assert_eq!(refresh_from(&host).unwrap().access, "toy-new-access");
+
+            let host = serve(vec![(
+                200,
+                padded_json(token, MAX_TOKEN_RESPONSE_BYTES + 1),
+            )]);
+            let error = refresh_from(&host).unwrap_err().to_string();
+            assert_eq!(error, "response body exceeded 1048576 bytes");
+        }
+    }
+
+    #[test]
+    fn an_unauthorized_refresh_body_is_kept_up_to_the_limit() {
+        use crate::upstream_http::test_support::serve_in_order;
+
+        let host = serve_in_order(vec![(401, vec![b'e'; MAX_ERROR_BODY_BYTES])]);
+        let error = refresh_from(&host).unwrap_err().to_string();
+        assert_eq!(error, "e".repeat(MAX_ERROR_BODY_BYTES));
+
+        let host = serve_in_order(vec![(401, vec![b'e'; MAX_ERROR_BODY_BYTES + 1])]);
+        let error = refresh_from(&host).unwrap_err().to_string();
+        assert_eq!(error, "Token refresh unauthorized");
     }
 }

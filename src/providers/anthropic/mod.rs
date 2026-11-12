@@ -215,6 +215,17 @@ fn is_stripped_response_header(name: &str) -> bool {
     )
 }
 
+/// The upstream body as relayed, chunk for chunk. Only a transport error is
+/// changed: it loses its URL, as its text becomes the request's failure.
+fn relayed_body(
+    upstream: reqwest::Response,
+) -> impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> {
+    use futures_util::StreamExt;
+    upstream
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(reqwest::Error::without_url))
+}
+
 pub struct AnthropicProvider {
     /// The passthrough client, which never follows a redirect. The relayed
     /// model listing goes out on it too.
@@ -322,7 +333,7 @@ impl AnthropicProvider {
                         let mut observer =
                             UsageObserver::new(monitor, req_id, kind, outcome.clone())
                                 .with_session_title(session_title);
-                        let mut inner = Box::pin(upstream.bytes_stream());
+                        let mut inner = Box::pin(relayed_body(upstream));
                         let body = Body::from_stream(futures_util::stream::poll_fn(move |cx| {
                             match Stream::poll_next(inner.as_mut(), cx) {
                                 Poll::Ready(Some(Ok(bytes))) => {
@@ -338,7 +349,7 @@ impl AnthropicProvider {
                         }));
                         (body, Some(outcome))
                     }
-                    _ => (Body::from_stream(upstream.bytes_stream()), None),
+                    _ => (Body::from_stream(relayed_body(upstream)), None),
                 };
                 let mut response = Response::new(body);
                 *response.status_mut() = status;
@@ -351,7 +362,10 @@ impl AnthropicProvider {
             Err(err) => json_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
-                format!("anthropic upstream request failed: {err}"),
+                format!(
+                    "anthropic upstream request failed: {}",
+                    crate::upstream_http::error_text(err)
+                ),
             ),
         }
     }
@@ -1268,6 +1282,107 @@ data: {"type":"message_stop"}
         let cut = &TITLE_STREAM[..TITLE_STREAM.find("event: message_stop").unwrap()];
         observe_stream(&monitor, cut, true, 7);
         assert_eq!(session_name(&monitor), None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_answers_502_without_the_upstream_url() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let provider = AnthropicProvider {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            catalog_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://127.0.0.1:{port}/toy-secret-path"),
+        };
+        let ctx = RequestContext {
+            req_id: "r1".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "anthropic".to_string(),
+            traffic: None,
+            monitor: None,
+            passthrough: Some(crate::provider::Passthrough {
+                raw_body: axum::body::Bytes::from_static(b"{}"),
+                headers: axum::http::HeaderMap::new(),
+                path_and_query: "/v1/messages?token=toy-secret-query".to_string(),
+            }),
+        };
+
+        let response = provider.relay(ctx).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("anthropic upstream request failed"), "{body}");
+        for leaked in [
+            "toy-secret-path",
+            "toy-secret-query",
+            "127.0.0.1",
+            "for url",
+        ] {
+            assert!(!body.contains(leaked), "{leaked} in {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_broken_relayed_body_keeps_its_bytes_and_reports_no_url() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"partial\":",
+                )
+                .await;
+        });
+        let provider = AnthropicProvider {
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            catalog_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            base_url: format!("http://{address}/toy-secret-path"),
+        };
+        let ctx = RequestContext {
+            req_id: "r1".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "anthropic".to_string(),
+            traffic: None,
+            monitor: None,
+            passthrough: Some(crate::provider::Passthrough {
+                raw_body: axum::body::Bytes::from_static(b"{}"),
+                headers: axum::http::HeaderMap::new(),
+                path_and_query: "/v1/messages?token=toy-secret-query".to_string(),
+            }),
+        };
+
+        let response = provider.relay(ctx).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let mut relayed = Vec::new();
+        let error = loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => relayed.extend_from_slice(&chunk),
+                Some(Err(error)) => break error.to_string(),
+                None => panic!("a truncated body ended cleanly"),
+            }
+        };
+        assert_eq!(relayed, b"{\"partial\":");
+        for leaked in [
+            "toy-secret-path",
+            "toy-secret-query",
+            "127.0.0.1",
+            "for url",
+        ] {
+            assert!(!error.contains(leaked), "{leaked} in {error}");
+        }
     }
 
     #[tokio::test]

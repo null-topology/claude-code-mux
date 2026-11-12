@@ -145,7 +145,15 @@ Request path:
    `/v1/messages/count_tokens`, `/v1/models`, `/v1/models/{model_id}`.
    Optional OpenAI-compatible
    surfaces gated by `AppFeatures`: `/v1/responses` and `/v1/chat/completions`
-   (`CCP_CODEX_RESPONSES_API`), `/v1/images/*` (`CCP_CODEX_IMAGES_API`),
+   (`CCP_CODEX_RESPONSES_API`; a buffered chat completion reads at most
+   `MAX_PROVIDER_STREAM_BYTES`, 32 MiB, of the Codex answer; a streaming one
+   (`chat_completions/stream.rs`) has already sent its 200 status line, so
+   it ends the stream with an SSE error event of type `api_error` followed
+   by `data: [DONE]` and reads no further once the bytes it holds without a
+   complete SSE frame pass `MAX_HTTP_SSE_FRAME_BYTES` (8 MiB) or a text
+   delta would take the output text it keeps (`CompletionState::text`) past
+   `MAX_PROVIDER_STREAM_BYTES`, that delta not appended; neither
+   surface's error text names the request URL), `/v1/images/*` (`CCP_CODEX_IMAGES_API`),
    `/v1/audio/transcriptions` (`CCP_CODEX_TRANSCRIPTIONS_API`).
    `dispatch_request` handles the Anthropic routes: read the body, normalize
    the model (strip `[1m]`), look up the session by `x-claude-code-session-id`,
@@ -288,9 +296,23 @@ Request path:
      HTTP answer leaves no continuation state, and every later attempt of
      that client request (a 401 refresh) stays on HTTP
      (`post_codex_with_transport`); the next client request starts on the
-     WebSocket again. Under `websocket` it is answered once with 413
-     `request_too_large`, never resent, and the message adds that the
-     `auto` transport sends such a request over HTTP; any other 413 of a
+     WebSocket again. The HTTP replay goes out only under a credential shown
+     to be the one of the WebSocket attempt
+     (`refuse_size_fallback_under_another_account`,
+     `SizeRefusalFallback::same_credential`): the account id of that attempt
+     and the one the HTTP attempt holds (the fresh credential read of the
+     live path, a 401 refresh on either path) are both known and equal, or,
+     with an id unknown on either side, the HTTP attempt's access token is
+     the very string the WebSocket attempt went out with. The live stream
+     publishes each attempt's token beside its account
+     (`CodexWebSocketEventStream::access_token`), held in memory for this
+     comparison only, in types without `Debug`. Otherwise nothing more is
+     sent over HTTP, the size refusal itself is answered, and one
+     `codex_websocket_size_fallback_refused` warning carries `reqId` only
+     (`size_fallback_refused_fields`); a renewed token of the same account
+     goes ahead. Under `websocket` it is answered
+     once with 413 `request_too_large`, never resent, and the message adds
+     that the `auto` transport sends such a request over HTTP; any other 413 of a
      size refusal (buffered `auto` whose HTTP fallback is off behind a
      WebSocket proxy) states only what happened
      (`map_codex_transport_error_to_response` in `mod.rs`). A 1009 after
@@ -320,7 +342,11 @@ Request path:
      for a size refusal a fixed text naming only the frame length and the
      limit or the 1009 close, never anything from the request. For a size
      refusal `status` is the proxy's own 413, not a status the backend
-     sent. A connect that got no answer (`ConnectAttemptError::Unreachable`:
+     sent. A buffered request that fails logs a
+     `codex_upstream_request_failed` warning whose `detail` is the error's
+     `CodexError.detail` cut to 300 characters on a character boundary
+     (`failed_request_log_detail`), null when it has none. A connect that
+     got no answer (`ConnectAttemptError::Unreachable`:
      before the connect timeout the upgrade's response head, a proxy's
      status line or the tunneled destination's handshake response was not
      complete, or the connection or the TLS handshake failed) made for a
@@ -373,14 +399,47 @@ Request path:
      `compaction.rs`).
      `continuation.rs` keeps `previous_response_id` state keyed by
      `ConversationIdentity` (session plus agent headers) so subagents do not
-     clobber each other; `compaction.rs` does server-side compaction;
+     clobber each other (a live stream whose events, or whose output held
+     for translation, went past `MAX_BUFFERED_RESPONSE_BYTES` leaves none);
+     `compaction.rs` does
+     server-side compaction;
      `events.rs` classifies stream failures and recognises the
      `usage_limit_reached` error; `rate_limits.rs` keeps the newest
      `codex.rate_limits` reading of one ChatGPT account and publishes it as
      `anthropic-ratelimit-unified-*` headers (see below). Auth reads the Codex
      CLI's `~/.codex/auth.json` (`CCP_CODEX_AUTH_FILE` overrides the path).
    - `kimi/`, `grok/`: Chat Completions / Responses translators with their own
-     OAuth. `cursor/`: Connect protocol over protobuf.
+     OAuth. `cursor/`: Connect protocol over protobuf. These three and the
+     Anthropic relay never pass on a `reqwest::Error`'s own text, which ends
+     with ` for url (...)` and may hold a credential from a configured URL:
+     they use `upstream_http::error_text`, or `url_free_error` where `?`
+     carries the error on; both keep only reqwest's top-level text, never its
+     source chain. Each body they hold is read under a cap named in its
+     file, enforced while reading: 1 MiB for a token, device, login poll or
+     refresh answer, 64 KiB for an error body, 8 MiB for a Kimi or Cursor
+     response held whole, `MAX_METADATA_BYTES` (256 KiB) for Grok's OIDC
+     metadata. A body over its cap fails as an unreadable one does at that
+     place, except a Kimi response: over the cap it answers 502 `api_error`
+     naming the cap, while an unreadable one is still taken as empty. A
+     Cursor answer of status 400 or more keeps its status mapping and loses
+     only its message when its body is over the cap or unreadable
+     (`read_run_response`). A blocking body read (`read_blocking_body_capped`
+     and the helpers over it) takes a `deadline`, the timeout of the client
+     that sent the request, from one constant per client file
+     (`REQUEST_TIMEOUT`, `HTTP_TIMEOUT`) that the builder uses too: reqwest's
+     blocking `Read` restarts its timeout on every read, so the helper starts
+     no read past the deadline and fails with `BODY_READ_TIMEOUT_TEXT`.
+     Cursor's gzip frames are inflated through `connect::GzipFrames`, at
+     most `MAX_GZIP_FRAME_BYTES` (32 MiB) per frame and
+     `MAX_GZIP_RESPONSE_BYTES` (64 MiB) for the frames of one response, since
+     the events built from them are held together; past either the frame
+     fails as an undecodable one. The
+     passthrough's relayed body is streamed, not held, and has no cap. Their
+     login and status commands print provider-supplied text (verification
+     URL, user code, account id, email, error code or body) through
+     `upstream_http::escape_control_chars`, which escapes what
+     `char::is_control` matches (Cc only, so not U+202E); text the proxy
+     composes itself is printed as is.
 6. Cross-cutting: `session.rs` (in-memory sessions, 30 min idle TTL, provider
    affinity), `request_identity.rs` (Claude Code session and agent headers),
    `retry.rs` (backoff on 429 and 5xx), `monitor.rs` + `tui.rs`, `traffic.rs`
@@ -945,7 +1004,9 @@ byte-exact.
   at every `force_refresh` site there); any other failure answers 401. The
   model listing maps the same split to `ModelsError::Unreachable` and
   `Unauthorized` (`auth_models_error` in `models.rs`). No refresh error
-  carries the token endpoint's response body.
+  carries the token endpoint's response body. That answer is read up to
+  `MAX_TOKEN_RESPONSE_BYTES` (1 MiB); a longer one fails the refresh as an
+  unreadable one does, as a transient failure.
 
 ## Codex rate limits
 
@@ -1007,15 +1068,27 @@ under another account replaces the held reading whole, and
 `with_rate_limit_headers` publishes it only for a request under the same
 account. A pooled WebSocket keeps the `ChatGPT-Account-Id` of its handshake
 (`PoolEntry::account_id`), since the backend answers every request on it
-under that account: `take_pool_entry_for_request` hands it only to a
-request built with the same account and otherwise drops it as gone, so a
+under that account, and the handshake's access token
+(`PoolEntry::access_token`, in memory only, in a type without `Debug`, never
+logged). `take_pool_entry_for_request` hands it only to a request it serves
+(`PoolEntry::serves_request`): both account ids are known and equal, or
+neither is known and the request's access token is the very string of the
+handshake. An account known on one side only is another login. Otherwise it
+drops the socket as gone, so a
 continuation that needed it takes the missing-socket path
 (`continuation_socket_missing_error`) and is sent again with full context,
-and any other request opens its own connection. A token of the same account
-renewed before it expires keeps the socket (a refresh forced by a 401 still
+and any other request opens its own connection. A token of the same known
+account renewed before it expires keeps the socket, while a renewed token
+with no account id does not (a refresh forced by a 401 still
 drops the conversation's socket, as before), whereas the Codex CLI resets its
 connection on any auth change (`codex-rs/core/src/client.rs` at
-rust-v0.166.0). A reading whose
+rust-v0.166.0). The HTTP replay of a WebSocket size refusal likewise goes
+out only under the account of the WebSocket attempt it replaces, and, when
+an account id is unknown, only under that attempt's own access token
+(`refuse_size_fallback_under_another_account`). When the request's account
+id is unknown, the pool rule makes its token the one its socket was opened
+with (a pooled socket serves it only under the same token, else it opens
+its own), so the token that comparison reads is the socket's. A reading whose
 `metered_limit_name`, else `limit_name`, names a limit other than `codex`
 updates nothing, and its refusal marks no window (`reads_codex_limit`,
 `CodexUsageLimit::feeds_gauge`); one naming neither reads `codex`, as the
@@ -1157,7 +1230,90 @@ request, the search call) is read the same way, up to `MAX_ERROR_BODY_BYTES`
 and within one deadline of `body_idle_timeout_ms` for the whole read
 (`read_error_body`); the classification, a spent window and the traffic
 capture see only those bytes, and a read past the deadline fails with
-`detail: http_response_body` and is neither refreshed nor resent. Under `auto` transport
+`detail: http_response_body` and is neither refreshed nor resent. A
+successful buffered Messages answer is held up to
+`MAX_BUFFERED_RESPONSE_BYTES` (64 MiB of SSE, in `client.rs`; no setting,
+`with_buffered_response_limit` is for tests), over HTTP
+(`collect_http_response`) and WebSocket (`collect_ws_events`) alike; one
+byte more fails it with a 502 `api_error` whose detail is
+`BUFFERED_RESPONSE_TOO_LARGE_DETAIL`, drops the socket, and is neither
+refreshed, resent nor replayed over HTTP. The exception is a refusal the
+proxy holds at that point (`capped_body_names_refusal`: a spent window from
+`usage_limit_from_response`, else a classified failure from
+`first_reportable_failure` for a 2xx or `error_class_from_body` otherwise):
+the collector ends the body there and returns it, so the readers of
+`post_codex_with_transport` answer it as without the limit, the spent window
+recorded and the readings merged; the socket is still dropped and nothing
+is resent. On HTTP the bytes examined are those held, the crossing chunk
+cut at the limit, so a refusal that arrives wholly after the limit is not
+seen and the answer is the 502, and a refusal held is answered from what is
+held even when a more specific one follows past the limit. On WebSocket the
+event that crosses the
+limit is examined when its `type` is `error`, `response.failed` or
+`codex.rate_limits` and the collector would stop on it as a failure
+(`failure_past_limit`: a terminal event or a terminal snapshot, not a
+missing previous response); it joins the body as one compact `data:` line.
+A live stream is relayed as it
+arrives, and the copies of its events kept beside the relay stop at the
+client's same limit (`CodexHttpClient::buffered_response_limit`). The copy
+its continuation state is read from (`LiveUpstreamCopy` in `mod.rs`) is
+released for good by the event that would take it past the limit, with one
+`codex_live_stream_copy_dropped` warning (`reqId`, `limitBytes`); at the
+terminal event such a stream records no continuation state
+(`abort_request_state`), so the conversation's next request sends its full
+context without `previous_response_id`. The WebSocket reader's copy for the
+response-body capture (`LiveCaptureBody` in `websocket.rs`) exists only
+while a traffic capture is on and stops before the event that would pass
+the limit, so `032-upstream-response-body.sse` then holds the events up to
+that point. The client receives every event either way. No copy is built
+before it is known to fit: `encoded_sse_len` gives `encode_sse`'s framed
+length without allocating, and `append_upstream_sse_payload` serialises into
+a writer that stops at the room left. The live HTTP
+reader keeps no copy of the stream; it captures event by event. What a live
+stream holds is bounded by the same limit too. The translator
+(`LiveStreamTranslator`, built `with_retained_limit` from it in
+`live_stream_response_once`) keeps a running count: the bytes of every
+string it appends or stores (text, tool call arguments and the sanitized
+replacement of a finished call's arguments when it differs from what was
+held, reasoning ids and `encrypted_content`, message and call ids, tool
+names, web search ids, queries and result titles and URLs; a replacement
+adds its length and subtracts nothing, a move into `deferred_text` adds
+nothing), plus a fixed `RETAINED_ENTRY_BYTES` for every entry it inserts
+into a collection it keeps (a block, a message id lookup, a pending
+reasoning item, the `deferred_text` slot of a deferred text block, a web
+search, a web search result), charged before the entry goes in, so entries
+that hold no string still move the count. `emit_web_searches` emits every
+held result under every search, so each pair of a search and a result is
+charged once, when the later of the two arrives: a new search adds the
+results already held, a new result its own bytes once for itself and once
+more for every search already held. It is a count, not a measure of process
+memory. The translator refuses the string or entry that would take the
+count past the limit before keeping it (`reserve_retained`), with
+`RETAINED_OUTPUT_TOO_LARGE`.
+After output that refusal ends the stream with an SSE `error` of type
+`api_error`, before output it answers a plain 502 `api_error`. Either way
+`abort_refused_live_stream` then takes three steps in order. It drops the
+upstream stream, which closes the channel the WebSocket task sends on, so
+the task can no longer hand its answer on. It removes the socket the turn
+has pooled (`invalidate_live_continuation_pool`): the task pools it on a
+`response.completed` that arrived before the refusal, while the turn is
+still current (`pool_insert_for_turn`). It aborts the request state, which
+drops the turn's continuation, so the turn is no longer current and the
+task can pool nothing more for it. A socket the task pools between the
+removal and the abort belongs to a turn the backend completed and carries
+no continuation; the task removes it again when its final send finds the
+channel closed, and one whose final send was still accepted stays pooled.
+Before
+output, the translated framing held in `pending_chunk` (`message_start` and
+pings) answers `buffered_response_too_large_error` the same way once the
+next chunk would pass the limit, and `spawn_http_event_stream` counts the
+SSE data length (`DecodedHttpSseEvent::data_bytes`) of the events it holds
+in `pending_events` and, when the next one would pass the limit, drops them
+and fails the stream with that error, which is neither resent, refreshed
+nor replayed. The live WebSocket coordinator holds nothing before output: it
+forwards each event as it arrives over a bounded channel.
+Text built from a `reqwest::Error` in these paths goes through
+`upstream_http::error_text`, which leaves out the request URL. Under `auto` transport
 (the default) a handshake failure, classified or not, falls back to HTTP unless the
 WebSocket proxy refused it (`should_fallback_to_http` in `client.rs`), and
 that HTTP answer is classified on its own. The codes and their shapes follow
@@ -1242,7 +1398,10 @@ else null; `max_tokens` null, as the translator sends no output cap;
 `capabilities` from `UpstreamModel::capabilities`, where a leaf is true only
 when the Codex translator carries that feature), keeps hidden entries, and
 remembers the slugs so
-routing and `assert_allowed_model` accept them. The other catalog fields stay
+routing and `assert_allowed_model` accept them. At most
+`MAX_MODELS_BODY_BYTES` (4 MiB) of the answer is read; a longer one fails the
+listing as an unreadable one does (`ModelsError::Unreachable`), and no
+listing error text names the request URL. The other catalog fields stay
 in `UpstreamModel` for the proxy's own use and are not in the rows. Under the
 `inventory` lane policy `use_responses_lite` from the listing overrides the compiled-in
 lane table, while under the default `full` policy the proxy forces the full
@@ -1343,7 +1502,9 @@ Hosted web search sits outside the policy: a request carrying the hosted
 lane table lists `gpt-6-luna`, `gpt-6-sol`, `gpt-6.1-sol` and `gpt-6.1-terra`
 beside the gpt-5.6 family and `gpt-6-astra`. The forced standalone `/alpha/search` path
 (`is_standalone_search_request`) builds a request of its own and keeps the
-model that was asked for. The rewrite rests on no reproducible capture of a
+model that was asked for. Its answer is read up to `MAX_SEARCH_BODY_BYTES`
+(8 MiB); a longer one fails as an unreadable body does (`detail:
+http_response_body`) and is not sent again. The rewrite rests on no reproducible capture of a
 Luna refusal on the full lane, and no live capability check has been run
 either way.
 

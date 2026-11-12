@@ -12,7 +12,9 @@ use futures_util::StreamExt;
 use http::StatusCode;
 use serde_json::{Value, json};
 
+use crate::openai_compat::MAX_PROVIDER_STREAM_BYTES;
 use crate::provider::RequestContext;
+use crate::upstream_http::{BodyReadError, error_text};
 
 use super::client::{CodexError, CodexHttpClient};
 use request::TranslatedRequest;
@@ -69,11 +71,17 @@ impl ChatCompletionsBackend {
         }
 
         let headers = stream::response_headers(upstream.headers());
-        let bytes =
-            match collect_body(upstream, self.client.body_idle_timeout_ms(), Some(&ctx)).await {
-                Ok(bytes) => bytes,
-                Err(error) => return error.response(),
-            };
+        let bytes = match collect_body(
+            upstream,
+            self.client.body_idle_timeout_ms(),
+            Some(&ctx),
+            MAX_PROVIDER_STREAM_BYTES,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return error.response(),
+        };
         if let Some(traffic) = ctx.traffic.as_deref() {
             traffic.write_bytes("032-upstream-response-body.sse", &bytes);
         }
@@ -103,10 +111,13 @@ impl ChatCompletionsBackend {
     }
 }
 
+/// Reads the whole body, at most `limit` bytes in total; a longer body fails
+/// as a body that could not be read does.
 async fn collect_body(
     upstream: reqwest::Response,
     idle_timeout_ms: u64,
     ctx: Option<&RequestContext>,
+    limit: usize,
 ) -> Result<Vec<u8>, ChatError> {
     let mut stream = upstream.bytes_stream();
     let mut bytes = Vec::new();
@@ -114,6 +125,12 @@ async fn collect_body(
     loop {
         match tokio::time::timeout(Duration::from_millis(idle_timeout_ms), stream.next()).await {
             Ok(Some(Ok(chunk))) => {
+                if chunk.len() > limit - bytes.len() {
+                    return Err(ChatError::upstream(format!(
+                        "Codex response body read failed: {}",
+                        BodyReadError::TooLarge { limit }
+                    )));
+                }
                 if !started {
                     if let Some(ctx) = ctx
                         && let Some(monitor) = ctx.monitor.as_ref()
@@ -131,7 +148,8 @@ async fn collect_body(
             }
             Ok(Some(Err(error))) => {
                 return Err(ChatError::upstream(format!(
-                    "Codex response body read failed: {error}"
+                    "Codex response body read failed: {}",
+                    error_text(error)
                 )));
             }
             Ok(None) => return Ok(bytes),
@@ -161,7 +179,8 @@ fn codex_error_response(error: CodexError) -> Response {
 async fn upstream_error_response(upstream: reqwest::Response, idle_timeout_ms: u64) -> Response {
     let status = upstream.status();
     let retry_after = upstream.headers().get(http::header::RETRY_AFTER).cloned();
-    let bytes = match collect_body(upstream, idle_timeout_ms, None).await {
+    let bytes = match collect_body(upstream, idle_timeout_ms, None, MAX_PROVIDER_STREAM_BYTES).await
+    {
         Ok(bytes) => bytes,
         Err(error) => return error.response(),
     };
@@ -414,6 +433,79 @@ mod tests {
         let snapshot = monitor.snapshot();
         assert_eq!(snapshot.active[0].input_tokens, Some(8));
         assert_eq!(snapshot.active[0].output_tokens, Some(4));
+    }
+
+    /// A body of exactly the cap is read whole; one byte more, counted across
+    /// chunks, fails as a body that could not be read does.
+    #[tokio::test]
+    async fn a_buffered_body_is_read_up_to_its_cap() {
+        fn chunked(pieces: &[&'static [u8]]) -> reqwest::Response {
+            let chunks: Vec<Result<&'static [u8], std::io::Error>> =
+                pieces.iter().copied().map(Ok).collect();
+            http::Response::new(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                chunks,
+            )))
+            .into()
+        }
+
+        let body = collect_body(chunked(&[b"12345678", b"abcdefgh"]), 1_000, None, 16)
+            .await
+            .unwrap();
+        assert_eq!(body, b"12345678abcdefgh");
+
+        let error = collect_body(chunked(&[b"12345678", b"abcdefghi"]), 1_000, None, 16)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.kind, "api_error");
+        assert_eq!(
+            error.message,
+            "Codex response body read failed: response body exceeded 16 bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_answers_without_the_url() {
+        // Nothing listens on port 1, so the send fails before any answer.
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1/toy-secret-path/v1/responses?token=toy-secret-query".into(),
+            1_000,
+            1_000,
+            0,
+        );
+        client.auth_manager().set_test_auth(StoredAuth {
+            access: "test-token".into(),
+            refresh: String::new(),
+            account_id: Some("account".into()),
+            expires: u64::MAX,
+        });
+        let backend = ChatCompletionsBackend::with_client(client);
+        let request = request::translate_request(json!({
+            "model":"gpt-5.6-sol",
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        let response = backend
+            .handle(request, context(MonitorHandle::new(10)))
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("Native Responses transport error"), "{body}");
+        for secret in [
+            "toy-secret-path",
+            "toy-secret-query",
+            "127.0.0.1",
+            "for url",
+        ] {
+            assert!(!body.contains(secret), "{body}");
+        }
     }
 
     #[tokio::test]
