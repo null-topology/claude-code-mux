@@ -798,6 +798,8 @@ fn normalize_proxy_url(raw: &str) -> Option<String> {
     Some(parsed.to_string())
 }
 
+// The upgrade must trust what the WebSocket connection trusts, so it takes that TLS configuration.
+#[allow(clippy::disallowed_methods)]
 fn websocket_http_client(proxy_environment: &ProxyEnvironment) -> reqwest::Client {
     let tls_config = super::websocket::websocket_tls_config();
     proxy_environment

@@ -147,6 +147,66 @@ fn auth_returns_token_from_env() {
     }
 }
 
+#[test]
+fn login_poll_error_leaves_out_the_poll_url() {
+    use claude_code_mux::providers::cursor::auth::{CursorLogin, wait_for_cursor_login};
+    use std::io::{Read, Write};
+
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mock_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..read]);
+        }
+        let body = b"not json";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+        String::from_utf8_lossy(&request).into_owned()
+    });
+
+    unsafe {
+        std::env::set_var("CCP_CURSOR_BASE_URL", &mock_url);
+    }
+    let login = CursorLogin {
+        login_url: String::new(),
+        uuid: "toy-uuid".into(),
+        verifier: "toy-verifier-value".into(),
+    };
+    let result = wait_for_cursor_login(&login, 1, |_| {});
+    unsafe {
+        std::env::remove_var("CCP_CURSOR_BASE_URL");
+    }
+
+    let request = server.join().unwrap();
+    assert!(
+        request.starts_with("GET /auth/poll?uuid=toy-uuid&verifier=toy-verifier-value "),
+        "{request}"
+    );
+    let error = result.expect_err("a poll answer that is not JSON fails the login");
+    for text in [
+        format!("{error}"),
+        format!("{error:#}"),
+        format!("{error:?}"),
+    ] {
+        assert!(!text.contains("toy-verifier-value"), "{text}");
+        assert!(!text.contains("verifier="), "{text}");
+        assert!(!text.contains("/auth/poll"), "{text}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Model catalog
 // ---------------------------------------------------------------------------

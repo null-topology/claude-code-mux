@@ -7,4 +7,8 @@ disallowed-methods = [
     { path = "reqwest::blocking::ClientBuilder::new", reason = "start from http_client::blocking_client_builder, which installs ring and trusts only the bundled roots" },
     { path = "reqwest::get", reason = "send through a client built from http_client::client_builder, which installs ring and trusts only the bundled roots" },
     { path = "reqwest::blocking::get", reason = "send through a client built from http_client::blocking_client_builder, which installs ring and trusts only the bundled roots" },
+    { path = "reqwest::ClientBuilder::use_preconfigured_tls", reason = "replaces the bundled roots and ring setup of http_client::client_builder with a TLS configuration of its own" },
+    { path = "reqwest::ClientBuilder::tls_backend_preconfigured", reason = "replaces the bundled roots and ring setup of http_client::client_builder with a TLS configuration of its own" },
+    { path = "reqwest::blocking::ClientBuilder::use_preconfigured_tls", reason = "replaces the bundled roots and ring setup of http_client::blocking_client_builder with a TLS configuration of its own" },
+    { path = "reqwest::blocking::ClientBuilder::tls_backend_preconfigured", reason = "replaces the bundled roots and ring setup of http_client::blocking_client_builder with a TLS configuration of its own" },
 ]

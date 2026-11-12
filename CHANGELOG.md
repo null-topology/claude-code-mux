@@ -8,12 +8,15 @@
   in configuration or behaviour.
 - The monitor's terminal libraries are updated to ratatui 0.30 and
   crossterm 0.29. The monitor works as before and no setting changes.
-- The HTTP client library is updated to reqwest 0.13. TLS still uses the
-  ring crypto provider and the Mozilla root certificates bundled with the
-  proxy, never the operating system's store, and nothing changes in
-  configuration. One root that Mozilla limits to the domains of a single
-  country is no longer trusted by the HTTP clients, since they take the
-  roots as plain certificates and that limit cannot be applied there.
+- The HTTP client library is updated to reqwest 0.13. The HTTP clients still
+  use the ring crypto provider and the Mozilla root certificates bundled with
+  the proxy, never the operating system's store, and nothing changes in
+  configuration. The Codex WebSocket connection keeps its own trust,
+  unchanged by this update: the operating system's certificates plus the
+  bundled Mozilla anchors, which the HTTP client that performs its upgrade
+  uses as well. One root that Mozilla limits to the domains of a single
+  country is no longer trusted by the other HTTP clients, since they take
+  the roots as plain certificates and that limit cannot be applied there.
 
 ## v0.18.1 (2026-11-12)
 

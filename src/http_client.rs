@@ -1,14 +1,21 @@
 //! Every reqwest client the proxy builds starts from a builder made here, so
 //! all of them use the same TLS setup: ring as the crypto provider and the
 //! Mozilla root set bundled at build time. The operating system's store and
-//! the platform verifier are never consulted.
+//! the platform verifier are never consulted, with one exception: the client
+//! that performs the Codex WebSocket upgrade (`websocket_http_client`) replaces
+//! this setup with the WebSocket connection's own configuration
+//! (`WEBSOCKET_TLS_CONFIG`), which trusts the operating system's certificates
+//! plus the Mozilla anchors.
 //!
 //! The roots reach reqwest as certificates, and a certificate cannot carry a
 //! name constraint that Mozilla sets on a root outside the certificate. A root
 //! whose Mozilla trust anchor has such a constraint is left out rather than
 //! trusted for every name, so these clients never trust more than the
-//! constrained anchor set does. `clippy.toml` forbids building a client any
-//! other way.
+//! constrained anchor set does. `clippy.toml` forbids the reqwest client
+//! constructors, `reqwest::get` and the builder methods that replace the TLS
+//! setup, allowed only on the two constructor calls below and in
+//! `websocket_http_client`. It cannot see `Client::default()` or
+//! `ClientBuilder::default()`, which call the constructors inside reqwest.
 
 use once_cell::sync::Lazy;
 use rustls::pki_types::{CertificateDer, TrustAnchor};
