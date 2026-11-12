@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::providers::kimi::auth::constants::api_base_url;
 use crate::providers::kimi::auth::headers::common_headers;
@@ -6,7 +6,9 @@ use crate::providers::kimi::auth::manager::KimiAuthManager;
 use crate::providers::kimi::auth::token_store::{StoredAuth, file_store};
 use crate::providers::kimi::translate::request::KimiChatRequest;
 use crate::retry::{MAX_RATE_LIMIT_RETRIES, compute_backoff_delay};
-use crate::upstream_http::blocking_error_text as error_body_text;
+use crate::upstream_http::{
+    BodyReadError, blocking_error_text as error_body_text, read_blocking_body_capped,
+};
 
 #[derive(Debug)]
 pub struct KimiError {
@@ -37,7 +39,7 @@ impl KimiHttpClient {
     pub fn new() -> Self {
         Self {
             client: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("failed to create HTTP client"),
             auth_manager: KimiAuthManager::new(file_store()),
@@ -149,10 +151,13 @@ impl KimiHttpClient {
             request_start_time,
             MAX_ERROR_BODY_BYTES,
             MAX_RESPONSE_BYTES,
+            REQUEST_TIMEOUT,
         )
     }
 }
 
+/// The timeout of the Kimi API client, and the deadline for reading a body.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// The most of an error response kept for its message.
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// The most of a successful response held in memory before it is translated.
@@ -163,6 +168,7 @@ fn read_response(
     request_start_time: u64,
     max_error_bytes: usize,
     max_response_bytes: usize,
+    deadline: Duration,
 ) -> Result<KimiResponse, KimiError> {
     let status = resp.status().as_u16();
 
@@ -172,7 +178,7 @@ fn read_response(
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let text = error_body_text(resp, max_error_bytes);
+        let text = error_body_text(resp, max_error_bytes, deadline);
         return Err(KimiError {
             status: 429,
             message: "Rate limited".to_string(),
@@ -182,7 +188,7 @@ fn read_response(
     }
 
     if status == 401 || status == 403 {
-        let text = error_body_text(resp, max_error_bytes);
+        let text = error_body_text(resp, max_error_bytes, deadline);
         return Err(KimiError {
             status,
             message: if status == 401 {
@@ -197,7 +203,7 @@ fn read_response(
     }
 
     if !resp.status().is_success() {
-        let text = error_body_text(resp, max_error_bytes);
+        let text = error_body_text(resp, max_error_bytes, deadline);
         return Err(KimiError {
             status,
             message: "Upstream error".to_string(),
@@ -206,8 +212,21 @@ fn read_response(
         });
     }
 
-    let body_bytes = crate::upstream_http::read_blocking_body_capped(resp, max_response_bytes)
-        .unwrap_or_default();
+    // An answer over the limit is an upstream failure: an empty body would
+    // reach the client as an empty successful message. A failed read keeps
+    // its old outcome, an empty body.
+    let body_bytes = match read_blocking_body_capped(resp, max_response_bytes, deadline) {
+        Ok(body) => body,
+        Err(error @ BodyReadError::TooLarge { .. }) => {
+            return Err(KimiError {
+                status: 502,
+                message: "Upstream error".to_string(),
+                detail: Some(format!("Kimi {error}")),
+                retry_after: None,
+            });
+        }
+        Err(BodyReadError::Transport(_)) => Vec::new(),
+    };
 
     Ok(KimiResponse {
         body: body_bytes,
@@ -260,7 +279,7 @@ mod tests {
             .get(serve_body(status, size))
             .send()
             .unwrap();
-        read_response(resp, 0, 16, 32)
+        read_response(resp, 0, 16, 32, REQUEST_TIMEOUT)
     }
 
     #[test]
@@ -286,9 +305,36 @@ mod tests {
     }
 
     #[test]
-    fn a_response_over_the_limit_is_dropped() {
-        let response = read_served(200, 33).ok().unwrap();
-        assert_eq!(response.status, 200);
-        assert!(response.body.is_empty());
+    fn a_response_over_the_limit_is_an_upstream_error() {
+        assert_over_the_limit(read_served(200, 33).err().unwrap());
+    }
+
+    #[test]
+    fn an_undeclared_response_over_the_limit_is_an_upstream_error() {
+        use crate::upstream_http::test_support::serve_in_order_undeclared;
+        let url = serve_in_order_undeclared(vec![(200, vec![b'a'; 32]), (200, vec![b'a'; 33])]);
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let read = || {
+            let resp = client.get(&url).send().unwrap();
+            assert_eq!(resp.content_length(), None);
+            read_response(resp, 0, 16, 32, REQUEST_TIMEOUT)
+        };
+        assert_eq!(read().ok().unwrap().body, vec![b'a'; 32]);
+        assert_over_the_limit(read().err().unwrap());
+    }
+
+    /// A 502 `api_error` naming the limit, not an empty successful answer.
+    fn assert_over_the_limit(error: KimiError) {
+        assert_eq!(error.status, 502);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("Kimi response body exceeded 32 bytes")
+        );
+        assert_eq!(error.retry_after, None);
+        let response = super::super::map_kimi_error_to_response(&error);
+        assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
     }
 }

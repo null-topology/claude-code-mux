@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::Deserialize;
 
 use super::constants::{CLIENT_ID, oauth_host};
@@ -36,10 +38,15 @@ const POLL_SAFETY_MARGIN_MS: u64 = 500;
 const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 /// The most of an error answer kept for its message.
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// The timeout of the login client, and the deadline for reading a body: the
+/// 30 s reqwest's blocking client applies by default.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn run_device_login() -> Result<TokenResponse, anyhow::Error> {
     let headers = common_headers()?;
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()?;
     device_login_at(&client, &oauth_host(), &headers)
 }
 
@@ -62,11 +69,16 @@ fn device_login_at(
 
     if !init_resp.status().is_success() {
         let status = init_resp.status();
-        let text = escape_control_chars(&blocking_error_text(init_resp, MAX_ERROR_BODY_BYTES));
+        let text = escape_control_chars(&blocking_error_text(
+            init_resp,
+            MAX_ERROR_BODY_BYTES,
+            HTTP_TIMEOUT,
+        ));
         anyhow::bail!("Device authorization failed: {status} {text}");
     }
 
-    let auth: DeviceAuthResponse = read_blocking_json_capped(init_resp, MAX_TOKEN_RESPONSE_BYTES)?;
+    let auth: DeviceAuthResponse =
+        read_blocking_json_capped(init_resp, MAX_TOKEN_RESPONSE_BYTES, HTTP_TIMEOUT)?;
     let interval_ms = (auth.interval.unwrap_or(5).max(1)) * 1000;
 
     eprintln!();
@@ -91,13 +103,18 @@ fn device_login_at(
 
         let status = resp.status();
         if status.as_u16() == 200 {
-            return read_blocking_json_capped::<TokenResponse>(resp, MAX_TOKEN_RESPONSE_BYTES);
+            return read_blocking_json_capped::<TokenResponse>(
+                resp,
+                MAX_TOKEN_RESPONSE_BYTES,
+                HTTP_TIMEOUT,
+            );
         }
 
-        let body: serde_json::Value = read_blocking_body_capped(resp, MAX_ERROR_BODY_BYTES)
-            .ok()
-            .and_then(|body| serde_json::from_slice(&body).ok())
-            .unwrap_or(serde_json::json!({}));
+        let body: serde_json::Value =
+            read_blocking_body_capped(resp, MAX_ERROR_BODY_BYTES, HTTP_TIMEOUT)
+                .ok()
+                .and_then(|body| serde_json::from_slice(&body).ok())
+                .unwrap_or(serde_json::json!({}));
         let error = body
             .get("error")
             .and_then(|v| v.as_str())
@@ -152,7 +169,8 @@ fn build_header_map(
 mod tests {
     use super::*;
     use crate::upstream_http::test_support::{
-        assert_no_url, padded_json, refused_secret_url, serve_in_order,
+        assert_no_url, padded_json, serve_in_order, serve_in_order_undeclared,
+        unanswered_secret_url,
     };
 
     const DEVICE: &str = r#"{"user_code":"ABCD","device_code":"dev","verification_uri_complete":"https://example.test/device","interval":1}"#;
@@ -168,7 +186,7 @@ mod tests {
 
     #[test]
     fn a_failed_device_authorization_send_carries_no_url() {
-        let error = login(&refused_secret_url()).unwrap_err();
+        let error = login(&unanswered_secret_url()).unwrap_err();
         assert_no_url(&format!("{error:?}"));
     }
 
@@ -200,12 +218,16 @@ mod tests {
 
     #[test]
     fn a_token_answer_over_the_limit_is_refused() {
-        let host = serve_in_order(vec![
-            (200, DEVICE.as_bytes().to_vec()),
-            (200, padded_json(TOKEN, MAX_TOKEN_RESPONSE_BYTES + 1)),
-        ]);
-        let error = login(&host).unwrap_err().to_string();
-        assert_eq!(error, "response body exceeded 1048576 bytes");
+        // Declared, the length is refused before the read; undeclared, the
+        // read counts the bytes.
+        for serve in [serve_in_order, serve_in_order_undeclared] {
+            let host = serve(vec![
+                (200, DEVICE.as_bytes().to_vec()),
+                (200, padded_json(TOKEN, MAX_TOKEN_RESPONSE_BYTES + 1)),
+            ]);
+            let error = login(&host).unwrap_err().to_string();
+            assert_eq!(error, "response body exceeded 1048576 bytes");
+        }
     }
 
     #[test]

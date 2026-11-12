@@ -400,11 +400,27 @@ Request path:
      Anthropic relay never pass on a `reqwest::Error`'s own text, which ends
      with ` for url (...)` and may hold a credential from a configured URL:
      they use `upstream_http::error_text`, or `url_free_error` where `?`
-     carries the error on. Each body they hold is read under a cap named in
-     its file, enforced while reading: 1 MiB for a token, device or refresh
-     answer, 64 KiB for an error body, 8 MiB for a Kimi or Cursor response
-     held whole, `MAX_METADATA_BYTES` (256 KiB) for Grok's OIDC metadata. A
-     body over its cap fails as an unreadable one does at that place. The
+     carries the error on; both keep only reqwest's top-level text, never its
+     source chain. Each body they hold is read under a cap named in its
+     file, enforced while reading: 1 MiB for a token, device, login poll or
+     refresh answer, 64 KiB for an error body, 8 MiB for a Kimi or Cursor
+     response held whole, `MAX_METADATA_BYTES` (256 KiB) for Grok's OIDC
+     metadata. A body over its cap fails as an unreadable one does at that
+     place, except a Kimi response: over the cap it answers 502 `api_error`
+     naming the cap, while an unreadable one is still taken as empty. A
+     Cursor answer of status 400 or more keeps its status mapping and loses
+     only its message when its body is over the cap or unreadable
+     (`read_run_response`). A blocking body read (`read_blocking_body_capped`
+     and the helpers over it) takes a `deadline`, the timeout of the client
+     that sent the request, from one constant per client file
+     (`REQUEST_TIMEOUT`, `HTTP_TIMEOUT`) that the builder uses too: reqwest's
+     blocking `Read` restarts its timeout on every read, so the helper starts
+     no read past the deadline and fails with `BODY_READ_TIMEOUT_TEXT`.
+     Cursor's gzip frames are inflated through `connect::GzipFrames`, at
+     most `MAX_GZIP_FRAME_BYTES` (32 MiB) per frame and
+     `MAX_GZIP_RESPONSE_BYTES` (64 MiB) for the frames of one response, since
+     the events built from them are held together; past either the frame
+     fails as an undecodable one. The
      passthrough's relayed body is streamed, not held, and has no cap. Their
      login and status commands print provider-supplied text (verification
      URL, user code, account id, email, error code or body) through

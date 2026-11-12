@@ -54,17 +54,37 @@
   providers, their login and token refresh included, no longer end with
   ` for url (...)`. A configured base URL or proxy URL can carry a credential
   in its path or query, and these messages reach client error answers, the
-  terminal and `proxy.log`. The rest of each message is unchanged, and the
-  bytes the passthrough relays are untouched.
+  terminal and `proxy.log`. The bytes the passthrough relays are untouched.
+  Two more things change in that text. A request that cannot be sent, or an
+  answer that cannot be read, in a login or token refresh now reports only
+  the first line of the error, so the `Caused by:` lines that used to follow
+  it, such as a refused connection, are gone. A connection that breaks while a login or token
+  refresh answer is being read now reports `request or response body error`
+  instead of `error decoding response body`, and an answer still arriving
+  when the client's timeout has run out reports `timed out reading the
+  response body`.
 - The Kimi, Grok and Cursor providers now stop reading an upstream body once
   it passes a fixed size, instead of holding whatever the server sends: 1 MiB
-  for a login, device or token refresh answer, 64 KiB for an error body kept
-  for its message, 8 MiB for a Kimi or Cursor response held before it is
-  translated, and 256 KiB for Grok's login metadata, which used to be checked
-  only after the whole body had been read. A larger body fails the way one
-  that cannot be read failed before: an error answer loses the upstream
-  message, a login or refresh fails, a Cursor request fails with a read error
-  and a Kimi response is treated as empty. The limits have no setting.
+  for a login, login poll, device or token refresh answer, 64 KiB for an
+  error body kept for its message, 8 MiB for a Kimi or Cursor response held
+  before it is translated, and 256 KiB for Grok's login metadata, which used
+  to be refused early only when it declared a larger length and was
+  otherwise read whole first. A larger body fails the way one that cannot be
+  read fails: an error answer loses the upstream message and keeps its
+  status, a login or refresh fails, and a Cursor request fails with a read
+  error. A Kimi response over the limit answers 502 `api_error` with a
+  message naming the limit; a Kimi response that cannot be read is still
+  treated as empty. A Cursor answer with a status of 400 or more whose body
+  is too large or cannot be read keeps its status, so a 401 still answers as
+  an authentication error and a 429 as a rate limit with `Retry-After`,
+  where it used to answer 502. A Cursor frame compressed with gzip is
+  inflated up to 32 MiB, and the frames of one response up to 64 MiB
+  together; past that the response fails as one with a frame that cannot be
+  decoded does. Reading a Kimi response or a login or token refresh answer
+  still ends at the timeout of the client that made the request (120 s for
+  a Kimi request, 20 s for Grok's login and token refresh, 30 s for Grok's
+  device flow and for the Kimi and Cursor login and token refresh), after at
+  most one more read already under way. The limits have no setting.
 - The Kimi, Grok and Cursor login and status commands now print control
   characters in text that comes from the provider (a verification URL, a
   user code, an account id, an email, an error code or message) as visible

@@ -101,10 +101,13 @@ fn device_login_inner<S: AuthStorage<StoredAuth>>(
     Ok(())
 }
 
+/// The timeout of the device-flow client, and the deadline for reading a body.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn client() -> anyhow::Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
+        .timeout(HTTP_TIMEOUT)
         .build()?)
 }
 
@@ -176,7 +179,11 @@ fn request_device_code(
             response.status()
         );
     }
-    crate::upstream_http::read_blocking_json_capped(response, MAX_TOKEN_RESPONSE_BYTES)
+    crate::upstream_http::read_blocking_json_capped(
+        response,
+        MAX_TOKEN_RESPONSE_BYTES,
+        HTTP_TIMEOUT,
+    )
 }
 
 fn poll_token(
@@ -195,13 +202,20 @@ fn poll_token(
         .map_err(crate::upstream_http::url_free_error)?;
     if response.status().is_success() {
         return Ok(DevicePoll::Tokens(
-            crate::upstream_http::read_blocking_json_capped(response, MAX_TOKEN_RESPONSE_BYTES)?,
+            crate::upstream_http::read_blocking_json_capped(
+                response,
+                MAX_TOKEN_RESPONSE_BYTES,
+                HTTP_TIMEOUT,
+            )?,
         ));
     }
     let status = response.status();
-    let body: serde_json::Value =
-        crate::upstream_http::read_blocking_json_capped(response, MAX_ERROR_BODY_BYTES)
-            .unwrap_or_else(|_| serde_json::json!({}));
+    let body: serde_json::Value = crate::upstream_http::read_blocking_json_capped(
+        response,
+        MAX_ERROR_BODY_BYTES,
+        HTTP_TIMEOUT,
+    )
+    .unwrap_or_else(|_| serde_json::json!({}));
     match body.get("error").and_then(|value| value.as_str()) {
         Some("authorization_pending") => Ok(DevicePoll::Pending),
         Some("slow_down") => Ok(DevicePoll::SlowDown),
@@ -372,8 +386,8 @@ mod tests {
 
     #[test]
     fn device_flow_send_failures_carry_no_url() {
-        use crate::upstream_http::test_support::{assert_no_url, refused_secret_url};
-        let issuer = refused_secret_url();
+        use crate::upstream_http::test_support::{assert_no_url, unanswered_secret_url};
+        let issuer = unanswered_secret_url();
         let init = request_device_code(&test_client(), &issuer).err().unwrap();
         assert_no_url(&format!("{init:#}"));
         let poll = poll_token(&test_client(), &issuer, "dev").err().unwrap();
@@ -399,21 +413,25 @@ mod tests {
 
     #[test]
     fn token_answer_is_read_up_to_its_limit() {
-        use crate::upstream_http::test_support::{padded_json, serve_in_order};
+        use crate::upstream_http::test_support::{
+            padded_json, serve_in_order, serve_in_order_undeclared,
+        };
         let tokens = r#"{"access_token":"access-7","refresh_token":"refresh-7","expires_in":3600,"token_type":"Bearer"}"#;
-        let issuer = serve_in_order(vec![
-            (200, padded_json(tokens, MAX_TOKEN_RESPONSE_BYTES)),
-            (200, padded_json(tokens, MAX_TOKEN_RESPONSE_BYTES + 1)),
-        ]);
-        assert!(matches!(
-            poll_token(&test_client(), &issuer, "dev-7").ok().unwrap(),
-            DevicePoll::Tokens(tokens) if tokens.access_token == "access-7"
-        ));
-        let error = poll_token(&test_client(), &issuer, "dev-7").err().unwrap();
-        assert!(
-            format!("{error:#}").contains("response body exceeded"),
-            "{error:#}"
-        );
+        for serve in [serve_in_order, serve_in_order_undeclared] {
+            let issuer = serve(vec![
+                (200, padded_json(tokens, MAX_TOKEN_RESPONSE_BYTES)),
+                (200, padded_json(tokens, MAX_TOKEN_RESPONSE_BYTES + 1)),
+            ]);
+            assert!(matches!(
+                poll_token(&test_client(), &issuer, "dev-7").ok().unwrap(),
+                DevicePoll::Tokens(tokens) if tokens.access_token == "access-7"
+            ));
+            let error = poll_token(&test_client(), &issuer, "dev-7").err().unwrap();
+            assert!(
+                format!("{error:#}").contains("response body exceeded"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]

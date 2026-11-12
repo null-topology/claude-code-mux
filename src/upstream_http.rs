@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::{Duration, Instant};
 
 /// The `Display` text of `error` with its URL removed. A reqwest error that
 /// holds a URL ends its text with ` for url (<url>)`, and an upstream URL can
@@ -59,12 +60,25 @@ pub(crate) async fn read_body_capped(
     Ok(body)
 }
 
+/// The failure of a blocking body read that ran out of time.
+pub(crate) const BODY_READ_TIMEOUT_TEXT: &str = "timed out reading the response body";
+
 /// [`read_body_capped`] for a response of the blocking client: a declared
-/// length over `limit` is refused before anything is read, and the read stops
-/// one byte past `limit`, so no more than that is ever held.
+/// length over `limit` is refused before anything is read; otherwise the body
+/// is read piece by piece and refused as soon as it would pass `limit`.
+///
+/// The whole read is bounded by `deadline`, which the caller sets to the
+/// timeout of the client that sent the request, as reqwest's own `bytes()`
+/// and `json()` bound it. The blocking `Read` impl starts that timeout again
+/// on every read, so a body that keeps arriving a byte at a time would
+/// otherwise never time out. A read in progress cannot be interrupted: no new
+/// read starts once `deadline` has passed, and the call then fails with
+/// [`BODY_READ_TIMEOUT_TEXT`], so it returns within `deadline` plus at most
+/// one per-read timeout.
 pub(crate) fn read_blocking_body_capped(
-    response: reqwest::blocking::Response,
+    mut response: reqwest::blocking::Response,
     limit: usize,
+    deadline: Duration,
 ) -> Result<Vec<u8>, BodyReadError> {
     use std::io::Read;
 
@@ -74,15 +88,24 @@ pub(crate) fn read_blocking_body_capped(
     {
         return Err(BodyReadError::TooLarge { limit });
     }
+    let started = Instant::now();
     let mut body = Vec::new();
-    response
-        .take((limit as u64).saturating_add(1))
-        .read_to_end(&mut body)
-        .map_err(blocking_read_error)?;
-    if body.len() > limit {
-        return Err(BodyReadError::TooLarge { limit });
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        if started.elapsed() >= deadline {
+            return Err(BodyReadError::Transport(BODY_READ_TIMEOUT_TEXT.to_string()));
+        }
+        let read = match response.read(&mut buffer) {
+            Ok(0) => return Ok(body),
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(blocking_read_error(error)),
+        };
+        if read > limit - body.len() {
+            return Err(BodyReadError::TooLarge { limit });
+        }
+        body.extend_from_slice(&buffer[..read]);
     }
-    Ok(body)
 }
 
 /// The blocking client reports a failed body read as an `io::Error` wrapping
@@ -121,20 +144,25 @@ pub(crate) async fn read_json_capped<T: serde::de::DeserializeOwned>(
     decode_json(&read_body_capped(response, limit).await?)
 }
 
-/// A JSON answer of the blocking client, read under `limit` with
-/// [`read_blocking_body_capped`] and parsed with [`decode_json`].
+/// A JSON answer of the blocking client, read under `limit` and `deadline`
+/// with [`read_blocking_body_capped`] and parsed with [`decode_json`].
 pub(crate) fn read_blocking_json_capped<T: serde::de::DeserializeOwned>(
     response: reqwest::blocking::Response,
     limit: usize,
+    deadline: Duration,
 ) -> anyhow::Result<T> {
-    decode_json(&read_blocking_body_capped(response, limit)?)
+    decode_json(&read_blocking_body_capped(response, limit, deadline)?)
 }
 
 /// A body of the blocking client as text for an error message, empty when it
-/// cannot be read or is over `limit`, as reqwest's `text().unwrap_or_default()`
-/// gives for a body it cannot read.
-pub(crate) fn blocking_error_text(response: reqwest::blocking::Response, limit: usize) -> String {
-    read_blocking_body_capped(response, limit)
+/// cannot be read within `deadline` or is over `limit`, as reqwest's
+/// `text().unwrap_or_default()` gives for a body it cannot read.
+pub(crate) fn blocking_error_text(
+    response: reqwest::blocking::Response,
+    limit: usize,
+    deadline: Duration,
+) -> String {
+    read_blocking_body_capped(response, limit, deadline)
         .map(|body| String::from_utf8_lossy(&body).into_owned())
         .unwrap_or_default()
 }
@@ -159,14 +187,24 @@ pub(crate) fn escape_control_chars(text: &str) -> String {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::io::{Read, Write};
+    use std::net::TcpListener;
 
-    /// A URL on loopback that refuses connections, with a toy secret in its
-    /// path and query.
-    pub(crate) fn refused_secret_url() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        format!("http://127.0.0.1:{port}/toy-secret-path?token=toy-secret-query")
+    /// A URL on a loopback listener that stays bound and closes every
+    /// connection without answering, so a request to it fails while it is
+    /// being sent. Its path and query hold a toy secret.
+    pub(crate) fn unanswered_secret_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || close_unanswered(listener));
+        format!("http://{addr}/toy-secret-path?token=toy-secret-query")
+    }
+
+    /// Reads each request on `listener` and closes its connection without an
+    /// answer, for as long as the test process runs.
+    fn close_unanswered(listener: TcpListener) {
+        for mut stream in listener.incoming().flatten() {
+            read_request(&mut stream);
+        }
     }
 
     /// Asserts that `text` names neither the toy secret nor the address.
@@ -191,27 +229,46 @@ pub(crate) mod test_support {
     }
 
     /// Answers one connection per entry of `responses`, in order, each with
-    /// its status and body and `connection: close`, then stops listening, so
-    /// a later request is refused. Returns `http://<addr>/toy-secret-path`.
+    /// its status and body, a declared `content-length` and `connection:
+    /// close`, then closes every later connection without answering, so a
+    /// later request fails while it is being sent. Returns
+    /// `http://<addr>/toy-secret-path`.
     pub(crate) fn serve_in_order(responses: Vec<(u16, Vec<u8>)>) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        serve(responses, true)
+    }
+
+    /// [`serve_in_order`] with no declared length: each body ends when its
+    /// connection closes, so a reader learns its size only by reading it.
+    pub(crate) fn serve_in_order_undeclared(responses: Vec<(u16, Vec<u8>)>) -> String {
+        serve(responses, false)
+    }
+
+    fn serve(responses: Vec<(u16, Vec<u8>)>, declare_length: bool) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             for (status, body) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 read_request(&mut stream);
+                let length = if declare_length {
+                    format!("content-length: {}\r\n", body.len())
+                } else {
+                    String::new()
+                };
                 let mut response = format!(
-                    "HTTP/1.1 {status} STATUS\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    body.len()
+                    "HTTP/1.1 {status} STATUS\r\ncontent-type: application/json\r\n{length}connection: close\r\n\r\n"
                 )
                 .into_bytes();
                 response.extend_from_slice(&body);
                 let _ = stream.write_all(&response);
             }
+            close_unanswered(listener);
         });
         format!("http://{addr}/toy-secret-path")
     }
 
+    /// Reads one request, head and declared body, or as much of it as the
+    /// client sends before it closes or fails.
     fn read_request(stream: &mut std::net::TcpStream) {
         let mut request = Vec::new();
         let mut buffer = [0_u8; 4096];
@@ -219,9 +276,10 @@ pub(crate) mod test_support {
             if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
                 break end + 4;
             }
-            let read = stream.read(&mut buffer).unwrap();
-            assert!(read > 0, "request ended before its headers");
-            request.extend_from_slice(&buffer[..read]);
+            match stream.read(&mut buffer) {
+                Ok(read) if read > 0 => request.extend_from_slice(&buffer[..read]),
+                _ => return,
+            }
         };
         let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
         let length = head
@@ -230,11 +288,10 @@ pub(crate) mod test_support {
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(0);
         while request.len() < head_end + length {
-            let read = stream.read(&mut buffer).unwrap();
-            if read == 0 {
-                break;
+            match stream.read(&mut buffer) {
+                Ok(read) if read > 0 => request.extend_from_slice(&buffer[..read]),
+                _ => return,
             }
-            request.extend_from_slice(&buffer[..read]);
         }
     }
 }
@@ -301,18 +358,28 @@ mod tests {
 
     #[tokio::test]
     async fn error_text_of_a_send_error_names_no_url() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
         let error = loopback_client()
-            .get(format!("http://127.0.0.1:{port}{SECRET_TARGET}"))
+            .get(test_support::unanswered_secret_url())
             .send()
             .await
             .unwrap_err();
-        assert!(error.url().is_some());
+        assert!(error.is_request(), "{error:?}");
+        assert!(error.to_string().contains("toy-secret-query"), "{error}");
         assert_no_url(&error_text(error));
+    }
+
+    #[test]
+    fn a_blocking_send_error_carries_the_url_that_url_free_error_drops() {
+        let error = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(test_support::unanswered_secret_url())
+            .send()
+            .unwrap_err();
+        assert!(error.is_request(), "{error:?}");
+        assert!(error.to_string().contains("toy-secret-query"), "{error}");
+        assert_no_url(&format!("{:#}", url_free_error(error)));
     }
 
     #[tokio::test]
@@ -414,7 +481,55 @@ mod tests {
             .get(format!("http://{addr}{target}"))
             .send()
             .unwrap();
-        read_blocking_body_capped(response, limit)
+        read_blocking_body_capped(response, limit, Duration::from_secs(5))
+    }
+
+    #[test]
+    fn a_blocking_body_that_trickles_in_stops_at_its_deadline() {
+        // 80 bytes, one every 100 ms. Each read returns well within the
+        // client's 1 s timeout, which reqwest's `Read` starts again for every
+        // read, so only a deadline over the whole body ends the read before
+        // the trickle does, 8 s in.
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 80\r\nconnection: close\r\n\r\n");
+            for _ in 0..80 {
+                if stream.write_all(b"a").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let deadline = Duration::from_secs(1);
+        let response = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(deadline)
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .unwrap();
+        let started = Instant::now();
+        let result = read_blocking_body_capped(response, 1024, deadline);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            result,
+            Err(BodyReadError::Transport(BODY_READ_TIMEOUT_TEXT.to_string()))
+        );
+        // The deadline plus one per-read timeout is 2 s; the rest is room for
+        // a loaded runner, still well short of the 8 s trickle.
+        assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
     }
 
     #[test]

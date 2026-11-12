@@ -1114,9 +1114,16 @@ async fn smoke_kimi_send_failure_does_not_echo_the_base_url() {
     let config = TempDir::new().unwrap();
     write_kimi_auth(config.path());
 
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = closed.local_addr().unwrap().port();
-    drop(closed);
+    // The listener stays bound, so no other process can take the port; each
+    // connection is closed without an answer and the request fails to send.
+    let unanswered = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = unanswered.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in unanswered.incoming().flatten() {
+            let mut request = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+        }
+    });
     let base_url = format!("http://127.0.0.1:{port}/toy-secret-path?token=toy-secret-query");
 
     let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());

@@ -69,11 +69,14 @@ pub fn login<S: AuthStorage<StoredAuth>>(store: &GrokTokenStore<S>) -> anyhow::R
     Ok(())
 }
 
+/// The timeout of the login client, and the deadline for reading a body.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+
 fn client() -> anyhow::Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(20))
+        .timeout(HTTP_TIMEOUT)
         .build()?)
 }
 
@@ -95,7 +98,7 @@ fn read_metadata(client: &reqwest::blocking::Client, url: &str) -> anyhow::Resul
         .map_err(url_free_error)?
         .error_for_status()
         .map_err(url_free_error)?;
-    match read_blocking_body_capped(response, MAX_METADATA_BYTES) {
+    match read_blocking_body_capped(response, MAX_METADATA_BYTES, HTTP_TIMEOUT) {
         Ok(bytes) => Ok(bytes),
         Err(BodyReadError::TooLarge { .. }) => {
             anyhow::bail!("Grok OIDC metadata exceeds the size limit")
@@ -183,8 +186,11 @@ fn exchange_code(
             response.status()
         );
     }
-    let tokens: TokenResponse =
-        crate::upstream_http::read_blocking_json_capped(response, MAX_TOKEN_RESPONSE_BYTES)?;
+    let tokens: TokenResponse = crate::upstream_http::read_blocking_json_capped(
+        response,
+        MAX_TOKEN_RESPONSE_BYTES,
+        HTTP_TIMEOUT,
+    )?;
     validate_tokens(&tokens)?;
     Ok(tokens)
 }
@@ -361,10 +367,10 @@ mod tests {
     #[test]
     fn metadata_send_and_status_failures_carry_no_url() {
         use crate::upstream_http::test_support::{
-            assert_no_url, refused_secret_url, serve_in_order,
+            assert_no_url, serve_in_order, unanswered_secret_url,
         };
         let client = client().unwrap();
-        let refused = read_metadata(&client, &refused_secret_url()).unwrap_err();
+        let refused = read_metadata(&client, &unanswered_secret_url()).unwrap_err();
         assert_no_url(&format!("{refused:#}"));
         let url = serve_in_order(vec![(500, b"{}".to_vec())]);
         let rejected =
@@ -374,28 +380,30 @@ mod tests {
 
     #[test]
     fn metadata_is_read_up_to_its_limit() {
-        use crate::upstream_http::test_support::serve_in_order;
+        use crate::upstream_http::test_support::{serve_in_order, serve_in_order_undeclared};
         let client = client().unwrap();
-        let url = serve_in_order(vec![
-            (200, vec![b' '; MAX_METADATA_BYTES]),
-            (200, vec![b' '; MAX_METADATA_BYTES + 1]),
-        ]);
-        assert_eq!(
-            read_metadata(&client, &url).unwrap().len(),
-            MAX_METADATA_BYTES
-        );
-        let error = read_metadata(&client, &url).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "Grok OIDC metadata exceeds the size limit"
-        );
+        for serve in [serve_in_order, serve_in_order_undeclared] {
+            let url = serve(vec![
+                (200, vec![b' '; MAX_METADATA_BYTES]),
+                (200, vec![b' '; MAX_METADATA_BYTES + 1]),
+            ]);
+            assert_eq!(
+                read_metadata(&client, &url).unwrap().len(),
+                MAX_METADATA_BYTES
+            );
+            let error = read_metadata(&client, &url).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Grok OIDC metadata exceeds the size limit"
+            );
+        }
     }
 
     #[test]
     fn token_exchange_send_failure_carries_no_url() {
-        use crate::upstream_http::test_support::{assert_no_url, refused_secret_url};
+        use crate::upstream_http::test_support::{assert_no_url, unanswered_secret_url};
         let mut discovery = metadata();
-        discovery.token_endpoint = refused_secret_url();
+        discovery.token_endpoint = unanswered_secret_url();
         let error = exchange_code(
             &client().unwrap(),
             &discovery,

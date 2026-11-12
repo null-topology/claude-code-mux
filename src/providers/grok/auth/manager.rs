@@ -183,10 +183,10 @@ mod tests {
     #[tokio::test]
     async fn refresh_send_and_status_failures_carry_no_url() {
         use crate::upstream_http::test_support::{
-            assert_no_url, refused_secret_url, serve_in_order,
+            assert_no_url, serve_in_order, unanswered_secret_url,
         };
         let refused = fetch_json::<RefreshResponse>(
-            test_client().post(refused_secret_url()),
+            test_client().post(unanswered_secret_url()),
             MAX_TOKEN_RESPONSE_BYTES,
         )
         .await

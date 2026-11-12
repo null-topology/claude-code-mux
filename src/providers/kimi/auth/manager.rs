@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::constants::{CLIENT_ID, REFRESH_MARGIN_MS, oauth_host};
 use super::headers::common_headers;
@@ -14,6 +14,9 @@ const RETRYABLE_STATUSES: &[u16] = &[429, 500, 502, 503, 504];
 const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 /// The most of a refusal kept for its message.
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// The timeout of the refresh client, and the deadline for reading a body:
+/// the 30 s reqwest's blocking client applies by default.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct KimiAuthManager<S: AuthStorage<StoredAuth>> {
     pub store: KimiTokenStore<S>,
@@ -85,7 +88,9 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
         }
 
         let headers = common_headers()?;
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .build()?;
         self.refresh_at(&client, &oauth_host(), &headers, current)
     }
 
@@ -125,6 +130,7 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
                 let tokens: TokenResponse = crate::upstream_http::read_blocking_json_capped(
                     resp,
                     MAX_TOKEN_RESPONSE_BYTES,
+                    HTTP_TIMEOUT,
                 )?;
                 let expires = Self::now_ms() + (tokens.expires_in.unwrap_or(900) as u64 * 1000);
                 let next = StoredAuth {
@@ -152,10 +158,13 @@ impl<S: AuthStorage<StoredAuth>> KimiAuthManager<S> {
                     *guard = None;
                 }
                 let _ = self.store.clear_auth();
-                let err_msg =
-                    crate::upstream_http::read_blocking_body_capped(resp, MAX_ERROR_BODY_BYTES)
-                        .map(|body| String::from_utf8_lossy(&body).into_owned())
-                        .unwrap_or_else(|_| "Token refresh unauthorized".to_string());
+                let err_msg = crate::upstream_http::read_blocking_body_capped(
+                    resp,
+                    MAX_ERROR_BODY_BYTES,
+                    HTTP_TIMEOUT,
+                )
+                .map(|body| String::from_utf8_lossy(&body).into_owned())
+                .unwrap_or_else(|_| "Token refresh unauthorized".to_string());
                 anyhow::bail!("{err_msg}");
             }
 
@@ -271,25 +280,29 @@ mod tests {
 
     #[test]
     fn a_refresh_that_cannot_connect_carries_no_url() {
-        let url = crate::upstream_http::test_support::refused_secret_url();
+        let url = crate::upstream_http::test_support::unanswered_secret_url();
         let error = refresh_from(&url).unwrap_err();
         crate::upstream_http::test_support::assert_no_url(&format!("{error:?}"));
     }
 
     #[test]
     fn a_refresh_answer_is_read_up_to_the_limit() {
-        use crate::upstream_http::test_support::{padded_json, serve_in_order};
+        use crate::upstream_http::test_support::{
+            padded_json, serve_in_order, serve_in_order_undeclared,
+        };
         let token = r#"{"access_token":"toy-new-access"}"#;
 
-        let host = serve_in_order(vec![(200, padded_json(token, MAX_TOKEN_RESPONSE_BYTES))]);
-        assert_eq!(refresh_from(&host).unwrap().access, "toy-new-access");
+        for serve in [serve_in_order, serve_in_order_undeclared] {
+            let host = serve(vec![(200, padded_json(token, MAX_TOKEN_RESPONSE_BYTES))]);
+            assert_eq!(refresh_from(&host).unwrap().access, "toy-new-access");
 
-        let host = serve_in_order(vec![(
-            200,
-            padded_json(token, MAX_TOKEN_RESPONSE_BYTES + 1),
-        )]);
-        let error = refresh_from(&host).unwrap_err().to_string();
-        assert_eq!(error, "response body exceeded 1048576 bytes");
+            let host = serve(vec![(
+                200,
+                padded_json(token, MAX_TOKEN_RESPONSE_BYTES + 1),
+            )]);
+            let error = refresh_from(&host).unwrap_err().to_string();
+            assert_eq!(error, "response body exceeded 1048576 bytes");
+        }
     }
 
     #[test]

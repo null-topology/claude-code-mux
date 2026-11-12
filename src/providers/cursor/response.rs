@@ -60,6 +60,9 @@ pub fn decode_upstream_response(body: &[u8]) -> Result<Vec<CursorStreamEvent>, C
     let frames =
         decode_upstream_frames(body).map_err(|e| CursorDecodeError::Decode(e.to_string()))?;
     let mut events = Vec::new();
+    // What a frame yields is kept in `events`, so inflation is bounded per
+    // response as well as per frame.
+    let mut gzip_frames = crate::providers::cursor::connect::GzipFrames::new();
 
     for frame in &frames {
         if frame.flags & FLAG_END != 0 {
@@ -75,7 +78,8 @@ pub fn decode_upstream_response(body: &[u8]) -> Result<Vec<CursorStreamEvent>, C
 
         let decompressed;
         let payload = if frame.flags & crate::providers::cursor::connect::FLAG_GZIP != 0 {
-            decompressed = crate::providers::cursor::connect::decode_gzip_frame(&frame.payload)
+            decompressed = gzip_frames
+                .decode(&frame.payload)
                 .map_err(|error| CursorDecodeError::Decode(format!("gzip decompress: {error}")))?;
             &decompressed[..]
         } else {
@@ -422,6 +426,25 @@ mod tests {
         };
         let json = decode_cursor_upstream(&upstream, "msg_empty", "cursor-test").unwrap();
         assert_eq!(json["content"][0]["text"], "");
+    }
+
+    #[test]
+    fn a_gzip_frame_that_inflates_past_its_limit_is_undecodable() {
+        use crate::providers::cursor::connect::{FLAG_GZIP, MAX_GZIP_FRAME_BYTES};
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder
+            .write_all(&vec![0; MAX_GZIP_FRAME_BYTES + 1])
+            .unwrap();
+        let frame = encode_connect_frame(encoder.finish().unwrap(), FLAG_GZIP);
+
+        match decode_upstream_response(&frame) {
+            Err(CursorDecodeError::Decode(detail)) => assert_eq!(
+                detail,
+                format!("gzip decompress: gzip frame inflates past {MAX_GZIP_FRAME_BYTES} bytes")
+            ),
+            other => panic!("expected a decode error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -99,14 +99,69 @@ impl ConnectFrameDecoder {
     }
 }
 
-/// Decode gzipped payload bytes. The caller decides when to call this based
-/// on frame flags & FLAG_GZIP.
+/// The most one gzip frame is inflated to.
+pub const MAX_GZIP_FRAME_BYTES: usize = 32 * 1024 * 1024;
+/// The most the gzip frames of one response are inflated to together.
+pub const MAX_GZIP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Decode gzipped payload bytes, refusing a frame that inflates past
+/// `MAX_GZIP_FRAME_BYTES`. The caller decides when to call this based on
+/// frame flags & FLAG_GZIP.
 pub fn decode_gzip_frame(payload: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    use std::io::Read;
-    let mut decoder = flate2::read::GzDecoder::new(payload);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out)?;
-    Ok(out)
+    GzipFrames::new().decode(payload)
+}
+
+/// Inflates the gzip frames of one response, each up to a frame limit and
+/// all of them together up to a response limit. Inflation stops one byte
+/// past the smaller of the two, so no more than that is ever held.
+pub struct GzipFrames {
+    frame_limit: usize,
+    response_limit: usize,
+    left: usize,
+}
+
+impl GzipFrames {
+    pub fn new() -> Self {
+        Self::with_limits(MAX_GZIP_FRAME_BYTES, MAX_GZIP_RESPONSE_BYTES)
+    }
+
+    fn with_limits(frame_limit: usize, response_limit: usize) -> Self {
+        Self {
+            frame_limit,
+            response_limit,
+            left: response_limit,
+        }
+    }
+
+    pub fn decode(&mut self, payload: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+        use std::io::Read;
+        let limit = self.frame_limit.min(self.left);
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(payload)
+            .take(limit as u64 + 1)
+            .read_to_end(&mut out)?;
+        let refused = if out.len() > self.frame_limit {
+            format!("gzip frame inflates past {} bytes", self.frame_limit)
+        } else if out.len() > self.left {
+            format!(
+                "gzip frames of one response inflate past {} bytes",
+                self.response_limit
+            )
+        } else {
+            self.left -= out.len();
+            return Ok(out);
+        };
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            refused,
+        ))
+    }
+}
+
+impl Default for GzipFrames {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Parse a Connect end-frame JSON error payload into a structured error.
@@ -369,5 +424,39 @@ mod tests {
 
         let decompressed = decode_gzip_frame(&frames[0].payload).unwrap();
         assert_eq!(decompressed, b"hello gzip");
+    }
+
+    fn gzip(payload: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn a_gzip_frame_inflates_up_to_the_frame_limit() {
+        let limit = 64 * 1024;
+        let at_limit = gzip(&vec![0; limit]);
+        let past_limit = gzip(&vec![0; 16 * limit]);
+        assert!(past_limit.len() < 2048, "{} bytes", past_limit.len());
+
+        let mut frames = GzipFrames::with_limits(limit, 4 * limit);
+        assert_eq!(frames.decode(&at_limit).unwrap().len(), limit);
+        let error = frames.decode(&past_limit).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "gzip frame inflates past 65536 bytes");
+    }
+
+    #[test]
+    fn the_gzip_frames_of_a_response_share_one_limit() {
+        let mut frames = GzipFrames::with_limits(8, 12);
+        assert_eq!(frames.decode(&gzip(b"12345678")).unwrap().len(), 8);
+        assert_eq!(frames.decode(&gzip(b"1234")).unwrap().len(), 4);
+        assert_eq!(frames.decode(&gzip(b"")).unwrap().len(), 0);
+        let error = frames.decode(&gzip(b"1")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "gzip frames of one response inflate past 12 bytes"
+        );
     }
 }
