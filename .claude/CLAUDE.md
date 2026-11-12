@@ -1223,7 +1223,9 @@ the collector ends the body there and returns it, so the readers of
 recorded and the readings merged; the socket is still dropped and nothing
 is resent. On HTTP the bytes examined are those held, the crossing chunk
 cut at the limit, so a refusal that arrives wholly after the limit is not
-seen and the answer is the 502. On WebSocket the event that crosses the
+seen and the answer is the 502, and a refusal held is answered from what is
+held even when a more specific one follows past the limit. On WebSocket the
+event that crosses the
 limit is examined when its `type` is `error`, `response.failed` or
 `codex.rate_limits` and the collector would stop on it as a failure
 (`failure_past_limit`: a terminal event or a terminal snapshot, not a

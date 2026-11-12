@@ -8,14 +8,16 @@
   chat completions surfaces, the hosted search call, and the transcription
   and image endpoints), the Anthropic passthrough, whose relayed bytes are
   untouched, and the Kimi, Grok and Cursor providers with their login and
-  token refresh. In a Kimi, Grok or Cursor login or token refresh two more
-  things change in that text. A request that cannot be sent, or an answer
-  that cannot be read, now reports only the first line of the error, so the
-  `Caused by:` lines that used to follow it, such as a refused connection,
-  are gone. A connection that breaks while the answer is being read now
-  reports `request or response body error` instead of `error decoding
-  response body`, and an answer still arriving when the client's timeout
-  has run out reports `timed out reading the response body`.
+  token refresh. The text of a failed Kimi, Grok or Cursor login or token
+  refresh changes in other ways too. A request that cannot be sent, or an
+  answer that cannot be read, now reports only the first line of the error,
+  so the `Caused by:` lines that used to follow it, such as a refused
+  connection, are gone. In a Kimi or Cursor login or token refresh and in
+  Grok's login and device flow, a connection that breaks while the answer
+  is being read now reports `request or response body error` instead of
+  `error decoding response body`, and an answer that is still arriving
+  piece by piece when the client's timeout has run out reports `timed out
+  reading the response body`. Grok's token refresh keeps its wording.
 - Some Codex answers are now read only up to a size limit: the model
   listing up to 4 MiB, a token refresh answer up to 1 MiB, the hosted search
   answer up to 8 MiB and a buffered chat completion up to 32 MiB. A larger
