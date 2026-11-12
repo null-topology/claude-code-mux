@@ -1071,9 +1071,17 @@ async fn live_stream_response_once(
                 }
                 // A refusal that names a 4xx status of its own describes the
                 // request, so it is answered as the same refusal over HTTP is,
-                // not as a gateway failure the client would retry.
+                // not as a gateway failure the client would retry. 408, 409 and
+                // 425 ask for another attempt, and a forgotten previous response
+                // is cleared by one, as its state is already dropped and the
+                // retry carries full context, so those keep the gateway answer.
+                // The error takes the HTTP origin, so a backend message equal
+                // to the proxy's own WebSocket size refusal text is not read as
+                // that refusal.
                 if let Some(failure) = failure.as_ref()
                     && let Some(status @ 400..=499) = failure.explicit_status
+                    && !matches!(status, 408 | 409 | 425)
+                    && !websocket::is_previous_response_missing(&payload)
                 {
                     return LiveStreamStart::Response(map_codex_error_to_response(
                         &client::CodexError {
@@ -1083,7 +1091,7 @@ async fn live_stream_response_once(
                             retry_after: failure.retry_after.clone(),
                             usage_limit: None,
                             class: None,
-                            origin: client::CodexErrorOrigin::WebSocket,
+                            origin: client::CodexErrorOrigin::Http,
                         },
                     ));
                 }
@@ -5498,6 +5506,123 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = error_body(response).await;
         assert_eq!(body["error"]["type"], "api_error");
+    }
+
+    /// A forgotten previous response is cleared by the client's retry, which
+    /// carries full context once the state is dropped, so it stays a 502.
+    #[tokio::test]
+    async fn a_live_forgotten_previous_response_keeps_the_gateway_answer() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let response = run_live_failure_case(
+            "live-refusal-previous-response-cleanup",
+            serde_json::json!({
+                "type": "response.error",
+                "status": 404,
+                "error": {
+                    "code": "previous_response_not_found",
+                    "message": "toy response id is unknown"
+                }
+            }),
+            1,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "api_error");
+    }
+
+    #[tokio::test]
+    async fn a_live_http_forgotten_previous_response_keeps_the_gateway_answer() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let (response, requests) = run_live_http_failure_case(
+            "live-http-refusal-previous-response-cleanup",
+            serde_json::json!({
+                "type": "error",
+                "status": 400,
+                "error": {"message": "toy previous response was not found"}
+            }),
+        )
+        .await;
+
+        assert_eq!(requests, 1);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "api_error");
+    }
+
+    #[tokio::test]
+    async fn a_live_refusal_asking_for_another_attempt_keeps_the_gateway_answer() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        for (status, message) in [
+            (408, "toy request took too long to arrive"),
+            (409, "toy request conflicts with another one"),
+            (425, "toy request arrived too early"),
+        ] {
+            let response = run_live_failure_case(
+                &format!("live-refusal-another-attempt-{status}-cleanup"),
+                serde_json::json!({
+                    "type": "error",
+                    "status": status,
+                    "error": {"message": message}
+                }),
+                1,
+            )
+            .await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "status {status}"
+            );
+            let body = error_body(response).await;
+            assert_eq!(body["error"]["type"], "api_error", "status {status}");
+        }
+    }
+
+    /// A backend message that equals the proxy's own WebSocket size refusal
+    /// text is answered as the backend's refusal, not as the proxy's own.
+    #[tokio::test]
+    async fn a_live_refusal_with_the_size_refusal_text_stays_a_client_error() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let response = run_live_failure_case(
+            "live-refusal-size-text-cleanup",
+            serde_json::json!({
+                "type": "error",
+                "status": 400,
+                "error": {"message": "websocket_message_too_large"}
+            }),
+            1,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "websocket_message_too_large");
+    }
+
+    #[tokio::test]
+    async fn a_live_http_refusal_with_the_size_refusal_text_stays_a_client_error() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let (response, requests) = run_live_http_failure_case(
+            "live-http-refusal-size-text-cleanup",
+            serde_json::json!({
+                "type": "error",
+                "status": 400,
+                "error": {"message": "websocket_message_too_large"}
+            }),
+        )
+        .await;
+
+        assert_eq!(requests, 1);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "websocket_message_too_large");
     }
 
     #[tokio::test]
