@@ -19,6 +19,17 @@
   `http_response_body` for an answer that could not be read or the start of
   the backend's error answer, cut to 300 characters, or null when there is
   none.
+- A Codex request that fails while it is sent, or while its answer is read,
+  no longer repeats the request URL in its error text, so a base URL that
+  carries a credential in its path or query stays out of the answer and the
+  proxy's error messages. This covers Messages requests, live and buffered,
+  and the transcription and image endpoints.
+- A buffered (non-streaming) Codex answer is now capped at 64 MiB of
+  upstream events, over HTTP and over the WebSocket alike. A larger answer
+  fails with a 502 `api_error` instead of growing the proxy's memory without
+  bound; it is not sent again, not retried after a token refresh and not
+  replayed over HTTP, and its WebSocket is closed rather than kept for the
+  conversation. Streaming requests are not affected. The cap has no setting.
 
 ## v0.18.0 (2026-11-12)
 

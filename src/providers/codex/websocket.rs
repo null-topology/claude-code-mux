@@ -30,7 +30,7 @@ use crate::traffic::TrafficCapture;
 
 use super::client::{
     ActualTransport, CodexError, CodexErrorOrigin, CodexResponse, MAX_ERROR_BODY_BYTES,
-    OwnerAwareCodexResponse, headers_to_json,
+    OwnerAwareCodexResponse, buffered_response_too_large_error, headers_to_json,
 };
 use super::continuation::ContinuationReservation;
 
@@ -1049,6 +1049,7 @@ pub(super) async fn codex_websocket_request(
     traffic: Option<&TrafficCapture>,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
+    body_limit: usize,
     reservation: Option<&ContinuationReservation>,
     on_connect_failure: OnConnectFailure<'_>,
 ) -> Result<OwnerAwareCodexResponse, CodexError> {
@@ -1164,6 +1165,7 @@ pub(super) async fn codex_websocket_request(
     let collected = collect_ws_events(
         &mut guard,
         idle_timeout_ms,
+        body_limit,
         pool_owner,
         Some(&entry),
         traffic,
@@ -2686,6 +2688,7 @@ struct WsEvent {
 async fn collect_ws_events<S>(
     ws: &mut WebSocketStream<S>,
     idle_timeout_ms: u64,
+    body_limit: usize,
     pool_owner: Option<&ConversationIdentity>,
     pool_entry: Option<&Arc<PoolEntry>>,
     traffic: Option<&TrafficCapture>,
@@ -2697,6 +2700,7 @@ where
     collect_ws_events_with_keepalive_interval(
         ws,
         idle_timeout_ms,
+        body_limit,
         pool_owner,
         pool_entry,
         traffic,
@@ -2706,9 +2710,13 @@ where
     .await
 }
 
+/// `body_limit` bounds the SSE body held for the answer; past it the request
+/// fails and the socket is not kept.
+#[allow(clippy::too_many_arguments)]
 async fn collect_ws_events_with_keepalive_interval<S>(
     ws: &mut WebSocketStream<S>,
     idle_timeout_ms: u64,
+    body_limit: usize,
     pool_owner: Option<&ConversationIdentity>,
     pool_entry: Option<&Arc<PoolEntry>>,
     traffic: Option<&TrafficCapture>,
@@ -2770,6 +2778,13 @@ where
         match frame {
             Some(Ok(Message::Text(text))) => {
                 text_received = true;
+                let event = encode_sse(&text);
+                if sse_body.len() + event.len() > body_limit {
+                    invalidate_pool_owner(pool_owner, pool_entry);
+                    return Err(buffered_response_too_large_error(
+                        CodexErrorOrigin::WebSocket,
+                    ));
+                }
                 // Parse JSON
                 let parsed: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,
@@ -2784,13 +2799,13 @@ where
                             );
                         }
                         // Write invalid JSON as-is
-                        sse_body.extend_from_slice(&encode_sse(&text));
+                        sse_body.extend_from_slice(&event);
                         continue;
                     }
                 };
 
                 // Convert to SSE bytes
-                sse_body.extend_from_slice(&encode_sse(&text));
+                sse_body.extend_from_slice(&event);
                 if let Some(tc) = traffic {
                     tc.write_json_event("040-upstream-event", &parsed);
                 }
@@ -3095,6 +3110,7 @@ fn summarize_json_request_size(body: &serde_json::Value, body_json: &str) -> ser
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+    use super::super::client::{BUFFERED_RESPONSE_TOO_LARGE_DETAIL, MAX_BUFFERED_RESPONSE_BYTES};
     use super::*;
 
     #[test]
@@ -3358,6 +3374,7 @@ mod tests {
             None,
             1_000,
             2_000,
+            MAX_BUFFERED_RESPONSE_BYTES,
             Some(&continuation),
             OnConnectFailure::Fail,
         )
@@ -5517,8 +5534,16 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let err = match collect_ws_events(&mut ws, 1_000, Some(&owner), None, None, "test-request")
-            .await
+        let err = match collect_ws_events(
+            &mut ws,
+            1_000,
+            MAX_BUFFERED_RESPONSE_BYTES,
+            Some(&owner),
+            None,
+            None,
+            "test-request",
+        )
+        .await
         {
             Ok(_) => panic!("expected binary frame to fail"),
             Err(err) => err,
@@ -5526,6 +5551,85 @@ mod tests {
 
         assert!(err.message.contains("binary frames"));
         assert!(!WS_POOL.lock().unwrap().contains_key(&owner));
+    }
+
+    const LIMIT_CREATED_EVENT: &str =
+        r#"{"type":"response.created","response":{"id":"resp_limit"}}"#;
+    const LIMIT_COMPLETED_EVENT: &str =
+        r#"{"type":"response.completed","response":{"id":"resp_limit","output":[]}}"#;
+
+    /// A socket that answers with `LIMIT_CREATED_EVENT` then
+    /// `LIMIT_COMPLETED_EVENT`, as a buffered answer of two events.
+    async fn connect_to_two_event_answer()
+    -> WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for event in [LIMIT_CREATED_EVENT, LIMIT_COMPLETED_EVENT] {
+                ws.send(Message::Text(event.into())).await.unwrap();
+            }
+            let _ = ws.next().await;
+        });
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        ws
+    }
+
+    #[tokio::test]
+    async fn a_buffered_body_one_byte_over_the_limit_fails_and_drops_the_socket() {
+        let _pool_test_guard = lock_codex_websocket_pool_for_tests().await;
+        clear_codex_websocket_pool_for_tests();
+        let pooled_stream = create_dummy_stream_async().await;
+        let owner = agent_owner("limit-session", "limit-agent");
+        {
+            let mut guard = WS_POOL.lock().unwrap();
+            guard.insert(owner.clone(), Arc::new(PoolEntry::new(pooled_stream)));
+        }
+        let limit =
+            encode_sse(LIMIT_CREATED_EVENT).len() + encode_sse(LIMIT_COMPLETED_EVENT).len() - 1;
+
+        let mut ws = connect_to_two_event_answer().await;
+        let err = match collect_ws_events(
+            &mut ws,
+            1_000,
+            limit,
+            Some(&owner),
+            None,
+            None,
+            "test-request",
+        )
+        .await
+        {
+            Ok(_) => panic!("a body over the limit must fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.status, 502);
+        assert_eq!(
+            err.detail.as_deref(),
+            Some(BUFFERED_RESPONSE_TOO_LARGE_DETAIL)
+        );
+        assert!(!super::super::client::is_continuation_retry_error(&err));
+        assert!(!WS_POOL.lock().unwrap().contains_key(&owner));
+    }
+
+    #[tokio::test]
+    async fn a_buffered_body_exactly_at_the_limit_is_collected() {
+        let created = encode_sse(LIMIT_CREATED_EVENT);
+        let completed = encode_sse(LIMIT_COMPLETED_EVENT);
+        let limit = created.len() + completed.len();
+
+        let mut ws = connect_to_two_event_answer().await;
+        let (body, terminal) =
+            collect_ws_events(&mut ws, 1_000, limit, None, None, None, "test-request")
+                .await
+                .expect("a body at the limit must be collected");
+
+        assert_eq!(body, [created, completed].concat());
+        assert!(terminal.is_some());
     }
 
     #[tokio::test]
@@ -5560,11 +5664,20 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let err =
-            match collect_ws_events(&mut ws, 50, Some(&owner), None, None, "test-request").await {
-                Ok(_) => panic!("expected response start timeout"),
-                Err(err) => err,
-            };
+        let err = match collect_ws_events(
+            &mut ws,
+            50,
+            MAX_BUFFERED_RESPONSE_BYTES,
+            Some(&owner),
+            None,
+            None,
+            "test-request",
+        )
+        .await
+        {
+            Ok(_) => panic!("expected response start timeout"),
+            Err(err) => err,
+        };
 
         assert_eq!(
             err.detail.as_deref(),
@@ -5606,11 +5719,20 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
             .await
             .unwrap();
-        let err =
-            match collect_ws_events(&mut ws, 50, Some(&owner), None, None, "test-request").await {
-                Ok(_) => panic!("expected response idle timeout"),
-                Err(err) => err,
-            };
+        let err = match collect_ws_events(
+            &mut ws,
+            50,
+            MAX_BUFFERED_RESPONSE_BYTES,
+            Some(&owner),
+            None,
+            None,
+            "test-request",
+        )
+        .await
+        {
+            Ok(_) => panic!("expected response idle timeout"),
+            Err(err) => err,
+        };
 
         assert!(err.message.contains("idle timeout"));
         assert_eq!(err.detail, None);
@@ -5653,6 +5775,7 @@ mod tests {
         let error = match collect_ws_events_with_keepalive_interval(
             &mut client,
             60_000,
+            MAX_BUFFERED_RESPONSE_BYTES,
             None,
             None,
             None,
@@ -5693,6 +5816,7 @@ mod tests {
         let error = match collect_ws_events_with_keepalive_interval(
             &mut client,
             50,
+            MAX_BUFFERED_RESPONSE_BYTES,
             None,
             None,
             None,
@@ -5780,6 +5904,7 @@ mod tests {
                 None,
                 1_000,
                 60_000,
+                MAX_BUFFERED_RESPONSE_BYTES,
                 None,
                 OnConnectFailure::Fail,
             ),
@@ -5880,6 +6005,7 @@ mod tests {
             collect_ws_events_with_keepalive_interval(
                 &mut client,
                 60_000,
+                MAX_BUFFERED_RESPONSE_BYTES,
                 None,
                 None,
                 None,
@@ -6619,6 +6745,7 @@ mod tests {
             None,
             1_000,
             2_000,
+            MAX_BUFFERED_RESPONSE_BYTES,
             Some(&continuation),
             fall_back,
         )

@@ -596,6 +596,26 @@ const IMAGE_HEADER_TIMEOUT_MS: u64 = 300_000;
 /// How much of a non-success Codex body is read to classify it, over HTTP and
 /// on a rejected WebSocket upgrade alike; the rest of the body is not read.
 pub(super) const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// The most of a buffered Codex answer's SSE body held in memory, over HTTP
+/// and WebSocket alike. A live stream is relayed as it arrives and has none.
+pub(super) const MAX_BUFFERED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// Marks a buffered answer whose body went past `MAX_BUFFERED_RESPONSE_BYTES`.
+/// The request is not sent again, refreshed or replayed over HTTP.
+pub(super) const BUFFERED_RESPONSE_TOO_LARGE_DETAIL: &str =
+    "Response body exceeded the size limit for a buffered answer";
+
+/// A buffered answer that grew past its limit, on the transport that read it.
+pub(super) fn buffered_response_too_large_error(origin: CodexErrorOrigin) -> CodexError {
+    CodexError {
+        status: 502,
+        message: "Codex response body exceeded the size limit for a buffered answer".to_string(),
+        detail: Some(BUFFERED_RESPONSE_TOO_LARGE_DETAIL.to_string()),
+        retry_after: None,
+        usage_limit: None,
+        class: None,
+        origin,
+    }
+}
 
 #[derive(Clone)]
 struct ProxyEnvironment {
@@ -804,6 +824,7 @@ pub struct CodexHttpClient {
     base_url: String,
     header_timeout_ms: u64,
     body_idle_timeout_ms: u64,
+    buffered_response_limit: usize,
     #[allow(dead_code)]
     header_timeout_retries: u32,
 }
@@ -828,6 +849,7 @@ impl CodexHttpClient {
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
+            buffered_response_limit: MAX_BUFFERED_RESPONSE_BYTES,
             header_timeout_retries: 1,
         }
     }
@@ -851,6 +873,7 @@ impl CodexHttpClient {
             base_url,
             header_timeout_ms: 60_000,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
+            buffered_response_limit: MAX_BUFFERED_RESPONSE_BYTES,
             header_timeout_retries: 1,
         }
     }
@@ -873,8 +896,17 @@ impl CodexHttpClient {
             base_url,
             header_timeout_ms,
             body_idle_timeout_ms,
+            buffered_response_limit: MAX_BUFFERED_RESPONSE_BYTES,
             header_timeout_retries,
         }
+    }
+
+    /// The same client with a smaller buffered answer limit, so a test can
+    /// reach it without a body of `MAX_BUFFERED_RESPONSE_BYTES`.
+    #[cfg(test)]
+    fn with_buffered_response_limit(mut self, limit: usize) -> Self {
+        self.buffered_response_limit = limit;
+        self
     }
 
     pub fn auth_manager(&self) -> &CodexAuthManager<DefaultCodexAuthStore> {
@@ -942,7 +974,7 @@ impl CodexHttpClient {
             .map_err(|error| CodexError {
                 status: 400,
                 message: "Invalid audio content type".to_string(),
-                detail: Some(error.to_string()),
+                detail: Some(crate::upstream_http::error_text(error)),
                 retry_after: None,
                 usage_limit: None,
                 class: None,
@@ -975,7 +1007,10 @@ impl CodexHttpClient {
         })?
         .map_err(|error| CodexError {
             status: 0,
-            message: format!("Codex transcription transport error: {error}"),
+            message: format!(
+                "Codex transcription transport error: {}",
+                crate::upstream_http::error_text(error)
+            ),
             detail: None,
             retry_after: None,
             usage_limit: None,
@@ -1060,7 +1095,10 @@ impl CodexHttpClient {
         })?
         .map_err(|error| CodexError {
             status: 0,
-            message: format!("Codex image transport error: {error}"),
+            message: format!(
+                "Codex image transport error: {}",
+                crate::upstream_http::error_text(error)
+            ),
             detail: None,
             retry_after: None,
             usage_limit: None,
@@ -1530,7 +1568,8 @@ impl CodexHttpClient {
                             let error = CodexError {
                                 status: 0,
                                 message: format!(
-                                    "Transport error reading Codex response body: {err}"
+                                    "Transport error reading Codex response body: {}",
+                                    crate::upstream_http::error_text(err)
                                 ),
                                 detail: Some("http_response_body".to_string()),
                                 retry_after: None,
@@ -1773,6 +1812,7 @@ impl CodexHttpClient {
                         ctx.traffic.as_deref(),
                         super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                         super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
+                        self.buffered_response_limit,
                         active_continuation.as_ref(),
                         super::websocket::OnConnectFailure::Fail,
                     )
@@ -1812,6 +1852,7 @@ impl CodexHttpClient {
                         ctx.traffic.as_deref(),
                         super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                         super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
+                        self.buffered_response_limit,
                         active_continuation.as_ref(),
                         on_connect_failure,
                     )
@@ -2377,7 +2418,10 @@ impl CodexHttpClient {
                 if is_retryable_reqwest_error(&e) {
                     CodexError {
                         status: 0,
-                        message: format!("Transport error: {e}"),
+                        message: format!(
+                            "Transport error: {}",
+                            crate::upstream_http::error_text(e)
+                        ),
                         detail: None,
                         retry_after: None,
                         usage_limit: None,
@@ -2387,7 +2431,7 @@ impl CodexHttpClient {
                 } else {
                     CodexError {
                         status: 0,
-                        message: format!("Network error: {e}"),
+                        message: format!("Network error: {}", crate::upstream_http::error_text(e)),
                         detail: None,
                         retry_after: None,
                         usage_limit: None,
@@ -2445,7 +2489,10 @@ impl CodexHttpClient {
             })?
             .map_err(|e| CodexError {
                 status: 0,
-                message: format!("Transport error reading Codex response body: {e}"),
+                message: format!(
+                    "Transport error reading Codex response body: {}",
+                    crate::upstream_http::error_text(e)
+                ),
                 detail: Some("http_response_body".to_string()),
                 retry_after: None,
                 usage_limit: None,
@@ -2461,6 +2508,10 @@ impl CodexHttpClient {
                     monitor.generation_started(&ctx.req_id);
                 }
                 response_started = true;
+            }
+            // Dropping the response here closes its connection unread.
+            if body_bytes.len() + chunk.len() > self.buffered_response_limit {
+                return Err(buffered_response_too_large_error(CodexErrorOrigin::Http));
             }
             body_bytes.extend_from_slice(&chunk);
         }
@@ -4919,6 +4970,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_buffered_websocket_answer_over_the_limit_is_neither_resent_nor_replayed_over_http() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _registry_guard =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner = ConversationIdentity::Main("buffered-limit-session".to_string());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upgrades = Arc::new(AtomicUsize::new(0));
+        let posts = Arc::new(AtomicUsize::new(0));
+        let server = {
+            let (upgrades, posts) = (upgrades.clone(), posts.clone());
+            tokio::spawn(async move {
+                let mut sockets = Vec::new();
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut first = [0_u8; 1];
+                    if stream.peek(&mut first).await.unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    if first[0] == b'G' {
+                        let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                        upgrades.fetch_add(1, Ordering::SeqCst);
+                        let _request = next_websocket_json(&mut websocket).await;
+                        send_completed_websocket_response(&mut websocket, "resp_limit").await;
+                        sockets.push(websocket);
+                        continue;
+                    }
+                    let _request = read_http_request(&mut stream).await;
+                    posts.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+
+        let client = authenticated_http_test_client(format!("http://{addr}/responses"))
+            .with_buffered_response_limit(1);
+        let request = buffered_test_request();
+        let candidate = super::super::continuation::continuation_candidate_for_owner(
+            Some(&owner),
+            &request,
+            true,
+        );
+        let result = tokio::time::timeout(
+            MOCK_DEADLINE,
+            client.post_codex_with_transport(
+                &request,
+                &http_test_context(),
+                Some(&candidate),
+                crate::config::CodexTransport::Auto,
+            ),
+        )
+        .await
+        .expect("the request did not finish");
+        let error = match result {
+            Ok(_) => panic!("an answer over the limit must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status, 502);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(BUFFERED_RESPONSE_TOO_LARGE_DETAIL)
+        );
+        assert_eq!(upgrades.load(Ordering::SeqCst), 1);
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            super::super::websocket::pooled_socket_id_for_tests(&owner),
+            None
+        );
+
+        server.abort();
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        super::super::continuation::abort_continuation_for_owner(&candidate);
+    }
+
+    #[tokio::test]
     async fn live_request_write_timeout_is_neither_resent_nor_replayed_over_http() {
         let _registry_guard =
             super::super::continuation::lock_continuation_registry_for_async_tests().await;
@@ -5873,6 +6002,159 @@ mod tests {
                 .contains("Transport error reading Codex response body")
         );
         assert_eq!(error.detail.as_deref(), Some("http_response_body"));
+    }
+
+    /// A path and query standing in for credentials in the upstream URL.
+    const URL_SECRET_TARGET: &str = "/toy-secret-path?token=toy-secret-query";
+
+    /// An origin that closes every connection unanswered, so each request to it
+    /// fails while it is sent.
+    fn spawn_closing_origin(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        })
+    }
+
+    async fn assert_names_no_url(error: &CodexError) {
+        for text in [Some(error.message.as_str()), error.detail.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            assert!(!text.contains("toy-secret"), "{text}");
+        }
+        let body = error_body(super::super::map_codex_error_to_response(error)).await;
+        assert!(!body.to_string().contains("toy-secret"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_buffered_http_send_names_no_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_closing_origin(listener);
+        let client = authenticated_http_test_client(format!("http://{addr}{URL_SECRET_TARGET}"));
+        let (body, context) = (buffered_test_request(), http_test_context());
+
+        let request = client.post_codex_with_transport(
+            &body,
+            &context,
+            None,
+            crate::config::CodexTransport::Http,
+        );
+        let error = match tokio::time::timeout(MOCK_DEADLINE, request)
+            .await
+            .expect("the request did not finish")
+        {
+            Ok(_) => panic!("a closed connection must fail the request"),
+            Err(error) => error,
+        };
+        server.abort();
+
+        assert_eq!(error.status, 0);
+        assert_names_no_url(&error).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_live_http_start_names_no_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = spawn_closing_origin(listener);
+        let client = Arc::new(authenticated_http_test_client(format!(
+            "http://{addr}{URL_SECRET_TARGET}"
+        )));
+
+        let (body, context) = (buffered_test_request(), http_test_context());
+        let start = client.stream_codex_http_events(&body, &context);
+        let error = match tokio::time::timeout(MOCK_DEADLINE, start)
+            .await
+            .expect("the request did not start")
+        {
+            Ok(_) => panic!("a closed connection must fail the start"),
+            Err(error) => error,
+        };
+        server.abort();
+
+        assert_eq!(error.status, 0);
+        assert_names_no_url(&error).await;
+    }
+
+    /// An origin that answers every HTTP request with `body` and counts them.
+    fn spawn_fixed_body_origin(
+        listener: TcpListener,
+        body: &'static str,
+        posts: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _request = read_http_request(&mut stream).await;
+                posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_buffered_http_body_one_byte_over_the_limit_answers_502_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let answer =
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http\"}}\n\n";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/responses", listener.local_addr().unwrap());
+        let posts = Arc::new(AtomicUsize::new(0));
+        let server = spawn_fixed_body_origin(listener, answer, posts.clone());
+        let (body, context) = (buffered_test_request(), http_test_context());
+
+        let over = authenticated_http_test_client(url.clone())
+            .with_buffered_response_limit(answer.len() - 1);
+        let request = over.post_codex_with_transport(
+            &body,
+            &context,
+            None,
+            crate::config::CodexTransport::Http,
+        );
+        let error = match tokio::time::timeout(MOCK_DEADLINE, request)
+            .await
+            .expect("the request did not finish")
+        {
+            Ok(_) => panic!("a body over the limit must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, 502);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(BUFFERED_RESPONSE_TOO_LARGE_DETAIL)
+        );
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        let response = super::super::map_codex_error_to_response(&error);
+        assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+        let answered = error_body(response).await;
+        assert_eq!(answered["error"]["type"], "api_error");
+        assert_eq!(
+            answered["error"]["message"],
+            BUFFERED_RESPONSE_TOO_LARGE_DETAIL
+        );
+
+        let at_limit =
+            authenticated_http_test_client(url).with_buffered_response_limit(answer.len());
+        let request = at_limit.post_codex_with_transport(
+            &body,
+            &context,
+            None,
+            crate::config::CodexTransport::Http,
+        );
+        let response = tokio::time::timeout(MOCK_DEADLINE, request)
+            .await
+            .expect("the request did not finish")
+            .expect("a body at the limit must be answered");
+        server.abort();
+        assert_eq!(response.status, 200);
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
     }
 
     #[test]

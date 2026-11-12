@@ -1165,7 +1165,15 @@ request, the search call) is read the same way, up to `MAX_ERROR_BODY_BYTES`
 and within one deadline of `body_idle_timeout_ms` for the whole read
 (`read_error_body`); the classification, a spent window and the traffic
 capture see only those bytes, and a read past the deadline fails with
-`detail: http_response_body` and is neither refreshed nor resent. Under `auto` transport
+`detail: http_response_body` and is neither refreshed nor resent. A
+successful buffered Messages answer is held up to
+`MAX_BUFFERED_RESPONSE_BYTES` (64 MiB of SSE, in `client.rs`), over HTTP
+(`collect_http_response`) and WebSocket (`collect_ws_events`) alike; one
+byte more fails it with a 502 `api_error` whose detail is
+`BUFFERED_RESPONSE_TOO_LARGE_DETAIL`, drops the socket, and is neither
+refreshed, resent nor replayed over HTTP. Live streams have no such cap.
+Text built from a `reqwest::Error` in these paths goes through
+`upstream_http::error_text`, which leaves out the request URL. Under `auto` transport
 (the default) a handshake failure, classified or not, falls back to HTTP unless the
 WebSocket proxy refused it (`should_fallback_to_http` in `client.rs`), and
 that HTTP answer is classified on its own. The codes and their shapes follow
