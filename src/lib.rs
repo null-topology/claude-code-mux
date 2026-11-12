@@ -2,6 +2,7 @@ pub mod agent_summary;
 pub mod anthropic;
 pub mod auth;
 pub mod config;
+pub mod http_client;
 pub mod logging;
 pub mod monitor;
 pub mod openai_compat;

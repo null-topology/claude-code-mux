@@ -381,7 +381,7 @@ mod tests {
             body
         });
         let client = CodexHttpClient::new_for_test(
-            reqwest::Client::new(),
+            crate::http_client::client_builder().build().unwrap(),
             format!("http://{address}/v1/responses"),
             1_000,
             1_000,
@@ -468,7 +468,7 @@ mod tests {
     async fn a_transport_error_answers_without_the_url() {
         // Nothing listens on port 1, so the send fails before any answer.
         let client = CodexHttpClient::new_for_test(
-            reqwest::Client::new(),
+            crate::http_client::client_builder().build().unwrap(),
             "http://127.0.0.1:1/toy-secret-path/v1/responses?token=toy-secret-query".into(),
             1_000,
             1_000,

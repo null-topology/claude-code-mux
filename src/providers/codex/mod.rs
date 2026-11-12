@@ -2846,7 +2846,10 @@ mod tests {
 
     fn authenticated_live_test_client(base_url: String) -> Arc<CodexHttpClient> {
         let client = CodexHttpClient::new_for_test(
-            reqwest::Client::builder().no_proxy().build().unwrap(),
+            crate::http_client::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
             base_url,
             1_000,
             1_000,
@@ -2881,7 +2884,10 @@ mod tests {
                 "http://127.0.0.1:1/oauth/token".to_string(),
             );
             let client = CodexHttpClient::new_with_client(
-                reqwest::Client::builder().no_proxy().build().unwrap(),
+                crate::http_client::client_builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap(),
                 manager,
                 "http://127.0.0.1:1/responses".to_string(),
             );

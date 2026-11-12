@@ -73,7 +73,7 @@ pub fn login<S: AuthStorage<StoredAuth>>(store: &GrokTokenStore<S>) -> anyhow::R
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn client() -> anyhow::Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder()
+    Ok(crate::http_client::blocking_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(HTTP_TIMEOUT)

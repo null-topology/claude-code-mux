@@ -231,7 +231,7 @@ fn wait_for_cursor_login_at(
     max_attempts: usize,
     mut on_progress: impl FnMut(usize),
 ) -> anyhow::Result<Option<RefreshResponse>> {
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::http_client::blocking_client_builder()
         .timeout(HTTP_TIMEOUT)
         .build()?;
     let base = base_url.trim_end_matches('/').to_string();
@@ -240,6 +240,8 @@ fn wait_for_cursor_login_at(
     for attempt in 0..max_attempts {
         let delay =
             Duration::from_millis((1000.0 * 1.2_f64.powi(attempt as i32)).min(10_000.0) as u64);
+        // The query holds the login's verifier, and reqwest names the URL in
+        // its errors, so every error of this request leaves the URL out.
         let url = format!(
             "{base}/auth/poll?uuid={}&verifier={}",
             login.uuid, login.verifier
@@ -248,6 +250,7 @@ fn wait_for_cursor_login_at(
             .get(url)
             .header("content-type", "application/json")
             .send()
+            .map_err(reqwest::Error::without_url)
         {
             Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
                 consecutive_errors = 0;
@@ -288,7 +291,7 @@ fn refresh_cursor_auth_at(
     base_url: &str,
     refresh_token: &str,
 ) -> anyhow::Result<Option<RefreshResponse>> {
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::http_client::blocking_client_builder()
         .timeout(HTTP_TIMEOUT)
         .build()?;
     let url = format!("{}/auth/refresh", base_url.trim_end_matches('/'));

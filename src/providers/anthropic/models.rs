@@ -433,7 +433,10 @@ pub fn insert_unstarted_anthropic_catalog_flight_for_tests(url: &str) {
             .expect("failed to build a runtime");
         let flight = {
             let _entered = runtime.enter();
-            start_catalog_flight(reqwest::Client::new(), url.clone())
+            start_catalog_flight(
+                crate::http_client::client_builder().build().unwrap(),
+                url.clone(),
+            )
         };
         catalog_flights().insert(url, flight);
         drop(runtime);

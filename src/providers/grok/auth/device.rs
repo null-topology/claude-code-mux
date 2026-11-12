@@ -105,7 +105,7 @@ fn device_login_inner<S: AuthStorage<StoredAuth>>(
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn client() -> anyhow::Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder()
+    Ok(crate::http_client::blocking_client_builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(HTTP_TIMEOUT)
         .build()?)
@@ -324,7 +324,7 @@ mod tests {
     }
 
     fn test_client() -> reqwest::blocking::Client {
-        reqwest::blocking::Client::builder()
+        crate::http_client::blocking_client_builder()
             .pool_max_idle_per_host(0)
             .build()
             .unwrap()

@@ -238,11 +238,11 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build anthropic passthrough client");
-        let catalog_client = reqwest::Client::builder()
+        let catalog_client = crate::http_client::client_builder()
             .build()
             .expect("failed to build anthropic model catalog client");
         Self {
@@ -1292,8 +1292,14 @@ data: {"type":"message_stop"}
             .unwrap()
             .port();
         let provider = AnthropicProvider {
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            catalog_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            client: crate::http_client::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
+            catalog_client: crate::http_client::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
             base_url: format!("http://127.0.0.1:{port}/toy-secret-path"),
         };
         let ctx = RequestContext {
@@ -1345,8 +1351,14 @@ data: {"type":"message_stop"}
                 .await;
         });
         let provider = AnthropicProvider {
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            catalog_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            client: crate::http_client::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
+            catalog_client: crate::http_client::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
             base_url: format!("http://{address}/toy-secret-path"),
         };
         let ctx = RequestContext {
@@ -1406,8 +1418,14 @@ data: {"type":"message_stop"}
         tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
 
         let provider = AnthropicProvider {
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            catalog_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            client: crate::http_client::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
+            catalog_client: crate::http_client::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
             base_url: format!("http://{address}"),
         };
         // Key order, spacing and an escape that a reserialization would change.

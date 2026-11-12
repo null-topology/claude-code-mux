@@ -48,7 +48,7 @@ impl CursorHttpClient {
         let base_url = config::cursor_base_url();
         let is_cleartext = base_url.starts_with("http://");
 
-        let mut builder = reqwest::Client::builder()
+        let mut builder = crate::http_client::client_builder()
             .http2_keep_alive_timeout(std::time::Duration::from_secs(30))
             .http2_keep_alive_while_idle(true);
 
@@ -529,7 +529,7 @@ mod tests {
 
     async fn read_served_body(size: usize, limit: usize) -> Result<Vec<u8>, CursorError> {
         let url = serve_body(size).await;
-        let response = reqwest::Client::builder()
+        let response = crate::http_client::client_builder()
             .no_proxy()
             .build()
             .unwrap()
@@ -543,7 +543,10 @@ mod tests {
     #[tokio::test]
     async fn a_failed_send_carries_no_url() {
         let client = CursorHttpClient {
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            client: crate::http_client::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
             base_url: crate::upstream_http::test_support::unanswered_secret_url(),
         };
         let error = match client
@@ -579,7 +582,7 @@ mod tests {
         let mut errors = Vec::new();
         for serve in [serve_in_order, serve_in_order_undeclared] {
             let url = serve(vec![(status, body.clone())]);
-            let response = reqwest::Client::builder()
+            let response = crate::http_client::client_builder()
                 .no_proxy()
                 .build()
                 .unwrap()

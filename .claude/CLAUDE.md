@@ -1763,9 +1763,29 @@ capture may still contain a title as part of a recorded title reply.
 ## Style
 
 Match the surrounding code. `reqwest` is built without gzip or brotli so bodies
-are never auto-decompressed, and with rustls so no OS keychain is touched. Keep
-new code in the same shape as the module it lives in. Stay close to upstream
-and avoid style-only divergence so ports in either direction stay cheap.
+are never auto-decompressed, and with rustls rather than the platform's TLS
+library. Every client starts from `http_client::client_builder` or
+`blocking_client_builder`, which install ring and trust only the bundled
+Mozilla roots, less every root whose `webpki-roots` anchor carries a name
+constraint its certificate does not produce (`BUNDLED_ROOTS`): `tls_certs_only`
+takes certificates, so such a root would otherwise be trusted without its
+limit. Those clients never read the operating system's certificate store. The
+Codex WebSocket connection is the exception: `WEBSOCKET_TLS_CONFIG` in
+`src/providers/codex/websocket.rs` trusts the operating system's certificates
+(`rustls-native-certs`, on macOS the keychain's trust settings) plus the
+`webpki-roots` anchors, and `websocket_http_client` in
+`src/providers/codex/client.rs` hands that same configuration to the client
+that performs the upgrade through `use_preconfigured_tls`. A bare
+`Client::builder()` would use the platform verifier, or panic while no crypto
+provider is installed, so `clippy.toml`
+lists the reqwest client constructors, `reqwest::get` and the builder methods
+that replace the TLS setup (`use_preconfigured_tls`,
+`tls_backend_preconfigured`, async and blocking) under `disallowed-methods`,
+allowed only on the two calls in `src/http_client.rs` and in
+`websocket_http_client`; the lint cannot see `Client::default()` or
+`ClientBuilder::default()`, which call the constructors inside reqwest. Keep new code
+in the same shape as the module it lives in. Stay close to upstream and avoid
+style-only divergence so ports in either direction stay cheap.
 
 ## Where the rest is
 

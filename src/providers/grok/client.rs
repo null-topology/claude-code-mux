@@ -66,7 +66,7 @@ impl GrokResponse {
 impl GrokClient {
     pub fn new(base_url: String, client_version: String) -> anyhow::Result<Self> {
         let client = Arc::new(
-            reqwest::Client::builder()
+            crate::http_client::client_builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
                 .tcp_nodelay(true)
