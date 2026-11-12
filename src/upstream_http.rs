@@ -5,8 +5,6 @@ use std::fmt;
 /// carry a credential in its path or query, so the text that reaches a client,
 /// the CLI or `proxy.log` must never include it. `Debug` and the source chain
 /// are left out for the same reason.
-// Call sites follow in the same pull request.
-#[allow(dead_code)]
 pub(crate) fn error_text(error: reqwest::Error) -> String {
     error.without_url().to_string()
 }
@@ -37,8 +35,6 @@ impl std::error::Error for BodyReadError {}
 /// chunk by chunk and refused as soon as it would pass `limit`, so an
 /// oversized or endless body never sits in memory whole. A body of exactly
 /// `limit` bytes is returned. A read failure carries URL-free text.
-// Call sites follow in the same pull request.
-#[allow(dead_code)]
 pub(crate) async fn read_body_capped(
     mut response: reqwest::Response,
     limit: usize,
