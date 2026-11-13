@@ -1928,10 +1928,19 @@ impl MonitorStore {
 
     /// The gauges of [`MonitorHandle::gauge_reading`]. The sessions are counted
     /// as the snapshot counts them, visible and hidden, and every request in
-    /// flight under the provider and model known for it so far.
+    /// flight under the provider and model known for it so far. The sessions
+    /// are counted straight off their records, with no session summaries
+    /// built, because the store's lock is held meanwhile and every request
+    /// publishes through it.
     fn gauge_reading(&self, now: SystemTime) -> GaugeReading {
-        let mut sessions = session_summaries(&self.ledger);
-        let idle_sessions = hide_idle_sessions(&mut sessions, now);
+        let (mut sessions_active, mut sessions_idle) = (0_u64, 0_u64);
+        for (_, record) in self.ledger.sessions() {
+            if session_is_idle(now, record.counts.active_count > 0, record.last_seen) {
+                sessions_idle = sessions_idle.saturating_add(1);
+            } else {
+                sessions_active = sessions_active.saturating_add(1);
+            }
+        }
         let mut in_flight: BTreeMap<(Option<&str>, Option<&str>), u64> = BTreeMap::new();
         for request in self.active.values() {
             let model = metric_model(request.effective_model.as_deref(), request.model.as_deref());
@@ -1941,8 +1950,8 @@ impl MonitorStore {
             *requests = requests.saturating_add(1);
         }
         GaugeReading {
-            sessions_active: u64::try_from(sessions.len()).unwrap_or(u64::MAX),
-            sessions_idle: u64::try_from(idle_sessions).unwrap_or(u64::MAX),
+            sessions_active,
+            sessions_idle,
             sessions_started: self.ledger.sessions_started(),
             in_flight: in_flight
                 .into_iter()
@@ -2122,12 +2131,17 @@ fn session_summaries(ledger: &Ledger) -> Vec<SessionSummary> {
 /// within [`SESSION_HIDDEN_AFTER`], and say how many that was. They stay in
 /// the store, and a request makes one recent again.
 fn hide_idle_sessions(sessions: &mut Vec<SessionSummary>, now: SystemTime) -> usize {
-    let Some(cutoff) = now.checked_sub(SESSION_HIDDEN_AFTER) else {
-        return 0;
-    };
     let held = sessions.len();
-    sessions.retain(|session| session.active_count > 0 || session.last_seen >= cutoff);
+    sessions.retain(|session| !session_is_idle(now, session.active_count > 0, session.last_seen));
     held - sessions.len()
+}
+
+/// Whether the pane leaves a session out: nothing in flight and no request
+/// within [`SESSION_HIDDEN_AFTER`] of `now`. With no moment that far back, no
+/// session is idle.
+fn session_is_idle(now: SystemTime, in_flight: bool, last_seen: SystemTime) -> bool {
+    now.checked_sub(SESSION_HIDDEN_AFTER)
+        .is_some_and(|cutoff| !in_flight && last_seen < cutoff)
 }
 
 fn session_summary(session_id: Option<String>, record: &SessionRecord) -> SessionSummary {
@@ -6882,28 +6896,30 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     }
 
     /// The session gauges count what the Sessions pane counts: the visible
-    /// sessions as active, the hidden ones as idle.
+    /// sessions as active, the hidden ones as idle. A session with a request
+    /// in flight stays visible however long ago that request started.
     #[test]
     fn the_gauge_reading_matches_the_snapshot() {
         let monitor = MonitorHandle::new(10);
         finish_request(&monitor, "r1", "s1", "gpt-5.6-sol");
+        monitor.request_started("r0", Some("s0".to_string()), None, EndpointKind::Messages);
         advance_clock(&monitor, Duration::from_secs(2 * 60 * 60));
         monitor.request_started("r2", Some("s2".to_string()), None, EndpointKind::Messages);
         finish_request(&monitor, "r3", "s3", "gpt-5.6-sol");
 
         let gauges = monitor.gauge_reading();
         let state = monitor.snapshot();
-        assert_eq!(state.sessions.len(), 2);
+        assert_eq!(state.sessions.len(), 3);
         assert_eq!(state.idle_sessions, 1);
         assert_eq!(gauges.sessions_active, state.sessions.len() as u64);
         assert_eq!(gauges.sessions_idle, state.idle_sessions as u64);
-        assert_eq!(gauges.sessions_started, 3);
+        assert_eq!(gauges.sessions_started, 4);
         assert_eq!(
             gauge_lines(&monitor, "ccmux_sessions"),
             line_set(&[
-                "ccmux_sessions{state=\"active\"} 2",
+                "ccmux_sessions{state=\"active\"} 3",
                 "ccmux_sessions{state=\"idle\"} 1",
-                "ccmux_sessions_started_total 3",
+                "ccmux_sessions_started_total 4",
             ])
         );
     }
