@@ -337,3 +337,122 @@ async fn scraping_stamps_no_request_id_and_counts_no_request() {
     }
     assert_eq!(monitor.snapshot().recent.len(), 1);
 }
+
+/// Stops the proxy process when the test ends, whether it passed or not.
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Starts the binary in plain mode (`serve --no-monitor`) on a free loopback
+/// port with a cleared environment: every backend on a closed port, no Codex
+/// login, all of its state under `home`, plus `extra_env`. Returns once
+/// `/healthz` answers.
+async fn plain_proxy(
+    home: &std::path::Path,
+    extra_env: &[(&str, &str)],
+) -> (ChildGuard, reqwest::Client, String) {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let closed = "http://127.0.0.1:9";
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-mux"));
+    command
+        .args(["serve", "--no-monitor", "--port", &port.to_string()])
+        .env_clear()
+        .env("HOME", home)
+        .env("CCP_CONFIG_DIR", home.join("config"))
+        .env("XDG_CONFIG_HOME", home.join("xdg-config"))
+        .env("XDG_DATA_HOME", home.join("xdg-data"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("CCP_CODEX_AUTH_FILE", home.join("auth.json"))
+        .env("CCP_CODEX_BASE_URL", closed)
+        .env("CCP_CODEX_TRANSPORT", "http")
+        .env("CCP_CODEX_CLIENT_VERSION", "9.9.9")
+        .env("CCP_CODEX_IMAGES_BASE_URL", closed)
+        .env("CCP_ANTHROPIC_BASE_URL", closed)
+        .env(
+            "CCP_ANTHROPIC_CATALOG_URL",
+            format!("{closed}/model-catalog/v1/catalog.json"),
+        )
+        .env("CCP_KIMI_BASE_URL", closed)
+        .env("CCP_KIMI_OAUTH_HOST", closed)
+        .env("CCP_GROK_BASE_URL", closed)
+        .env("CCP_CURSOR_BASE_URL", closed)
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let child = ChildGuard(command.spawn().unwrap());
+
+    let client = claude_code_mux::http_client::client_builder()
+        .no_proxy()
+        .build()
+        .unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !client
+        .get(format!("{base}/healthz"))
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
+    {
+        assert!(std::time::Instant::now() < deadline, "proxy never came up");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    (child, client, base)
+}
+
+/// Plain mode keeps a monitor store for metrics, so its scrape carries the
+/// session gauge and not only the process figures.
+#[tokio::test]
+async fn the_binary_serves_metrics_in_plain_mode() {
+    let home = tempfile::TempDir::new().unwrap();
+    let (_child, client, base) = plain_proxy(home.path(), &[]).await;
+
+    let response = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some(TEXT_CONTENT_TYPE)
+    );
+    assert!(!response.headers().contains_key("request-id"));
+    let text = response.text().await.unwrap();
+    assert_eq!(
+        series(&text, "ccmux_sessions"),
+        lines(&[
+            "ccmux_sessions{state=\"active\"} 0",
+            "ccmux_sessions{state=\"idle\"} 0",
+        ]),
+        "{text}"
+    );
+    assert_eq!(
+        series(&text, "ccmux_build_info"),
+        lines(&[&build_info_line()]),
+        "{text}"
+    );
+}
+
+/// `CCP_METRICS=off` leaves the path unrouted in the running binary.
+#[tokio::test]
+async fn the_binary_hides_metrics_when_switched_off() {
+    let home = tempfile::TempDir::new().unwrap();
+    let (_child, client, base) = plain_proxy(home.path(), &[("CCP_METRICS", "off")]).await;
+
+    let response = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(response.status().as_u16(), 404);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["message"], "No route for GET /metrics");
+}
