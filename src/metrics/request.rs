@@ -2,11 +2,12 @@
 //! settlement, and the gauge readings it hands to a render.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use prometheus_client::encoding::EncodeLabelSet;
-use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::counter::{self, Counter};
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::{Registry, Unit};
@@ -21,6 +22,34 @@ const OTHER: &str = "other";
 
 type HistogramFamily<L> = Family<L, Histogram, fn() -> Histogram>;
 
+/// A counter value that stops at `u64::MAX` instead of wrapping, so a token
+/// total never reads lower after an addition.
+#[derive(Debug, Default)]
+struct SaturatingU64(AtomicU64);
+
+impl counter::Atomic<u64> for SaturatingU64 {
+    fn inc(&self) -> u64 {
+        self.inc_by(1)
+    }
+
+    fn inc_by(&self, v: u64) -> u64 {
+        // The update never declines, so either arm holds the previous value.
+        match self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(v))
+            }) {
+            Ok(previous) | Err(previous) => previous,
+        }
+    }
+
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+type TokenCounter = Counter<u64, SaturatingU64>;
+
 /// Families of the request metrics. A clone shares every counter and the
 /// pair set with the original.
 #[derive(Clone, Debug)]
@@ -30,8 +59,8 @@ pub struct RequestMetrics {
     duration: HistogramFamily<EndpointLabels>,
     first_token: HistogramFamily<PairLabels>,
     prompt: HistogramFamily<PairLabels>,
-    tokens: Family<TokenLabels, Counter>,
-    hit_basis: Family<HitBasisLabels, Counter>,
+    tokens: Family<TokenLabels, TokenCounter>,
+    hit_basis: Family<HitBasisLabels, TokenCounter>,
     misses: Family<MissLabels, Counter>,
     rewrites: Family<PairLabels, Counter>,
 }
@@ -701,6 +730,54 @@ mod tests {
             let samples = samples(&metrics, format);
             assert!(with_prefix(&samples, "ccmux_cache_hit_basis_tokens").is_empty());
             assert_eq!(with_prefix(&samples, "ccmux_tokens_total").len(), 4);
+        }
+    }
+
+    #[test]
+    fn a_token_count_stops_at_the_largest_value() {
+        let metrics = RequestMetrics::new();
+        for tokens in [u64::MAX, 1] {
+            metrics.request_settled(&SettledRequest {
+                usage: Some(SettledUsage {
+                    input: exact(tokens),
+                    ..SettledUsage::default()
+                }),
+                ..settled("gpt-6-sol")
+            });
+        }
+
+        let expected = set(&[
+            "ccmux_tokens_total{provider=\"codex\",model=\"gpt-6-sol\",kind=\"input\",quality=\"exact\"} 18446744073709551615",
+        ]);
+        for format in BOTH_FORMATS {
+            let samples = samples(&metrics, format);
+            assert_eq!(with_prefix(&samples, "ccmux_tokens_total"), expected);
+        }
+    }
+
+    #[test]
+    fn the_hit_basis_stops_at_the_largest_value() {
+        let metrics = RequestMetrics::new();
+        for tokens in [u64::MAX, 1] {
+            metrics.request_settled(&SettledRequest {
+                usage: Some(SettledUsage {
+                    cache_read: exact(tokens),
+                    carries_history: true,
+                    ..SettledUsage::default()
+                }),
+                ..settled("gpt-6-sol")
+            });
+        }
+
+        let expected = set(&[
+            "ccmux_cache_hit_basis_tokens_total{provider=\"codex\",model=\"gpt-6-sol\",kind=\"cache_read\"} 18446744073709551615",
+        ]);
+        for format in BOTH_FORMATS {
+            let samples = samples(&metrics, format);
+            assert_eq!(
+                with_prefix(&samples, "ccmux_cache_hit_basis_tokens_total"),
+                expected
+            );
         }
     }
 

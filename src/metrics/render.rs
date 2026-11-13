@@ -120,8 +120,8 @@ pub fn render(input: &RenderInput<'_>, format: Format) -> String {
     output
 }
 
-/// Entries whose labels resolve to the same pair are summed; an entry with
-/// no request in flight adds no sample.
+/// Entries whose labels resolve to the same pair are summed, stopping at
+/// `u64::MAX`; an entry with no request in flight adds no sample.
 fn in_flight(
     requests: &RequestMetrics,
     gauges: &GaugeReading,
@@ -129,7 +129,10 @@ fn in_flight(
     let family = Family::<PairLabels, Gauge<u64, AtomicU64>>::default();
     for entry in gauges.in_flight.iter().filter(|entry| entry.requests > 0) {
         let labels = requests.pair_labels(entry.provider.as_deref(), entry.model.as_deref());
-        family.get_or_create(&labels).inc_by(entry.requests);
+        // The family is local to this render, so nothing else writes it
+        // between the read and the write.
+        let gauge = family.get_or_create(&labels);
+        gauge.set(gauge.get().saturating_add(entry.requests));
     }
     family
 }
@@ -460,6 +463,32 @@ mod tests {
             "ccmux_requests_in_flight{provider=\"codex\",model=\"gpt-6-sol\"} 5",
             "ccmux_requests_in_flight{provider=\"unknown\",model=\"unknown\"} 1",
             "ccmux_requests_in_flight{provider=\"other\",model=\"other\"} 5",
+        ]);
+        for format in BOTH_FORMATS {
+            let samples = samples(&render(&input, format));
+            assert_eq!(with_prefix(&samples, "ccmux_requests_in_flight"), expected);
+        }
+    }
+
+    #[test]
+    fn an_in_flight_sum_stops_at_the_largest_value() {
+        let requests = RequestMetrics::new();
+        let entry = |count: u64| InFlight {
+            provider: Some("codex".to_owned()),
+            model: Some("gpt-6-sol".to_owned()),
+            requests: count,
+        };
+        let reading = GaugeReading {
+            in_flight: vec![entry(u64::MAX), entry(1)],
+            ..GaugeReading::default()
+        };
+        let input = RenderInput {
+            requests: Some(&requests),
+            gauges: Some(&reading),
+            ..RenderInput::default()
+        };
+        let expected = set(&[
+            "ccmux_requests_in_flight{provider=\"codex\",model=\"gpt-6-sol\"} 18446744073709551615",
         ]);
         for format in BOTH_FORMATS {
             let samples = samples(&render(&input, format));
