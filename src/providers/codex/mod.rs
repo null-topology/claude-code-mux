@@ -78,6 +78,20 @@ pub fn clear_codex_rate_limits_for_tests() {
     rate_limits::clear_for_tests();
 }
 
+/// The Codex allowance windows held from the newest reading, whichever account
+/// it came under, without a window whose reset has passed.
+pub fn metrics_windows() -> Option<crate::metrics::CodexWindows> {
+    let snapshot = rate_limits::held_windows()?;
+    let window = |state: rate_limits::WindowState| crate::metrics::CodexWindow {
+        used_ratio: state.utilization,
+        resets_at: state.resets_at,
+    };
+    Some(crate::metrics::CodexWindows {
+        five_hour: snapshot.five_hour.map(window),
+        seven_day: snapshot.seven_day.map(window),
+    })
+}
+
 pub struct CodexProvider {
     client: Arc<CodexHttpClient>,
 }
@@ -2242,6 +2256,48 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("1788879437"),
         );
+    }
+
+    #[test]
+    fn metrics_windows_map_both_windows() {
+        let _rate_limits = rate_limits::lock_for_tests();
+        clear_codex_rate_limits_for_tests();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        rate_limits::observe_event(
+            Some("acct-a"),
+            &serde_json::json!({
+                "type": "codex.rate_limits",
+                "rate_limits": {
+                    "primary": {"used_percent": 25.0, "window_minutes": 300, "reset_at": now + 10_000},
+                    "secondary": {"used_percent": 50.0, "window_minutes": 10080, "reset_at": now + 500_000}
+                }
+            }),
+        );
+
+        assert_eq!(
+            metrics_windows(),
+            Some(crate::metrics::CodexWindows {
+                five_hour: Some(crate::metrics::CodexWindow {
+                    used_ratio: 0.25,
+                    resets_at: now + 10_000,
+                }),
+                seven_day: Some(crate::metrics::CodexWindow {
+                    used_ratio: 0.5,
+                    resets_at: now + 500_000,
+                }),
+            })
+        );
+        clear_codex_rate_limits_for_tests();
+    }
+
+    #[test]
+    fn metrics_windows_are_none_without_a_reading() {
+        let _rate_limits = rate_limits::lock_for_tests();
+        clear_codex_rate_limits_for_tests();
+        assert_eq!(metrics_windows(), None);
     }
 
     fn classified_codex_error(
