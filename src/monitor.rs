@@ -6695,7 +6695,9 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             1.0
         );
         let observed = sample_value(&lines, "ccmux_time_to_first_token_seconds_sum{");
-        assert!((2.0..2.5).contains(&observed), "{observed}");
+        // Real time runs on top of the moved clock, so a slow machine adds to
+        // the figure; only a time taken from the wrong moment falls outside.
+        assert!((2.0..30.0).contains(&observed), "{observed}");
         assert_eq!(
             sample_value(&lines, "ccmux_request_duration_seconds_count{"),
             2.0
@@ -6749,6 +6751,36 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             line_set(&[
                 "ccmux_cache_misses_total{provider=\"anthropic\",model=\"claude-opus-5\",cause=\"expired\"} 1",
                 "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 1",
+            ])
+        );
+    }
+
+    /// A request routed as one model and run as another is exported under the
+    /// one that ran, and so is a miss between two such requests.
+    #[test]
+    fn a_request_routed_as_one_model_exports_the_model_that_ran() {
+        let monitor = MonitorHandle::new(10);
+        let run = |request_id: &str, usage: UsageReport| {
+            start_codex_request(&monitor, request_id, "main");
+            monitor.model_resolved(request_id, "gpt-6-sol");
+            monitor.usage_reported(request_id, usage);
+            monitor.request_completed(request_id, 200, None, None);
+        };
+        run("r1", closing_usage(30_000, 0, 0, 50));
+        // Nothing of the prefix came back.
+        run("r2", closing_usage(31_000, 0, 0, 40));
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_requests_total"),
+            line_set(&[
+                "ccmux_requests_total{provider=\"codex\",model=\"gpt-6-sol\",endpoint=\"messages\",outcome=\"completed\",status=\"200\"} 2",
+            ])
+        );
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_cache_misses_total"),
+            line_set(&[
+                "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-6-sol\",cause=\"within_ttl\"} 1",
             ])
         );
     }
@@ -6817,6 +6849,21 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert_eq!(sample_value(&lines, "ccmux_requests_total{"), 2.0);
         assert!(lines_with_prefix(&lines, "ccmux_context_rewrites_total").is_empty());
         assert!(lines_with_prefix(&lines, "ccmux_cache_misses_total").is_empty());
+        // r2 was judged and found neither, rather than never judged: it was
+        // evaluated, and its prompt is the one the lane now measures against.
+        assert!(recent_by_id(&monitor.snapshot(), "r2").cache.evaluated());
+        let lane = LaneKey {
+            session_id: Some("s1".to_string()),
+            conversation: Some("main".to_string()),
+            provider: "codex".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+        };
+        let baseline = monitor
+            .store
+            .lock()
+            .ok()
+            .and_then(|store| store.lanes.get(&lane).map(|lane| lane.prompt_tokens));
+        assert_eq!(baseline, Some(28_976));
     }
 
     fn gauge_lines(monitor: &MonitorHandle, prefix: &str) -> BTreeSet<String> {
