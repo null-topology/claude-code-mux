@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod http_client;
 pub mod logging;
+pub mod metrics;
 pub mod monitor;
 pub mod openai_compat;
 pub mod paths;
