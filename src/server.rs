@@ -502,8 +502,9 @@ async fn healthz() -> Json<serde_json::Value> {
 /// the same as their comma-joined value; a line that is not valid text is
 /// skipped. A scrape is not a proxied request: it carries no
 /// `request-id` and publishes nothing to the monitor. Every input is read
-/// into an owned value before encoding starts, so no lock is held while the
-/// exposition is built.
+/// into an owned value before encoding starts, so the monitor's store lock
+/// and the lock of the Codex reading are released by then; encoding takes
+/// only the metric families' own locks.
 async fn handler_metrics(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
     let format = headers
         .get_all(http::header::ACCEPT)

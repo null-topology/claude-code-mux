@@ -843,8 +843,9 @@ in `config.json`, removes the route, which then answers 404 like any other
 unknown path. The setting is read at startup, so a change needs a restart.
 
 The format follows the request's `Accept` header. When it contains
-`application/openmetrics-text` (in any letter case, on any of its lines), the
-answer is OpenMetrics text ending in `# EOF`, with
+`application/openmetrics-text` (in any letter case, on any of its lines; a line
+holding a byte other than printable ASCII or a tab is skipped), the answer is
+OpenMetrics text ending in `# EOF`, with
 `Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8`.
 Anything else, no header included, gets the Prometheus text format 0.0.4 with
 `Content-Type: text/plain; version=0.0.4; charset=utf-8`. Sample names are the
@@ -856,7 +857,11 @@ of a histogram's lines differ, so keep a scraper on one format.
 The monitor's store feeds the request metrics, so with metrics on, plain mode
 (`--no-monitor`, or stdout that is not a terminal) keeps the same memory the
 monitor does: the recent request list, the ledger of the sessions still in use
-and a session title seen on the wire. The Anthropic relay then observes each
+and a session title seen on the wire. The ledger holds one small numeric record
+per request for as long as its session is kept: a session with nothing in
+flight is dropped with its records once it has had no activity for 24 hours,
+at the next request or scrape. Requests without a session id form one session.
+The Anthropic relay then observes each
 relayed body for usage, parsing the SSE it relays and holding a non-streaming
 JSON answer of up to 4 MiB. The bytes the client receives do not change, and
 none of that data is shown on `/metrics`. Plain mode reads no session
@@ -871,11 +876,11 @@ transcripts; only the terminal monitor does.
 | `ccmux_request_duration_seconds` | histogram | `provider`, `model`, `endpoint` | Time from a request's start to its end, as the monitor measures it. |
 | `ccmux_time_to_first_token_seconds` | histogram | `provider`, `model` | Time from a request's start until the monitor first saw its response generating. What marks that moment depends on the backend (see the limits below). |
 | `ccmux_request_prompt_tokens` | histogram | `provider`, `model` | Prompt size of each request whose prompt the backend measured; `_sum` is the measured prompt total. |
-| `ccmux_tokens_total` | counter | `provider`, `model`, `kind`, `quality` | Tokens per `kind`: `input` (uncached), `cache_read`, `cache_write`, `output`. `quality` is `exact` for a count set by a closing usage report and `estimate` for one known only from opening values, which is every count from Kimi, Grok and Cursor. A count the backend never reported adds nothing and creates no series; a reported zero does create one. |
+| `ccmux_tokens_total` | counter | `provider`, `model`, `kind`, `quality` | Tokens per `kind`: `input` (uncached), `cache_read`, `cache_write`, `output`. `quality` is `exact` when the backend's final count had arrived by the time the request ended and `estimate` when only a provisional count had, which is every count from Kimi, Grok and Cursor. A count the backend never reported adds nothing and creates no series; a reported zero does create one. |
 | `ccmux_cache_hit_basis_tokens_total` | counter | `provider`, `model`, `kind` | The `input`, `cache_read` and `cache_write` tokens of the requests that carried conversation history, the basis the monitor's hit % is read from. It is a part of `ccmux_tokens_total`; never add the two. |
 | `ccmux_cache_misses_total` | counter | `provider`, `model`, `cause` | Cache misses as the monitor judges them (see [Prompt cache](#prompt-cache)), by `cause`: `within_ttl`, `expired`, or `unknown_ttl` when the backend's cache lifetime is not known. |
 | `ccmux_context_rewrites_total` | counter | `provider`, `model` | Requests whose measured prompt is more than 1024 tokens below the previous request of the same conversation and model: a client rewrite such as compaction, clear or rewind. Side calls and a request that started before that previous one are not counted. A rewrite is not a cache miss. |
-| `ccmux_codex_refusals_total` | counter | `class` | Codex refusals the proxy answered on the Anthropic Messages path of the Codex backend, once per answer to the client, by `class`: `usage_limit` (a spent window), `quota_exceeded`, `usage_not_included`, `rejected`, `context_overflow`, `throttled`, `overloaded`, `model_not_found`, `permission_denied`. A refusal that arrives after output started counts too. An unclassified 429 or 5xx is not counted here; it shows in `ccmux_requests_total`. |
+| `ccmux_codex_refusals_total` | counter | `class` | Codex refusals the proxy answered to `/v1/messages` requests served by Codex, once per answer to the client, by `class`: `usage_limit` (a spent window), `quota_exceeded`, `usage_not_included`, `rejected`, `context_overflow`, `throttled`, `overloaded`, `model_not_found`, `permission_denied`. A refusal that arrives after output started counts too. An unclassified 429 or 5xx is not counted here; it shows in `ccmux_requests_total`. |
 | `ccmux_codex_window_used_ratio` | gauge | `window` | Utilization of the held Codex allowance window, `5h` or `7d`, as a fraction; it can pass 1.0. No sample until Codex has reported a reading, and none for a window whose reset has passed. No account id is exported. |
 | `ccmux_codex_window_reset_timestamp_seconds` | gauge | `window` | When that window resets, in Unix seconds. |
 | `ccmux_sessions` | gauge | `state` | Sessions the monitor holds: `active` (shown) and `idle` (hidden after an hour with nothing in flight and no activity). Both states are present whenever the gauge is. |
@@ -886,8 +891,8 @@ transcripts; only the terminal monitor does.
 
 `provider` is the backend the request was routed to (`anthropic`, `codex`,
 `kimi`, `grok`, `cursor`, or `local` for an answer the proxy made itself), else
-`unknown`. `model` is the model that ran when known, else the model it was
-routed to, else `unknown`. `endpoint` is one of `messages`, `count_tokens`,
+`unknown`. `model` is the model the request was sent upstream as, when known,
+else the model it was routed to, else `unknown`. `endpoint` is one of `messages`, `count_tokens`,
 `responses`, `chat_completions`, `images`, `transcriptions`. A `count_tokens`
 request and a `local` answer count in `ccmux_requests_total` and
 `ccmux_request_duration_seconds` but add no tokens and no prompt size.
@@ -954,13 +959,12 @@ histogram_quantile(0.95,
 
 - A request's figures are fixed when it ends. A usage report that arrives
   later corrects the monitor and changes none of the request, duration, prompt
-  or token metrics, and nothing counts such reports. Summing
-  `ccmux_tokens_total` over `quality` gives the monitor's totals as they stood
-  when each request ended. A late report can still complete a request's
+  or token metrics, and there is no counter of late reports. Summing
+  `ccmux_tokens_total` over `quality` can therefore differ from the monitor's
+  totals, which take those late corrections. A late report can still complete a request's
   pending cache judgement, which then counts a miss or a rewrite as usual.
-- A Codex stream that failed or was abandoned before its closing counts
-  arrived exports the whole-prompt estimate as `input` under
-  `quality="estimate"`.
+- A Codex stream that ended holding only the whole-prompt estimate exports it
+  as `input` under `quality="estimate"`.
 - Time to first token differs by backend. Codex and Grok send a signal when
   generation starts. On the Claude route it is the first relayed stream chunk
   (`message_start`, before any token). Kimi and Cursor report progress only
@@ -970,8 +974,8 @@ histogram_quantile(0.95,
 - `ccmux_request_prompt_tokens` leaves out requests whose prompt was not
   measured, which includes every request of a backend that never reports
   closing counts.
-- `ccmux_codex_refusals_total` covers the Codex backend's Anthropic Messages
-  path only, not the OpenAI-compatible surfaces.
+- `ccmux_codex_refusals_total` covers `/v1/messages` requests served by Codex
+  only, not the OpenAI-compatible surfaces.
 - Requests without a session id count as one session.
 - The format is chosen by a substring of `Accept`: q-values and versions are
   not read, so a client that lists OpenMetrics with `q=0` still gets it. Either

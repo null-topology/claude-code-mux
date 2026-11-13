@@ -6709,8 +6709,9 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             1.0
         );
         let observed = sample_value(&lines, "ccmux_time_to_first_token_seconds_sum{");
-        // Real time runs on top of the moved clock, so a slow machine adds to
-        // the figure; only a time taken from the wrong moment falls outside.
+        // Real time runs on top of the moved clock, so the wide upper bound
+        // tolerates scheduling delay; a time taken from the wrong moment still
+        // falls outside the range.
         assert!((2.0..30.0).contains(&observed), "{observed}");
         assert_eq!(
             sample_value(&lines, "ccmux_request_duration_seconds_count{"),

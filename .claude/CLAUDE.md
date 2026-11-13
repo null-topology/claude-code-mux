@@ -879,16 +879,21 @@ unless it is a `count_tokens` request or provider `local`, its measured prompt,
 its tokens per kind with `quality` `exact` (a closing report) or `estimate`
 (an opening one only) and, for a request that carried history, its hit basis.
 A count the backend never reported adds nothing and creates no series; a
-reported zero does. The `model` label is the model that ran when known, else
-the routed one (`metric_model`). A usage report that arrives after the
-terminal event changes no settled metric and is counted nowhere. The endpoint
+reported zero does. The `model` label is the model the request went upstream
+as when known, else the routed one (`metric_model`). A usage report that
+arrives after the terminal event changes none of the request, duration, prompt
+or token metrics, and there is no counter of late reports. The endpoint
 does not export the ledger's running totals because they are not monotonic:
 an opening estimate is replaced by the closing report, and a request's
 numbers move between model rows once its effective model is known. A counter
 that goes down reads to Prometheus as a restart, and `rate` turns the drop
 into a spike. Cache misses and context rewrites are counted in
-`evaluate_cache` when a request's cache read is judged, which can happen
-before, at or after its terminal event, so a late report can still add one.
+`evaluate_cache`, which judges a request once: the first time its prompt size
+is measured (`prompt_is_measured`) and its provider and model are known. That
+can happen before, at or after its terminal event, so a late report can still
+add one. A miss is counted only when the request's cache read is final
+(`closed.cache_read`) at that moment; a rewrite needs the measured prompt and
+not a final cache read.
 A miss carries its `cause`. A rewrite is a request that is not superseded,
 not on a side lane, has an earlier baseline on its lane and whose measured
 prompt is more than `CACHE_MISS_MIN_TOKENS` (1024) below it; it is never also

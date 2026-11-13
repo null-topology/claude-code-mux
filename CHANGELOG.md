@@ -4,10 +4,11 @@
   They cover finished requests per provider, model and endpoint with their
   outcome and HTTP status, requests in flight, request duration, time to
   first token and prompt size, tokens per kind and the share that came from
-  the cache, cache misses and context rewrites, Codex refusals and the held
-  Codex window utilization and reset time, active and idle sessions, log
-  events per service, level and message, the version and the process start
-  time. A request is counted once, when it ends, so a usage report that
+  the cache, cache misses and context rewrites (a prompt that shrank because
+  the client compacted, cleared or rewound the conversation), Codex refusals
+  and the utilization and reset time of the Codex allowance windows as last
+  reported, active and idle sessions, log events per service, level and
+  message, the version and the process start time. A request is counted once, when it ends, so a usage report that
   arrives later still corrects the monitor but does not move the request,
   duration, prompt or token metrics; it can still complete a pending cache
   judgement, which then counts a cache miss or a context rewrite. The
@@ -19,8 +20,10 @@
   bind address wider than the default `127.0.0.1` exposes `/metrics` with
   the rest. To feed it, plain mode (`--no-monitor`, or stdout that is not a
   terminal) now keeps what the monitor keeps in memory: the recent request
-  list, the ledger of the sessions still in use and a session title seen on
-  the wire. The Anthropic relay then observes each relayed body for usage,
+  list, one small numeric record per request of the sessions still in use
+  (a session with nothing in flight is dropped with its records after 24
+  hours without activity) and a session title taken from a relayed title
+  reply. The Anthropic relay then observes each relayed body for usage,
   parsing the SSE it relays and holding a non-streaming JSON answer of up to
   4 MiB, as it already did with the monitor on; the bytes the client
   receives do not change, and none of that data is shown on `/metrics`.
