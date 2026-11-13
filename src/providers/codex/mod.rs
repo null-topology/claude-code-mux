@@ -1370,6 +1370,15 @@ fn remaining_live_stream_response(
                                     ("api_error", client_error_text(&message, "api_error"))
                                 }
                             };
+                            match (limit.as_ref(), classified.as_ref()) {
+                                (Some(_), _) => crate::metrics::codex_refusal(
+                                    crate::metrics::RefusalClass::UsageLimit,
+                                ),
+                                (None, Some((class, _))) => {
+                                    crate::metrics::codex_refusal(refusal_class(*class))
+                                }
+                                (None, None) => {}
+                            }
                             let chunk =
                                 translator.error_chunk(text, error_type, ctx.traffic.as_deref());
                             // The status left with the first chunk, so the
@@ -1803,6 +1812,7 @@ fn with_rate_limit_headers(mut response: Response, account: Option<&str>) -> Res
 /// (`rate_limits::observe_usage_limit`), so later responses carry it.
 fn usage_limit_response(limit: &events::CodexUsageLimit) -> Response {
     rate_limits::observe_usage_limit(limit);
+    crate::metrics::codex_refusal(crate::metrics::RefusalClass::UsageLimit);
     let mut headers = HeaderMap::new();
     headers.insert(
         HeaderName::from_static("x-should-retry"),
@@ -1971,8 +1981,10 @@ fn classified_error_response(
         generic_error_text(error_type)
     };
     if class == events::CodexErrorClass::ContextOverflow {
+        // Counted where that answer is built, as for the message path.
         return context_overflow_response(native);
     }
+    crate::metrics::codex_refusal(refusal_class(class));
     let response = client_error(
         StatusCode::from_u16(class.status()).unwrap_or(StatusCode::BAD_GATEWAY),
         error_type,
@@ -2017,7 +2029,23 @@ fn map_codex_failure_to_response(message: &str) -> Response {
 /// message says so. The native text is kept as it came, never replaced by
 /// `client_error`.
 fn context_overflow_response(message: &str) -> Response {
+    crate::metrics::codex_refusal(crate::metrics::RefusalClass::ContextOverflow);
     json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", message)
+}
+
+/// The class a refusal of this Codex error class is counted under.
+fn refusal_class(class: events::CodexErrorClass) -> crate::metrics::RefusalClass {
+    use crate::metrics::RefusalClass;
+    match class {
+        events::CodexErrorClass::QuotaExceeded => RefusalClass::QuotaExceeded,
+        events::CodexErrorClass::UsageNotIncluded => RefusalClass::UsageNotIncluded,
+        events::CodexErrorClass::Rejected => RefusalClass::Rejected,
+        events::CodexErrorClass::ContextOverflow => RefusalClass::ContextOverflow,
+        events::CodexErrorClass::Throttled => RefusalClass::Throttled,
+        events::CodexErrorClass::Overloaded => RefusalClass::Overloaded,
+        events::CodexErrorClass::ModelNotFound => RefusalClass::ModelNotFound,
+        events::CodexErrorClass::PermissionDenied => RefusalClass::PermissionDenied,
+    }
 }
 
 /// An error for `/v1/messages`. The client expects Anthropic's API, so a text
@@ -2304,6 +2332,259 @@ mod tests {
             assert_eq!(body["error"]["type"], error_type, "{class:?}");
             assert_eq!(body["error"]["message"], "toy backend message", "{class:?}");
         }
+    }
+
+    /// The refusal samples a scoped metrics instance renders.
+    fn refusal_samples(
+        metrics: &crate::metrics::ProcessMetrics,
+    ) -> std::collections::BTreeSet<String> {
+        crate::metrics::render(
+            &crate::metrics::RenderInput {
+                process: Some(metrics),
+                ..crate::metrics::RenderInput::default()
+            },
+            crate::metrics::Format::Text,
+        )
+        .lines()
+        .filter(|line| line.starts_with("ccmux_codex_refusals"))
+        .map(str::to_string)
+        .collect()
+    }
+
+    fn refusals(class: &str, count: u64) -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::from([format!(
+            "ccmux_codex_refusals_total{{class=\"{class}\"}} {count}"
+        )])
+    }
+
+    fn unclassified_codex_error(status: u16, message: &str) -> client::CodexError {
+        client::CodexError {
+            status,
+            message: message.to_string(),
+            detail: Some(message.to_string()),
+            retry_after: None,
+            usage_limit: None,
+            class: None,
+            origin: client::CodexErrorOrigin::BufferedHttp,
+        }
+    }
+
+    const CONTEXT_WINDOW_TEXT: &str =
+        "Codex error: your input exceeds the context window of this model.";
+
+    #[test]
+    fn a_spent_window_answer_counts_one_usage_limit_refusal() {
+        let _rate_limits = rate_limits::lock_for_tests();
+        clear_codex_rate_limits_for_tests();
+        let metrics = crate::metrics::scoped_process_for_tests();
+
+        let response = usage_limit_response(&events::CodexUsageLimit {
+            message: "The usage limit has been reached".to_string(),
+            resets_at: Some(1788879437),
+            window: Some(events::CodexLimitWindow::FiveHour),
+            account: None,
+            feeds_gauge: true,
+        });
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refusal_samples(&metrics), refusals("usage_limit", 1));
+        clear_codex_rate_limits_for_tests();
+    }
+
+    #[test]
+    fn a_classified_answer_counts_its_class_once() {
+        for (class, label) in [
+            (events::CodexErrorClass::QuotaExceeded, "quota_exceeded"),
+            (
+                events::CodexErrorClass::UsageNotIncluded,
+                "usage_not_included",
+            ),
+            (events::CodexErrorClass::Rejected, "rejected"),
+            (events::CodexErrorClass::Throttled, "throttled"),
+            (events::CodexErrorClass::Overloaded, "overloaded"),
+            (events::CodexErrorClass::ModelNotFound, "model_not_found"),
+            (
+                events::CodexErrorClass::PermissionDenied,
+                "permission_denied",
+            ),
+        ] {
+            let metrics = crate::metrics::scoped_process_for_tests();
+            let _response = map_codex_error_to_response(&classified_codex_error(
+                class,
+                400,
+                "toy backend message",
+                None,
+            ));
+            assert_eq!(refusal_samples(&metrics), refusals(label, 1), "{class:?}");
+        }
+    }
+
+    #[test]
+    fn a_classified_context_overflow_counts_once() {
+        let metrics = crate::metrics::scoped_process_for_tests();
+        // The text names the context window too, which the message path reads.
+        let response = map_codex_error_to_response(&classified_codex_error(
+            events::CodexErrorClass::ContextOverflow,
+            400,
+            CONTEXT_WINDOW_TEXT,
+            None,
+        ));
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(refusal_samples(&metrics), refusals("context_overflow", 1));
+    }
+
+    #[test]
+    fn a_context_window_message_counts_one_overflow() {
+        {
+            let metrics = crate::metrics::scoped_process_for_tests();
+            let response = map_codex_failure_to_response(CONTEXT_WINDOW_TEXT);
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert_eq!(refusal_samples(&metrics), refusals("context_overflow", 1));
+        }
+        let metrics = crate::metrics::scoped_process_for_tests();
+        let response =
+            map_codex_error_to_response(&unclassified_codex_error(400, CONTEXT_WINDOW_TEXT));
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(refusal_samples(&metrics), refusals("context_overflow", 1));
+    }
+
+    #[test]
+    fn an_unclassified_failure_counts_no_refusal() {
+        let metrics = crate::metrics::scoped_process_for_tests();
+        let _failure = map_codex_failure_to_response("toy upstream failure");
+        for status in [400, 401, 403, 500] {
+            let _response =
+                map_codex_error_to_response(&unclassified_codex_error(status, "toy failure"));
+        }
+        assert_eq!(refusal_samples(&metrics), std::collections::BTreeSet::new());
+    }
+
+    /// Streams output to the client, then hands the stream `failure`, and
+    /// returns the whole body the client read.
+    async fn live_body_after_output(failure: serde_json::Value) -> String {
+        let request_body = translate_request(
+            &request_with_tools(serde_json::json!([])),
+            TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-5.6-sol".to_string(),
+                use_responses_lite: true,
+            },
+        )
+        .unwrap();
+        let ctx = RequestContext {
+            req_id: "refusal-after-output".to_string(),
+            session_id: None,
+            session_seq: None,
+            provider: "codex".to_string(),
+            traffic: None,
+            monitor: None,
+            passthrough: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        for payload in [
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "id": "msg_up"}
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": "first"
+            }),
+        ] {
+            tx.send(Ok(payload)).await.unwrap();
+        }
+        let (rx, _) = websocket::CodexWebSocketEventStream::pending(rx);
+        let response = match live_stream_response_once(
+            rx,
+            Vec::new(),
+            "msg_test".to_string(),
+            "claude-opus-4-8",
+            ctx,
+            ContinuationReservation::for_owner_turn(None, None),
+            request_body,
+            LiveStreamCompaction {
+                compact_boundary: false,
+                attempt: None,
+            },
+            config::CodexTransport::WebSocket,
+            client::MAX_BUFFERED_RESPONSE_BYTES,
+        )
+        .await
+        {
+            LiveStreamStart::Response(response) => response,
+            LiveStreamStart::Retry { error, .. } => panic!("unexpected retry: {error}"),
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let first = tokio::time::timeout(Duration::from_millis(200), body.frame())
+            .await
+            .expect("output must reach the client before the failure")
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let mut text = String::from_utf8(first.to_vec()).unwrap();
+        assert!(text.contains("event: content_block_delta"));
+
+        tx.send(Ok(failure)).await.unwrap();
+        drop(tx);
+        while let Some(frame) = body.frame().await {
+            if let Ok(data) = frame.unwrap().into_data() {
+                text.push_str(std::str::from_utf8(&data).unwrap());
+            }
+        }
+        text
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_refusal_after_output_started_counts_once() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool_guard = websocket::lock_codex_websocket_pool_for_tests().await;
+        let _rate_limits = rate_limits::lock_for_tests();
+        clear_codex_rate_limits_for_tests();
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "error",
+                    "status_code": 429,
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "The usage limit has been reached",
+                        "resets_at": 1788879437u64
+                    }
+                }),
+                "rate_limit_error",
+                refusals("usage_limit", 1),
+            ),
+            (
+                serde_json::json!({
+                    "type": "error",
+                    "error": {"code": "insufficient_quota", "message": "toy quota message"}
+                }),
+                "rate_limit_error",
+                refusals("quota_exceeded", 1),
+            ),
+            (
+                serde_json::json!({
+                    "type": "error",
+                    "error": {"code": "toy_unknown_code", "message": "toy failure"}
+                }),
+                "api_error",
+                std::collections::BTreeSet::new(),
+            ),
+        ];
+        for (failure, error_type, expected) in cases {
+            let metrics = crate::metrics::scoped_process_for_tests();
+            let body = live_body_after_output(failure).await;
+            assert!(body.contains("event: error"), "{body}");
+            assert!(body.contains(error_type), "{body}");
+            assert_eq!(refusal_samples(&metrics), expected, "{error_type}");
+        }
+        clear_codex_rate_limits_for_tests();
     }
 
     /// What a client gets for a failure event that reached it before any
