@@ -498,16 +498,20 @@ async fn healthz() -> Json<serde_json::Value> {
 }
 
 /// The Prometheus exposition of the proxy, OpenMetrics when the `Accept`
-/// header names it. A scrape is not a proxied request: it carries no
+/// header names it. Every `Accept` field line is read, as several lines mean
+/// the same as their comma-joined value; a line that is not valid text is
+/// skipped. A scrape is not a proxied request: it carries no
 /// `request-id` and publishes nothing to the monitor. Every input is read
 /// into an owned value before encoding starts, so no lock is held while the
 /// exposition is built.
 async fn handler_metrics(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
-    let format = crate::metrics::format_for_accept(
-        headers
-            .get(http::header::ACCEPT)
-            .and_then(|value| value.to_str().ok()),
-    );
+    let format = headers
+        .get_all(http::header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(|accept| crate::metrics::format_for_accept(Some(accept)))
+        .find(|format| *format == crate::metrics::Format::OpenMetrics)
+        .unwrap_or_else(|| crate::metrics::format_for_accept(None));
     let requests = state.monitor.as_ref().map(MonitorHandle::request_metrics);
     let gauges = state.monitor.as_ref().map(MonitorHandle::gauge_reading);
     let codex_windows = crate::providers::codex::metrics_windows();

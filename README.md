@@ -843,8 +843,8 @@ in `config.json`, removes the route, which then answers 404 like any other
 unknown path. The setting is read at startup, so a change needs a restart.
 
 The format follows the request's `Accept` header. When it contains
-`application/openmetrics-text` (in any letter case), the answer is OpenMetrics
-text ending in `# EOF`, with
+`application/openmetrics-text` (in any letter case, on any of its lines), the
+answer is OpenMetrics text ending in `# EOF`, with
 `Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8`.
 Anything else, no header included, gets the Prometheus text format 0.0.4 with
 `Content-Type: text/plain; version=0.0.4; charset=utf-8`. Sample names are the

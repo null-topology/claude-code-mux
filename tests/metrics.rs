@@ -222,6 +222,28 @@ async fn metrics_route_answers_in_both_formats() {
     assert_eq!(series(&open, "ccmux_build_info"), build, "{open}");
 }
 
+/// An `Accept` sent as several field lines means their comma-joined value,
+/// so OpenMetrics named on a later line still selects that format.
+#[tokio::test]
+async fn open_metrics_on_a_later_accept_line_selects_it() {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .header(header::ACCEPT, "text/plain")
+        .header(
+            header::ACCEPT,
+            "application/openmetrics-text; version=1.0.0",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let response = bare_app(None, true).oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(content_type(&response), OPEN_METRICS_CONTENT_TYPE);
+    let body = body_text(response).await;
+    assert!(body.ends_with("# EOF\n"), "{body}");
+}
+
 /// With the setting off the path is not routed and falls to the fallback.
 #[tokio::test]
 async fn metrics_route_is_absent_when_the_feature_is_off() {
