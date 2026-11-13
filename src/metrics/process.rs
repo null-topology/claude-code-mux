@@ -204,7 +204,9 @@ fn innermost_scope() -> Option<ProcessMetrics> {
 
 /// Installs a fresh instance that the free functions called on this thread
 /// feed until the returned guard drops. Scopes nest: dropping an inner guard
-/// hands the thread back to the scope that was open before it.
+/// hands the thread back to the scope that was open before it. Drop the
+/// guards in reverse order of creation: a guard dropped out of order also
+/// ends every scope opened after it.
 #[cfg(test)]
 pub(crate) fn scoped_process_for_tests() -> ScopedProcess {
     let metrics = ProcessMetrics::new();
@@ -256,7 +258,8 @@ mod tests {
 
     use super::{ProcessMetrics, RefusalClass};
     use crate::metrics::{
-        Format, RenderInput, codex_refusal, log_event, render, scoped_process_for_tests,
+        Format, MAX_LOG_EVENT_SERIES, RenderInput, codex_refusal, log_event, render,
+        scoped_process_for_tests,
     };
 
     const BOTH_FORMATS: [Format; 2] = [Format::OpenMetrics, Format::Text];
@@ -320,6 +323,26 @@ mod tests {
         ]);
         for format in BOTH_FORMATS {
             assert_eq!(samples(&metrics, format), expected);
+        }
+    }
+
+    #[test]
+    fn the_default_event_budget_keeps_512_label_sets() {
+        assert_eq!(MAX_LOG_EVENT_SERIES, 512);
+        let metrics = ProcessMetrics::new();
+        for index in 0..512 {
+            metrics.log_event("server", "info", &format!("event-{index}"));
+        }
+        metrics.log_event("codex", "warn", "event-512");
+        metrics.log_event("server", "info", "event-511");
+
+        for format in BOTH_FORMATS {
+            let samples = samples(&metrics, format);
+            assert_eq!(samples.len(), 513);
+            assert!(samples.contains(&event_line("server", "info", "event-0", 1)));
+            assert!(samples.contains(&event_line("server", "info", "event-511", 2)));
+            assert!(samples.contains(&event_line("other", "warn", "other", 1)));
+            assert!(!samples.iter().any(|line| line.contains("event-512")));
         }
     }
 

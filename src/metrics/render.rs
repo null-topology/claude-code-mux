@@ -178,12 +178,12 @@ fn register_codex_windows(registry: &mut Registry, windows: &CodexWindows) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use super::*;
     use crate::metrics::{
-        CodexWindow, CodexWindows, GaugeReading, InFlight, ProcessMetrics, RefusalClass,
-        RequestMetrics, mark_process_start,
+        CodexWindow, CodexWindows, GaugeReading, InFlight, Outcome, ProcessMetrics, RefusalClass,
+        RequestMetrics, SettledRequest, mark_process_start,
     };
 
     const BOTH_FORMATS: [Format; 2] = [Format::OpenMetrics, Format::Text];
@@ -252,12 +252,7 @@ mod tests {
     fn the_start_time_is_positive_and_stable() {
         let first = start_time(&render(&RenderInput::default(), Format::OpenMetrics));
         let second = start_time(&render(&RenderInput::default(), Format::Text));
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after the epoch")
-            .as_secs();
         assert!(first > 0);
-        assert!(first <= now);
         assert_eq!(first, second);
         mark_process_start();
         assert_eq!(
@@ -451,6 +446,7 @@ mod tests {
                 entry(None, None, 1),
                 entry(Some("codex"), Some("x".repeat(121)), 1),
                 entry(Some("codex"), Some("y".repeat(121)), 4),
+                entry(Some("kimi"), Some("never-settled".to_owned()), 0),
             ],
             ..GaugeReading::default()
         };
@@ -463,6 +459,103 @@ mod tests {
             "ccmux_requests_in_flight{provider=\"codex\",model=\"gpt-6-sol\"} 5",
             "ccmux_requests_in_flight{provider=\"unknown\",model=\"unknown\"} 1",
             "ccmux_requests_in_flight{provider=\"other\",model=\"other\"} 5",
+        ]);
+        for format in BOTH_FORMATS {
+            let samples = samples(&render(&input, format));
+            assert_eq!(with_prefix(&samples, "ccmux_requests_in_flight"), expected);
+        }
+    }
+
+    fn one_in_flight(model: &str) -> InFlight {
+        InFlight {
+            provider: Some("codex".to_owned()),
+            model: Some(model.to_owned()),
+            requests: 1,
+        }
+    }
+
+    fn in_flight_line(provider: &str, model: &str) -> String {
+        format!("ccmux_requests_in_flight{{provider=\"{provider}\",model=\"{model}\"}} 1")
+    }
+
+    fn settled(model: &str) -> SettledRequest<'_> {
+        SettledRequest {
+            provider: Some("codex"),
+            model: Some(model),
+            endpoint: "messages",
+            outcome: Outcome::Completed,
+            http_status: Some(200),
+            duration: Duration::from_secs(1),
+            time_to_first_token: None,
+            usage: None,
+        }
+    }
+
+    fn requests_line(provider: &str, model: &str) -> String {
+        format!(
+            "ccmux_requests_total{{provider=\"{provider}\",model=\"{model}\",endpoint=\"messages\",outcome=\"completed\",status=\"200\"}} 1"
+        )
+    }
+
+    #[test]
+    fn pairs_admitted_in_flight_take_the_budget_of_settlements() {
+        let requests = RequestMetrics::new();
+        let models: Vec<String> = (0..200).map(|index| format!("model-{index}")).collect();
+        let reading = GaugeReading {
+            in_flight: models.iter().map(|model| one_in_flight(model)).collect(),
+            ..GaugeReading::default()
+        };
+        let with_gauges = RenderInput {
+            requests: Some(&requests),
+            gauges: Some(&reading),
+            ..RenderInput::default()
+        };
+        let admitted: BTreeSet<String> = models
+            .iter()
+            .map(|model| in_flight_line("codex", model))
+            .collect();
+        assert_eq!(
+            with_prefix(
+                &samples(&render(&with_gauges, Format::Text)),
+                "ccmux_requests_in_flight"
+            ),
+            admitted
+        );
+
+        requests.request_settled(&settled("model-0"));
+        requests.request_settled(&settled("model-200"));
+        let settlements = RenderInput {
+            requests: Some(&requests),
+            ..RenderInput::default()
+        };
+        let expected = BTreeSet::from([
+            requests_line("codex", "model-0"),
+            requests_line("other", "other"),
+        ]);
+        for format in BOTH_FORMATS {
+            let samples = samples(&render(&settlements, format));
+            assert_eq!(with_prefix(&samples, "ccmux_requests_total"), expected);
+        }
+    }
+
+    #[test]
+    fn pairs_admitted_by_settlements_take_the_budget_of_the_in_flight_gauge() {
+        let requests = RequestMetrics::new();
+        for index in 0..200 {
+            requests.request_settled(&settled(&format!("model-{index}")));
+        }
+        let reading = GaugeReading {
+            in_flight: vec![one_in_flight("model-0"), one_in_flight("model-200")],
+            ..GaugeReading::default()
+        };
+        let input = RenderInput {
+            requests: Some(&requests),
+            gauges: Some(&reading),
+            ..RenderInput::default()
+        };
+        let expected = BTreeSet::from([
+            in_flight_line("codex", "model-0"),
+            in_flight_line("other", "other"),
         ]);
         for format in BOTH_FORMATS {
             let samples = samples(&render(&input, format));

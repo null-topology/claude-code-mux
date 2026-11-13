@@ -401,7 +401,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::metrics::{Format, MAX_MODEL_SERIES, RenderInput, render};
+    use crate::metrics::{Format, MAX_LABEL_BYTES, MAX_MODEL_SERIES, RenderInput, render};
 
     const BOTH_FORMATS: [Format; 2] = [Format::OpenMetrics, Format::Text];
 
@@ -527,6 +527,30 @@ mod tests {
     }
 
     #[test]
+    fn one_settled_request_counts_once_with_its_duration() {
+        let metrics = RequestMetrics::new();
+        metrics.request_settled(&settled("gpt-6-sol"));
+
+        let labels = "provider=\"codex\",model=\"gpt-6-sol\",endpoint=\"messages\"";
+        let expected = BTreeSet::from([
+            format!("ccmux_request_duration_seconds_sum{{{labels}}} 1.5"),
+            format!("ccmux_request_duration_seconds_count{{{labels}}} 1"),
+        ]);
+        for format in BOTH_FORMATS {
+            let samples = samples(&metrics, format);
+            let totals: BTreeSet<String> = with_prefix(&samples, "ccmux_request_duration_seconds")
+                .into_iter()
+                .filter(|line| !line.starts_with("ccmux_request_duration_seconds_bucket"))
+                .collect();
+            assert_eq!(totals, expected);
+            assert_eq!(
+                with_prefix(&samples, "ccmux_requests_total"),
+                set(&[&requests_line("codex", "gpt-6-sol", 1)])
+            );
+        }
+    }
+
+    #[test]
     fn tokens_carry_kind_and_quality() {
         let metrics = RequestMetrics::new();
         let usage = SettledUsage {
@@ -559,6 +583,36 @@ mod tests {
         for format in BOTH_FORMATS {
             let samples = samples(&metrics, format);
             assert_eq!(with_prefix(&samples, "ccmux_tokens_total"), expected);
+        }
+    }
+
+    #[test]
+    fn a_missing_count_adds_no_series_and_a_zero_count_does() {
+        let metrics = RequestMetrics::new();
+        metrics.request_settled(&SettledRequest {
+            usage: Some(SettledUsage {
+                input: exact(0),
+                cache_read: estimate(0),
+                ..SettledUsage::default()
+            }),
+            ..settled("gpt-6-sol")
+        });
+
+        let expected = set(&[
+            "ccmux_tokens_total{provider=\"codex\",model=\"gpt-6-sol\",kind=\"input\",quality=\"exact\"} 0",
+            "ccmux_tokens_total{provider=\"codex\",model=\"gpt-6-sol\",kind=\"cache_read\",quality=\"estimate\"} 0",
+        ]);
+        for format in BOTH_FORMATS {
+            let tokens = with_prefix(&samples(&metrics, format), "ccmux_tokens_total");
+            assert_eq!(tokens, expected);
+            for kind in ["cache_write", "output"] {
+                assert!(
+                    !tokens
+                        .iter()
+                        .any(|line| line.contains(&format!("kind=\"{kind}\""))),
+                    "{kind} rendered in {tokens:?}"
+                );
+            }
         }
     }
 
@@ -628,6 +682,7 @@ mod tests {
             "ccmux_time_to_first_token_seconds",
         );
         for line in [
+            format!("ccmux_time_to_first_token_seconds_sum{{{labels}}} 0.3"),
             format!("ccmux_time_to_first_token_seconds_bucket{{{labels},le=\"0.25\"}} 0"),
             format!("ccmux_time_to_first_token_seconds_bucket{{{labels},le=\"0.5\"}} 1"),
             format!("ccmux_time_to_first_token_seconds_count{{{labels}}} 1"),
@@ -677,6 +732,7 @@ mod tests {
             "ccmux_request_prompt_tokens",
         );
         for line in [
+            format!("ccmux_request_prompt_tokens_sum{{{labels}}} 15000.0"),
             format!("ccmux_request_prompt_tokens_bucket{{{labels},le=\"10000\"}} 0"),
             format!("ccmux_request_prompt_tokens_bucket{{{labels},le=\"20000\"}} 1"),
             format!("ccmux_request_prompt_tokens_count{{{labels}}} 1"),
@@ -782,6 +838,12 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn the_label_limits_keep_their_values() {
+        assert_eq!(MAX_LABEL_BYTES, 120);
+        assert_eq!(MAX_MODEL_SERIES, 200);
     }
 
     #[test]
