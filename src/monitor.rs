@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
@@ -32,7 +32,8 @@ pub use usage::{
 use usage::{ClosedFields, UsageDelta, apply_closing, apply_opening, quality_of};
 
 use crate::metrics::{
-    MissCause, Outcome, RequestMetrics, SettledRequest, SettledUsage, TokenCount,
+    GaugeReading, InFlight, MissCause, Outcome, RequestMetrics, SettledRequest, SettledUsage,
+    TokenCount,
 };
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
@@ -1008,6 +1009,20 @@ impl MonitorHandle {
         self.metrics.clone()
     }
 
+    /// The session and in-flight gauges, read under one lock. Sessions idle
+    /// past their limit are dropped first, as [`Self::snapshot`] drops them, so
+    /// both count the same sessions.
+    pub fn gauge_reading(&self) -> GaugeReading {
+        match self.store.lock() {
+            Ok(mut store) => {
+                let now = store.now();
+                store.drop_idle_sessions(now);
+                store.gauge_reading(now)
+            }
+            Err(_) => GaugeReading::default(),
+        }
+    }
+
     pub fn publish(&self, event: MonitorEvent) {
         if let Ok(mut store) = self.store.lock() {
             store.apply(event);
@@ -1902,6 +1917,35 @@ impl MonitorStore {
         if !dropped.is_empty() {
             self.lanes
                 .retain(|key, _| !dropped.contains(&key.session_id));
+        }
+    }
+
+    /// The gauges of [`MonitorHandle::gauge_reading`]. The sessions are counted
+    /// as the snapshot counts them, visible and hidden, and every request in
+    /// flight under the provider and model known for it so far.
+    fn gauge_reading(&self, now: SystemTime) -> GaugeReading {
+        let mut sessions = session_summaries(&self.ledger);
+        let idle_sessions = hide_idle_sessions(&mut sessions, now);
+        let mut in_flight: BTreeMap<(Option<&str>, Option<&str>), u64> = BTreeMap::new();
+        for request in self.active.values() {
+            let model = metric_model(request.effective_model.as_deref(), request.model.as_deref());
+            let requests = in_flight
+                .entry((request.provider.as_deref(), model))
+                .or_default();
+            *requests = requests.saturating_add(1);
+        }
+        GaugeReading {
+            sessions_active: u64::try_from(sessions.len()).unwrap_or(u64::MAX),
+            sessions_idle: u64::try_from(idle_sessions).unwrap_or(u64::MAX),
+            sessions_started: self.ledger.sessions_started(),
+            in_flight: in_flight
+                .into_iter()
+                .map(|((provider, model), requests)| InFlight {
+                    provider: provider.map(str::to_owned),
+                    model: model.map(str::to_owned),
+                    requests,
+                })
+                .collect(),
         }
     }
 
@@ -6767,5 +6811,116 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert_eq!(sample_value(&lines, "ccmux_requests_total{"), 2.0);
         assert!(lines_with_prefix(&lines, "ccmux_context_rewrites_total").is_empty());
         assert!(lines_with_prefix(&lines, "ccmux_cache_misses_total").is_empty());
+    }
+
+    fn gauge_lines(monitor: &MonitorHandle, prefix: &str) -> BTreeSet<String> {
+        let requests = monitor.request_metrics();
+        let gauges = monitor.gauge_reading();
+        let input = crate::metrics::RenderInput {
+            requests: Some(&requests),
+            gauges: Some(&gauges),
+            ..crate::metrics::RenderInput::default()
+        };
+        crate::metrics::render(&input, crate::metrics::Format::Text)
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The session gauges count what the Sessions pane counts: the visible
+    /// sessions as active, the hidden ones as idle.
+    #[test]
+    fn the_gauge_reading_matches_the_snapshot() {
+        let monitor = MonitorHandle::new(10);
+        finish_request(&monitor, "r1", "s1", "gpt-5.6-sol");
+        advance_clock(&monitor, Duration::from_secs(2 * 60 * 60));
+        monitor.request_started("r2", Some("s2".to_string()), None, EndpointKind::Messages);
+        finish_request(&monitor, "r3", "s3", "gpt-5.6-sol");
+
+        let gauges = monitor.gauge_reading();
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions.len(), 2);
+        assert_eq!(state.idle_sessions, 1);
+        assert_eq!(gauges.sessions_active, state.sessions.len() as u64);
+        assert_eq!(gauges.sessions_idle, state.idle_sessions as u64);
+        assert_eq!(gauges.sessions_started, 3);
+        assert_eq!(
+            gauge_lines(&monitor, "ccmux_sessions"),
+            line_set(&[
+                "ccmux_sessions{state=\"active\"} 2",
+                "ccmux_sessions{state=\"idle\"} 1",
+                "ccmux_sessions_started_total 3",
+            ])
+        );
+    }
+
+    /// A session dropped after a day idle and started again under the same id
+    /// is a new session, so it is counted as started twice.
+    #[test]
+    fn a_session_dropped_and_restarted_counts_twice() {
+        let monitor = MonitorHandle::new(10);
+        finish_request(&monitor, "r1", "s1", "gpt-5.6-sol");
+        assert_eq!(monitor.gauge_reading().sessions_started, 1);
+        advance_clock(&monitor, Duration::from_secs(25 * 60 * 60));
+        let gauges = monitor.gauge_reading();
+        assert_eq!(
+            (gauges.sessions_active, gauges.sessions_idle),
+            (0, 0),
+            "the idle session was dropped"
+        );
+        finish_request(&monitor, "r2", "s1", "gpt-5.6-sol");
+
+        let gauges = monitor.gauge_reading();
+        assert_eq!(gauges.sessions_started, 2);
+        assert_eq!((gauges.sessions_active, gauges.sessions_idle), (1, 0));
+    }
+
+    /// A request in flight is labelled with what is known of it so far: no
+    /// model before routing, then the routed one, then the one that runs.
+    #[test]
+    fn an_in_flight_request_follows_its_model() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", Some("s1".to_string()), None, EndpointKind::Messages);
+        assert_eq!(
+            monitor.gauge_reading().in_flight,
+            [InFlight {
+                provider: None,
+                model: None,
+                requests: 1,
+            }]
+        );
+        assert_eq!(
+            gauge_lines(&monitor, "ccmux_requests_in_flight"),
+            line_set(&["ccmux_requests_in_flight{provider=\"unknown\",model=\"unknown\"} 1"])
+        );
+
+        monitor.provider_selected("r1", "codex", "claude-sonnet-5", None);
+        assert_eq!(
+            monitor.gauge_reading().in_flight,
+            [InFlight {
+                provider: Some("codex".to_string()),
+                model: Some("claude-sonnet-5".to_string()),
+                requests: 1,
+            }]
+        );
+
+        monitor.model_resolved("r1", "gpt-6-sol");
+        assert_eq!(
+            monitor.gauge_reading().in_flight,
+            [InFlight {
+                provider: Some("codex".to_string()),
+                model: Some("gpt-6-sol".to_string()),
+                requests: 1,
+            }]
+        );
+        assert_eq!(
+            gauge_lines(&monitor, "ccmux_requests_in_flight"),
+            line_set(&["ccmux_requests_in_flight{provider=\"codex\",model=\"gpt-6-sol\"} 1"])
+        );
+
+        monitor.request_completed("r1", 200, Some(100), Some(10));
+        assert!(monitor.gauge_reading().in_flight.is_empty());
+        assert!(gauge_lines(&monitor, "ccmux_requests_in_flight").is_empty());
     }
 }
