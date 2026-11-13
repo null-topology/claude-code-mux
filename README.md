@@ -871,7 +871,7 @@ transcripts; only the terminal monitor does.
 | `ccmux_request_duration_seconds` | histogram | `provider`, `model`, `endpoint` | Time from a request's start to its end, as the monitor measures it. |
 | `ccmux_time_to_first_token_seconds` | histogram | `provider`, `model` | Time from a request's start until the monitor first saw its response generating. What marks that moment depends on the backend (see the limits below). |
 | `ccmux_request_prompt_tokens` | histogram | `provider`, `model` | Prompt size of each request whose prompt the backend measured; `_sum` is the measured prompt total. |
-| `ccmux_tokens_total` | counter | `provider`, `model`, `kind`, `quality` | Tokens per `kind`: `input` (uncached), `cache_read`, `cache_write`, `output`. `quality` is `exact` once the backend's own count arrived and `estimate` while only an estimate had. A count the backend never reported adds nothing and creates no series; a reported zero does create one. |
+| `ccmux_tokens_total` | counter | `provider`, `model`, `kind`, `quality` | Tokens per `kind`: `input` (uncached), `cache_read`, `cache_write`, `output`. `quality` is `exact` for a count set by a closing usage report and `estimate` for one known only from opening values, which is every count from Kimi, Grok and Cursor. A count the backend never reported adds nothing and creates no series; a reported zero does create one. |
 | `ccmux_cache_hit_basis_tokens_total` | counter | `provider`, `model`, `kind` | The `input`, `cache_read` and `cache_write` tokens of the requests that carried conversation history, the basis the monitor's hit % is read from. It is a part of `ccmux_tokens_total`; never add the two. |
 | `ccmux_cache_misses_total` | counter | `provider`, `model`, `cause` | Cache misses as the monitor judges them (see [Prompt cache](#prompt-cache)), by `cause`: `within_ttl`, `expired`, or `unknown_ttl` when the backend's cache lifetime is not known. |
 | `ccmux_context_rewrites_total` | counter | `provider`, `model` | Requests whose measured prompt is more than 1024 tokens below the previous request of the same conversation and model: a client rewrite such as compaction, clear or rewind. Side calls and a request that started before that previous one are not counted. A rewrite is not a cache miss. |
@@ -933,7 +933,8 @@ Tokens per model and kind over the last hour:
 sum by (provider, model, kind) (increase(ccmux_tokens_total[1h]))
 ```
 
-Cache hit ratio per model, the way the monitor computes its hit %:
+Cache hit ratio per model over the last hour, taken over the same basis the
+monitor's hit % uses:
 
 ```promql
 sum by (provider, model) (rate(ccmux_cache_hit_basis_tokens_total{kind="cache_read"}[1h]))
@@ -941,7 +942,8 @@ sum by (provider, model) (rate(ccmux_cache_hit_basis_tokens_total{kind="cache_re
 sum by (provider, model) (rate(ccmux_cache_hit_basis_tokens_total[1h]))
 ```
 
-95th percentile of request duration per model:
+95th percentile of request duration per model, for `endpoint="messages"` over
+a five minute rate window:
 
 ```promql
 histogram_quantile(0.95,
@@ -956,8 +958,9 @@ histogram_quantile(0.95,
   `ccmux_tokens_total` over `quality` gives the monitor's totals as they stood
   when each request ended. A late report can still complete a request's
   pending cache judgement, which then counts a miss or a rewrite as usual.
-- A Codex stream that failed or was abandoned exports the whole-prompt estimate
-  as `input` under `quality="estimate"`.
+- A Codex stream that failed or was abandoned before its closing counts
+  arrived exports the whole-prompt estimate as `input` under
+  `quality="estimate"`.
 - Time to first token differs by backend. Codex and Grok send a signal when
   generation starts. On the Claude route it is the first relayed stream chunk
   (`message_start`, before any token). Kimi and Cursor report progress only
@@ -973,8 +976,10 @@ histogram_quantile(0.95,
 - The format is chosen by a substring of `Accept`: q-values and versions are
   not read, so a client that lists OpenMetrics with `q=0` still gets it. Either
   format is valid for Prometheus and VictoriaMetrics.
-- As in the monitor, a non-streaming Claude answer over 4 MiB and a relay that
-  ends on an error chunk count as a request with no usage.
+- As in the monitor, a non-streaming Claude answer over 4 MiB counts as a
+  request with no usage, and so does one whose relay ends on an error chunk:
+  its usage is read only once the body ends. A streamed answer whose relay
+  ends that way keeps the usage it reported before the error chunk.
 
 ## HTTP API
 

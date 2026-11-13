@@ -929,10 +929,12 @@ labels are summed. The log event counter admits `MAX_LOG_EVENT_SERIES` (512)
 label sets, then counts under `service="other"`, `event="other"` with the
 line's own level.
 
-Plain mode keeps a monitor store for the metrics. `serve_listener`'s body is
-`serve_listener_with(listener, monitor, spawn_reader, shutdown)`, the only
-caller of `spawn_transcript_reader`, which it starts only when `spawn_reader`
-holds and a monitor exists. `serving_monitor(monitor, metrics_enabled)`
+Plain mode keeps a monitor store for the metrics. `serve_inner` calls
+`serve_listener_with(listener, monitor, spawn_reader, shutdown)` with the
+`spawn_reader` that `serving_monitor` returned, and `serve_listener` calls it
+with `true`. `serve_listener_with` is the only caller of
+`spawn_transcript_reader`, which it starts only when `spawn_reader` holds and
+a monitor exists. `serving_monitor(monitor, metrics_enabled)`
 returns a supplied monitor with the reader on, a fresh
 `MonitorHandle::default()` with the reader off when none was supplied and
 metrics are on, and no monitor when they are off. So the transcript reader
@@ -949,8 +951,12 @@ Tests of the process-wide counters use `metrics::scoped_process_for_tests()`
 (`#[cfg(test)]`, in `process.rs`, re-exported `pub(crate)`): until its guard
 drops, the calling thread counts into a fresh instance. Scopes nest, and the
 guard is not `Send`. Such a test runs the counted code on its own thread
-inside a scope and asserts exact counts; no test asserts on the real
-process-wide instance, which the whole test binary feeds.
+inside a scope and asserts exact counts; no unit test of the library asserts
+on the real process-wide instance, which the whole test binary feeds. The
+integration test `an_app_without_a_monitor_serves_process_metrics_only` in
+`tests/metrics.rs` does read the real instance: it logs through a logger whose
+service name no other test of that binary uses, so the series it reads is its
+own.
 
 ## What the Codex subscription actually meters
 

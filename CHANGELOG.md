@@ -8,7 +8,9 @@
   Codex window utilization and reset time, active and idle sessions, log
   events per service, level and message, the version and the process start
   time. A request is counted once, when it ends, so a usage report that
-  arrives later still corrects the monitor but does not move a metric. The
+  arrives later still corrects the monitor but does not move the request,
+  duration, prompt or token metrics; it can still complete a pending cache
+  judgement, which then counts a cache miss or a context rewrite. The
   answer is the Prometheus text format, or OpenMetrics when the `Accept`
   header asks for `application/openmetrics-text`. It shows provider and
   model names, counts, log event names and the Codex window utilization,
