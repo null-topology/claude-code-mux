@@ -677,6 +677,7 @@ async fn the_openai_compatible_route_keeps_its_own_body_limit() {
             responses_api: true,
             images_api: false,
             transcriptions_api: false,
+            metrics: false,
         },
     )
     .oneshot(
@@ -779,6 +780,7 @@ async fn image_routes_reject_variations_wrong_media_and_oversized_generation() {
         responses_api: false,
         images_api: true,
         transcriptions_api: false,
+        metrics: false,
     };
     let variation = app_with_features(Arc::new(Registry::with_default_alias()), None, features)
         .oneshot(
@@ -829,6 +831,7 @@ async fn monitor_tracks_image_endpoint_without_session_affinity() {
             responses_api: false,
             images_api: true,
             transcriptions_api: false,
+            metrics: false,
         },
     );
     let response = app
@@ -864,6 +867,7 @@ async fn image_edit_accepts_multipart_and_validates_fields() {
             responses_api: false,
             images_api: true,
             transcriptions_api: false,
+            metrics: false,
         },
     );
     let boundary = "ccp-image-test";
@@ -910,6 +914,7 @@ async fn image_routes_are_independently_opt_in() {
             responses_api: false,
             images_api: false,
             transcriptions_api: false,
+            metrics: false,
         },
     );
     let response = disabled
@@ -932,6 +937,7 @@ async fn image_routes_are_independently_opt_in() {
             responses_api: false,
             images_api: true,
             transcriptions_api: false,
+            metrics: false,
         },
     );
     let response = enabled
@@ -957,6 +963,7 @@ async fn transcription_route_is_independently_opt_in_and_validates_multipart() {
             responses_api: false,
             images_api: false,
             transcriptions_api: false,
+            metrics: false,
         },
     );
     let response = disabled
@@ -978,6 +985,7 @@ async fn transcription_route_is_independently_opt_in_and_validates_multipart() {
             responses_api: false,
             images_api: false,
             transcriptions_api: true,
+            metrics: false,
         },
     );
     let boundary = "ccp-transcription-test";
@@ -1017,6 +1025,7 @@ async fn transcription_route_rejects_non_audio_uploads() {
             responses_api: false,
             images_api: false,
             transcriptions_api: true,
+            metrics: false,
         },
     );
     let boundary = "ccp-transcription-type-test";
