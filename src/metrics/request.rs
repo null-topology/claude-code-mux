@@ -33,12 +33,16 @@ impl counter::Atomic<u64> for SaturatingU64 {
     }
 
     fn inc_by(&self, v: u64) -> u64 {
-        // The update never declines, so either arm holds the previous value.
-        match self
+        // `fetch_update` is deprecated in favour of `try_update`, which older
+        // stable toolchains do not have yet.
+        #[allow(deprecated)]
+        let updated = self
             .0
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(v))
-            }) {
+            });
+        // The update never declines, so either arm holds the previous value.
+        match updated {
             Ok(previous) | Err(previous) => previous,
         }
     }
