@@ -1,4 +1,4 @@
-## Unreleased
+## v0.20.0 (2026-11-13)
 
 - The proxy now serves Prometheus metrics at `GET /metrics`, on by default.
   They cover finished requests per provider, model and endpoint with their
