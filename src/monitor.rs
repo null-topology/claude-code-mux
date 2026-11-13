@@ -31,7 +31,9 @@ pub use usage::{
 };
 use usage::{ClosedFields, UsageDelta, apply_closing, apply_opening, quality_of};
 
-use crate::metrics::{Outcome, RequestMetrics, SettledRequest, SettledUsage, TokenCount};
+use crate::metrics::{
+    MissCause, Outcome, RequestMetrics, SettledRequest, SettledUsage, TokenCount,
+};
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
 pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
@@ -1734,7 +1736,7 @@ impl MonitorStore {
     /// The figures come from the ledger, so a request whose counts arrive after
     /// it left the recent list is still judged.
     fn evaluate_cache(&mut self, request_id: &str) {
-        let (key, prompt, cache, started_at, response_started_at, judge) = {
+        let (key, metric_label, prompt, cache, started_at, response_started_at, judge) = {
             let Some(record) = self.ledger.record(request_id) else {
                 return;
             };
@@ -1764,6 +1766,8 @@ impl MonitorStore {
                     provider,
                     model,
                 },
+                metric_model(record.effective_model.as_deref(), record.model.as_deref())
+                    .map(str::to_owned),
                 record.prompt_tokens().unwrap_or(0),
                 record.cache,
                 record.started_at,
@@ -1806,6 +1810,13 @@ impl MonitorStore {
             let ttl = lane.ttl.or(cache.ttl).or(default_cache_ttl(&key.provider));
             detect_cache_miss(lane.prompt_tokens, prompt, cache_read, gap, ttl)
         });
+        // A prompt that shrank past the noise floor was rewritten by the
+        // client; the lane only takes it as its new baseline.
+        let rewrite = !superseded
+            && !side
+            && previous.is_some_and(|lane| {
+                prompt.saturating_add(usage::CACHE_MISS_MIN_TOKENS) < lane.prompt_tokens
+            });
         if !superseded {
             let readable_from = response_started_at.unwrap_or_else(|| self.now());
             self.lanes.insert(
@@ -1852,6 +1863,18 @@ impl MonitorStore {
             if let Some(miss) = miss {
                 note_miss(stats, started_at, miss);
             }
+        }
+
+        if let Some(miss) = miss {
+            self.metrics.cache_miss(
+                Some(&key.provider),
+                metric_label.as_deref(),
+                miss_cause(miss.cause),
+            );
+        }
+        if rewrite {
+            self.metrics
+                .context_rewrite(Some(&key.provider), metric_label.as_deref());
         }
 
         self.ledger.note_cache_evaluation(request_id, miss);
@@ -2013,6 +2036,14 @@ fn order_conversations(conversations: Vec<ConversationSummary>) -> Vec<Conversat
 /// display, so it is read only while `effective_model` is unset.
 fn metric_model<'a>(effective_model: Option<&'a str>, model: Option<&'a str>) -> Option<&'a str> {
     effective_model.or(model)
+}
+
+fn miss_cause(cause: CacheMissCause) -> MissCause {
+    match cause {
+        CacheMissCause::Expired => MissCause::Expired,
+        CacheMissCause::WithinTtl => MissCause::WithinTtl,
+        CacheMissCause::UnknownTtl => MissCause::UnknownTtl,
+    }
 }
 
 /// The rows of every session the process has served, built from what the
@@ -6619,5 +6650,122 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             sample_value(&lines, "ccmux_request_duration_seconds_count{"),
             2.0
         );
+    }
+
+    /// A judged miss counts once, under the cause its lane evaluation gave
+    /// it and the model that ran.
+    #[test]
+    fn a_judged_miss_counts_once_under_its_cause() {
+        let monitor = MonitorHandle::new(10);
+        // Within the lifetime on a codex lane: nothing of the prefix came back.
+        start_codex_request(&monitor, "c1", "main");
+        monitor.usage_reported("c1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("c1", 200, None, None);
+        start_codex_request(&monitor, "c2", "main");
+        monitor.usage_reported("c2", closing_usage(31_000, 0, 0, 40));
+        monitor.request_completed("c2", 200, None, None);
+        // A second terminal event and a late report judge nothing again.
+        monitor.request_failed("c2", Some(502), "failed after it completed");
+        monitor.usage_reported("c2", closing_usage(31_000, 0, 0, 45));
+
+        // An expiry on an anthropic lane: idle longer than the reported lifetime.
+        start_anthropic_request(&monitor, "o1", "claude-opus-5");
+        monitor.model_resolved("o1", "claude-opus-5");
+        backdate(&monitor, "o1", Duration::from_secs(2 * 60 * 60));
+        monitor.usage_reported(
+            "o1",
+            UsageReport {
+                cache_ttl: Some(Duration::from_secs(60 * 60)),
+                ..closing_usage(2, 0, 40_000, 10)
+            },
+        );
+        monitor.request_completed("o1", 200, None, None);
+        start_anthropic_request(&monitor, "o2", "claude-opus-5");
+        monitor.model_resolved("o2", "claude-opus-5");
+        monitor.usage_reported("o2", closing_usage(3, 0, 40_100, 10));
+        monitor.request_completed("o2", 200, None, None);
+
+        let state = monitor.snapshot();
+        assert_eq!(
+            recent_by_id(&state, "c2").cache.miss.map(|miss| miss.cause),
+            Some(CacheMissCause::WithinTtl)
+        );
+        assert_eq!(
+            recent_by_id(&state, "o2").cache.miss.map(|miss| miss.cause),
+            Some(CacheMissCause::Expired)
+        );
+        assert_eq!(
+            lines_with_prefix(&request_lines(&monitor), "ccmux_cache_misses_total"),
+            line_set(&[
+                "ccmux_cache_misses_total{provider=\"anthropic\",model=\"claude-opus-5\",cause=\"expired\"} 1",
+                "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 1",
+            ])
+        );
+    }
+
+    /// A request whose closing report arrives after its terminal event is
+    /// judged then: the miss counts, and what settled stays as it was.
+    #[test]
+    fn a_miss_judged_by_a_late_report_counts_without_resettling() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+        // The live path hands the response on before the stream ends.
+        start_codex_request(&monitor, "r2", "main");
+        monitor.request_completed("r2", 200, None, None);
+        let before = request_lines(&monitor);
+        assert_eq!(sample_value(&before, "ccmux_requests_total{"), 2.0);
+        assert!(lines_with_prefix(&before, "ccmux_cache_misses_total").is_empty());
+
+        monitor.usage_reported("r2", closing_usage(31_000, 0, 0, 40));
+        assert!(recent_by_id(&monitor.snapshot(), "r2").cache.miss.is_some());
+        let mut expected = before;
+        expected.insert(
+            "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 1"
+                .to_owned(),
+        );
+        assert_eq!(request_lines(&monitor), expected);
+    }
+
+    /// A prompt that shrank past the noise floor was rewritten by the client:
+    /// it counts as a rewrite and never also as a miss.
+    #[test]
+    fn a_shrunken_prompt_counts_as_a_rewrite_not_a_miss() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+        // 1025 tokens fewer, and nothing of it cached.
+        start_codex_request(&monitor, "r2", "main");
+        monitor.usage_reported("r2", closing_usage(28_975, 0, 0, 40));
+        monitor.request_completed("r2", 200, None, None);
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_context_rewrites_total"),
+            line_set(&["ccmux_context_rewrites_total{provider=\"codex\",model=\"gpt-5.6-sol\"} 1"])
+        );
+        assert!(lines_with_prefix(&lines, "ccmux_cache_misses_total").is_empty());
+    }
+
+    /// A prompt that shrank by no more than the noise floor is the same
+    /// conversation going on; served from the cache, it is neither a rewrite
+    /// nor a miss.
+    #[test]
+    fn a_prompt_within_the_noise_floor_is_neither() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+        // Exactly 1024 tokens fewer.
+        start_codex_request(&monitor, "r2", "main");
+        monitor.usage_reported("r2", closing_usage(976, 28_000, 0, 40));
+        monitor.request_completed("r2", 200, None, None);
+
+        let lines = request_lines(&monitor);
+        assert_eq!(sample_value(&lines, "ccmux_requests_total{"), 2.0);
+        assert!(lines_with_prefix(&lines, "ccmux_context_rewrites_total").is_empty());
+        assert!(lines_with_prefix(&lines, "ccmux_cache_misses_total").is_empty());
     }
 }
