@@ -835,6 +835,156 @@ conversation:
 Switching a conversation to another model is not labeled as a miss. The new
 model starts its own cache, so its first request processes the whole context.
 
+## Metrics
+
+`GET /metrics` serves the proxy's figures for Prometheus or any scraper that
+reads its formats. It is on by default. `CCP_METRICS=off`, or `"metrics": false`
+in `config.json`, removes the route, which then answers 404 like any other
+unknown path. The setting is read at startup, so a change needs a restart.
+
+The format follows the request's `Accept` header. When it contains
+`application/openmetrics-text` (in any letter case, on any of its lines; a line
+holding a byte other than printable ASCII or a tab is skipped), the answer is
+OpenMetrics text ending in `# EOF`, with
+`Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8`.
+Anything else, no header included, gets the Prometheus text format 0.0.4 with
+`Content-Type: text/plain; version=0.0.4; charset=utf-8`. Sample names are the
+same in both, and so is every label set except a histogram bucket's. The
+`# HELP` and `# TYPE` lines, the spelling of the bucket label (`le="1.0"` in
+OpenMetrics, `le="1"` in text), where `le` sits among the labels and the order
+of a histogram's lines differ, so keep a scraper on one format.
+
+The monitor's store feeds the request metrics, so with metrics on, plain mode
+(`--no-monitor`, or stdout that is not a terminal) keeps the same memory the
+monitor does: the recent request list, the ledger of the sessions still in use
+and a session title seen on the wire. The ledger holds one small numeric record
+per request for as long as its session is kept: a session with nothing in
+flight is dropped with its records once it has had no activity for 24 hours,
+at the next request or scrape. Requests without a session id form one session.
+The Anthropic relay then observes each
+relayed body for usage, parsing the SSE it relays and holding a non-streaming
+JSON answer of up to 4 MiB. The bytes the client receives do not change, and
+none of that data is shown on `/metrics`. Plain mode reads no session
+transcripts; only the terminal monitor does.
+
+### What it exports
+
+| metric | type | labels | what it counts |
+| --- | --- | --- | --- |
+| `ccmux_requests_total` | counter | `provider`, `model`, `endpoint`, `outcome`, `status` | Requests that ended. `outcome` is `completed`, `failed` or `abandoned` (the response was dropped before it finished, for example when the client disconnected). `status` is the HTTP status, else `none`; an abandoned request has `status="none"`, and a stream that failed after its 200 status line left is `outcome="failed"` with `status="200"`. |
+| `ccmux_requests_in_flight` | gauge | `provider`, `model` | Requests started and not yet ended. No sample while nothing is in flight. |
+| `ccmux_request_duration_seconds` | histogram | `provider`, `model`, `endpoint` | Time from a request's start to its end, as the monitor measures it. |
+| `ccmux_time_to_first_token_seconds` | histogram | `provider`, `model` | Time from a request's start until the monitor first saw its response generating. What marks that moment depends on the backend (see the limits below). |
+| `ccmux_request_prompt_tokens` | histogram | `provider`, `model` | Prompt size of each request whose prompt the backend measured; `_sum` is the measured prompt total. |
+| `ccmux_tokens_total` | counter | `provider`, `model`, `kind`, `quality` | Tokens per `kind`: `input` (uncached), `cache_read`, `cache_write`, `output`. `quality` is `exact` when the backend's final count had arrived by the time the request ended and `estimate` when only a provisional count had, which is every count from Kimi, Grok and Cursor. A count the backend never reported adds nothing and creates no series; a reported zero does create one. |
+| `ccmux_cache_hit_basis_tokens_total` | counter | `provider`, `model`, `kind` | The `input`, `cache_read` and `cache_write` tokens of the requests that carried conversation history, the basis the monitor's hit % is read from. It is a part of `ccmux_tokens_total`; never add the two. |
+| `ccmux_cache_misses_total` | counter | `provider`, `model`, `cause` | Cache misses as the monitor judges them (see [Prompt cache](#prompt-cache)), by `cause`: `within_ttl`, `expired`, or `unknown_ttl` when the backend's cache lifetime is not known. |
+| `ccmux_context_rewrites_total` | counter | `provider`, `model` | Requests whose measured prompt is more than 1024 tokens below the previous request of the same conversation and model: a client rewrite such as compaction, clear or rewind. Side calls and a request that started before that previous one are not counted. A rewrite is not a cache miss. |
+| `ccmux_codex_refusals_total` | counter | `class` | Codex refusals the proxy answered to `/v1/messages` requests served by Codex, once per answer to the client, by `class`: `usage_limit` (a spent window), `quota_exceeded`, `usage_not_included`, `rejected`, `context_overflow`, `throttled`, `overloaded`, `model_not_found`, `permission_denied`. A refusal that arrives after output started counts too. An unclassified 429 or 5xx is not counted here; it shows in `ccmux_requests_total`. |
+| `ccmux_codex_window_used_ratio` | gauge | `window` | Utilization of the held Codex allowance window, `5h` or `7d`, as a fraction; it can pass 1.0. No sample until Codex has reported a reading, and none for a window whose reset has passed. No account id is exported. |
+| `ccmux_codex_window_reset_timestamp_seconds` | gauge | `window` | When that window resets, in Unix seconds. |
+| `ccmux_sessions` | gauge | `state` | Sessions the monitor holds: `active` (shown) and `idle` (hidden after an hour with nothing in flight and no activity). Both states are present whenever the gauge is. |
+| `ccmux_sessions_started_total` | counter | none | Sessions started since the process began. A session dropped after a day idle and started again under the same id counts again. |
+| `ccmux_log_events_total` | counter | `service`, `level`, `event` | Log events per logger `service`, `level` (`debug`, `info`, `warn`, `error`) and `event`, which is the log message, a fixed text at every call site. No log field is exported. |
+| `ccmux_build_info` | info | `version` | Always 1; `version` is the proxy's version. |
+| `ccmux_process_start_time_seconds` | gauge | none | When the process started serving, in Unix seconds. |
+
+`provider` is the backend the request was routed to (`anthropic`, `codex`,
+`kimi`, `grok`, `cursor`, or `local` for an answer the proxy made itself), else
+`unknown`. `model` is the model the request was sent upstream as, when known,
+else the model it was routed to, else `unknown`. `endpoint` is one of `messages`, `count_tokens`,
+`responses`, `chat_completions`, `images`, `transcriptions`. A `count_tokens`
+request and a `local` answer count in `ccmux_requests_total` and
+`ccmux_request_duration_seconds` but add no tokens and no prompt size.
+
+Histogram buckets, upper bounds in seconds for the two durations and in tokens
+for the prompt (`+Inf` is added):
+
+- `ccmux_request_duration_seconds`: 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60,
+  120, 300, 600, 1200, 1800.
+- `ccmux_time_to_first_token_seconds`: 0.25, 0.5, 1, 2, 4, 8, 15, 30, 60, 120,
+  300.
+- `ccmux_request_prompt_tokens`: 1000, 2000, 5000, 10000, 20000, 50000, 100000,
+  150000, 200000, 300000, 500000, 750000, 1000000.
+
+A metric with no sample is left out of the answer, and a gauge with nothing to
+report emits no sample rather than a zero.
+
+**Series limits.** The per-model metrics share one set of (provider, model)
+pairs. A provider or model value longer than 120 bytes, or a new pair once 200
+pairs exist, is counted under `provider="other"`, `model="other"`. Past 512
+label sets, a new log event is counted under `service="other"`,
+`event="other"` with its own level.
+
+**What it exposes.** `/metrics` shows provider and model names, counts, the
+names of log events and the Codex window utilization. It shows no session id,
+project, title, account id, request id, prompt, error text or log field. The
+proxy binds `127.0.0.1` by default and has no inbound authentication on any
+route, so a wider bind address exposes `/metrics` with the rest.
+`CCP_METRICS=off` removes the route.
+
+### Scraping it
+
+```yaml
+scrape_configs:
+  - job_name: claude-code-mux
+    static_configs:
+      - targets: ["127.0.0.1:18765"]
+```
+
+Tokens per model and kind over the last hour:
+
+```promql
+sum by (provider, model, kind) (increase(ccmux_tokens_total[1h]))
+```
+
+Cache hit ratio per model over the last hour, taken over the same basis the
+monitor's hit % uses:
+
+```promql
+sum by (provider, model) (rate(ccmux_cache_hit_basis_tokens_total{kind="cache_read"}[1h]))
+  /
+sum by (provider, model) (rate(ccmux_cache_hit_basis_tokens_total[1h]))
+```
+
+95th percentile of request duration per model, for `endpoint="messages"` over
+a five minute rate window:
+
+```promql
+histogram_quantile(0.95,
+  sum by (le, provider, model) (rate(ccmux_request_duration_seconds_bucket{endpoint="messages"}[5m])))
+```
+
+### Limits
+
+- A request's figures are fixed when it ends. A usage report that arrives
+  later corrects the monitor and changes none of the request, duration, prompt
+  or token metrics, and there is no counter of late reports. Summing
+  `ccmux_tokens_total` over `quality` can therefore differ from the monitor's
+  totals, which take those late corrections. A late report can still complete a request's
+  pending cache judgement, which then counts a miss or a rewrite as usual.
+- A Codex stream that ended holding only the whole-prompt estimate exports it
+  as `input` under `quality="estimate"`.
+- Time to first token differs by backend. Codex and Grok send a signal when
+  generation starts. On the Claude route it is the first relayed stream chunk
+  (`message_start`, before any token). Kimi and Cursor report progress only
+  after the whole upstream answer was read, so their value is close to the full
+  duration, and a Cursor tool-bridge answer made locally shows near zero. A
+  request with neither signal is not observed.
+- `ccmux_request_prompt_tokens` leaves out requests whose prompt was not
+  measured, which includes every request of a backend that never reports
+  closing counts.
+- `ccmux_codex_refusals_total` covers `/v1/messages` requests served by Codex
+  only, not the OpenAI-compatible surfaces.
+- Requests without a session id count as one session.
+- The format is chosen by a substring of `Accept`: q-values and versions are
+  not read, so a client that lists OpenMetrics with `q=0` still gets it. Either
+  format is valid for Prometheus and VictoriaMetrics.
+- As in the monitor, a non-streaming Claude answer over 4 MiB counts as a
+  request with no usage, and so does one whose relay ends on an error chunk:
+  its usage is read only once the body ends. A streamed answer whose relay
+  ends that way keeps the usage it reported before the error chunk.
+
 ## HTTP API
 
 The proxy speaks the Anthropic Messages API. These routes are always served:
@@ -856,6 +1006,10 @@ Grok or Cursor id works on them too:
 | `POST /v1/responses`, `POST /v1/chat/completions` | `CCP_CODEX_RESPONSES_API=1` |
 | `POST /v1/images/generations`, `POST /v1/images/edits` | `CCP_CODEX_IMAGES_API=1` |
 | `POST /v1/audio/transcriptions` | `CCP_CODEX_TRANSCRIPTIONS_API=1` |
+| `GET /metrics` | on by default; `CCP_METRICS=off` removes it |
+
+`GET /metrics` is not an OpenAI-compatible surface: it is the Prometheus
+endpoint described in [Metrics](#metrics), served unless it is switched off.
 
 Any other path answers 404 with an Anthropic-shaped `not_found` error.
 
@@ -1024,6 +1178,7 @@ This is the complete list of variables the proxy reads.
 | --- | --- | --- |
 | `PORT` | `18765` | Listening port. `claude-code-mux serve --port N` overrides it. |
 | `CCP_BIND_ADDRESS` | `127.0.0.1` | Listening address. |
+| `CCP_METRICS` | `true` | Serve Prometheus metrics at `GET /metrics` (see [Metrics](#metrics)). `1`, `true`, `yes` and `on` turn it on, `0`, `false`, `no` and `off` turn it off; the value is trimmed and case-insensitive. Any other value, the empty one included, is skipped and logged as a `config summary` warning, and the next source decides: `metrics` in `config.json`, then the default. Read at startup, so a change needs a restart. With it on, plain mode also keeps the monitor's memory, which the metrics are read from. |
 | `CCP_CONFIG_DIR` | per platform | Move the config directory. It does **not** move the state directory. |
 | `CLAUDE_CONFIG_DIR` | `$HOME/.claude` | Claude Code's own configuration directory, read the way Claude Code reads it. The monitor looks for session transcripts under its `projects` directory to name sessions. Separate from `CCP_CONFIG_DIR`. |
 | `CCP_ALIAS_PROVIDER` | `anthropic` | Backend for the Claude aliases: `anthropic`, `codex` or `kimi`. Leave it alone unless you want `opus` to stop meaning Claude. |
@@ -1127,7 +1282,7 @@ the default. Twelve variables have no key in the file and are environment-only:
 
 | object | keys |
 | --- | --- |
-| top level | `bindAddress`, `port`, `aliasProvider`, `autoReviewModel`, `agentSummary` |
+| top level | `bindAddress`, `port`, `aliasProvider`, `autoReviewModel`, `agentSummary`, `metrics` |
 | `log` | `verbose`, `stderr` |
 | `codex` | `baseUrl`, `originator`, `userAgent`, `clientVersion`, `previousResponseId`, `lanePolicy`, `fullLane` (legacy), `serverCompaction`, `responsesApi`, `imagesApi`, `imagesBaseUrl`, `transcriptionsApi`, `serviceTier`, `serviceTierByModel`, `reasoningSummary`, `effort`, `model`, `transport` |
 | `kimi` | `baseUrl`, `oauthHost`, `userAgent` |
@@ -1386,6 +1541,12 @@ seconds, each from where the previous read stopped, to name sessions. It keeps
 only the titles and its read offsets, never modifies the files, sends nothing
 from them upstream and writes no name to `proxy.log`. A traffic capture can
 still contain a title, as part of a recorded title reply.
+
+`/metrics`, on by default, shows provider and model names, counts, the names of
+log events and the Codex window utilization, and no session id, project,
+title, account id, request id, prompt, error text or log field. No route has
+inbound authentication, so binding wider than `127.0.0.1` exposes `/metrics`
+with the rest; `CCP_METRICS=off` removes it.
 
 ## Limitations
 

@@ -46,6 +46,8 @@ struct FileConfig {
     pub auto_review_model: Option<String>,
     #[serde(rename = "agentSummary")]
     pub agent_summary: Option<String>,
+    #[serde(rename = "metrics")]
+    pub metrics: Option<bool>,
     pub log: Option<FileLog>,
     pub kimi: Option<KimiConfig>,
     pub codex: Option<CodexConfig>,
@@ -437,6 +439,12 @@ pub fn config_override_summary(cfg: &LoadedConfig) -> Vec<ConfigSummaryLine> {
     {
         out.push(ConfigSummaryLine::set("CCP_AUTO_REVIEW_MODEL (env)"));
     }
+    if let Some(raw) = env.get("CCP_METRICS") {
+        out.push(match parse_metrics(raw) {
+            Some(_) => ConfigSummaryLine::set("metrics (env)"),
+            None => ConfigSummaryLine::ignored("CCP_METRICS (env): invalid boolean; ignored"),
+        });
+    }
     for name in non_unicode_env_names() {
         out.push(ConfigSummaryLine::ignored(&format!(
             "{name} (env): not valid Unicode; ignored"
@@ -457,6 +465,9 @@ pub fn config_override_summary(cfg: &LoadedConfig) -> Vec<ConfigSummaryLine> {
             .is_some_and(|model| !model.is_empty())
         {
             out.push(ConfigSummaryLine::set("autoReviewModel (config)"));
+        }
+        if file_cfg.metrics == Some(false) {
+            out.push(ConfigSummaryLine::set_to("metrics", false));
         }
         if let Some(log) = file_cfg.log {
             if let Some(v) = log.verbose {
@@ -1187,6 +1198,29 @@ pub fn auto_review_model() -> Option<String> {
         .filter(|model| !model.is_empty())
 }
 
+/// `1`, `true`, `yes`, `on` or `0`, `false`, `no`, `off`, trimmed and
+/// case-insensitive. Anything else, the empty string included, is skipped.
+fn parse_metrics(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether the `/metrics` route is served. `CCP_METRICS`, then `metrics` in
+/// `config.json`, else on. An unusable env value is skipped and reported by
+/// [`config_override_summary_lines`].
+pub fn metrics_enabled() -> bool {
+    let env = env_vars();
+    if let Some(enabled) = env.get("CCP_METRICS").and_then(|raw| parse_metrics(raw)) {
+        return enabled;
+    }
+    read_file_config(&paths::config_dir())
+        .and_then(|file| file.metrics)
+        .unwrap_or(true)
+}
+
 // ---------------------------------------------------------------------------
 // Codex transport config
 // ---------------------------------------------------------------------------
@@ -1328,6 +1362,7 @@ mod tests {
         "CCP_AUTO_REVIEW_MODEL",
         "CCP_AGENT_SUMMARY",
         "CCP_CODEX_SERVICE_TIER",
+        "CCP_METRICS",
     ];
 
     struct ClearedEnv {
@@ -2263,6 +2298,194 @@ mod tests {
             assert!(
                 lines.iter().any(|line| line == expected),
                 "missing {expected:?} in {lines:?}"
+            );
+        }
+    }
+
+    /// The summary lines that speak about the metrics setting.
+    fn metrics_summary_lines() -> Vec<ConfigSummaryLine> {
+        config_override_summary(&load_config())
+            .into_iter()
+            .filter(|line| {
+                line.text.contains("metrics")
+                    || line.text.contains("METRICS")
+                    || line.logged.contains("metrics")
+                    || line.logged.contains("METRICS")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn metrics_are_on_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(metrics_enabled());
+        assert_eq!(metrics_summary_lines(), Vec::<ConfigSummaryLine>::new());
+
+        // A file without the key leaves the default in place.
+        write_config(&config, r#"{"port":18999}"#);
+        assert!(metrics_enabled());
+        assert_eq!(metrics_summary_lines(), Vec::<ConfigSummaryLine>::new());
+    }
+
+    #[test]
+    fn the_metrics_env_accepts_each_spelling() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        for (raw, expected) in [
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("on", true),
+            ("TRUE", true),
+            (" On ", true),
+            ("\tYes\n", true),
+            ("0", false),
+            ("false", false),
+            ("no", false),
+            ("off", false),
+            ("FALSE", false),
+            (" Off ", false),
+            ("\tNO\n", false),
+        ] {
+            let _metrics_env = EnvGuard::set("CCP_METRICS", raw);
+            assert_eq!(metrics_enabled(), expected, "value {raw:?}");
+            assert_eq!(
+                metrics_summary_lines(),
+                [ConfigSummaryLine::set("metrics (env)")],
+                "value {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unusable_metrics_env_is_skipped_and_reported_without_its_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        let rejected = ["", "   ", "maybe", "2", "enable", "onn", "perhaps"];
+        for raw in rejected {
+            let _metrics_env = EnvGuard::set("CCP_METRICS", raw);
+            // Skipped, so the default stands.
+            assert!(metrics_enabled(), "value {raw:?}");
+            assert_eq!(
+                metrics_summary_lines(),
+                [ConfigSummaryLine::ignored(
+                    "CCP_METRICS (env): invalid boolean; ignored"
+                )],
+                "value {raw:?}"
+            );
+            if !raw.trim().is_empty() {
+                for line in config_override_summary(&load_config()) {
+                    assert!(
+                        !line.text.contains(raw) && !line.logged.contains(raw),
+                        "value {raw:?} leaked into {line:?}"
+                    );
+                }
+            }
+        }
+
+        // The next source applies: the file decides.
+        write_config(&config, r#"{"metrics":false}"#);
+        for raw in rejected {
+            let _metrics_env = EnvGuard::set("CCP_METRICS", raw);
+            assert!(!metrics_enabled(), "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn the_metrics_env_wins_over_the_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        write_config(&config, r#"{"metrics":false}"#);
+        assert!(!metrics_enabled());
+        {
+            let _metrics_env = EnvGuard::set("CCP_METRICS", "on");
+            assert!(metrics_enabled());
+            let lines = config_override_summary_lines(&load_config());
+            assert!(
+                lines.iter().any(|line| line == "metrics (env)"),
+                "{lines:?}"
+            );
+        }
+
+        write_config(&config, r#"{"metrics":true}"#);
+        assert!(metrics_enabled());
+        let _metrics_env = EnvGuard::set("CCP_METRICS", "off");
+        assert!(!metrics_enabled());
+    }
+
+    #[test]
+    fn the_file_can_turn_metrics_off() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        assert!(metrics_enabled());
+        write_config(&config, r#"{"metrics":false}"#);
+        assert!(!metrics_enabled());
+
+        let lines = metrics_summary_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].text, "metrics: false");
+        assert_eq!(lines[0].logged, "metrics (config)");
+        assert!(!lines[0].ignored, "{lines:?}");
+    }
+
+    #[test]
+    fn a_file_true_adds_no_summary_line() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        write_config(&config, r#"{"metrics":true}"#);
+        assert!(metrics_enabled());
+        assert_eq!(metrics_summary_lines(), Vec::<ConfigSummaryLine>::new());
+    }
+
+    #[test]
+    fn a_metrics_key_of_another_type_fails_the_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _cleared = clear_env();
+        let config = tempfile::TempDir::new().unwrap();
+        let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+
+        for raw in [
+            r#""off""#,
+            r#""false""#,
+            "0",
+            "[false]",
+            r#"{"enabled":false}"#,
+        ] {
+            write_config(
+                &config,
+                &format!(r#"{{"metrics":{raw},"bindAddress":"127.0.0.9"}}"#),
+            );
+            // The whole file is dropped: neither key applies.
+            assert_eq!(load_config().bind_address, "127.0.0.1", "value {raw}");
+            let lines = config_override_summary_lines(&load_config());
+            assert!(
+                !lines.iter().any(|line| line.contains("bindAddress")),
+                "value {raw}: {lines:?}"
+            );
+            assert!(metrics_enabled(), "value {raw}");
+            assert_eq!(
+                metrics_summary_lines(),
+                Vec::<ConfigSummaryLine>::new(),
+                "value {raw}"
             );
         }
     }

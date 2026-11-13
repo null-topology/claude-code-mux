@@ -268,7 +268,24 @@ async fn serve_inner(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let listener = bind_proxy_listener(&config.bind_address, config.port).await?;
-    serve_listener(listener, config.monitor, shutdown).await
+    let (monitor, spawn_reader) = serving_monitor(config.monitor, crate::config::metrics_enabled());
+    serve_listener_with(listener, monitor, spawn_reader, shutdown).await
+}
+
+/// The monitor store a server keeps and whether it runs the transcript
+/// reader. A supplied monitor is served as itself with its reader. Without
+/// one, metrics on keeps a store of its own so `/metrics` has request
+/// figures, with no reader, since nothing displays session names; metrics
+/// off keeps none.
+fn serving_monitor(
+    monitor: Option<MonitorHandle>,
+    metrics_enabled: bool,
+) -> (Option<MonitorHandle>, bool) {
+    match monitor {
+        Some(monitor) => (Some(monitor), true),
+        None if metrics_enabled => (Some(MonitorHandle::default()), false),
+        None => (None, false),
+    }
 }
 
 pub async fn bind_proxy_listener(bind_address: &str, port: u16) -> anyhow::Result<TcpListener> {
@@ -286,6 +303,19 @@ pub async fn serve_listener(
     monitor: Option<MonitorHandle>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    serve_listener_with(listener, monitor, true, shutdown).await
+}
+
+/// Serves on `listener` until `shutdown`. The transcript reader runs only
+/// when `spawn_reader` holds and there is a monitor; this is its only
+/// caller.
+async fn serve_listener_with(
+    listener: TcpListener,
+    monitor: Option<MonitorHandle>,
+    spawn_reader: bool,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    crate::metrics::mark_process_start();
     let local_addr = listener.local_addr()?;
     let port = local_addr.port();
     create_logger("server").info(
@@ -306,7 +336,7 @@ pub async fn serve_listener(
             ),
         ])),
     );
-    if let Some(monitor) = monitor.as_ref() {
+    if spawn_reader && let Some(monitor) = monitor.as_ref() {
         crate::monitor::spawn_transcript_reader(monitor.clone());
     }
     let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
@@ -324,6 +354,7 @@ pub fn app(registry: Arc<Registry>) -> Router {
             responses_api: crate::config::codex_responses_api(),
             images_api: crate::config::codex_images_api(),
             transcriptions_api: crate::config::codex_transcriptions_api(),
+            metrics: crate::config::metrics_enabled(),
         },
     )
 }
@@ -336,6 +367,7 @@ pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>)
             responses_api: crate::config::codex_responses_api(),
             images_api: crate::config::codex_images_api(),
             transcriptions_api: crate::config::codex_transcriptions_api(),
+            metrics: crate::config::metrics_enabled(),
         },
     )
 }
@@ -345,6 +377,8 @@ pub struct AppFeatures {
     pub responses_api: bool,
     pub images_api: bool,
     pub transcriptions_api: bool,
+    /// Serves `GET /metrics`.
+    pub metrics: bool,
 }
 
 pub fn app_with_options(
@@ -359,6 +393,7 @@ pub fn app_with_options(
             responses_api,
             images_api: false,
             transcriptions_api: false,
+            metrics: false,
         },
     )
 }
@@ -440,6 +475,11 @@ pub fn app_with_features(
     } else {
         router
     };
+    let router = if features.metrics {
+        router.route("/metrics", get(handler_metrics))
+    } else {
+        router
+    };
     router.fallback(fallback_handler).with_state(state)
 }
 
@@ -455,6 +495,44 @@ struct AppState {
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
+}
+
+/// The Prometheus exposition of the proxy, OpenMetrics when the `Accept`
+/// header names it. Every `Accept` field line is read, as several lines mean
+/// the same as their comma-joined value; a line that is not valid text is
+/// skipped. A scrape is not a proxied request: it carries no
+/// `request-id` and publishes nothing to the monitor. Every input is read
+/// into an owned value before encoding starts, so the monitor's store lock
+/// and the lock of the Codex reading are released by then; encoding takes
+/// only the metric families' own locks.
+async fn handler_metrics(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
+    let format = headers
+        .get_all(http::header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(|accept| crate::metrics::format_for_accept(Some(accept)))
+        .find(|format| *format == crate::metrics::Format::OpenMetrics)
+        .unwrap_or_else(|| crate::metrics::format_for_accept(None));
+    let requests = state.monitor.as_ref().map(MonitorHandle::request_metrics);
+    let gauges = state.monitor.as_ref().map(MonitorHandle::gauge_reading);
+    let codex_windows = crate::providers::codex::metrics_windows();
+    let process = crate::metrics::process();
+    let body = crate::metrics::render(
+        &crate::metrics::RenderInput {
+            requests: requests.as_ref(),
+            gauges: gauges.as_ref(),
+            codex_windows: codex_windows.as_ref(),
+            process: Some(&process),
+        },
+        format,
+    );
+    axum::response::IntoResponse::into_response((
+        [(
+            http::header::CONTENT_TYPE,
+            crate::metrics::content_type(format),
+        )],
+        body,
+    ))
 }
 
 /// Largest `limit` the Anthropic Models API accepts.
@@ -3319,5 +3397,44 @@ mod auto_review_tests {
             apply_auto_review_model(&mut classifier, true, Some("grok-4.5"), "codex").is_none()
         );
         assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-sol"));
+    }
+}
+
+#[cfg(test)]
+mod serving_monitor_tests {
+    use super::serving_monitor;
+    use crate::monitor::{EndpointKind, MonitorEvent, MonitorHandle};
+
+    #[test]
+    fn serving_monitor_decides_the_store_and_the_reader() {
+        // No monitor: the setting alone decides whether plain mode keeps a
+        // store, and it never runs the transcript reader.
+        let (store, reader) = serving_monitor(None, true);
+        let store = store.expect("metrics on keeps a store");
+        assert!(store.snapshot().active.is_empty());
+        assert!(store.snapshot().recent.is_empty());
+        assert!(!reader);
+
+        let (store, reader) = serving_monitor(None, false);
+        assert!(store.is_none());
+        assert!(!reader);
+
+        // A supplied monitor is served as itself, with its reader, whatever
+        // the setting: what one handle records the other reads.
+        for metrics_enabled in [true, false] {
+            let supplied = MonitorHandle::default();
+            let (store, reader) = serving_monitor(Some(supplied.clone()), metrics_enabled);
+            let store = store.expect("a supplied monitor is kept");
+            supplied.publish(MonitorEvent::RequestStarted {
+                request_id: "req-serving-monitor".to_string(),
+                session_id: None,
+                session_seq: None,
+                endpoint: EndpointKind::Messages,
+            });
+            let active = store.snapshot().active;
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].request_id, "req-serving-monitor");
+            assert!(reader);
+        }
     }
 }

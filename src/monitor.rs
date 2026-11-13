@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
@@ -30,6 +30,11 @@ pub use usage::{
     usage_report_from_anthropic_body, usage_report_from_anthropic_sse,
 };
 use usage::{ClosedFields, UsageDelta, apply_closing, apply_opening, quality_of};
+
+use crate::metrics::{
+    GaugeReading, InFlight, MissCause, Outcome, RequestMetrics, SettledRequest, SettledUsage,
+    TokenCount,
+};
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
 pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
@@ -816,6 +821,9 @@ struct MonitorStore {
     ledger: Ledger,
     lanes: HashMap<LaneKey, LaneState>,
     recent_limit: usize,
+    /// The request families the store feeds as requests settle; the handle
+    /// holds the same families for rendering.
+    metrics: RequestMetrics,
     /// How far a test moved the store's clock on, to reach an idle session's
     /// limits without waiting for them.
     #[cfg(test)]
@@ -967,6 +975,7 @@ impl UsageTarget<'_> {
 #[derive(Debug, Clone)]
 pub struct MonitorHandle {
     store: Arc<Mutex<MonitorStore>>,
+    metrics: RequestMetrics,
 }
 
 impl Default for MonitorHandle {
@@ -977,6 +986,7 @@ impl Default for MonitorHandle {
 
 impl MonitorHandle {
     pub fn new(recent_limit: usize) -> Self {
+        let metrics = RequestMetrics::new();
         Self {
             store: Arc::new(Mutex::new(MonitorStore {
                 started_at: SystemTime::now(),
@@ -985,9 +995,37 @@ impl MonitorHandle {
                 ledger: Ledger::default(),
                 lanes: HashMap::new(),
                 recent_limit,
+                metrics: metrics.clone(),
                 #[cfg(test)]
                 clock_offset: Duration::ZERO,
             })),
+            metrics,
+        }
+    }
+
+    /// The request families this monitor feeds, for rendering. A clone shares
+    /// the counters, so it reads what the store has added since.
+    pub fn request_metrics(&self) -> RequestMetrics {
+        self.metrics.clone()
+    }
+
+    /// The session and in-flight gauges, read under one lock. Sessions idle
+    /// past their limit are dropped first, as [`Self::snapshot`] drops them, so
+    /// both count the same sessions.
+    pub fn gauge_reading(&self) -> GaugeReading {
+        match self.store.lock() {
+            Ok(mut store) => {
+                let now = store.now();
+                store.drop_idle_sessions(now);
+                store.gauge_reading(now)
+            }
+            // A panic while the store was held may have left it half updated,
+            // so nothing is walked. The started count is a counter and must not
+            // fall back to zero; it is a plain read.
+            Err(poisoned) => GaugeReading {
+                sessions_started: poisoned.into_inner().ledger.sessions_started(),
+                ..GaugeReading::default()
+            },
         }
     }
 
@@ -1428,6 +1466,7 @@ impl MonitorStore {
             } => {
                 self.finish(
                     &request_id,
+                    Outcome::Completed,
                     RequestStatus::Completed,
                     Some(http_status),
                     input_tokens,
@@ -1442,6 +1481,7 @@ impl MonitorStore {
             } => {
                 self.finish(
                     &request_id,
+                    Outcome::Failed,
                     RequestStatus::Failed,
                     http_status,
                     None,
@@ -1452,6 +1492,7 @@ impl MonitorStore {
             MonitorEvent::RequestAbandoned { request_id, error } => {
                 self.finish_active(
                     &request_id,
+                    Outcome::Abandoned,
                     RequestStatus::Failed,
                     None,
                     None,
@@ -1462,9 +1503,11 @@ impl MonitorStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_active(
         &mut self,
         request_id: &str,
+        outcome: Outcome,
         status: RequestStatus,
         http_status: Option<u16>,
         input_tokens: Option<u64>,
@@ -1474,6 +1517,7 @@ impl MonitorStore {
         if self.active.contains_key(request_id) {
             self.finish(
                 request_id,
+                outcome,
                 status,
                 http_status,
                 input_tokens,
@@ -1483,9 +1527,14 @@ impl MonitorStore {
         }
     }
 
+    /// Apply a terminal event. `outcome` is what the metrics export for it;
+    /// the ledger keeps `status`, which does not tell an abandoned request
+    /// from a failed one.
+    #[allow(clippy::too_many_arguments)]
     fn finish(
         &mut self,
         request_id: &str,
+        outcome: Outcome,
         status: RequestStatus,
         http_status: Option<u16>,
         input_tokens: Option<u64>,
@@ -1534,6 +1583,7 @@ impl MonitorStore {
                 traffic_capture_path: None,
             });
         let numbers = self.ledger.numbers(request_id);
+        let latency = active.started_instant.elapsed();
         let completed = CompletedRequest {
             request_id: active.request_id,
             session_id: active.session_id,
@@ -1555,7 +1605,7 @@ impl MonitorStore {
             generation_duration: active.generation_duration,
             status,
             http_status,
-            latency: active.started_instant.elapsed(),
+            latency,
             streamed_bytes: active.streamed_bytes,
             stream_chunks: active.stream_chunks,
             input_tokens: active.input_tokens,
@@ -1572,6 +1622,56 @@ impl MonitorStore {
             self.project_numbers(request_id, numbers);
         }
         self.evaluate_cache(request_id);
+        self.settle(request_id, outcome, http_status, latency);
+    }
+
+    /// Export a request once, at its first terminal event, from the record
+    /// as the ledger holds it after taking that event. Later reports correct
+    /// the ledger and leave the exported figures alone, since a counter that
+    /// went down would read as a restart.
+    fn settle(
+        &self,
+        request_id: &str,
+        outcome: Outcome,
+        http_status: Option<u16>,
+        duration: Duration,
+    ) {
+        let Some(record) = self.ledger.record(request_id) else {
+            return;
+        };
+        let time_to_first_token = record
+            .generation_started_at
+            .and_then(|at| at.duration_since(record.started_at).ok());
+        let usage = record.counts_tokens().then(|| {
+            let quality = record.quality();
+            let count = |tokens: Option<u64>, quality: UsageQuality| {
+                tokens.map(|tokens| TokenCount {
+                    tokens,
+                    exact: quality == UsageQuality::Exact,
+                })
+            };
+            SettledUsage {
+                input: count(record.input_tokens, quality.input),
+                cache_read: count(record.cache.read_tokens, quality.cache_read),
+                cache_write: count(record.cache.write_tokens, quality.cache_write),
+                output: count(record.output_tokens, quality.output),
+                measured_prompt: record
+                    .prompt_is_measured()
+                    .then(|| record.prompt_tokens())
+                    .flatten(),
+                carries_history: !record.without_history,
+            }
+        });
+        self.metrics.request_settled(&SettledRequest {
+            provider: record.provider.as_deref(),
+            model: metric_model(record.effective_model.as_deref(), record.model.as_deref()),
+            endpoint: record.endpoint.label(),
+            outcome,
+            http_status,
+            duration,
+            time_to_first_token,
+            usage,
+        });
     }
 
     /// Apply a streaming report at a chosen moment, for tests that need a
@@ -1657,7 +1757,7 @@ impl MonitorStore {
     /// The figures come from the ledger, so a request whose counts arrive after
     /// it left the recent list is still judged.
     fn evaluate_cache(&mut self, request_id: &str) {
-        let (key, prompt, cache, started_at, response_started_at, judge) = {
+        let (key, metric_label, prompt, cache, started_at, response_started_at, judge) = {
             let Some(record) = self.ledger.record(request_id) else {
                 return;
             };
@@ -1687,6 +1787,8 @@ impl MonitorStore {
                     provider,
                     model,
                 },
+                metric_model(record.effective_model.as_deref(), record.model.as_deref())
+                    .map(str::to_owned),
                 record.prompt_tokens().unwrap_or(0),
                 record.cache,
                 record.started_at,
@@ -1729,6 +1831,13 @@ impl MonitorStore {
             let ttl = lane.ttl.or(cache.ttl).or(default_cache_ttl(&key.provider));
             detect_cache_miss(lane.prompt_tokens, prompt, cache_read, gap, ttl)
         });
+        // A prompt that shrank past the noise floor was rewritten by the
+        // client; the lane only takes it as its new baseline.
+        let rewrite = !superseded
+            && !side
+            && previous.is_some_and(|lane| {
+                prompt.saturating_add(usage::CACHE_MISS_MIN_TOKENS) < lane.prompt_tokens
+            });
         if !superseded {
             let readable_from = response_started_at.unwrap_or_else(|| self.now());
             self.lanes.insert(
@@ -1777,6 +1886,18 @@ impl MonitorStore {
             }
         }
 
+        if let Some(miss) = miss {
+            self.metrics.cache_miss(
+                Some(&key.provider),
+                metric_label.as_deref(),
+                miss_cause(miss.cause),
+            );
+        }
+        if rewrite {
+            self.metrics
+                .context_rewrite(Some(&key.provider), metric_label.as_deref());
+        }
+
         self.ledger.note_cache_evaluation(request_id, miss);
         self.project(request_id);
     }
@@ -1802,6 +1923,44 @@ impl MonitorStore {
         if !dropped.is_empty() {
             self.lanes
                 .retain(|key, _| !dropped.contains(&key.session_id));
+        }
+    }
+
+    /// The gauges of [`MonitorHandle::gauge_reading`]. The sessions are counted
+    /// as the snapshot counts them, visible and hidden, and every request in
+    /// flight under the provider and model known for it so far. The sessions
+    /// are counted straight off their records, with no session summaries
+    /// built, because the store's lock is held meanwhile and every request
+    /// publishes through it.
+    fn gauge_reading(&self, now: SystemTime) -> GaugeReading {
+        let (mut sessions_active, mut sessions_idle) = (0_u64, 0_u64);
+        for (_, record) in self.ledger.sessions() {
+            if session_is_idle(now, record.counts.active_count > 0, record.last_seen) {
+                sessions_idle = sessions_idle.saturating_add(1);
+            } else {
+                sessions_active = sessions_active.saturating_add(1);
+            }
+        }
+        let mut in_flight: BTreeMap<(Option<&str>, Option<&str>), u64> = BTreeMap::new();
+        for request in self.active.values() {
+            let model = metric_model(request.effective_model.as_deref(), request.model.as_deref());
+            let requests = in_flight
+                .entry((request.provider.as_deref(), model))
+                .or_default();
+            *requests = requests.saturating_add(1);
+        }
+        GaugeReading {
+            sessions_active,
+            sessions_idle,
+            sessions_started: self.ledger.sessions_started(),
+            in_flight: in_flight
+                .into_iter()
+                .map(|((provider, model), requests)| InFlight {
+                    provider: provider.map(str::to_owned),
+                    model: model.map(str::to_owned),
+                    requests,
+                })
+                .collect(),
         }
     }
 
@@ -1931,6 +2090,21 @@ fn order_conversations(conversations: Vec<ConversationSummary>) -> Vec<Conversat
         .collect()
 }
 
+/// The model a metric names: the one a built upstream request named, else the
+/// routed one. Once a model resolved, `model` holds the `requested → effective`
+/// display, so it is read only while `effective_model` is unset.
+fn metric_model<'a>(effective_model: Option<&'a str>, model: Option<&'a str>) -> Option<&'a str> {
+    effective_model.or(model)
+}
+
+fn miss_cause(cause: CacheMissCause) -> MissCause {
+    match cause {
+        CacheMissCause::Expired => MissCause::Expired,
+        CacheMissCause::WithinTtl => MissCause::WithinTtl,
+        CacheMissCause::UnknownTtl => MissCause::UnknownTtl,
+    }
+}
+
 /// The rows of every session the process has served, built from what the
 /// ledger kept rather than from the requests the recent list still holds.
 ///
@@ -1957,12 +2131,17 @@ fn session_summaries(ledger: &Ledger) -> Vec<SessionSummary> {
 /// within [`SESSION_HIDDEN_AFTER`], and say how many that was. They stay in
 /// the store, and a request makes one recent again.
 fn hide_idle_sessions(sessions: &mut Vec<SessionSummary>, now: SystemTime) -> usize {
-    let Some(cutoff) = now.checked_sub(SESSION_HIDDEN_AFTER) else {
-        return 0;
-    };
     let held = sessions.len();
-    sessions.retain(|session| session.active_count > 0 || session.last_seen >= cutoff);
+    sessions.retain(|session| !session_is_idle(now, session.active_count > 0, session.last_seen));
     held - sessions.len()
+}
+
+/// Whether the pane leaves a session out: nothing in flight and no request
+/// within [`SESSION_HIDDEN_AFTER`] of `now`. With no moment that far back, no
+/// session is idle.
+fn session_is_idle(now: SystemTime, in_flight: bool, last_seen: SystemTime) -> bool {
+    now.checked_sub(SESSION_HIDDEN_AFTER)
+        .is_some_and(|cutoff| !in_flight && last_seen < cutoff)
 }
 
 fn session_summary(session_id: Option<String>, record: &SessionRecord) -> SessionSummary {
@@ -2185,6 +2364,8 @@ pub fn usage_from_anthropic_sse(bytes: &[u8]) -> (Option<u64>, Option<u64>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -6253,5 +6434,602 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert_eq!(after.model_stats(), before.model_stats());
         assert!(after.sessions.is_empty());
         assert_eq!(after.idle_sessions, 0);
+    }
+
+    /// The sample lines the request families render, in the text format, with
+    /// the comment lines and the always-present process lines left out.
+    fn request_lines(monitor: &MonitorHandle) -> BTreeSet<String> {
+        let requests = monitor.request_metrics();
+        let input = crate::metrics::RenderInput {
+            requests: Some(&requests),
+            ..crate::metrics::RenderInput::default()
+        };
+        crate::metrics::render(&input, crate::metrics::Format::Text)
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter(|line| {
+                !line.starts_with("ccmux_build_info") && !line.starts_with("ccmux_process_start")
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn lines_with_prefix(lines: &BTreeSet<String>, prefix: &str) -> BTreeSet<String> {
+        lines
+            .iter()
+            .filter(|line| line.starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+
+    fn line_set(lines: &[&str]) -> BTreeSet<String> {
+        lines.iter().map(|line| (*line).to_owned()).collect()
+    }
+
+    /// The value of the one sample line that starts with `prefix`.
+    fn sample_value(lines: &BTreeSet<String>, prefix: &str) -> f64 {
+        let matching = lines_with_prefix(lines, prefix);
+        assert_eq!(matching.len(), 1, "one line for {prefix} in {lines:?}");
+        matching
+            .first()
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok())
+            .expect("a numeric sample value")
+    }
+
+    /// A request is exported at its first terminal event; a second one for
+    /// the same id adds nothing.
+    #[test]
+    fn a_request_settles_once_when_two_terminal_events_arrive() {
+        let monitor = MonitorHandle::new(10);
+        finish_with_usage(
+            &monitor,
+            "r1",
+            "s1",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(100, 0, 0, 10),
+        );
+        monitor.request_failed("r1", Some(502), "failed after it completed");
+        monitor.request_completed("r1", 200, None, None);
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_requests_total"),
+            line_set(&[
+                "ccmux_requests_total{provider=\"codex\",model=\"gpt-5.6-sol\",endpoint=\"messages\",outcome=\"completed\",status=\"200\"} 1",
+            ])
+        );
+        assert_eq!(
+            sample_value(&lines, "ccmux_request_duration_seconds_count{"),
+            1.0
+        );
+        assert!(lines.contains(
+            "ccmux_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",kind=\"input\",quality=\"exact\"} 100"
+        ));
+    }
+
+    /// The outcome is the event that ended the request, and the status the
+    /// one that event carried.
+    #[test]
+    fn outcomes_and_statuses_follow_the_terminal_event() {
+        let monitor = MonitorHandle::new(10);
+        let start = |request_id: &str| {
+            monitor.request_started(
+                request_id,
+                Some("s1".to_string()),
+                None,
+                EndpointKind::Messages,
+            );
+            monitor.provider_selected(request_id, "codex", "gpt-5.6-sol", None);
+        };
+        start("done");
+        monitor.request_completed("done", 200, None, None);
+        // A stream that failed after its status line had left.
+        start("broken");
+        monitor.request_failed("broken", Some(200), "stream ended early");
+        start("refused");
+        monitor.request_failed("refused", None, "no answer");
+        // The response was dropped before it finished.
+        start("dropped");
+        monitor.request_abandoned("dropped", "client went away");
+        // Dropping a response that already finished ends nothing.
+        monitor.request_abandoned("done", "client went away");
+
+        assert_eq!(
+            lines_with_prefix(&request_lines(&monitor), "ccmux_requests_total"),
+            line_set(&[
+                "ccmux_requests_total{provider=\"codex\",model=\"gpt-5.6-sol\",endpoint=\"messages\",outcome=\"completed\",status=\"200\"} 1",
+                "ccmux_requests_total{provider=\"codex\",model=\"gpt-5.6-sol\",endpoint=\"messages\",outcome=\"failed\",status=\"200\"} 1",
+                "ccmux_requests_total{provider=\"codex\",model=\"gpt-5.6-sol\",endpoint=\"messages\",outcome=\"failed\",status=\"none\"} 1",
+                "ccmux_requests_total{provider=\"codex\",model=\"gpt-5.6-sol\",endpoint=\"messages\",outcome=\"abandoned\",status=\"none\"} 1",
+            ])
+        );
+    }
+
+    /// A count only an estimate gave is exported as one; a count the
+    /// backend closed is exact, a reported zero included.
+    #[test]
+    fn an_opening_count_exports_as_an_estimate_and_a_closed_one_as_exact() {
+        let monitor = MonitorHandle::new(10);
+        // The stream ended before the backend's closing report arrived.
+        finish_with_usage(
+            &monitor,
+            "early",
+            "s1",
+            "codex",
+            "gpt-5.6-sol",
+            UsageReport::opening(Some(30_000), Some(5)),
+        );
+        finish_with_usage(
+            &monitor,
+            "closed",
+            "s2",
+            "codex",
+            "gpt-5.6-terra",
+            closing_usage(100, 2_000, 0, 7),
+        );
+
+        assert_eq!(
+            lines_with_prefix(&request_lines(&monitor), "ccmux_tokens_total"),
+            line_set(&[
+                "ccmux_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",kind=\"input\",quality=\"estimate\"} 30000",
+                "ccmux_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",kind=\"output\",quality=\"estimate\"} 5",
+                "ccmux_tokens_total{provider=\"codex\",model=\"gpt-5.6-terra\",kind=\"input\",quality=\"exact\"} 100",
+                "ccmux_tokens_total{provider=\"codex\",model=\"gpt-5.6-terra\",kind=\"cache_read\",quality=\"exact\"} 2000",
+                "ccmux_tokens_total{provider=\"codex\",model=\"gpt-5.6-terra\",kind=\"cache_write\",quality=\"exact\"} 0",
+                "ccmux_tokens_total{provider=\"codex\",model=\"gpt-5.6-terra\",kind=\"output\",quality=\"exact\"} 7",
+            ])
+        );
+    }
+
+    /// A report that arrives after the request settled corrects the
+    /// monitor's totals and leaves what was exported as it was.
+    #[test]
+    fn a_late_usage_report_changes_no_request_family_line() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(30_000, 0, 0, 50));
+        // Its cache was judged before the terminal event.
+        assert!(monitor.snapshot().active[0].cache.evaluated());
+        monitor.request_completed("r1", 200, None, None);
+
+        let before = request_lines(&monitor);
+        assert!(before.contains(
+            "ccmux_requests_total{provider=\"codex\",model=\"gpt-5.6-sol\",endpoint=\"messages\",outcome=\"completed\",status=\"200\"} 1"
+        ));
+        assert!(before.contains(
+            "ccmux_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",kind=\"input\",quality=\"exact\"} 30000"
+        ));
+        assert!(before.contains(
+            "ccmux_cache_hit_basis_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",kind=\"input\"} 30000"
+        ));
+        assert_eq!(
+            sample_value(&before, "ccmux_request_prompt_tokens_count{"),
+            1.0
+        );
+
+        monitor.usage_reported("r1", closing_usage(31_000, 1_000, 0, 60));
+        assert_eq!(monitor.snapshot().sessions[0].input_tokens, 31_000);
+        monitor.usage_updated("r1", Some(40_000), Some(70));
+        assert_eq!(request_lines(&monitor), before);
+    }
+
+    /// A token estimate and a local answer are requests like any other, and
+    /// their tokens belong to no total.
+    #[test]
+    fn count_tokens_and_local_requests_export_no_tokens() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started(
+            "count",
+            Some("s1".to_string()),
+            None,
+            EndpointKind::CountTokens,
+        );
+        monitor.provider_selected("count", "codex", "gpt-5.6-sol", None);
+        monitor.usage_reported("count", closing_usage(5_000, 0, 0, 0));
+        monitor.request_completed("count", 200, None, None);
+        monitor.request_started(
+            "label",
+            Some("s1".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.provider_selected("label", LOCAL_PROVIDER, "gpt-5.6-sol", None);
+        monitor.usage_reported("label", closing_usage(0, 0, 0, 12));
+        monitor.request_completed("label", 200, None, None);
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_requests_total"),
+            line_set(&[
+                "ccmux_requests_total{provider=\"codex\",model=\"gpt-5.6-sol\",endpoint=\"count_tokens\",outcome=\"completed\",status=\"200\"} 1",
+                "ccmux_requests_total{provider=\"local\",model=\"gpt-5.6-sol\",endpoint=\"messages\",outcome=\"completed\",status=\"200\"} 1",
+            ])
+        );
+        for family in [
+            "ccmux_tokens_total",
+            "ccmux_cache_hit_basis_tokens_total",
+            "ccmux_request_prompt_tokens",
+        ] {
+            assert!(
+                lines_with_prefix(&lines, family).is_empty(),
+                "{family} in {lines:?}"
+            );
+        }
+    }
+
+    /// A request that carried no history counts its tokens and stays out of
+    /// the basis the hit rate is read from.
+    #[test]
+    fn a_request_without_history_stays_out_of_the_hit_basis() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "first", "main");
+        monitor.request_without_history("first");
+        monitor.usage_reported("first", closing_usage(100, 0, 0, 10));
+        monitor.request_completed("first", 200, None, None);
+        finish_with_usage(
+            &monitor,
+            "second",
+            "s1",
+            "codex",
+            "gpt-5.6-sol",
+            closing_usage(50, 200, 0, 10),
+        );
+
+        let lines = request_lines(&monitor);
+        assert!(lines.contains(
+            "ccmux_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",kind=\"input\",quality=\"exact\"} 150"
+        ));
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_cache_hit_basis_tokens_total"),
+            line_set(&[
+                "ccmux_cache_hit_basis_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",kind=\"input\"} 50",
+                "ccmux_cache_hit_basis_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",kind=\"cache_read\"} 200",
+                "ccmux_cache_hit_basis_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",kind=\"cache_write\"} 0",
+            ])
+        );
+    }
+
+    /// The first-token time runs from the start to the moment the monitor saw
+    /// the response generating; a request that never did observes none.
+    #[test]
+    fn first_token_time_comes_from_the_generation_start() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "main");
+        advance_clock(&monitor, Duration::from_secs(2));
+        monitor.generation_started("r1");
+        monitor.request_completed("r1", 200, None, None);
+        start_codex_request(&monitor, "r2", "main");
+        monitor.request_completed("r2", 200, None, None);
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            sample_value(&lines, "ccmux_time_to_first_token_seconds_count{"),
+            1.0
+        );
+        let observed = sample_value(&lines, "ccmux_time_to_first_token_seconds_sum{");
+        // Real time runs on top of the moved clock, so the wide upper bound
+        // tolerates scheduling delay; a time taken from the wrong moment still
+        // falls outside the range.
+        assert!((2.0..30.0).contains(&observed), "{observed}");
+        assert_eq!(
+            sample_value(&lines, "ccmux_request_duration_seconds_count{"),
+            2.0
+        );
+    }
+
+    /// A judged miss counts once, under the cause its lane evaluation gave
+    /// it and the model that ran.
+    #[test]
+    fn a_judged_miss_counts_once_under_its_cause() {
+        let monitor = MonitorHandle::new(10);
+        // Within the lifetime on a codex lane: nothing of the prefix came back.
+        start_codex_request(&monitor, "c1", "main");
+        monitor.usage_reported("c1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("c1", 200, None, None);
+        start_codex_request(&monitor, "c2", "main");
+        monitor.usage_reported("c2", closing_usage(31_000, 0, 0, 40));
+        monitor.request_completed("c2", 200, None, None);
+        // A second terminal event and a late report judge nothing again.
+        monitor.request_failed("c2", Some(502), "failed after it completed");
+        monitor.usage_reported("c2", closing_usage(31_000, 0, 0, 45));
+
+        // An expiry on an anthropic lane: idle longer than the reported lifetime.
+        start_anthropic_request(&monitor, "o1", "claude-opus-5");
+        monitor.model_resolved("o1", "claude-opus-5");
+        backdate(&monitor, "o1", Duration::from_secs(2 * 60 * 60));
+        monitor.usage_reported(
+            "o1",
+            UsageReport {
+                cache_ttl: Some(Duration::from_secs(60 * 60)),
+                ..closing_usage(2, 0, 40_000, 10)
+            },
+        );
+        monitor.request_completed("o1", 200, None, None);
+        start_anthropic_request(&monitor, "o2", "claude-opus-5");
+        monitor.model_resolved("o2", "claude-opus-5");
+        monitor.usage_reported("o2", closing_usage(3, 0, 40_100, 10));
+        monitor.request_completed("o2", 200, None, None);
+
+        let state = monitor.snapshot();
+        assert_eq!(
+            recent_by_id(&state, "c2").cache.miss.map(|miss| miss.cause),
+            Some(CacheMissCause::WithinTtl)
+        );
+        assert_eq!(
+            recent_by_id(&state, "o2").cache.miss.map(|miss| miss.cause),
+            Some(CacheMissCause::Expired)
+        );
+        assert_eq!(
+            lines_with_prefix(&request_lines(&monitor), "ccmux_cache_misses_total"),
+            line_set(&[
+                "ccmux_cache_misses_total{provider=\"anthropic\",model=\"claude-opus-5\",cause=\"expired\"} 1",
+                "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 1",
+            ])
+        );
+    }
+
+    /// A request routed as one model and run as another is exported under the
+    /// one that ran, and so is a miss between two such requests.
+    #[test]
+    fn a_request_routed_as_one_model_exports_the_model_that_ran() {
+        let monitor = MonitorHandle::new(10);
+        let run = |request_id: &str, usage: UsageReport| {
+            start_codex_request(&monitor, request_id, "main");
+            monitor.model_resolved(request_id, "gpt-6-sol");
+            monitor.usage_reported(request_id, usage);
+            monitor.request_completed(request_id, 200, None, None);
+        };
+        run("r1", closing_usage(30_000, 0, 0, 50));
+        // Nothing of the prefix came back.
+        run("r2", closing_usage(31_000, 0, 0, 40));
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_requests_total"),
+            line_set(&[
+                "ccmux_requests_total{provider=\"codex\",model=\"gpt-6-sol\",endpoint=\"messages\",outcome=\"completed\",status=\"200\"} 2",
+            ])
+        );
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_cache_misses_total"),
+            line_set(&[
+                "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-6-sol\",cause=\"within_ttl\"} 1",
+            ])
+        );
+    }
+
+    /// A request whose closing report arrives after its terminal event is
+    /// judged then: the miss counts, and what settled stays as it was.
+    #[test]
+    fn a_miss_judged_by_a_late_report_counts_without_resettling() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+        // The live path hands the response on before the stream ends.
+        start_codex_request(&monitor, "r2", "main");
+        monitor.request_completed("r2", 200, None, None);
+        let before = request_lines(&monitor);
+        assert_eq!(sample_value(&before, "ccmux_requests_total{"), 2.0);
+        assert!(lines_with_prefix(&before, "ccmux_cache_misses_total").is_empty());
+
+        monitor.usage_reported("r2", closing_usage(31_000, 0, 0, 40));
+        assert!(recent_by_id(&monitor.snapshot(), "r2").cache.miss.is_some());
+        let mut expected = before;
+        expected.insert(
+            "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 1"
+                .to_owned(),
+        );
+        assert_eq!(request_lines(&monitor), expected);
+    }
+
+    /// A prompt that shrank past the noise floor was rewritten by the client:
+    /// it counts as a rewrite and never also as a miss.
+    #[test]
+    fn a_shrunken_prompt_counts_as_a_rewrite_not_a_miss() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+        // 1025 tokens fewer, and nothing of it cached.
+        start_codex_request(&monitor, "r2", "main");
+        monitor.usage_reported("r2", closing_usage(28_975, 0, 0, 40));
+        monitor.request_completed("r2", 200, None, None);
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_context_rewrites_total"),
+            line_set(&["ccmux_context_rewrites_total{provider=\"codex\",model=\"gpt-5.6-sol\"} 1"])
+        );
+        assert!(lines_with_prefix(&lines, "ccmux_cache_misses_total").is_empty());
+    }
+
+    /// A prompt that shrank by no more than the noise floor is the same
+    /// conversation going on; served from the cache, it is neither a rewrite
+    /// nor a miss.
+    #[test]
+    fn a_prompt_within_the_noise_floor_is_neither() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+        // Exactly 1024 tokens fewer.
+        start_codex_request(&monitor, "r2", "main");
+        monitor.usage_reported("r2", closing_usage(976, 28_000, 0, 40));
+        monitor.request_completed("r2", 200, None, None);
+
+        let lines = request_lines(&monitor);
+        assert_eq!(sample_value(&lines, "ccmux_requests_total{"), 2.0);
+        assert!(lines_with_prefix(&lines, "ccmux_context_rewrites_total").is_empty());
+        assert!(lines_with_prefix(&lines, "ccmux_cache_misses_total").is_empty());
+        // r2 was judged and found neither, rather than never judged: it was
+        // evaluated, and its prompt is the one the lane now measures against.
+        assert!(recent_by_id(&monitor.snapshot(), "r2").cache.evaluated());
+        let lane = LaneKey {
+            session_id: Some("s1".to_string()),
+            conversation: Some("main".to_string()),
+            provider: "codex".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+        };
+        let baseline = monitor
+            .store
+            .lock()
+            .ok()
+            .and_then(|store| store.lanes.get(&lane).map(|lane| lane.prompt_tokens));
+        assert_eq!(baseline, Some(28_976));
+    }
+
+    fn gauge_lines(monitor: &MonitorHandle, prefix: &str) -> BTreeSet<String> {
+        let requests = monitor.request_metrics();
+        let gauges = monitor.gauge_reading();
+        let input = crate::metrics::RenderInput {
+            requests: Some(&requests),
+            gauges: Some(&gauges),
+            ..crate::metrics::RenderInput::default()
+        };
+        crate::metrics::render(&input, crate::metrics::Format::Text)
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The session gauges count what the Sessions pane counts: the visible
+    /// sessions as active, the hidden ones as idle. A session with a request
+    /// in flight stays visible however long ago that request started.
+    #[test]
+    fn the_gauge_reading_matches_the_snapshot() {
+        let monitor = MonitorHandle::new(10);
+        finish_request(&monitor, "r1", "s1", "gpt-5.6-sol");
+        monitor.request_started("r0", Some("s0".to_string()), None, EndpointKind::Messages);
+        advance_clock(&monitor, Duration::from_secs(2 * 60 * 60));
+        monitor.request_started("r2", Some("s2".to_string()), None, EndpointKind::Messages);
+        finish_request(&monitor, "r3", "s3", "gpt-5.6-sol");
+
+        let gauges = monitor.gauge_reading();
+        let state = monitor.snapshot();
+        assert_eq!(state.sessions.len(), 3);
+        assert_eq!(state.idle_sessions, 1);
+        assert_eq!(gauges.sessions_active, state.sessions.len() as u64);
+        assert_eq!(gauges.sessions_idle, state.idle_sessions as u64);
+        assert_eq!(gauges.sessions_started, 4);
+        assert_eq!(
+            gauge_lines(&monitor, "ccmux_sessions"),
+            line_set(&[
+                "ccmux_sessions{state=\"active\"} 3",
+                "ccmux_sessions{state=\"idle\"} 1",
+                "ccmux_sessions_started_total 4",
+            ])
+        );
+    }
+
+    /// A session dropped after a day idle and started again under the same id
+    /// is a new session, so it is counted as started twice.
+    #[test]
+    fn a_session_dropped_and_restarted_counts_twice() {
+        let monitor = MonitorHandle::new(10);
+        finish_request(&monitor, "r1", "s1", "gpt-5.6-sol");
+        assert_eq!(monitor.gauge_reading().sessions_started, 1);
+        advance_clock(&monitor, Duration::from_secs(25 * 60 * 60));
+        let gauges = monitor.gauge_reading();
+        assert_eq!(
+            (gauges.sessions_active, gauges.sessions_idle),
+            (0, 0),
+            "the idle session was dropped"
+        );
+        finish_request(&monitor, "r2", "s1", "gpt-5.6-sol");
+
+        let gauges = monitor.gauge_reading();
+        assert_eq!(gauges.sessions_started, 2);
+        assert_eq!((gauges.sessions_active, gauges.sessions_idle), (1, 0));
+    }
+
+    /// A panic while the store was held poisons its lock. The started count is
+    /// a counter, so it keeps its value rather than falling to zero; the gauges
+    /// that need a walk over the store are left at their defaults.
+    #[test]
+    fn a_poisoned_store_keeps_the_sessions_started_count() {
+        let monitor = MonitorHandle::new(10);
+        finish_request(&monitor, "r1", "s1", "gpt-5.6-sol");
+        finish_request(&monitor, "r2", "s2", "gpt-5.6-sol");
+        monitor.request_started("r3", Some("s3".to_string()), None, EndpointKind::Messages);
+        let before = monitor.gauge_reading();
+        assert_eq!(
+            (
+                before.sessions_started,
+                before.sessions_active,
+                before.in_flight.len()
+            ),
+            (3, 3, 1)
+        );
+
+        let store = monitor.store.clone();
+        let poisoner = std::thread::spawn(move || {
+            let _held = store.lock();
+            panic!("panicked while the monitor store was held");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(
+            monitor.store.lock().is_err(),
+            "the store's lock is poisoned"
+        );
+
+        assert_eq!(
+            monitor.gauge_reading(),
+            GaugeReading {
+                sessions_started: before.sessions_started,
+                ..GaugeReading::default()
+            }
+        );
+    }
+
+    /// A request in flight is labelled with what is known of it so far: no
+    /// model before routing, then the routed one, then the one that runs.
+    #[test]
+    fn an_in_flight_request_follows_its_model() {
+        let monitor = MonitorHandle::new(10);
+        monitor.request_started("r1", Some("s1".to_string()), None, EndpointKind::Messages);
+        assert_eq!(
+            monitor.gauge_reading().in_flight,
+            [InFlight {
+                provider: None,
+                model: None,
+                requests: 1,
+            }]
+        );
+        assert_eq!(
+            gauge_lines(&monitor, "ccmux_requests_in_flight"),
+            line_set(&["ccmux_requests_in_flight{provider=\"unknown\",model=\"unknown\"} 1"])
+        );
+
+        monitor.provider_selected("r1", "codex", "claude-sonnet-5", None);
+        assert_eq!(
+            monitor.gauge_reading().in_flight,
+            [InFlight {
+                provider: Some("codex".to_string()),
+                model: Some("claude-sonnet-5".to_string()),
+                requests: 1,
+            }]
+        );
+
+        monitor.model_resolved("r1", "gpt-6-sol");
+        assert_eq!(
+            monitor.gauge_reading().in_flight,
+            [InFlight {
+                provider: Some("codex".to_string()),
+                model: Some("gpt-6-sol".to_string()),
+                requests: 1,
+            }]
+        );
+        assert_eq!(
+            gauge_lines(&monitor, "ccmux_requests_in_flight"),
+            line_set(&["ccmux_requests_in_flight{provider=\"codex\",model=\"gpt-6-sol\"} 1"])
+        );
+
+        monitor.request_completed("r1", 200, Some(100), Some(10));
+        assert!(monitor.gauge_reading().in_flight.is_empty());
+        assert!(gauge_lines(&monitor, "ccmux_requests_in_flight").is_empty());
     }
 }

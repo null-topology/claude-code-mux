@@ -115,6 +115,9 @@ impl Logger {
         if write_log_line(&line).is_err() && mirror_to_stderr {
             // swallow logging errors intentionally
         }
+        // Counted whether or not the write succeeded, by message only: the
+        // fields never become a label.
+        crate::metrics::log_event(&self.service, level, msg);
     }
 }
 
@@ -414,5 +417,41 @@ mod tests {
             .collect();
         assert_eq!(new_rotations.len(), 1);
         assert_eq!(fs::read_to_string(&new_rotations[0]).unwrap(), "current\n");
+    }
+
+    #[test]
+    fn a_logged_line_is_counted_once_and_its_fields_stay_out() {
+        use crate::metrics::{Format, ProcessMetrics, RenderInput, render};
+
+        fn rendered(metrics: &ProcessMetrics, format: Format) -> String {
+            let input = RenderInput {
+                process: Some(metrics),
+                ..RenderInput::default()
+            };
+            render(&input, format)
+        }
+        let series = "ccmux_log_events_total{service=\"metrics_test\",level=\"info\",event=\"line counted\"}";
+        let field_value = "field-value-5c1e8b";
+        let scope = crate::metrics::scoped_process_for_tests();
+        assert!(!rendered(&scope, Format::OpenMetrics).contains(series));
+
+        create_logger("metrics_test").info(
+            "line counted",
+            Some(serde_json::Map::from_iter([(
+                "detail".to_string(),
+                Value::String(field_value.to_string()),
+            )])),
+        );
+
+        for format in [Format::OpenMetrics, Format::Text] {
+            let text = rendered(&scope, format);
+            let samples: Vec<&str> = text
+                .lines()
+                .filter(|line| line.starts_with("ccmux_log_events_total"))
+                .collect();
+            assert_eq!(samples, [format!("{series} 1")]);
+            assert!(!text.contains(field_value));
+            assert!(!text.contains("detail"));
+        }
     }
 }

@@ -1009,6 +1009,12 @@ impl Ledger {
         self.sessions.iter()
     }
 
+    /// How many sessions the ledger has started, a session dropped and started
+    /// again under the same id counted each time.
+    pub(crate) fn sessions_started(&self) -> u64 {
+        self.next_session_rank
+    }
+
     /// The prompt-cache figures of a session, for the store to judge its lanes.
     pub(crate) fn session_cache_mut(
         &mut self,

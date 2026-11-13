@@ -296,6 +296,17 @@ pub(crate) fn latest(account: Option<&str>) -> Option<Snapshot> {
     still_running(snapshot, now())
 }
 
+/// The held snapshot for whichever account it was read under, with any window
+/// that has since rolled over left out as `latest` leaves it out. Metrics read
+/// the windows through it; the account stays here.
+pub(crate) fn held_windows() -> Option<Snapshot> {
+    let snapshot = cell()
+        .lock()
+        .ok()
+        .and_then(|latest| latest.as_ref().map(|held| held.snapshot.clone()))?;
+    still_running(snapshot, now())
+}
+
 fn still_running(snapshot: Snapshot, now: u64) -> Option<Snapshot> {
     let fresh = |window: Option<WindowState>| window.filter(|state| state.resets_at > now);
     let snapshot = Snapshot {
@@ -1091,5 +1102,55 @@ mod tests {
         assert!(!reads_codex_limit(
             &serde_json::json!({"metered_limit_name": 7})
         ));
+    }
+
+    #[test]
+    fn held_windows_ignore_the_account_and_drop_a_passed_reset() {
+        let _snapshot = lock_for_tests();
+        clear_for_tests();
+        assert_eq!(held_windows(), None);
+        let now = now();
+        let weekly = WindowState {
+            utilization: 0.16,
+            resets_at: now + 500_000,
+        };
+        // A merge never keeps a passed reset, so the held reading is set here
+        // as it stands once its five hour window has rolled over.
+        *cell().lock().unwrap() = Some(Held {
+            account: Some("acct-a".to_string()),
+            snapshot: Snapshot {
+                five_hour: Some(WindowState {
+                    utilization: 0.4,
+                    resets_at: now - 1,
+                }),
+                seven_day: Some(weekly),
+            },
+        });
+
+        assert_eq!(
+            held_windows(),
+            Some(Snapshot {
+                five_hour: None,
+                seven_day: Some(weekly),
+            })
+        );
+        clear_for_tests();
+    }
+
+    #[test]
+    fn latest_still_answers_only_for_the_held_account() {
+        let _snapshot = lock_for_tests();
+        clear_for_tests();
+        let now = now();
+        observe_event(
+            Some("acct-a"),
+            &event_resetting(3.0, now + 10_000, 16.0, now + 500_000),
+        );
+
+        assert!(latest(Some("acct-a")).is_some());
+        assert_eq!(latest(Some("acct-b")), None);
+        assert_eq!(latest(None), None);
+        assert_eq!(held_windows(), latest(Some("acct-a")));
+        clear_for_tests();
     }
 }
