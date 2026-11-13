@@ -95,7 +95,7 @@ impl ProcessMetrics {
         );
         registry.register(
             "log_events",
-            "Log lines written, by service, level and message",
+            "Log events emitted, by service, level and message",
             self.log_events.clone(),
         );
     }

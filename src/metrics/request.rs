@@ -330,7 +330,7 @@ impl RequestMetrics {
         );
         registry.register_with_unit(
             "time_to_first_token",
-            "Time from the start of a request to its first generated output",
+            "Time from the start of a request until its response was first seen generating",
             Unit::Seconds,
             self.first_token.clone(),
         );
