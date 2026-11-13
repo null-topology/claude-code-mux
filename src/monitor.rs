@@ -1019,7 +1019,13 @@ impl MonitorHandle {
                 store.drop_idle_sessions(now);
                 store.gauge_reading(now)
             }
-            Err(_) => GaugeReading::default(),
+            // A panic while the store was held may have left it half updated,
+            // so nothing is walked. The started count is a counter and must not
+            // fall back to zero; it is a plain read.
+            Err(poisoned) => GaugeReading {
+                sessions_started: poisoned.into_inner().ledger.sessions_started(),
+                ..GaugeReading::default()
+            },
         }
     }
 
@@ -6874,6 +6880,45 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         let gauges = monitor.gauge_reading();
         assert_eq!(gauges.sessions_started, 2);
         assert_eq!((gauges.sessions_active, gauges.sessions_idle), (1, 0));
+    }
+
+    /// A panic while the store was held poisons its lock. The started count is
+    /// a counter, so it keeps its value rather than falling to zero; the gauges
+    /// that need a walk over the store are left at their defaults.
+    #[test]
+    fn a_poisoned_store_keeps_the_sessions_started_count() {
+        let monitor = MonitorHandle::new(10);
+        finish_request(&monitor, "r1", "s1", "gpt-5.6-sol");
+        finish_request(&monitor, "r2", "s2", "gpt-5.6-sol");
+        monitor.request_started("r3", Some("s3".to_string()), None, EndpointKind::Messages);
+        let before = monitor.gauge_reading();
+        assert_eq!(
+            (
+                before.sessions_started,
+                before.sessions_active,
+                before.in_flight.len()
+            ),
+            (3, 3, 1)
+        );
+
+        let store = monitor.store.clone();
+        let poisoner = std::thread::spawn(move || {
+            let _held = store.lock();
+            panic!("panicked while the monitor store was held");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(
+            monitor.store.lock().is_err(),
+            "the store's lock is poisoned"
+        );
+
+        assert_eq!(
+            monitor.gauge_reading(),
+            GaugeReading {
+                sessions_started: before.sessions_started,
+                ..GaugeReading::default()
+            }
+        );
     }
 
     /// A request in flight is labelled with what is known of it so far: no
