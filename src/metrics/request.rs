@@ -288,12 +288,15 @@ impl RequestMetrics {
         self.rewrites.get_or_create(&pair).inc();
     }
 
-    /// The labels a (provider, model) pair is exported under. A value over
-    /// `MAX_LABEL_BYTES`, or a new pair once `MAX_MODEL_SERIES` pairs are
-    /// admitted, gives (`other`, `other`); an admitted pair keeps its labels.
+    /// The labels a (provider, model) pair is exported under. A missing or
+    /// empty value is `unknown`. A value over `MAX_LABEL_BYTES`, or a new pair
+    /// once `MAX_MODEL_SERIES` pairs are admitted, gives (`other`, `other`);
+    /// an admitted pair keeps its labels.
     pub(super) fn pair_labels(&self, provider: Option<&str>, model: Option<&str>) -> PairLabels {
-        let provider = provider.unwrap_or(UNKNOWN);
-        let model = model.unwrap_or(UNKNOWN);
+        let provider = provider
+            .filter(|value| !value.is_empty())
+            .unwrap_or(UNKNOWN);
+        let model = model.filter(|value| !value.is_empty()).unwrap_or(UNKNOWN);
         if provider.len() > MAX_LABEL_BYTES || model.len() > MAX_LABEL_BYTES {
             return PairLabels::other();
         }
@@ -836,6 +839,29 @@ mod tests {
                 set(&[
                     &requests_line("codex", &longest, 1),
                     &requests_line("other", "other", 2),
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_provider_or_model_is_unknown() {
+        let metrics = RequestMetrics::new();
+        metrics.request_settled(&settled(""));
+        metrics.request_settled(&SettledRequest {
+            provider: Some(""),
+            ..settled("gpt-6-sol")
+        });
+        metrics.request_settled(&settled(" "));
+
+        for format in BOTH_FORMATS {
+            let requests = with_prefix(&samples(&metrics, format), "ccmux_requests_total");
+            assert_eq!(
+                requests,
+                set(&[
+                    &requests_line("codex", "unknown", 1),
+                    &requests_line("unknown", "gpt-6-sol", 1),
+                    &requests_line("codex", " ", 1),
                 ])
             );
         }
