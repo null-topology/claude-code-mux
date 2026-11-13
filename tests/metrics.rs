@@ -370,19 +370,51 @@ impl Drop for ChildGuard {
     }
 }
 
+/// How many times `plain_proxy` starts the binary before it gives up.
+const PLAIN_PROXY_ATTEMPTS: usize = 3;
+
 /// Starts the binary in plain mode (`serve --no-monitor`) on a free loopback
 /// port with a cleared environment: every backend on a closed port, no Codex
 /// login, all of its state under `home`, plus `extra_env`. Returns once
-/// `/healthz` answers.
+/// `/healthz` answers while the process still runs. A port free when it is
+/// picked can be taken before the binary binds it, so a process that exits
+/// first is started again on a new port, `PLAIN_PROXY_ATTEMPTS` times in all.
+/// The returned client gives up on a request after 5 seconds.
 async fn plain_proxy(
     home: &std::path::Path,
     extra_env: &[(&str, &str)],
 ) -> (ChildGuard, reqwest::Client, String) {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let client = claude_code_mux::http_client::client_builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let mut exits = Vec::new();
+    for _ in 0..PLAIN_PROXY_ATTEMPTS {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut child = ChildGuard(plain_proxy_command(home, extra_env, port).spawn().unwrap());
+        let base = format!("http://127.0.0.1:{port}");
+        match wait_until_ready(&mut child, &client, &base).await {
+            Ok(()) => return (child, client, base),
+            Err(status) => exits.push(status.to_string()),
+        }
+    }
+    panic!(
+        "the proxy exited before it came up, {PLAIN_PROXY_ATTEMPTS} times: {}",
+        exits.join("; ")
+    );
+}
+
+/// The plain mode command `plain_proxy` runs on `port`.
+fn plain_proxy_command(
+    home: &std::path::Path,
+    extra_env: &[(&str, &str)],
+    port: u16,
+) -> std::process::Command {
     let closed = "http://127.0.0.1:9";
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-mux"));
     command
@@ -414,24 +446,37 @@ async fn plain_proxy(
     for (name, value) in extra_env {
         command.env(name, value);
     }
-    let child = ChildGuard(command.spawn().unwrap());
+    command
+}
 
-    let client = claude_code_mux::http_client::client_builder()
-        .no_proxy()
-        .build()
-        .unwrap();
-    let base = format!("http://127.0.0.1:{port}");
+/// Polls `/healthz` on `base` until it answers while `child` still runs, or
+/// returns the exit status of a child that ended first. An answer that came
+/// while the child was exiting may be another process's, so it counts only
+/// when the child is still running once it has arrived.
+async fn wait_until_ready(
+    child: &mut ChildGuard,
+    client: &reqwest::Client,
+    base: &str,
+) -> Result<(), std::process::ExitStatus> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while !client
-        .get(format!("{base}/healthz"))
-        .send()
-        .await
-        .is_ok_and(|response| response.status().is_success())
-    {
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            return Err(status);
+        }
+        let answered = client
+            .get(format!("{base}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success());
+        if answered {
+            return match child.0.try_wait().unwrap() {
+                Some(status) => Err(status),
+                None => Ok(()),
+            };
+        }
         assert!(std::time::Instant::now() < deadline, "proxy never came up");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    (child, client, base)
 }
 
 /// Plain mode keeps a monitor store for metrics, so its scrape carries the
