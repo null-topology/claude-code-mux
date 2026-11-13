@@ -152,3 +152,261 @@ pub(super) fn process_start_seconds() -> u64 {
             .map_or(0, |since_epoch| since_epoch.as_secs())
     })
 }
+
+static PROCESS: OnceLock<ProcessMetrics> = OnceLock::new();
+
+/// The instance the free functions below feed.
+pub fn process() -> ProcessMetrics {
+    with_current(ProcessMetrics::clone)
+}
+
+pub fn log_event(service: &str, level: &str, event: &str) {
+    with_current(|metrics| metrics.log_event(service, level, event));
+}
+
+pub fn codex_refusal(class: RefusalClass) {
+    with_current(|metrics| metrics.codex_refusal(class));
+}
+
+/// Calls `f` with the instance the free functions feed: in tests the
+/// innermost scope of the calling thread when one is open, else the
+/// process-wide instance.
+fn with_current<R>(f: impl FnOnce(&ProcessMetrics) -> R) -> R {
+    #[cfg(test)]
+    let scoped = innermost_scope();
+    #[cfg(not(test))]
+    let scoped: Option<ProcessMetrics> = None;
+    match scoped {
+        Some(metrics) => f(&metrics),
+        None => f(PROCESS.get_or_init(ProcessMetrics::new)),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Open scopes of this thread, innermost last.
+    static SCOPES: std::cell::RefCell<Vec<ProcessMetrics>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn innermost_scope() -> Option<ProcessMetrics> {
+    SCOPES
+        .try_with(|scopes| {
+            scopes
+                .try_borrow()
+                .ok()
+                .and_then(|scopes| scopes.last().cloned())
+        })
+        .ok()
+        .flatten()
+}
+
+/// Installs a fresh instance that the free functions called on this thread
+/// feed until the returned guard drops. Scopes nest: dropping an inner guard
+/// hands the thread back to the scope that was open before it.
+#[cfg(test)]
+pub(crate) fn scoped_process_for_tests() -> ScopedProcess {
+    let metrics = ProcessMetrics::new();
+    let depth = SCOPES.with(|scopes| {
+        let mut scopes = scopes.borrow_mut();
+        scopes.push(metrics.clone());
+        scopes.len() - 1
+    });
+    ScopedProcess {
+        metrics,
+        depth,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+/// Guard of one scope. It is not `Send`: the scope belongs to the thread that
+/// opened it.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ScopedProcess {
+    metrics: ProcessMetrics,
+    depth: usize,
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for ScopedProcess {
+    type Target = ProcessMetrics;
+
+    fn deref(&self) -> &ProcessMetrics {
+        &self.metrics
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedProcess {
+    fn drop(&mut self) {
+        let _ = SCOPES.try_with(|scopes| {
+            if let Ok(mut scopes) = scopes.try_borrow_mut() {
+                scopes.truncate(self.depth);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{ProcessMetrics, RefusalClass};
+    use crate::metrics::{
+        Format, RenderInput, codex_refusal, log_event, render, scoped_process_for_tests,
+    };
+
+    const BOTH_FORMATS: [Format; 2] = [Format::OpenMetrics, Format::Text];
+
+    /// Sample lines of the two process families in one render of `metrics`.
+    fn samples(metrics: &ProcessMetrics, format: Format) -> BTreeSet<String> {
+        let input = RenderInput {
+            process: Some(metrics),
+            ..RenderInput::default()
+        };
+        render(&input, format)
+            .lines()
+            .filter(|line| {
+                line.starts_with("ccmux_log_events") || line.starts_with("ccmux_codex_refusals")
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn event_line(service: &str, level: &str, event: &str, count: u64) -> String {
+        format!(
+            "ccmux_log_events_total{{service=\"{service}\",level=\"{level}\",event=\"{event}\"}} {count}"
+        )
+    }
+
+    fn refusal_line(class: &str, count: u64) -> String {
+        format!("ccmux_codex_refusals_total{{class=\"{class}\"}} {count}")
+    }
+
+    #[test]
+    fn a_log_event_gets_a_series() {
+        let metrics = ProcessMetrics::new();
+        metrics.log_event("server", "info", "request completed");
+        metrics.log_event("server", "info", "request completed");
+        metrics.log_event("server", "warn", "request completed");
+
+        let expected = BTreeSet::from([
+            event_line("server", "info", "request completed", 2),
+            event_line("server", "warn", "request completed", 1),
+        ]);
+        for format in BOTH_FORMATS {
+            assert_eq!(samples(&metrics, format), expected);
+        }
+    }
+
+    #[test]
+    fn the_log_event_budget_falls_back_to_other() {
+        let metrics = ProcessMetrics::with_event_budget(2);
+        metrics.log_event("server", "info", "first");
+        metrics.log_event("codex", "warn", "second");
+        metrics.log_event("server", "error", "third");
+        metrics.log_event("monitor", "error", "fourth");
+        metrics.log_event("codex", "info", "fifth");
+        metrics.log_event("server", "info", "first");
+
+        let expected = BTreeSet::from([
+            event_line("server", "info", "first", 2),
+            event_line("codex", "warn", "second", 1),
+            event_line("other", "error", "other", 2),
+            event_line("other", "info", "other", 1),
+        ]);
+        for format in BOTH_FORMATS {
+            assert_eq!(samples(&metrics, format), expected);
+        }
+    }
+
+    #[test]
+    fn a_refusal_counts_under_its_class() {
+        let classes = [
+            (RefusalClass::UsageLimit, "usage_limit"),
+            (RefusalClass::QuotaExceeded, "quota_exceeded"),
+            (RefusalClass::UsageNotIncluded, "usage_not_included"),
+            (RefusalClass::Rejected, "rejected"),
+            (RefusalClass::ContextOverflow, "context_overflow"),
+            (RefusalClass::Throttled, "throttled"),
+            (RefusalClass::Overloaded, "overloaded"),
+            (RefusalClass::ModelNotFound, "model_not_found"),
+            (RefusalClass::PermissionDenied, "permission_denied"),
+        ];
+        let metrics = ProcessMetrics::new();
+        for (class, _) in classes {
+            metrics.codex_refusal(class);
+        }
+        metrics.codex_refusal(RefusalClass::UsageLimit);
+
+        let expected: BTreeSet<String> = classes
+            .iter()
+            .map(|(class, label)| {
+                let count = if *class == RefusalClass::UsageLimit {
+                    2
+                } else {
+                    1
+                };
+                refusal_line(label, count)
+            })
+            .collect();
+        for format in BOTH_FORMATS {
+            assert_eq!(samples(&metrics, format), expected);
+        }
+    }
+
+    #[test]
+    fn a_scoped_instance_takes_the_free_functions() {
+        let scope = scoped_process_for_tests();
+        log_event("server", "warn", "request failed");
+        codex_refusal(RefusalClass::Throttled);
+        codex_refusal(RefusalClass::Throttled);
+
+        let expected = BTreeSet::from([
+            event_line("server", "warn", "request failed", 1),
+            refusal_line("throttled", 2),
+        ]);
+        for format in BOTH_FORMATS {
+            assert_eq!(samples(&scope, format), expected);
+        }
+    }
+
+    #[test]
+    fn a_nested_scope_hands_back_to_the_outer_one() {
+        let outer = scoped_process_for_tests();
+        log_event("server", "info", "before");
+
+        let inner = scoped_process_for_tests();
+        log_event("server", "info", "inside");
+        codex_refusal(RefusalClass::Overloaded);
+        for format in BOTH_FORMATS {
+            assert_eq!(
+                samples(&outer, format),
+                BTreeSet::from([event_line("server", "info", "before", 1)])
+            );
+        }
+        let inner_metrics = (*inner).clone();
+        drop(inner);
+
+        log_event("server", "info", "after");
+        for format in BOTH_FORMATS {
+            assert_eq!(
+                samples(&outer, format),
+                BTreeSet::from([
+                    event_line("server", "info", "before", 1),
+                    event_line("server", "info", "after", 1),
+                ])
+            );
+            assert_eq!(
+                samples(&inner_metrics, format),
+                BTreeSet::from([
+                    event_line("server", "info", "inside", 1),
+                    refusal_line("overloaded", 1),
+                ])
+            );
+        }
+    }
+}

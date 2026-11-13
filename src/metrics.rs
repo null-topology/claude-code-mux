@@ -9,7 +9,11 @@ mod process;
 mod render;
 mod request;
 
-pub use process::{ProcessMetrics, RefusalClass, mark_process_start};
+#[cfg(test)]
+pub(crate) use process::scoped_process_for_tests;
+pub use process::{
+    ProcessMetrics, RefusalClass, codex_refusal, log_event, mark_process_start, process,
+};
 pub use render::{Format, RenderInput, content_type, format_for_accept, render};
 pub use request::{
     CodexWindow, CodexWindows, GaugeReading, InFlight, MissCause, Outcome, RequestMetrics,
