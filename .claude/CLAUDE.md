@@ -155,6 +155,8 @@ Request path:
    `MAX_PROVIDER_STREAM_BYTES`, that delta not appended; neither
    surface's error text names the request URL), `/v1/images/*` (`CCP_CODEX_IMAGES_API`),
    `/v1/audio/transcriptions` (`CCP_CODEX_TRANSCRIPTIONS_API`).
+   `/metrics` (`CCP_METRICS`, on by default; see "Metrics") is gated by
+   `AppFeatures` too, though it is not an OpenAI-compatible surface.
    `dispatch_request` handles the Anthropic routes: read the body, normalize
    the model (strip `[1m]`), look up the session by `x-claude-code-session-id`,
    pick a provider via the registry, apply the auto-review override (Claude
@@ -442,7 +444,8 @@ Request path:
      composes itself is printed as is.
 6. Cross-cutting: `session.rs` (in-memory sessions, 30 min idle TTL, provider
    affinity), `request_identity.rs` (Claude Code session and agent headers),
-   `retry.rs` (backoff on 429 and 5xx), `monitor.rs` + `tui.rs`, `traffic.rs`
+   `retry.rs` (backoff on 429 and 5xx), `monitor.rs` + `tui.rs`, `metrics.rs`
+   (the `/metrics` families, with `metrics/`; see "Metrics"), `traffic.rs`
    (`CCP_TRAFFIC_LOG=1` writes full captures under the state dir),
    `logging.rs` (JSONL `proxy.log`, redacts known keys, cuts a string field
    over 4000 bytes on a character boundary unless verbose; past
@@ -503,6 +506,17 @@ raw `Value`, so an unusable value there is ignored on its own instead of
 failing the whole file; the legacy `codex.fullLane` keeps its boolean grammar
 and a wrong type there still fails the whole file in serde, which is why its
 invalid arm is unreachable and reports nothing.
+
+`CCP_METRICS` (config key `metrics`) has a chain of its own too
+(`config::metrics_enabled`): the env value, trimmed and ASCII-lowercased, is
+on for `1`, `true`, `yes` and `on` and off for `0`, `false`, `no` and `off`;
+any other value, the empty one included, is skipped and reported as
+`CCP_METRICS (env): invalid boolean; ignored`, without the value. Then the
+top-level boolean `metrics` in `config.json`, where a wrong type fails the
+whole file in serde, then the default `true`. The summary names `metrics (env)` for a
+usable env value and `metrics (config)` for a file `false`; a file `true`
+adds no line. It is read when the app is built (`AppFeatures`) and at
+`serve` start, never per request.
 
 All conversation state (sessions, continuations, compaction, WebSocket pool)
 lives in process-wide statics. A restart clears it.
@@ -830,6 +844,113 @@ is not proof that the prompt changed.
 Explicit cache controls (`prompt_cache_breakpoint`, `prompt_cache_retention`)
 are rejected by the subscription backend for GPT-5.6 models (openai/codex
 #35300, #39397).
+
+## Metrics
+
+`GET /metrics` serves the Prometheus text format 0.0.4, or OpenMetrics 1.0.0
+when the `Accept` header contains `application/openmetrics-text` (an ASCII
+case-insensitive substring, no q-value parsing; `metrics::format_for_accept`).
+Like `/healthz` it carries no `request-id` and publishes no monitor event.
+With `CCP_METRICS` off the route is not registered and the fallback answers
+404 `No route for GET /metrics`. The README lists the 17 families with their
+labels.
+
+The counters live in two places. The per-request families (requests,
+duration, first token, prompt tokens, tokens, hit basis, cache misses,
+context rewrites) are one `RequestMetrics` the monitor store owns;
+`MonitorHandle::request_metrics()` hands out a clone that shares them, so a
+test that builds its own `MonitorHandle` counts on its own. The Codex
+refusals and the log events are one process-wide `ProcessMetrics`
+(`metrics::process()`), shared by every app in the process. The Codex
+provider counts a refusal (`metrics::codex_refusal`, a `RefusalClass`) once
+per client answer, where it answers a spent window (`usage_limit_response`),
+a classified failure or a context-window refusal (`context_overflow_response`)
+on its Anthropic Messages path, before or after output started; the
+OpenAI-compatible surfaces and unclassified failures count none. `Logger::emit`
+calls `metrics::log_event` once per line, after the write and whether or not
+it succeeded, with the service, the level and the message as `event`. Every
+message is a fixed string at its call site, and no log field is read.
+
+A request is exported once, at its first terminal event
+(`MonitorStore::settle`): one `ccmux_requests_total` with its outcome and
+status, its duration, its time to first token when generation started no
+earlier than the request, and,
+unless it is a `count_tokens` request or provider `local`, its measured prompt,
+its tokens per kind with `quality` `exact` (a closing report) or `estimate`
+(an opening one only) and, for a request that carried history, its hit basis.
+A count the backend never reported adds nothing and creates no series; a
+reported zero does. The `model` label is the model that ran when known, else
+the routed one (`metric_model`). A usage report that arrives after the
+terminal event changes no settled metric and is counted nowhere. The endpoint
+does not export the ledger's running totals because they are not monotonic:
+an opening estimate is replaced by the closing report, and a request's
+numbers move between model rows once its effective model is known. A counter
+that goes down reads to Prometheus as a restart, and `rate` turns the drop
+into a spike. Cache misses and context rewrites are counted in
+`evaluate_cache` when a request's cache read is judged, which can happen
+before, at or after its terminal event, so a late report can still add one.
+A miss carries its `cause`. A rewrite is a request that is not superseded,
+not on a side lane, has an earlier baseline on its lane and whose measured
+prompt is more than `CACHE_MISS_MIN_TOKENS` (1024) below it; it is never also
+counted as a miss. The token counters and the in-flight sum stop at
+`u64::MAX` instead of wrapping.
+
+`src/metrics.rs` and `src/metrics/` (`request.rs`, `process.rs`, `render.rs`)
+are a pure module: they depend on `prometheus-client` and `std` only, and name
+no type of the monitor, the server, the configuration or the providers.
+Callers convert their own state into `RenderInput`, `GaugeReading`,
+`CodexWindows` and `RefusalClass`. The module never panics, never logs (a log
+line calls back into `log_event`) and never calls the monitor. The store
+feeds the request counters with its lock held, where a panic would poison
+that lock, and the module's own `std` locks recover with
+`unwrap_or_else(PoisonError::into_inner)`.
+
+There is no long-lived registry and no custom `Collector`. `metrics::render`
+builds a `Registry::with_prefix("ccmux")` for each scrape, registers clones of
+the long-lived families, builds the scrape-time ones fresh (in flight, the
+Codex windows, sessions, sessions started, build info, process start time),
+encodes, and drops it. `handler_metrics` holds everything it read as owned
+values before encoding: `MonitorHandle::gauge_reading()` (which drops idle
+sessions first, as `snapshot` does) and `request_metrics()` when a monitor
+exists, `providers::codex::metrics_windows()` over
+`rate_limits::held_windows()` (the held reading of any account, a window whose
+reset has passed left out) and `metrics::process()`. An empty family is
+absent, and a gauge with nothing to read emits no sample rather than a zero.
+`metrics::mark_process_start()` captures the process start time; it is the
+first thing `serve_listener_with` does, else the first render captures it.
+
+Cardinality is bounded by guards in the module. One admitted set of
+(provider, model) pairs serves the nine per-request families: a provider or
+model that is absent or empty is `unknown`; a value over `MAX_LABEL_BYTES`
+(120) bytes, or a new pair once `MAX_MODEL_SERIES` (200) pairs are admitted,
+is exported as `other`/`other`, so at most 201 pairs exist. In-flight entries
+resolve through the same set at render, and entries that land on the same
+labels are summed. The log event counter admits `MAX_LOG_EVENT_SERIES` (512)
+label sets, then counts under `service="other"`, `event="other"` with the
+line's own level.
+
+Plain mode keeps a monitor store for the metrics. `serve_listener`'s body is
+`serve_listener_with(listener, monitor, spawn_reader, shutdown)`, the only
+caller of `spawn_transcript_reader`, which it starts only when `spawn_reader`
+holds and a monitor exists. `serving_monitor(monitor, metrics_enabled)`
+returns a supplied monitor with the reader on, a fresh
+`MonitorHandle::default()` with the reader off when none was supplied and
+metrics are on, and no monitor when they are off. So the transcript reader
+stays with the TUI, and with metrics on plain mode holds the monitor's memory
+(the recent list, the ledger of sessions in use, a wire session title) and
+the Anthropic relay observes bodies for usage (it parses the relayed SSE and
+holds a non-streaming JSON answer up to 4 MiB); the client's bytes are
+unchanged and none of that reaches `/metrics`. The setting is read in
+`serve_inner` for the store and in `app_with_monitor` for the route, so a
+`config.json` edit between the two can leave a store without the route, or the
+route without a store, until the next restart.
+
+Tests of the process-wide counters use `metrics::scoped_process_for_tests()`
+(`#[cfg(test)]`, in `process.rs`, re-exported `pub(crate)`): until its guard
+drops, the calling thread counts into a fresh instance. Scopes nest, and the
+guard is not `Send`. Such a test runs the counted code on its own thread
+inside a scope and asserts exact counts; no test asserts on the real
+process-wide instance, which the whole test binary feeds.
 
 ## What the Codex subscription actually meters
 

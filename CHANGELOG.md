@@ -1,3 +1,32 @@
+## Unreleased
+
+- The proxy now serves Prometheus metrics at `GET /metrics`, on by default.
+  They cover finished requests per provider, model and endpoint with their
+  outcome and HTTP status, requests in flight, request duration, time to
+  first token and prompt size, tokens per kind and the share that came from
+  the cache, cache misses and context rewrites, Codex refusals and the held
+  Codex window utilization and reset time, active and idle sessions, log
+  events per service, level and message, the version and the process start
+  time. A request is counted once, when it ends, so a usage report that
+  arrives later still corrects the monitor but does not move a metric. The
+  answer is the Prometheus text format, or OpenMetrics when the `Accept`
+  header asks for `application/openmetrics-text`. It shows provider and
+  model names, counts, log event names and the Codex window utilization,
+  and no session id, project, title, account id, request id, prompt, error
+  text or log field. Like every other route it has no authentication, so a
+  bind address wider than the default `127.0.0.1` exposes `/metrics` with
+  the rest. To feed it, plain mode (`--no-monitor`, or stdout that is not a
+  terminal) now keeps what the monitor keeps in memory: the recent request
+  list, the ledger of the sessions still in use and a session title seen on
+  the wire. The Anthropic relay then observes each relayed body for usage,
+  parsing the SSE it relays and holding a non-streaming JSON answer of up to
+  4 MiB, as it already did with the monitor on; the bytes the client
+  receives do not change, and none of that data is shown on `/metrics`.
+  Plain mode still reads no session transcripts. To get the previous
+  behavior back, set `CCP_METRICS=off` or `"metrics": false` in
+  `config.json` and restart: `/metrics` answers 404 again and plain mode
+  keeps no monitor memory.
+
 ## v0.19.0 (2026-11-12)
 
 - Dependencies are refreshed to their newest releases within the version
