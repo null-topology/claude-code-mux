@@ -97,7 +97,10 @@ fn window_from_headers(headers: &HeaderMap, id: &str, now: u64) -> Option<Window
     let used_ratio = utilization
         .parse::<f64>()
         .ok()
-        .filter(|ratio| ratio.is_finite() && *ratio >= 0.0)?;
+        .filter(|ratio| ratio.is_finite() && *ratio >= 0.0)
+        // `-0` passes the check above; adding zero holds it as plain zero and
+        // leaves every other value as it is.
+        .map(|ratio| ratio + 0.0)?;
     if reset.is_empty() || !reset.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
@@ -365,6 +368,35 @@ mod tests {
                 ("abcdefghij_12345", window(0.5, 1_794_960_000)),
             ])
         );
+    }
+
+    #[test]
+    fn a_negative_zero_utilization_is_held_as_zero() {
+        let headers = header_map(&[
+            ("anthropic-ratelimit-unified-integer-utilization", "-0"),
+            ("anthropic-ratelimit-unified-integer-reset", "1794960000"),
+            ("anthropic-ratelimit-unified-decimal-utilization", "-0.0"),
+            ("anthropic-ratelimit-unified-decimal-reset", "1794960000"),
+        ]);
+
+        let parsed = windows_from_headers(&headers, NOW);
+
+        assert_eq!(
+            parsed,
+            windows(&[
+                ("decimal", window(0.0, 1_794_960_000)),
+                ("integer", window(0.0, 1_794_960_000)),
+            ])
+        );
+        // `-0.0 == 0.0` holds, so only the bits tell a negative zero apart.
+        for (id, window) in &parsed {
+            assert_eq!(
+                window.used_ratio.to_bits(),
+                0.0_f64.to_bits(),
+                "window {id} holds {:?}",
+                window.used_ratio
+            );
+        }
     }
 
     #[test]
