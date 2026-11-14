@@ -11,8 +11,10 @@ use axum::response::Response;
 use claude_code_mux::{
     config::AliasProvider,
     logging::create_logger,
+    metrics::{AnthropicWindow, AnthropicWindows},
     monitor::MonitorHandle,
     provider::Provider,
+    providers::anthropic::{clear_anthropic_rate_limits_for_tests, metrics_windows},
     registry::Registry,
     server::{AppFeatures, app_with_features},
 };
@@ -133,29 +135,87 @@ fn anthropic_provider_at(base: &str) -> Arc<dyn Provider> {
     provider
 }
 
-/// A mock Anthropic upstream that answers every request with one short
-/// message and these token counts: 12 input, 340 cache read, 56 cache write,
-/// 7 output.
+/// One short message with these token counts: 12 input, 340 cache read, 56
+/// cache write, 7 output.
+fn anthropic_reply() -> MockReply {
+    MockReply::json(
+        200,
+        json!({
+            "id": "msg_metrics",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 12,
+                "cache_read_input_tokens": 340,
+                "cache_creation_input_tokens": 56,
+                "output_tokens": 7
+            }
+        })
+        .to_string(),
+    )
+}
+
+/// A mock Anthropic upstream that answers every request with
+/// `anthropic_reply`.
 fn anthropic_upstream() -> MockHttp {
-    MockHttp::start(|_| {
-        MockReply::json(
-            200,
-            json!({
-                "id": "msg_metrics",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "ok"}],
-                "stop_reason": "end_turn",
-                "usage": {
-                    "input_tokens": 12,
-                    "cache_read_input_tokens": 340,
-                    "cache_creation_input_tokens": 56,
-                    "output_tokens": 7
-                }
-            })
-            .to_string(),
-        )
+    MockHttp::start(|_| anthropic_reply())
+}
+
+/// A synthetic organization id, which must never reach `/metrics`.
+const ORGANIZATION: &str = "org-test-1";
+
+/// Share of the allowance window the mock reports as used.
+const WINDOW_USED: &str = "0.38";
+
+/// A mock Anthropic upstream that answers like `anthropic_upstream` and also
+/// reports the `7d` allowance window, `WINDOW_USED` spent and resetting at
+/// `resets_at`, under `ORGANIZATION`.
+fn anthropic_upstream_with_window(resets_at: u64) -> MockHttp {
+    MockHttp::start(move |_| {
+        anthropic_reply()
+            .with_header("anthropic-organization-id", ORGANIZATION)
+            .with_header("anthropic-ratelimit-unified-status", "allowed")
+            .with_header("anthropic-ratelimit-unified-7d-utilization", WINDOW_USED)
+            .with_header(
+                "anthropic-ratelimit-unified-7d-reset",
+                resets_at.to_string(),
+            )
     })
+}
+
+/// A day from now, in Unix seconds.
+fn a_day_from_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 86_400
+}
+
+/// The Anthropic allowance reading is process-wide. A test that asserts on it
+/// or on the window families, their absence included, holds this for its
+/// whole run; the reading is cleared when it is taken and when it drops, a
+/// failed test included.
+static ANTHROPIC_READING: Mutex<()> = Mutex::new(());
+
+struct AnthropicReading {
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Drop for AnthropicReading {
+    fn drop(&mut self) {
+        clear_anthropic_rate_limits_for_tests();
+    }
+}
+
+fn hold_anthropic_reading() -> AnthropicReading {
+    let guard = ANTHROPIC_READING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    clear_anthropic_rate_limits_for_tests();
+    AnthropicReading { _guard: guard }
 }
 
 /// An app with a fresh monitor whose only provider is the Anthropic
@@ -163,13 +223,26 @@ fn anthropic_upstream() -> MockHttp {
 /// for `model` and its answer was read to the end, which settles it.
 async fn app_after_one_request(upstream: &MockHttp, model: &str) -> (axum::Router, MonitorHandle) {
     let monitor = MonitorHandle::default();
+    let app = relay_one_request(upstream, model, Some(monitor.clone()), true).await;
+    (app, monitor)
+}
+
+/// An app whose only provider is the Anthropic passthrough to `upstream`,
+/// built with `monitor` and the metrics setting `metrics`, once it has served
+/// one `/v1/messages` request for `model` and its answer was read to the end.
+async fn relay_one_request(
+    upstream: &MockHttp,
+    model: &str,
+    monitor: Option<MonitorHandle>,
+    metrics: bool,
+) -> axum::Router {
     let app = app_with_features(
         Arc::new(Registry::from_providers(
             AliasProvider::Anthropic,
             [anthropic_provider_at(&upstream.base)],
         )),
-        Some(monitor.clone()),
-        features(true),
+        monitor,
+        features(metrics),
     );
     let request = Request::builder()
         .method("POST")
@@ -189,7 +262,7 @@ async fn app_after_one_request(upstream: &MockHttp, model: &str) -> (axum::Route
     assert!(response.headers().contains_key("request-id"));
     body_text(response).await;
     assert_eq!(upstream.count(), 1);
-    (app, monitor)
+    app
 }
 
 /// The served request's line of `ccmux_requests_total`.
@@ -358,6 +431,93 @@ async fn scraping_stamps_no_request_id_and_counts_no_request() {
         assert_eq!(series(&text, "ccmux_requests_total"), served, "{text}");
     }
     assert_eq!(monitor.snapshot().recent.len(), 1);
+}
+
+/// The window held from a relayed response, as both gauges.
+fn window_gauges(resets_at: u64) -> [BTreeSet<String>; 2] {
+    [
+        lines(&[&format!(
+            "ccmux_anthropic_window_used_ratio{{window=\"7d\"}} {WINDOW_USED}"
+        )]),
+        lines(&[&format!(
+            "ccmux_anthropic_window_reset_timestamp_seconds{{window=\"7d\"}} {resets_at}"
+        )]),
+    ]
+}
+
+/// A relayed response that reports an allowance window shows it as the two
+/// window gauges, in both formats, without the organization it came under;
+/// once the reading is cleared both families are gone.
+#[tokio::test]
+async fn a_relayed_allowance_window_shows_as_a_gauge() {
+    let _reading = hold_anthropic_reading();
+    let resets_at = a_day_from_now();
+    let upstream = anthropic_upstream_with_window(resets_at);
+    let (app, _monitor) = app_after_one_request(&upstream, "claude-metrics-test-window").await;
+
+    let [used, resets] = window_gauges(resets_at);
+    for accept in [None, Some(OPEN_METRICS_FIRST)] {
+        let text = body_text(scrape(app.clone(), accept).await).await;
+        assert_eq!(
+            series(&text, "ccmux_anthropic_window_used_ratio"),
+            used,
+            "{text}"
+        );
+        assert_eq!(
+            series(&text, "ccmux_anthropic_window_reset_timestamp_seconds"),
+            resets,
+            "{text}"
+        );
+        assert!(!text.contains(ORGANIZATION), "{text}");
+    }
+
+    clear_anthropic_rate_limits_for_tests();
+    for accept in [None, Some(OPEN_METRICS_FIRST)] {
+        let text = body_text(scrape(app.clone(), accept).await).await;
+        assert!(!text.contains("ccmux_anthropic_window"), "{text}");
+    }
+    assert_eq!(metrics_windows(), None);
+}
+
+/// A relayed response without allowance headers leaves both window families
+/// out.
+#[tokio::test]
+async fn a_response_without_allowance_headers_adds_no_window_gauge() {
+    let _reading = hold_anthropic_reading();
+    let upstream = anthropic_upstream();
+    let (app, _monitor) = app_after_one_request(&upstream, "claude-metrics-test-no-window").await;
+
+    for accept in [None, Some(OPEN_METRICS_FIRST)] {
+        let text = body_text(scrape(app.clone(), accept).await).await;
+        assert!(!text.contains("ccmux_anthropic_window"), "{text}");
+    }
+    assert_eq!(metrics_windows(), None);
+}
+
+/// The relay reads the allowance window whether metrics are on or not: with
+/// them off `/metrics` is not routed, and the reading is still held.
+#[tokio::test]
+async fn a_reading_is_held_while_metrics_are_off() {
+    let _reading = hold_anthropic_reading();
+    let resets_at = a_day_from_now();
+    let upstream = anthropic_upstream_with_window(resets_at);
+    let app = relay_one_request(&upstream, "claude-metrics-test-off", None, false).await;
+
+    let response = scrape(app, Some(OPEN_METRICS_FIRST)).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["error"]["message"], "No route for GET /metrics");
+
+    assert_eq!(
+        metrics_windows(),
+        Some(AnthropicWindows {
+            windows: vec![AnthropicWindow {
+                id: "7d".to_owned(),
+                used_ratio: 0.38,
+                resets_at,
+            }],
+        })
+    );
 }
 
 /// Stops the proxy process when the test ends, whether it passed or not.
