@@ -11,13 +11,14 @@
   `ccmux_cache_missed_tokens_total` counts the tokens not read from cache by
   each cache miss the monitor judges, beside `ccmux_cache_misses_total`. The
   histogram `ccmux_request_pause_seconds` records, for each request compared
-  with the previous request of its conversation for a cache miss, the time
-  between their starts, with `result` `hit` or `miss`. The existing series
-  are unchanged. The window series rest on headers Anthropic sends today but
-  does not document: when Anthropic does not send them, or sends them in a
-  form the proxy cannot read, those series are absent once any window held
-  from earlier has reset. `CCP_METRICS=0` (or `off`) still turns all of it
-  off with the rest of `/metrics`.
+  with the previous request of the same conversation and model for a cache
+  miss, the time between their starts, with `result` `hit` or `miss`; a
+  context rewrite records no pause. The existing series are unchanged. The
+  window series rest on headers Anthropic sends today but does not document:
+  when Anthropic does not send them, or sends them in a form the proxy
+  cannot read, those series are absent once any window held from earlier
+  has reset. `CCP_METRICS=0` (or `off`) still turns all of it off with the
+  rest of `/metrics`.
 
 ## v0.20.0 (2026-11-13)
 

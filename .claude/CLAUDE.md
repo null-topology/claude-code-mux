@@ -883,8 +883,10 @@ its tokens per kind with `quality` `exact` (a closing report) or `estimate`
 A count the backend never reported adds nothing and creates no series; a
 reported zero does. The `model` label is the model the request went upstream
 as when known, else the routed one (`metric_model`). A usage report that
-arrives after the terminal event changes none of the request, duration, prompt
-or token metrics, and there is no counter of late reports. The endpoint
+arrives after the terminal event changes none of the request, duration or
+prompt metrics and no token counter other than
+`ccmux_cache_missed_tokens_total` (counted with the miss, below), and there is
+no counter of late reports. The endpoint
 does not export the ledger's running totals because they are not monotonic:
 an opening estimate is replaced by the closing report, and a request's
 numbers move between model rows once its effective model is known. A counter

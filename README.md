@@ -968,11 +968,13 @@ histogram_quantile(0.95,
 ### Limits
 
 - A request's figures are fixed when it ends. A usage report that arrives
-  later corrects the monitor and changes none of the request, duration, prompt
-  or token metrics, and there is no counter of late reports. Summing
-  `ccmux_tokens_total` over `quality` can therefore differ from the monitor's
-  totals, which take those late corrections. A late report can still complete a request's
-  pending cache judgement, which then counts a miss or a rewrite as usual.
+  later corrects the monitor and changes none of the request, duration or
+  prompt metrics and no token counter other than
+  `ccmux_cache_missed_tokens_total`, and there is no counter of late reports.
+  Summing `ccmux_tokens_total` over `quality` can therefore differ from the
+  monitor's totals, which take those late corrections. A late report can still
+  complete a request's pending cache judgement, which then counts a miss with
+  the tokens it did not read, a rewrite, or a pause sample as usual.
 - A Codex stream that ended holding only the whole-prompt estimate exports it
   as `input` under `quality="estimate"`.
 - Time to first token differs by backend. Codex and Grok send a signal when
