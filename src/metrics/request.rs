@@ -14,7 +14,7 @@ use prometheus_client::registry::{Registry, Unit};
 
 use super::{
     DURATION_BUCKETS_SECONDS, FIRST_TOKEN_BUCKETS_SECONDS, MAX_LABEL_BYTES, MAX_MODEL_SERIES,
-    PROMPT_TOKEN_BUCKETS,
+    PAUSE_BUCKETS_SECONDS, PROMPT_TOKEN_BUCKETS,
 };
 
 const UNKNOWN: &str = "unknown";
@@ -67,6 +67,9 @@ pub struct RequestMetrics {
     hit_basis: Family<HitBasisLabels, TokenCounter>,
     misses: Family<MissLabels, Counter>,
     rewrites: Family<PairLabels, Counter>,
+    cache_write: Family<CacheWriteLabels, TokenCounter>,
+    missed_tokens: Family<MissLabels, TokenCounter>,
+    pause: HistogramFamily<PauseLabels>,
 }
 
 /// The `provider` and `model` labels every request family starts with.
@@ -123,6 +126,21 @@ struct MissLabels {
     cause: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct CacheWriteLabels {
+    #[prometheus(flatten)]
+    pair: PairLabels,
+    ttl: &'static str,
+    quality: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct PauseLabels {
+    #[prometheus(flatten)]
+    pair: PairLabels,
+    result: &'static str,
+}
+
 fn duration_histogram() -> Histogram {
     Histogram::new(DURATION_BUCKETS_SECONDS)
 }
@@ -133,6 +151,14 @@ fn first_token_histogram() -> Histogram {
 
 fn prompt_histogram() -> Histogram {
     Histogram::new(PROMPT_TOKEN_BUCKETS)
+}
+
+fn pause_histogram() -> Histogram {
+    Histogram::new(PAUSE_BUCKETS_SECONDS)
+}
+
+fn quality_label(count: TokenCount) -> &'static str {
+    if count.exact { "exact" } else { "estimate" }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +195,22 @@ impl MissCause {
     }
 }
 
+/// Whether the request a pause led to was judged a cache miss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseResult {
+    Hit,
+    Miss,
+}
+
+impl PauseResult {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TokenCount {
     pub tokens: u64,
@@ -181,6 +223,10 @@ pub struct SettledUsage {
     pub cache_read: Option<TokenCount>,
     pub cache_write: Option<TokenCount>,
     pub output: Option<TokenCount>,
+    /// The 5-minute part of the cache write, as the backend reported it.
+    pub cache_write_5m: Option<TokenCount>,
+    /// The 1-hour part of the cache write, as the backend reported it.
+    pub cache_write_1h: Option<TokenCount>,
     /// `prompt_tokens()` when `prompt_is_measured()`.
     pub measured_prompt: Option<u64>,
     /// `!without_history`.
@@ -212,6 +258,9 @@ impl RequestMetrics {
             hit_basis: Family::default(),
             misses: Family::default(),
             rewrites: Family::default(),
+            cache_write: Family::default(),
+            missed_tokens: Family::default(),
+            pause: Family::new_with_constructor(pause_histogram),
         }
     }
 
@@ -252,12 +301,21 @@ impl RequestMetrics {
         ];
         for (kind, count) in counts {
             let Some(count) = count else { continue };
-            let quality = if count.exact { "exact" } else { "estimate" };
             self.tokens
                 .get_or_create(&TokenLabels {
                     pair: pair.clone(),
                     kind,
-                    quality,
+                    quality: quality_label(count),
+                })
+                .inc_by(count.tokens);
+        }
+        for (ttl, count) in [("5m", usage.cache_write_5m), ("1h", usage.cache_write_1h)] {
+            let Some(count) = count else { continue };
+            self.cache_write
+                .get_or_create(&CacheWriteLabels {
+                    pair: pair.clone(),
+                    ttl,
+                    quality: quality_label(count),
                 })
                 .inc_by(count.tokens);
         }
@@ -277,14 +335,38 @@ impl RequestMetrics {
         }
     }
 
-    pub fn cache_miss(&self, provider: Option<&str>, model: Option<&str>, cause: MissCause) {
-        let pair = self.pair_labels(provider, model);
-        self.misses
-            .get_or_create(&MissLabels {
-                pair,
-                cause: cause.label(),
+    pub fn cache_miss(
+        &self,
+        provider: Option<&str>,
+        model: Option<&str>,
+        cause: MissCause,
+        missed_tokens: u64,
+    ) {
+        let labels = MissLabels {
+            pair: self.pair_labels(provider, model),
+            cause: cause.label(),
+        };
+        self.misses.get_or_create(&labels).inc();
+        self.missed_tokens
+            .get_or_create(&labels)
+            .inc_by(missed_tokens);
+    }
+
+    /// Observes the time between the starts of a request and the baseline
+    /// request it was compared with for a cache miss.
+    pub fn pause_observed(
+        &self,
+        provider: Option<&str>,
+        model: Option<&str>,
+        pause: Duration,
+        result: PauseResult,
+    ) {
+        self.pause
+            .get_or_create(&PauseLabels {
+                pair: self.pair_labels(provider, model),
+                result: result.label(),
             })
-            .inc();
+            .observe(pause.as_secs_f64());
     }
 
     pub fn context_rewrite(&self, provider: Option<&str>, model: Option<&str>) {
@@ -362,6 +444,22 @@ impl RequestMetrics {
             "context_rewrites",
             "Client rewrites of a conversation's context",
             self.rewrites.clone(),
+        );
+        registry.register(
+            "cache_write_tokens",
+            "Cache write tokens by cache lifetime, as the backend reported them",
+            self.cache_write.clone(),
+        );
+        registry.register(
+            "cache_missed_tokens",
+            "Tokens of the expected cached prefix that a judged cache miss did not read from cache",
+            self.missed_tokens.clone(),
+        );
+        registry.register_with_unit(
+            "request_pause",
+            "Time between the starts of a request and the baseline request of its conversation lane, for requests compared with it for a cache miss, context rewrites left out",
+            Unit::Seconds,
+            self.pause.clone(),
         );
     }
 }
@@ -562,6 +660,8 @@ mod tests {
             cache_read: estimate(2_000),
             cache_write: exact(0),
             output: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
             measured_prompt: None,
             carries_history: false,
         };
@@ -754,6 +854,8 @@ mod tests {
                 cache_read: exact(90),
                 cache_write: exact(5),
                 output: exact(7),
+                cache_write_5m: None,
+                cache_write_1h: None,
                 measured_prompt: None,
                 carries_history: true,
             }),
@@ -783,6 +885,8 @@ mod tests {
                 cache_read: exact(90),
                 cache_write: exact(5),
                 output: exact(7),
+                cache_write_5m: None,
+                cache_write_1h: None,
                 measured_prompt: None,
                 carries_history: false,
             }),
@@ -857,7 +961,12 @@ mod tests {
             metrics.request_settled(&settled(&format!("model-{index}")));
         }
         metrics.request_settled(&settled("one-model-too-many"));
-        metrics.cache_miss(Some("codex"), Some("another-one"), MissCause::Expired);
+        metrics.cache_miss(
+            Some("codex"),
+            Some("another-one"),
+            MissCause::Expired,
+            1_000,
+        );
         metrics.context_rewrite(Some("kimi"), Some("model-0"));
 
         for format in BOTH_FORMATS {
@@ -942,7 +1051,12 @@ mod tests {
         }
         metrics.request_settled(&settled("one-model-too-many"));
         metrics.request_settled(&settled("gpt-6-sol"));
-        metrics.cache_miss(Some("codex"), Some("gpt-6-sol"), MissCause::WithinTtl);
+        metrics.cache_miss(
+            Some("codex"),
+            Some("gpt-6-sol"),
+            MissCause::WithinTtl,
+            1_000,
+        );
 
         for format in BOTH_FORMATS {
             let samples = samples(&metrics, format);
@@ -961,10 +1075,20 @@ mod tests {
     #[test]
     fn misses_and_rewrites_count_under_their_labels() {
         let metrics = RequestMetrics::new();
-        metrics.cache_miss(Some("codex"), Some("gpt-6-sol"), MissCause::WithinTtl);
-        metrics.cache_miss(Some("codex"), Some("gpt-6-sol"), MissCause::WithinTtl);
-        metrics.cache_miss(Some("codex"), Some("gpt-6-sol"), MissCause::Expired);
-        metrics.cache_miss(None, None, MissCause::UnknownTtl);
+        metrics.cache_miss(
+            Some("codex"),
+            Some("gpt-6-sol"),
+            MissCause::WithinTtl,
+            1_000,
+        );
+        metrics.cache_miss(
+            Some("codex"),
+            Some("gpt-6-sol"),
+            MissCause::WithinTtl,
+            1_000,
+        );
+        metrics.cache_miss(Some("codex"), Some("gpt-6-sol"), MissCause::Expired, 1_000);
+        metrics.cache_miss(None, None, MissCause::UnknownTtl, 1_000);
         metrics.context_rewrite(Some("anthropic"), Some("claude-opus-5-5"));
         metrics.context_rewrite(Some("anthropic"), None);
 
@@ -985,6 +1109,315 @@ mod tests {
                 rewrites
             );
             assert!(with_prefix(&samples, "ccmux_requests_total").is_empty());
+        }
+    }
+
+    fn with_buckets(
+        cache_write_5m: Option<TokenCount>,
+        cache_write_1h: Option<TokenCount>,
+    ) -> SettledRequest<'static> {
+        SettledRequest {
+            usage: Some(SettledUsage {
+                cache_write_5m,
+                cache_write_1h,
+                ..SettledUsage::default()
+            }),
+            ..settled("gpt-6-sol")
+        }
+    }
+
+    #[test]
+    fn cache_write_buckets_count_per_lifetime_and_quality() {
+        let metrics = RequestMetrics::new();
+        metrics.request_settled(&with_buckets(exact(300), exact(600)));
+        metrics.request_settled(&with_buckets(estimate(40), None));
+        metrics.request_settled(&SettledRequest {
+            usage: Some(SettledUsage {
+                cache_write: exact(900),
+                cache_write_1h: exact(500),
+                ..SettledUsage::default()
+            }),
+            ..settled("gpt-6-sol")
+        });
+
+        let expected = set(&[
+            "ccmux_cache_write_tokens_total{provider=\"codex\",model=\"gpt-6-sol\",ttl=\"5m\",quality=\"exact\"} 300",
+            "ccmux_cache_write_tokens_total{provider=\"codex\",model=\"gpt-6-sol\",ttl=\"1h\",quality=\"exact\"} 1100",
+            "ccmux_cache_write_tokens_total{provider=\"codex\",model=\"gpt-6-sol\",ttl=\"5m\",quality=\"estimate\"} 40",
+        ]);
+        for format in BOTH_FORMATS {
+            let samples = samples(&metrics, format);
+            assert_eq!(
+                with_prefix(&samples, "ccmux_cache_write_tokens_total"),
+                expected
+            );
+            assert_eq!(
+                with_prefix(&samples, "ccmux_tokens_total"),
+                set(&[
+                    "ccmux_tokens_total{provider=\"codex\",model=\"gpt-6-sol\",kind=\"cache_write\",quality=\"exact\"} 900"
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreported_bucket_creates_no_cache_write_series() {
+        let metrics = RequestMetrics::new();
+        metrics.request_settled(&SettledRequest {
+            usage: Some(SettledUsage {
+                cache_write: exact(900),
+                ..SettledUsage::default()
+            }),
+            ..settled("gpt-6-sol")
+        });
+        metrics.request_settled(&settled("gpt-6-sol"));
+
+        for format in BOTH_FORMATS {
+            let samples = samples(&metrics, format);
+            assert!(with_prefix(&samples, "ccmux_cache_write_tokens").is_empty());
+            assert_eq!(with_prefix(&samples, "ccmux_tokens_total").len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_bucket_reported_as_zero_creates_its_series_at_zero() {
+        let metrics = RequestMetrics::new();
+        metrics.request_settled(&with_buckets(exact(0), None));
+
+        let expected = set(&[
+            "ccmux_cache_write_tokens_total{provider=\"codex\",model=\"gpt-6-sol\",ttl=\"5m\",quality=\"exact\"} 0",
+        ]);
+        for format in BOTH_FORMATS {
+            let samples = samples(&metrics, format);
+            assert_eq!(
+                with_prefix(&samples, "ccmux_cache_write_tokens_total"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn a_miss_adds_its_missed_tokens_under_the_same_labels() {
+        let metrics = RequestMetrics::new();
+        metrics.cache_miss(
+            Some("codex"),
+            Some("gpt-6-sol"),
+            MissCause::WithinTtl,
+            40_000,
+        );
+        metrics.cache_miss(
+            Some("codex"),
+            Some("gpt-6-sol"),
+            MissCause::WithinTtl,
+            2_000,
+        );
+        metrics.cache_miss(Some("codex"), Some("gpt-6-sol"), MissCause::Expired, 5_000);
+        metrics.cache_miss(None, None, MissCause::UnknownTtl, 7);
+
+        let missed = set(&[
+            "ccmux_cache_missed_tokens_total{provider=\"codex\",model=\"gpt-6-sol\",cause=\"within_ttl\"} 42000",
+            "ccmux_cache_missed_tokens_total{provider=\"codex\",model=\"gpt-6-sol\",cause=\"expired\"} 5000",
+            "ccmux_cache_missed_tokens_total{provider=\"unknown\",model=\"unknown\",cause=\"unknown_ttl\"} 7",
+        ]);
+        let misses = set(&[
+            "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-6-sol\",cause=\"within_ttl\"} 2",
+            "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-6-sol\",cause=\"expired\"} 1",
+            "ccmux_cache_misses_total{provider=\"unknown\",model=\"unknown\",cause=\"unknown_ttl\"} 1",
+        ]);
+        for format in BOTH_FORMATS {
+            let samples = samples(&metrics, format);
+            assert_eq!(
+                with_prefix(&samples, "ccmux_cache_missed_tokens_total"),
+                missed
+            );
+            assert_eq!(with_prefix(&samples, "ccmux_cache_misses_total"), misses);
+        }
+    }
+
+    #[test]
+    fn missed_tokens_saturate_at_the_maximum() {
+        let metrics = RequestMetrics::new();
+        for tokens in [u64::MAX, 1] {
+            metrics.cache_miss(Some("codex"), Some("gpt-6-sol"), MissCause::Expired, tokens);
+        }
+
+        for format in BOTH_FORMATS {
+            let samples = samples(&metrics, format);
+            assert_eq!(
+                with_prefix(&samples, "ccmux_cache_missed_tokens_total"),
+                set(&[
+                    "ccmux_cache_missed_tokens_total{provider=\"codex\",model=\"gpt-6-sol\",cause=\"expired\"} 18446744073709551615"
+                ])
+            );
+            assert_eq!(
+                with_prefix(&samples, "ccmux_cache_misses_total"),
+                set(&[
+                    "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-6-sol\",cause=\"expired\"} 2"
+                ])
+            );
+        }
+    }
+
+    /// The pause bucket bounds as each format spells them.
+    const PAUSE_LE: [(&str, &str); 14] = [
+        ("60.0", "60"),
+        ("300.0", "300"),
+        ("600.0", "600"),
+        ("1200.0", "1200"),
+        ("1800.0", "1800"),
+        ("2700.0", "2700"),
+        ("3600.0", "3600"),
+        ("7200.0", "7200"),
+        ("14400.0", "14400"),
+        ("28800.0", "28800"),
+        ("43200.0", "43200"),
+        ("86400.0", "86400"),
+        ("259200.0", "259200"),
+        ("+Inf", "+Inf"),
+    ];
+
+    /// The lines of one pause series holding one observation, whose first
+    /// bucket is `PAUSE_LE[first]`.
+    fn pause_series(format: Format, labels: &str, first: usize, sum: &str) -> BTreeSet<String> {
+        let mut lines: BTreeSet<String> = PAUSE_LE
+            .iter()
+            .enumerate()
+            .map(|(index, (open_metrics, text))| {
+                let count = u8::from(index >= first);
+                match format {
+                    Format::OpenMetrics => format!(
+                        "ccmux_request_pause_seconds_bucket{{le=\"{open_metrics}\",{labels}}} {count}"
+                    ),
+                    Format::Text => format!(
+                        "ccmux_request_pause_seconds_bucket{{{labels},le=\"{text}\"}} {count}"
+                    ),
+                }
+            })
+            .collect();
+        lines.insert(format!("ccmux_request_pause_seconds_sum{{{labels}}} {sum}"));
+        lines.insert(format!("ccmux_request_pause_seconds_count{{{labels}}} 1"));
+        lines
+    }
+
+    #[test]
+    fn pause_buckets_render_in_both_formats() {
+        let metrics = RequestMetrics::new();
+        metrics.pause_observed(
+            Some("codex"),
+            Some("gpt-6-sol"),
+            Duration::from_millis(400_500),
+            PauseResult::Miss,
+        );
+        metrics.pause_observed(
+            Some("codex"),
+            Some("gpt-6-sol"),
+            Duration::from_millis(30_250),
+            PauseResult::Hit,
+        );
+        metrics.request_settled(&with_buckets(exact(1), None));
+        metrics.cache_miss(Some("codex"), Some("gpt-6-sol"), MissCause::Expired, 1);
+
+        for format in BOTH_FORMATS {
+            let samples = samples(&metrics, format);
+            let mut expected = pause_series(
+                format,
+                "provider=\"codex\",model=\"gpt-6-sol\",result=\"miss\"",
+                2,
+                "400.5",
+            );
+            expected.extend(pause_series(
+                format,
+                "provider=\"codex\",model=\"gpt-6-sol\",result=\"hit\"",
+                0,
+                "30.25",
+            ));
+            assert_eq!(
+                with_prefix(&samples, "ccmux_request_pause_seconds"),
+                expected
+            );
+
+            let text = render(
+                &RenderInput {
+                    requests: Some(&metrics),
+                    ..RenderInput::default()
+                },
+                format,
+            );
+            let lines: BTreeSet<&str> = text.lines().collect();
+            let counter = |name: &str| match format {
+                Format::OpenMetrics => name.to_owned(),
+                Format::Text => format!("{name}_total"),
+            };
+            for help in [
+                "# HELP ccmux_request_pause_seconds Time between the starts of a request and the baseline request of its conversation lane, for requests compared with it for a cache miss, context rewrites left out.".to_owned(),
+                format!(
+                    "# HELP {} Cache write tokens by cache lifetime, as the backend reported them.",
+                    counter("ccmux_cache_write_tokens")
+                ),
+                format!(
+                    "# HELP {} Tokens of the expected cached prefix that a judged cache miss did not read from cache.",
+                    counter("ccmux_cache_missed_tokens")
+                ),
+                "# TYPE ccmux_request_pause_seconds histogram".to_owned(),
+            ] {
+                assert!(lines.contains(help.as_str()), "{help} in {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn new_request_families_share_the_pair_guard() {
+        let metrics = RequestMetrics::new();
+        for index in 0..MAX_MODEL_SERIES {
+            metrics.request_settled(&settled(&format!("model-{index}")));
+        }
+        metrics.request_settled(&SettledRequest {
+            usage: Some(SettledUsage {
+                cache_write_5m: exact(5),
+                ..SettledUsage::default()
+            }),
+            ..settled("one-model-too-many")
+        });
+        metrics.cache_miss(
+            Some("codex"),
+            Some("another-one"),
+            MissCause::Expired,
+            1_000,
+        );
+        metrics.pause_observed(
+            Some("kimi"),
+            Some("model-0"),
+            Duration::from_secs(10),
+            PauseResult::Hit,
+        );
+        metrics.pause_observed(
+            Some("codex"),
+            Some("model-0"),
+            Duration::from_secs(10),
+            PauseResult::Miss,
+        );
+
+        for format in BOTH_FORMATS {
+            let samples = samples(&metrics, format);
+            assert_eq!(
+                with_prefix(&samples, "ccmux_cache_write_tokens_total"),
+                set(&[
+                    "ccmux_cache_write_tokens_total{provider=\"other\",model=\"other\",ttl=\"5m\",quality=\"exact\"} 5"
+                ])
+            );
+            assert_eq!(
+                with_prefix(&samples, "ccmux_cache_missed_tokens_total"),
+                set(&[
+                    "ccmux_cache_missed_tokens_total{provider=\"other\",model=\"other\",cause=\"expired\"} 1000"
+                ])
+            );
+            assert_eq!(
+                with_prefix(&samples, "ccmux_request_pause_seconds_count"),
+                set(&[
+                    "ccmux_request_pause_seconds_count{provider=\"other\",model=\"other\",result=\"hit\"} 1",
+                    "ccmux_request_pause_seconds_count{provider=\"codex\",model=\"model-0\",result=\"miss\"} 1",
+                ])
+            );
         }
     }
 }

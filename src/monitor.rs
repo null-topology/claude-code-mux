@@ -1644,6 +1644,7 @@ impl MonitorStore {
             .and_then(|at| at.duration_since(record.started_at).ok());
         let usage = record.counts_tokens().then(|| {
             let quality = record.quality();
+            let buckets = cache_write_quality(&record.cache);
             let count = |tokens: Option<u64>, quality: UsageQuality| {
                 tokens.map(|tokens| TokenCount {
                     tokens,
@@ -1655,6 +1656,8 @@ impl MonitorStore {
                 cache_read: count(record.cache.read_tokens, quality.cache_read),
                 cache_write: count(record.cache.write_tokens, quality.cache_write),
                 output: count(record.output_tokens, quality.output),
+                cache_write_5m: count(record.cache.write_5m_tokens, buckets.ephemeral_5m),
+                cache_write_1h: count(record.cache.write_1h_tokens, buckets.ephemeral_1h),
                 measured_prompt: record
                     .prompt_is_measured()
                     .then(|| record.prompt_tokens())
@@ -1891,6 +1894,7 @@ impl MonitorStore {
                 Some(&key.provider),
                 metric_label.as_deref(),
                 miss_cause(miss.cause),
+                miss.missed_tokens,
             );
         }
         if rewrite {
@@ -6822,6 +6826,10 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 1"
                 .to_owned(),
         );
+        expected.insert(
+            "ccmux_cache_missed_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 30000"
+                .to_owned(),
+        );
         assert_eq!(request_lines(&monitor), expected);
     }
 
@@ -7031,5 +7039,249 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         monitor.request_completed("r1", 200, Some(100), Some(10));
         assert!(monitor.gauge_reading().in_flight.is_empty());
         assert!(gauge_lines(&monitor, "ccmux_requests_in_flight").is_empty());
+    }
+
+    fn cache_write_lines(monitor: &MonitorHandle) -> BTreeSet<String> {
+        lines_with_prefix(&request_lines(monitor), "ccmux_cache_write_tokens_total")
+    }
+
+    /// One anthropic request on `model` that reports `usage` and completes.
+    fn run_anthropic_request(
+        monitor: &MonitorHandle,
+        request_id: &str,
+        model: &str,
+        usage: UsageReport,
+    ) {
+        start_anthropic_request(monitor, request_id, model);
+        monitor.model_resolved(request_id, model);
+        monitor.usage_reported(request_id, usage);
+        monitor.request_completed(request_id, 200, None, None);
+    }
+
+    /// Each lifetime bucket counts what the backend reported for it, whether
+    /// or not the buckets add up to the aggregate write.
+    #[test]
+    fn a_settled_request_counts_distinct_values_in_both_buckets() {
+        let monitor = MonitorHandle::new(10);
+        run_anthropic_request(
+            &monitor,
+            "o1",
+            "claude-opus-5",
+            cache_creation_usage(Some(900), Some(300), Some(600)),
+        );
+        run_anthropic_request(
+            &monitor,
+            "n1",
+            "claude-sonnet-5",
+            cache_creation_usage(Some(900), None, Some(500)),
+        );
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_cache_write_tokens_total"),
+            line_set(&[
+                "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-opus-5\",ttl=\"5m\",quality=\"exact\"} 300",
+                "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-opus-5\",ttl=\"1h\",quality=\"exact\"} 600",
+                "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-sonnet-5\",ttl=\"1h\",quality=\"exact\"} 500",
+            ])
+        );
+        assert_eq!(
+            lines_with_prefix(
+                &lines,
+                "ccmux_tokens_total{provider=\"anthropic\",model=\"claude-sonnet-5\",kind=\"cache_write\""
+            ),
+            line_set(&[
+                "ccmux_tokens_total{provider=\"anthropic\",model=\"claude-sonnet-5\",kind=\"cache_write\",quality=\"exact\"} 900",
+            ])
+        );
+    }
+
+    /// Codex reports no lifetime split, and a prompt estimate or a local
+    /// answer belongs to no token total; a bucket reported as zero is a count.
+    #[test]
+    fn codex_count_tokens_and_local_requests_count_no_cache_write_bucket() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "c1", "main");
+        monitor.usage_reported("c1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("c1", 200, None, None);
+        monitor.request_started(
+            "count",
+            Some("s1".to_string()),
+            None,
+            EndpointKind::CountTokens,
+        );
+        monitor.provider_selected("count", "anthropic", "claude-opus-5", None);
+        monitor.usage_reported(
+            "count",
+            cache_creation_usage(Some(900), Some(300), Some(600)),
+        );
+        monitor.request_completed("count", 200, None, None);
+        monitor.request_started(
+            "local",
+            Some("s1".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.conversation_resolved("local", "agent-1", None);
+        monitor.provider_selected("local", LOCAL_PROVIDER, "gpt-5.6-sol", None);
+        monitor.usage_reported(
+            "local",
+            cache_creation_usage(Some(900), Some(300), Some(600)),
+        );
+        monitor.request_completed("local", 200, None, None);
+        assert!(cache_write_lines(&monitor).is_empty());
+
+        run_anthropic_request(
+            &monitor,
+            "o1",
+            "claude-opus-5",
+            cache_creation_usage(Some(0), Some(0), None),
+        );
+        assert_eq!(
+            cache_write_lines(&monitor),
+            line_set(&[
+                "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-opus-5\",ttl=\"5m\",quality=\"exact\"} 0",
+            ])
+        );
+    }
+
+    /// A bucket only an opening report named settles as an estimate, and a
+    /// report after the terminal event changes no sample of it.
+    #[test]
+    fn an_opening_bucket_settles_as_an_estimate_and_late_reports_do_not_move_it() {
+        let monitor = MonitorHandle::new(10);
+        run_anthropic_request(
+            &monitor,
+            "o1",
+            "claude-opus-5",
+            UsageReport {
+                opening: UsageFields {
+                    cache_write_tokens: Some(700),
+                    cache_write_5m_tokens: Some(700),
+                    ..UsageFields::default()
+                },
+                ..UsageReport::default()
+            },
+        );
+        let settled = line_set(&[
+            "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-opus-5\",ttl=\"5m\",quality=\"estimate\"} 700",
+        ]);
+        assert_eq!(cache_write_lines(&monitor), settled);
+
+        monitor.usage_reported("o1", cache_creation_usage(Some(800), Some(800), Some(0)));
+        let cache = recent_by_id(&monitor.snapshot(), "o1").cache;
+        assert_eq!(cache.write_5m_tokens, Some(800));
+        assert_eq!(cache.write_1h_tokens, Some(0));
+        assert_eq!(cache_write_lines(&monitor), settled);
+    }
+
+    #[test]
+    fn a_closed_and_an_opening_bucket_settle_with_their_own_quality() {
+        let monitor = MonitorHandle::new(10);
+        run_anthropic_request(
+            &monitor,
+            "o1",
+            "claude-opus-5",
+            UsageReport {
+                opening: UsageFields {
+                    cache_write_1h_tokens: Some(600),
+                    ..UsageFields::default()
+                },
+                closing: UsageFields {
+                    cache_write_5m_tokens: Some(300),
+                    ..UsageFields::default()
+                },
+                ..UsageReport::default()
+            },
+        );
+
+        assert_eq!(
+            cache_write_lines(&monitor),
+            line_set(&[
+                "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-opus-5\",ttl=\"5m\",quality=\"exact\"} 300",
+                "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-opus-5\",ttl=\"1h\",quality=\"estimate\"} 600",
+            ])
+        );
+    }
+
+    /// A miss adds the part of the expected cached prefix it did not read,
+    /// under the labels its miss counts under.
+    #[test]
+    fn a_judged_miss_counts_its_missed_tokens() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(50_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+        // 52 000 prompt tokens, 10 000 of them read from the cache: 40 000 of
+        // the expected 50 000 were not.
+        start_codex_request(&monitor, "r2", "main");
+        monitor.usage_reported("r2", closing_usage(42_000, 10_000, 0, 40));
+        monitor.request_completed("r2", 200, None, None);
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_cache_missed_tokens_total"),
+            line_set(&[
+                "ccmux_cache_missed_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 40000",
+            ])
+        );
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_cache_misses_total"),
+            line_set(&[
+                "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 1",
+            ])
+        );
+    }
+
+    #[test]
+    fn hits_superseded_side_and_rewritten_requests_count_no_missed_tokens() {
+        let monitor = MonitorHandle::new(20);
+        let run = |request_id: &str, conversation: &str, usage: UsageReport| {
+            start_codex_request(&monitor, request_id, conversation);
+            monitor.usage_reported(request_id, usage);
+            monitor.request_completed(request_id, 200, None, None);
+        };
+        // A hit: 1 000 tokens of the prefix unread, under the threshold.
+        run("h1", "main", closing_usage(30_000, 0, 0, 50));
+        run("h2", "main", closing_usage(2_000, 29_000, 0, 40));
+        // Side calls are never judged.
+        run("w1", "main/side", closing_usage(40_000, 0, 0, 20));
+        run("w2", "main/side", closing_usage(41_000, 0, 0, 20));
+        // A rewrite: the prompt shrank past the noise floor.
+        run("a1", "agent-1", closing_usage(30_000, 0, 0, 50));
+        run("a2", "agent-1", closing_usage(28_975, 0, 0, 40));
+        // Superseded: it started before the baseline that finished first.
+        start_codex_request(&monitor, "b1", "agent-2");
+        advance_clock(&monitor, Duration::from_secs(1));
+        run("b2", "agent-2", closing_usage(30_000, 0, 0, 50));
+        monitor.usage_reported("b1", closing_usage(31_000, 0, 0, 40));
+        monitor.request_completed("b1", 200, None, None);
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_context_rewrites_total"),
+            line_set(&["ccmux_context_rewrites_total{provider=\"codex\",model=\"gpt-5.6-sol\"} 1"])
+        );
+        assert!(lines_with_prefix(&lines, "ccmux_cache_misses_total").is_empty());
+        assert!(lines_with_prefix(&lines, "ccmux_cache_missed_tokens_total").is_empty());
+    }
+
+    #[test]
+    fn a_miss_judged_by_a_late_report_adds_its_missed_tokens_once() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+        start_codex_request(&monitor, "r2", "main");
+        monitor.request_completed("r2", 200, None, None);
+        monitor.usage_reported("r2", closing_usage(31_000, 0, 0, 40));
+        monitor.usage_reported("r2", closing_usage(31_000, 0, 0, 45));
+
+        assert_eq!(
+            lines_with_prefix(&request_lines(&monitor), "ccmux_cache_missed_tokens_total"),
+            line_set(&[
+                "ccmux_cache_missed_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 30000",
+            ])
+        );
     }
 }
