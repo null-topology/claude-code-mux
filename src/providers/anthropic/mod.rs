@@ -9,6 +9,7 @@
 //! Anthropic credentials and never touches the cache-keyed request prefix.
 
 pub mod models;
+pub(crate) mod rate_limits;
 
 use std::task::Poll;
 
@@ -31,6 +32,12 @@ use crate::provider::{
 };
 use crate::providers::translate_shared::wrap_reasoning;
 use crate::registry::ANTHROPIC_STYLE_ALIASES;
+
+/// Forget the newest Anthropic allowance reading, for a test that leaves one
+/// behind.
+pub fn clear_anthropic_rate_limits_for_tests() {
+    rate_limits::clear_for_tests();
+}
 
 /// Rewrite an outgoing Anthropic request body so it survives a mid-conversation switch
 /// away from the codex backend.
@@ -305,6 +312,8 @@ impl AnthropicProvider {
         match upstream {
             Ok(upstream) => {
                 let status = upstream.status();
+                // Read-only: the allowance windows are forwarded as they came.
+                rate_limits::observe_headers(upstream.headers());
                 let mut out_headers =
                     axum::http::HeaderMap::with_capacity(upstream.headers().len());
                 for (name, value) in upstream.headers() {
@@ -1467,5 +1476,210 @@ data: {"type":"message_stop"}
             session_name(&monitor).map(|name| name.text).as_deref(),
             Some("Fix the flaky login test")
         );
+    }
+
+    const RELAYED_MESSAGE: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-haiku-4-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":12,"output_tokens":1}}"#;
+    const RELAYED_RATE_LIMIT: &str =
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}"#;
+    const RELAYED_COUNT: &str = r#"{"input_tokens":12}"#;
+
+    /// What the mock upstream answers in one relay case.
+    #[derive(Clone, Copy)]
+    struct MockAnswer {
+        status: StatusCode,
+        content_type: &'static str,
+        body: &'static str,
+        utilization: f64,
+    }
+
+    /// Relays one request to a mock upstream that answers `mock` with an
+    /// allowance window resetting a day from now, and checks that the client
+    /// gets the mock's status, body bytes and forwarded headers unchanged and
+    /// that the window is held. The caller holds `rate_limits::lock_for_tests()`.
+    async fn assert_relayed_and_read(
+        mock: MockAnswer,
+        endpoint: crate::monitor::EndpointKind,
+        monitored: bool,
+    ) {
+        use axum::http::HeaderValue;
+        use axum::http::header::CONTENT_TYPE;
+
+        rate_limits::clear_for_tests();
+        let resets_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 86_400;
+        let mut sent = axum::http::HeaderMap::new();
+        sent.insert(CONTENT_TYPE, HeaderValue::from_static(mock.content_type));
+        sent.insert("request-id", HeaderValue::from_static("req_mock_1"));
+        sent.insert(
+            "anthropic-organization-id",
+            HeaderValue::from_static("org-test-1"),
+        );
+        sent.insert(
+            "anthropic-ratelimit-unified-status",
+            HeaderValue::from_static("allowed"),
+        );
+        sent.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            HeaderValue::from_str(&mock.utilization.to_string()).unwrap(),
+        );
+        sent.insert(
+            "anthropic-ratelimit-unified-7d-reset",
+            HeaderValue::from(resets_at),
+        );
+        sent.insert(
+            "anthropic-ratelimit-unified-reset",
+            HeaderValue::from(resets_at),
+        );
+        sent.append("x-mock-repeated", HeaderValue::from_static("first"));
+        sent.append("x-mock-repeated", HeaderValue::from_static("second"));
+        sent.insert(
+            "proxy-authenticate",
+            HeaderValue::from_static("Basic realm=\"mock\""),
+        );
+
+        let answer = sent.clone();
+        let upstream = axum::Router::new().fallback(move || {
+            let answer = answer.clone();
+            async move { (mock.status, answer, Body::from(mock.body)) }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let provider = AnthropicProvider {
+            client: crate::http_client::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
+            catalog_client: crate::http_client::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
+            base_url: format!("http://{address}"),
+        };
+        let count_tokens = endpoint == crate::monitor::EndpointKind::CountTokens;
+        let path_and_query = if count_tokens {
+            "/v1/messages/count_tokens?beta=true"
+        } else {
+            "/v1/messages?beta=true"
+        };
+        let raw: &'static [u8] =
+            br#"{"model":"claude-haiku-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+        let monitor = monitored.then(|| {
+            let monitor = MonitorHandle::new(10);
+            monitor.request_started("r1", Some("s1".to_string()), None, endpoint);
+            monitor.provider_selected("r1", "anthropic", "claude-haiku-4-5", None);
+            monitor
+        });
+        let ctx = RequestContext {
+            req_id: "r1".to_string(),
+            session_id: Some("s1".to_string()),
+            session_seq: None,
+            provider: "anthropic".to_string(),
+            traffic: None,
+            monitor,
+            passthrough: Some(crate::provider::Passthrough {
+                raw_body: axum::body::Bytes::from_static(raw),
+                headers: axum::http::HeaderMap::new(),
+                path_and_query: path_and_query.to_string(),
+            }),
+        };
+        let request: MessagesRequest = serde_json::from_slice(raw).unwrap();
+
+        let response = if count_tokens {
+            provider.handle_count_tokens(request, ctx).await
+        } else {
+            provider.handle_messages(request, ctx).await
+        };
+
+        let case = format!(
+            "{} {} monitored={monitored}",
+            mock.status, mock.content_type
+        );
+        assert_eq!(response.status(), mock.status, "{case}");
+        let received = response.headers().clone();
+        let relayed = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(relayed.as_ref(), mock.body.as_bytes(), "{case}");
+        for name in sent.keys() {
+            let expected: Vec<&HeaderValue> = if is_stripped_response_header(name.as_str()) {
+                Vec::new()
+            } else {
+                sent.get_all(name).iter().collect()
+            };
+            let forwarded: Vec<&HeaderValue> = received.get_all(name).iter().collect();
+            assert_eq!(forwarded, expected, "{case}: {name}");
+        }
+        assert!(
+            is_stripped_response_header("proxy-authenticate"),
+            "the mock must send a header the relay drops"
+        );
+        assert_eq!(
+            rate_limits::held_windows(),
+            std::collections::BTreeMap::from([(
+                "7d".to_string(),
+                rate_limits::Window {
+                    used_ratio: mock.utilization,
+                    resets_at,
+                },
+            )]),
+            "{case}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relayed_response_is_read_and_reaches_the_client_unchanged() {
+        let _reading = rate_limits::lock_for_tests();
+        for monitored in [true, false] {
+            let stream = MockAnswer {
+                status: StatusCode::OK,
+                content_type: "text/event-stream",
+                body: TITLE_STREAM,
+                utilization: 0.38,
+            };
+            let json = MockAnswer {
+                status: StatusCode::OK,
+                content_type: "application/json",
+                body: RELAYED_MESSAGE,
+                utilization: 0.41,
+            };
+            for mock in [stream, json] {
+                assert_relayed_and_read(mock, crate::monitor::EndpointKind::Messages, monitored)
+                    .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_response_is_read_too() {
+        let _reading = rate_limits::lock_for_tests();
+        for monitored in [true, false] {
+            let mock = MockAnswer {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                content_type: "application/json",
+                body: RELAYED_RATE_LIMIT,
+                utilization: 1.0,
+            };
+            assert_relayed_and_read(mock, crate::monitor::EndpointKind::Messages, monitored).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_count_tokens_response_is_read_too() {
+        let _reading = rate_limits::lock_for_tests();
+        for monitored in [true, false] {
+            let mock = MockAnswer {
+                status: StatusCode::OK,
+                content_type: "application/json",
+                body: RELAYED_COUNT,
+                utilization: 0.38,
+            };
+            assert_relayed_and_read(mock, crate::monitor::EndpointKind::CountTokens, monitored)
+                .await;
+        }
     }
 }
