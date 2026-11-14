@@ -7458,6 +7458,12 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         let (pause, sum) = without_pause_sum(pause_lines(&monitor));
         assert!((0.0..60.0).contains(&sum), "pause sum {sum}");
         assert_eq!(pause, pause_series_lines(CODEX_HIT, 0));
+
+        // A further report for the same request observes nothing more.
+        monitor.usage_reported("r2", closing_usage(2_000, 29_000, 0, 45));
+        let (pause, sum) = without_pause_sum(pause_lines(&monitor));
+        assert!((0.0..60.0).contains(&sum), "pause sum {sum}");
+        assert_eq!(pause, pause_series_lines(CODEX_HIT, 0));
     }
 
     /// Dropping an idle session drops its lanes: the next request has no
@@ -7494,8 +7500,12 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         monitor.provider_selected("count", "codex", "gpt-5.6-sol", None);
         monitor.usage_reported("count", closing_usage(31_000, 0, 0, 0));
         monitor.request_completed("count", 200, None, None);
-        // Nor does a local answer.
-        for request_id in ["l1", "l2"] {
+        // Nor does a local answer, though the second one reads from cache on a
+        // prompt that grew and would otherwise be judged a hit.
+        for (request_id, usage) in [
+            ("l1", closing_usage(30_000, 0, 0, 50)),
+            ("l2", closing_usage(2_000, 29_000, 0, 40)),
+        ] {
             monitor.request_started(
                 request_id,
                 Some("s1".to_string()),
@@ -7504,7 +7514,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             );
             monitor.conversation_resolved(request_id, "agent-9", None);
             monitor.provider_selected(request_id, LOCAL_PROVIDER, "gpt-5.6-sol", None);
-            monitor.usage_reported(request_id, closing_usage(30_000, 0, 0, 10));
+            monitor.usage_reported(request_id, usage);
             monitor.request_completed(request_id, 200, None, None);
         }
         // Side calls are never judged.
