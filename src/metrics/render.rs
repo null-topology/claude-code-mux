@@ -1,6 +1,7 @@
 //! Rendering: one registry per call, encoded in the format the client asked
 //! for.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 
 use prometheus_client::encoding::{EncodeLabelSet, prometheus_text, text};
@@ -11,7 +12,10 @@ use prometheus_client::metrics::info::Info;
 use prometheus_client::registry::{Registry, Unit};
 
 use super::process::{ProcessMetrics, process_start_seconds};
-use super::request::{CodexWindows, GaugeReading, PairLabels, RequestMetrics};
+use super::request::{
+    AnthropicWindow, AnthropicWindows, CodexWindows, GaugeReading, PairLabels, RequestMetrics,
+};
+use super::{MAX_ANTHROPIC_WINDOWS, MAX_WINDOW_ID_BYTES};
 
 const OPEN_METRICS_MEDIA_TYPE: &[u8] = b"application/openmetrics-text";
 const OPEN_METRICS_CONTENT_TYPE: &str =
@@ -61,11 +65,17 @@ struct WindowLabels {
     window: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct AnthropicWindowLabels {
+    window: String,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct RenderInput<'a> {
     pub requests: Option<&'a RequestMetrics>,
     pub gauges: Option<&'a GaugeReading>,
     pub codex_windows: Option<&'a CodexWindows>,
+    pub anthropic_windows: Option<&'a AnthropicWindows>,
     pub process: Option<&'a ProcessMetrics>,
 }
 
@@ -88,6 +98,9 @@ pub fn render(input: &RenderInput<'_>, format: Format) -> String {
     }
     if let Some(windows) = input.codex_windows {
         register_codex_windows(&mut registry, windows);
+    }
+    if let Some(windows) = input.anthropic_windows {
+        register_anthropic_windows(&mut registry, windows);
     }
     if let Some(process) = input.process {
         process.register(&mut registry);
@@ -175,6 +188,50 @@ fn register_codex_windows(registry: &mut Registry, windows: &CodexWindows) {
     );
 }
 
+/// Whether a window id may be exported as a label: 1 to
+/// `MAX_WINDOW_ID_BYTES` bytes of lower-case ASCII letters, digits and
+/// underscores.
+fn window_id_admitted(id: &str) -> bool {
+    (1..=MAX_WINDOW_ID_BYTES).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// Exports a window whose id is admitted and whose share is finite and not
+/// negative; of several with one id the first, and of the ids left the first
+/// `MAX_ANTHROPIC_WINDOWS` in byte order. Nothing is filtered by time: the
+/// caller passes the windows still running.
+fn register_anthropic_windows(registry: &mut Registry, windows: &AnthropicWindows) {
+    let mut kept = BTreeMap::<&str, &AnthropicWindow>::new();
+    for window in &windows.windows {
+        let usable = window.used_ratio.is_finite() && window.used_ratio >= 0.0;
+        if usable && window_id_admitted(&window.id) {
+            kept.entry(window.id.as_str()).or_insert(window);
+        }
+    }
+    let used = Family::<AnthropicWindowLabels, Gauge<f64, AtomicU64>>::default();
+    let resets = Family::<AnthropicWindowLabels, Gauge<u64, AtomicU64>>::default();
+    for (id, window) in kept.into_iter().take(MAX_ANTHROPIC_WINDOWS) {
+        let labels = AnthropicWindowLabels {
+            window: id.to_owned(),
+        };
+        used.get_or_create(&labels).set(window.used_ratio);
+        resets.get_or_create(&labels).set(window.resets_at);
+    }
+    registry.register(
+        "anthropic_window_used_ratio",
+        "Share of the Anthropic allowance window already used",
+        used,
+    );
+    registry.register_with_unit(
+        "anthropic_window_reset_timestamp",
+        "Unix time the Anthropic allowance window resets",
+        Unit::Seconds,
+        resets,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -182,8 +239,8 @@ mod tests {
 
     use super::*;
     use crate::metrics::{
-        CodexWindow, CodexWindows, GaugeReading, InFlight, Outcome, ProcessMetrics, RefusalClass,
-        RequestMetrics, SettledRequest, mark_process_start,
+        AnthropicWindow, AnthropicWindows, CodexWindow, CodexWindows, GaugeReading, InFlight,
+        Outcome, ProcessMetrics, RefusalClass, RequestMetrics, SettledRequest, mark_process_start,
     };
 
     const BOTH_FORMATS: [Format; 2] = [Format::OpenMetrics, Format::Text];
@@ -428,6 +485,140 @@ mod tests {
         for format in BOTH_FORMATS {
             let samples = samples(&render(&input, format));
             assert_eq!(with_prefix(&samples, "ccmux_codex_window"), expected);
+        }
+    }
+
+    fn anthropic_window(id: &str, used_ratio: f64, resets_at: u64) -> AnthropicWindow {
+        AnthropicWindow {
+            id: id.to_owned(),
+            used_ratio,
+            resets_at,
+        }
+    }
+
+    fn anthropic_samples(windows: Option<&AnthropicWindows>, format: Format) -> BTreeSet<String> {
+        let input = RenderInput {
+            anthropic_windows: windows,
+            ..RenderInput::default()
+        };
+        with_prefix(&samples(&render(&input, format)), "ccmux_anthropic_window")
+    }
+
+    fn anthropic_pair(id: &str, ratio: &str, resets_at: u64) -> [String; 2] {
+        [
+            format!("ccmux_anthropic_window_used_ratio{{window=\"{id}\"}} {ratio}"),
+            format!(
+                "ccmux_anthropic_window_reset_timestamp_seconds{{window=\"{id}\"}} {resets_at}"
+            ),
+        ]
+    }
+
+    #[test]
+    fn anthropic_windows_render_ratio_and_reset() {
+        let windows = AnthropicWindows {
+            windows: vec![anthropic_window("7d", 0.38, 1_794_960_000)],
+        };
+        let input = RenderInput {
+            anthropic_windows: Some(&windows),
+            ..RenderInput::default()
+        };
+        let expected = set(&[
+            "ccmux_anthropic_window_used_ratio{window=\"7d\"} 0.38",
+            "ccmux_anthropic_window_reset_timestamp_seconds{window=\"7d\"} 1794960000",
+        ]);
+        for format in BOTH_FORMATS {
+            let text = render(&input, format);
+            assert_eq!(
+                with_prefix(&samples(&text), "ccmux_anthropic_window"),
+                expected
+            );
+            let lines: BTreeSet<&str> = text.lines().collect();
+            for help in [
+                "# HELP ccmux_anthropic_window_used_ratio Share of the Anthropic allowance window already used.",
+                "# HELP ccmux_anthropic_window_reset_timestamp_seconds Unix time the Anthropic allowance window resets.",
+            ] {
+                assert!(lines.contains(help), "{help} in {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn absent_or_unusable_anthropic_windows_render_no_sample() {
+        let empty = AnthropicWindows::default();
+        let unusable = AnthropicWindows {
+            windows: vec![
+                anthropic_window("", 0.5, 1_794_960_000),
+                anthropic_window("7D", 0.5, 1_794_960_000),
+                anthropic_window("seven-day", 0.5, 1_794_960_000),
+                anthropic_window("window id", 0.5, 1_794_960_000),
+                anthropic_window("a_window_id_too_long", 0.5, 1_794_960_000),
+                anthropic_window("nan", f64::NAN, 1_794_960_000),
+                anthropic_window("inf", f64::INFINITY, 1_794_960_000),
+                anthropic_window("negative_inf", f64::NEG_INFINITY, 1_794_960_000),
+                anthropic_window("negative", -0.01, 1_794_960_000),
+            ],
+        };
+        for format in BOTH_FORMATS {
+            for windows in [None, Some(&empty), Some(&unusable)] {
+                let input = RenderInput {
+                    anthropic_windows: windows,
+                    ..RenderInput::default()
+                };
+                let text = render(&input, format);
+                assert!(!text.contains("ccmux_anthropic_window"), "{text}");
+            }
+        }
+
+        let mixed = AnthropicWindows {
+            windows: vec![
+                anthropic_window("5H", 0.5, 1_794_960_000),
+                anthropic_window("7d", 0.38, 1_794_960_000),
+                anthropic_window("5h", -1.0, 1_794_960_000),
+                anthropic_window("sixteen_byte_id0", 0.0, 1_794_960_000),
+            ],
+        };
+        let expected: BTreeSet<String> = anthropic_pair("7d", "0.38", 1_794_960_000)
+            .into_iter()
+            .chain(anthropic_pair("sixteen_byte_id0", "0.0", 1_794_960_000))
+            .collect();
+        for format in BOTH_FORMATS {
+            assert_eq!(anthropic_samples(Some(&mixed), format), expected);
+        }
+    }
+
+    #[test]
+    fn anthropic_windows_render_once_per_id() {
+        let windows = AnthropicWindows {
+            windows: vec![
+                anthropic_window("7d", 0.38, 1_794_960_000),
+                anthropic_window("5h", 0.5, 1_794_900_000),
+                anthropic_window("7d", 0.9, 1_795_000_000),
+            ],
+        };
+        let expected: BTreeSet<String> = anthropic_pair("5h", "0.5", 1_794_900_000)
+            .into_iter()
+            .chain(anthropic_pair("7d", "0.38", 1_794_960_000))
+            .collect();
+        for format in BOTH_FORMATS {
+            assert_eq!(anthropic_samples(Some(&windows), format), expected);
+        }
+    }
+
+    #[test]
+    fn at_most_eight_anthropic_windows_render() {
+        let ids = ["w8", "w0", "w7", "w1", "w6", "w2", "w5", "w3", "w4"];
+        let windows = AnthropicWindows {
+            windows: ids
+                .iter()
+                .map(|id| anthropic_window(id, 0.5, 1_794_960_000))
+                .collect(),
+        };
+        let expected: BTreeSet<String> = ["w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7"]
+            .iter()
+            .flat_map(|id| anthropic_pair(id, "0.5", 1_794_960_000))
+            .collect();
+        for format in BOTH_FORMATS {
+            assert_eq!(anthropic_samples(Some(&windows), format), expected);
         }
     }
 

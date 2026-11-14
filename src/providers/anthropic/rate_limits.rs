@@ -22,13 +22,6 @@ use axum::http::HeaderMap;
 #[cfg_attr(test, derive(PartialEq))]
 pub(crate) struct Window {
     /// The spent share as sent, 1.0 being the whole window; it may pass 1.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read only by tests until metrics report the windows"
-        )
-    )]
     pub(crate) used_ratio: f64,
     /// Unix seconds.
     pub(crate) resets_at: u64,
@@ -207,13 +200,6 @@ pub(crate) fn observe_headers(headers: &HeaderMap) {
 
 /// The held windows whose reset has not passed, whichever organization they
 /// were read under. The organization stays here.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "read only by tests until metrics report the windows"
-    )
-)]
 pub(crate) fn held_windows() -> BTreeMap<String, Window> {
     let latest = LATEST.lock().unwrap_or_else(PoisonError::into_inner);
     latest

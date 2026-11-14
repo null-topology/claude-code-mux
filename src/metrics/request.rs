@@ -497,6 +497,20 @@ pub struct CodexWindows {
     pub seven_day: Option<CodexWindow>,
 }
 
+/// One Anthropic allowance window: its id as the response headers name it,
+/// the share already used and the Unix time it resets.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnthropicWindow {
+    pub id: String,
+    pub used_ratio: f64,
+    pub resets_at: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AnthropicWindows {
+    pub windows: Vec<AnthropicWindow>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

@@ -503,8 +503,8 @@ async fn healthz() -> Json<serde_json::Value> {
 /// skipped. A scrape is not a proxied request: it carries no
 /// `request-id` and publishes nothing to the monitor. Every input is read
 /// into an owned value before encoding starts, so the monitor's store lock
-/// and the lock of the Codex reading are released by then; encoding takes
-/// only the metric families' own locks.
+/// and the locks of the Codex and Anthropic readings are released by then;
+/// encoding takes only the metric families' own locks.
 async fn handler_metrics(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
     let format = headers
         .get_all(http::header::ACCEPT)
@@ -516,12 +516,14 @@ async fn handler_metrics(State(state): State<Arc<AppState>>, headers: http::Head
     let requests = state.monitor.as_ref().map(MonitorHandle::request_metrics);
     let gauges = state.monitor.as_ref().map(MonitorHandle::gauge_reading);
     let codex_windows = crate::providers::codex::metrics_windows();
+    let anthropic_windows = crate::providers::anthropic::metrics_windows();
     let process = crate::metrics::process();
     let body = crate::metrics::render(
         &crate::metrics::RenderInput {
             requests: requests.as_ref(),
             gauges: gauges.as_ref(),
             codex_windows: codex_windows.as_ref(),
+            anthropic_windows: anthropic_windows.as_ref(),
             process: Some(&process),
         },
         format,

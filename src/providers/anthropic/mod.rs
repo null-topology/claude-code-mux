@@ -39,6 +39,25 @@ pub fn clear_anthropic_rate_limits_for_tests() {
     rate_limits::clear_for_tests();
 }
 
+/// The Anthropic allowance windows held from the newest reading, in id order,
+/// without a window whose reset has passed; `None` when none is held.
+pub fn metrics_windows() -> Option<crate::metrics::AnthropicWindows> {
+    let held = rate_limits::held_windows();
+    if held.is_empty() {
+        return None;
+    }
+    Some(crate::metrics::AnthropicWindows {
+        windows: held
+            .into_iter()
+            .map(|(id, window)| crate::metrics::AnthropicWindow {
+                id,
+                used_ratio: window.used_ratio,
+                resets_at: window.resets_at,
+            })
+            .collect(),
+    })
+}
+
 /// Rewrite an outgoing Anthropic request body so it survives a mid-conversation switch
 /// away from the codex backend.
 ///
@@ -1681,5 +1700,57 @@ data: {"type":"message_stop"}
             assert_relayed_and_read(mock, crate::monitor::EndpointKind::CountTokens, monitored)
                 .await;
         }
+    }
+
+    #[test]
+    fn metrics_windows_list_the_held_windows_in_id_order() {
+        use axum::http::HeaderValue;
+
+        let _reading = rate_limits::lock_for_tests();
+        assert_eq!(metrics_windows(), None);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            HeaderValue::from_static("0.38"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-reset",
+            HeaderValue::from(now + 86_400),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.5"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            HeaderValue::from(now + 3_600),
+        );
+        rate_limits::observe_headers(&headers);
+
+        assert_eq!(
+            metrics_windows(),
+            Some(crate::metrics::AnthropicWindows {
+                windows: vec![
+                    crate::metrics::AnthropicWindow {
+                        id: "5h".to_owned(),
+                        used_ratio: 0.5,
+                        resets_at: now + 3_600,
+                    },
+                    crate::metrics::AnthropicWindow {
+                        id: "7d".to_owned(),
+                        used_ratio: 0.38,
+                        resets_at: now + 86_400,
+                    },
+                ],
+            })
+        );
+
+        clear_anthropic_rate_limits_for_tests();
+        assert_eq!(metrics_windows(), None);
     }
 }
