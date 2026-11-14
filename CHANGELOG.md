@@ -1,3 +1,24 @@
+## Unreleased
+
+- `/metrics` exports five more series. `ccmux_anthropic_window_used_ratio`
+  and `ccmux_anthropic_window_reset_timestamp_seconds` give the utilization
+  and reset time of each Anthropic allowance window, read from the response
+  headers the Claude route relays (the client still receives them unchanged)
+  and labelled with the window id from the header name, such as `7d`; other
+  windows appear when Anthropic sends them, and no organization id is
+  exported. `ccmux_cache_write_tokens_total` splits cache writes by cache
+  lifetime (`ttl` `5m` or `1h`) as Anthropic reports them.
+  `ccmux_cache_missed_tokens_total` counts the tokens not read from cache by
+  each cache miss the monitor judges, beside `ccmux_cache_misses_total`. The
+  histogram `ccmux_request_pause_seconds` records, for each request compared
+  with the previous request of its conversation for a cache miss, the time
+  between their starts, with `result` `hit` or `miss`. The existing series
+  are unchanged. The window series rest on headers Anthropic sends today but
+  does not document: when Anthropic does not send them, or sends them in a
+  form the proxy cannot read, those series are absent once any window held
+  from earlier has reset. `CCP_METRICS=0` (or `off`) still turns all of it
+  off with the rest of `/metrics`.
+
 ## v0.20.0 (2026-11-13)
 
 - The proxy now serves Prometheus metrics at `GET /metrics`, on by default.
