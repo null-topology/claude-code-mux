@@ -264,7 +264,8 @@ Request path:
      the `Passthrough` bytes verbatim; the only rewrite is turning a
      signature-less `thinking` block into tagged text. Holds no credentials.
      `models.rs` builds the Claude rows of `/v1/models` (see "Codex model
-     inventory").
+     inventory"). `rate_limits.rs` holds the Anthropic allowance windows read
+     from the relayed response headers for `/metrics` (see "Metrics").
    - `codex/`: by far the largest. Maps Anthropic Messages onto the OpenAI
      Responses API. A response that ended incomplete finishes with
      `stop_reason: max_tokens`, or `refusal` when its
@@ -852,12 +853,13 @@ when the `Accept` header contains `application/openmetrics-text` (an ASCII
 case-insensitive substring, no q-value parsing; `metrics::format_for_accept`).
 Like `/healthz` it carries no `request-id` and publishes no monitor event.
 With `CCP_METRICS` off the route is not registered and the fallback answers
-404 `No route for GET /metrics`. The README lists the 17 families with their
+404 `No route for GET /metrics`. The README lists the 22 families with their
 labels.
 
 The counters live in two places. The per-request families (requests,
 duration, first token, prompt tokens, tokens, hit basis, cache misses,
-context rewrites) are one `RequestMetrics` the monitor store owns;
+context rewrites, cache write lifetimes, missed tokens, pause) are one
+`RequestMetrics` the monitor store owns;
 `MonitorHandle::request_metrics()` hands out a clone that shares them, so a
 test that builds its own `MonitorHandle` counts on its own. The Codex
 refusals and the log events are one process-wide `ProcessMetrics`
@@ -881,8 +883,10 @@ its tokens per kind with `quality` `exact` (a closing report) or `estimate`
 A count the backend never reported adds nothing and creates no series; a
 reported zero does. The `model` label is the model the request went upstream
 as when known, else the routed one (`metric_model`). A usage report that
-arrives after the terminal event changes none of the request, duration, prompt
-or token metrics, and there is no counter of late reports. The endpoint
+arrives after the terminal event changes none of the request, duration or
+prompt metrics and no token counter other than
+`ccmux_cache_missed_tokens_total` (counted with the miss, below), and there is
+no counter of late reports. The endpoint
 does not export the ledger's running totals because they are not monotonic:
 an opening estimate is replaced by the closing report, and a request's
 numbers move between model rows once its effective model is known. A counter
@@ -900,11 +904,33 @@ prompt is more than `CACHE_MISS_MIN_TOKENS` (1024) below it; it is never also
 counted as a miss. The token counters and the in-flight sum stop at
 `u64::MAX` instead of wrapping.
 
+At the terminal event a request with usage also adds
+`ccmux_cache_write_tokens_total` per lifetime bucket (`ttl` `5m` and `1h`,
+`SettledUsage::cache_write_5m` / `cache_write_1h`), each with its own quality
+from `cache_write_quality`, never the aggregate write's. A bucket never
+reported adds nothing and a reported zero creates the series; only a usage
+`cache_creation` object fills the buckets, which in practice is the Anthropic
+relay. `RequestMetrics::cache_miss` counts a miss in
+`ccmux_cache_misses_total` and its `missed_tokens` in
+`ccmux_cache_missed_tokens_total` in the same call and under the same labels;
+`detect_cache_miss` gives the expected prefix less the cache read, saturating.
+`evaluate_cache` also observes `ccmux_request_pause_seconds`
+(`pause_observed`) for every comparison it judges that is not a rewrite: the
+start-to-start gap to the lane's baseline, `result` `miss` when
+`detect_cache_miss` found one, else `hit` (`PauseResult`). A comparison needs
+everything judging needs (a final cache read, not superseded, not a side lane,
+a baseline, a start no earlier than its `readable_from`, cache activity on the
+lane or a provider that caches implicitly), so a pause lands when a miss would,
+before, at or after the terminal event. The buckets are
+`PAUSE_BUCKETS_SECONDS`, 60 s to 259200 s. A `count_tokens` request and
+provider `local` add to none of the three.
+
 `src/metrics.rs` and `src/metrics/` (`request.rs`, `process.rs`, `render.rs`)
 are a pure module: they depend on `prometheus-client` and `std` only, and name
 no type of the monitor, the server, the configuration or the providers.
 Callers convert their own state into `RenderInput`, `GaugeReading`,
-`CodexWindows` and `RefusalClass`. The module never panics, never logs (a log
+`CodexWindows`, `AnthropicWindows`, `RefusalClass` and `PauseResult`. The
+module never panics, never logs (a log
 line calls back into `log_event`) and never calls the monitor. The store
 feeds the request counters with its lock held, where a panic would poison
 that lock, and the module's own `std` locks recover with
@@ -913,19 +939,21 @@ that lock, and the module's own `std` locks recover with
 There is no long-lived registry and no custom `Collector`. `metrics::render`
 builds a `Registry::with_prefix("ccmux")` for each scrape, registers clones of
 the long-lived families, builds the scrape-time ones fresh (in flight, the
-Codex windows, sessions, sessions started, build info, process start time),
-encodes, and drops it. `handler_metrics` holds everything it read as owned
-values before encoding: `MonitorHandle::gauge_reading()` (which drops idle
-sessions first, as `snapshot` does) and `request_metrics()` when a monitor
-exists, `providers::codex::metrics_windows()` over
-`rate_limits::held_windows()` (the held reading of any account, a window whose
-reset has passed left out) and `metrics::process()`. An empty family is
+Codex windows, the Anthropic windows, sessions, sessions started, build info,
+process start time), encodes, and drops it. `handler_metrics` holds
+everything it read as owned values before encoding:
+`MonitorHandle::gauge_reading()` (which drops idle sessions first, as
+`snapshot` does) and `request_metrics()` when a monitor exists,
+`providers::codex::metrics_windows()` over `rate_limits::held_windows()` (the
+held reading of any account, a window whose reset has passed left out),
+`providers::anthropic::metrics_windows()` (below) and `metrics::process()`.
+An empty family is
 absent, and a gauge with nothing to read emits no sample rather than a zero.
 `metrics::mark_process_start()` captures the process start time; it is the
 first thing `serve_listener_with` does, else the first render captures it.
 
 Cardinality is bounded by guards in the module. One admitted set of
-(provider, model) pairs serves the nine per-request families: a provider or
+(provider, model) pairs serves the twelve per-request families: a provider or
 model that is absent or empty is `unknown`; a value over `MAX_LABEL_BYTES`
 (120) bytes, or a new pair once `MAX_MODEL_SERIES` (200) pairs are admitted,
 is exported as `other`/`other`, so at most 201 pairs exist. In-flight entries
@@ -933,6 +961,45 @@ resolve through the same set at render, and entries that land on the same
 labels are summed. The log event counter admits `MAX_LOG_EVENT_SERIES` (512)
 label sets, then counts under `service="other"`, `event="other"` with the
 line's own level.
+
+The Anthropic allowance windows are read in
+`providers/anthropic/rate_limits.rs`. `relay` in `providers/anthropic/mod.rs`
+calls `rate_limits::observe_headers`
+on the upstream response headers right after taking the status and before
+copying them to the client, which gets them unchanged: every relayed Messages
+and `count_tokens` answer, any status, with or without a monitor and whatever
+`CCP_METRICS` says (with metrics off the reading is held and never served).
+A window is the pair `anthropic-ratelimit-unified-<id>-utilization` and
+`anthropic-ratelimit-unified-<id>-reset`, each present exactly once and
+UTF-8, with an id of 1 to `MAX_WINDOW_ID_BYTES` (16) bytes of `[a-z0-9_]`, a
+utilization that parses as a finite, non-negative `f64` (`-0` and `-0.0` are
+held as plain zero, a value above 1 is kept, there is no upper bound) and a
+reset of ASCII digits read as a `u64` later than now (`window_from_headers`).
+Anything else drops that window only; the bare
+`anthropic-ratelimit-unified-reset` and the other headers of the family name
+no window. The identity is `anthropic-organization-id`, present once,
+non-empty and UTF-8, compared and never parsed or exported; a response with
+neither an organization nor a window changes nothing. `merge` keeps only the
+incoming windows still running. With none left, a response without an
+organization or with the reading's own leaves the reading as it is, and one
+naming any other organization (against a reading held without one included)
+drops it. With some, a response of the same identity (equal ids, or none on
+either side) replaces each window it carries whatever the resets, so the
+latest arrival wins, and keeps the held windows it does not carry while they
+run; any other identity, no organization replacing a known one included,
+replaces the reading whole. The reading holds at most `MAX_HELD_WINDOWS` (8):
+the incoming windows first, the first 8 in byte order of their ids, then held
+ones in byte order until 8. `held_windows()` returns the windows still running
+on the real clock, and `providers::anthropic::metrics_windows()` hands them to
+`handler_metrics` as `AnthropicWindows`, `None` when nothing runs. `Held` has
+no `Debug`, the lock of the static `LATEST` recovers from poison, and nothing
+there logs. `metrics::render` applies the guard again
+(`register_anthropic_windows`, `window_id_admitted`): a window whose id breaks
+the rule or whose ratio is not finite and non-negative is skipped, the first
+occurrence of an id is kept, and the first `MAX_ANTHROPIC_WINDOWS` (8) ids in
+byte order are exported as `ccmux_anthropic_window_used_ratio` and
+`ccmux_anthropic_window_reset_timestamp_seconds`. Render applies no time
+filter of its own.
 
 Plain mode keeps a monitor store for the metrics. `serve_inner` calls
 `serve_listener_with(listener, monitor, spawn_reader, shutdown)` with the
@@ -962,6 +1029,14 @@ integration test `an_app_without_a_monitor_serves_process_metrics_only` in
 `tests/metrics.rs` does read the real instance: it logs through a logger whose
 service name no other test of that binary uses, so the series it reads is its
 own.
+
+The held Anthropic reading is process-wide too. A unit test that touches it
+takes `rate_limits::lock_for_tests()` (`#[cfg(test)]`), which recovers from
+poison and clears the reading on entry and again when its guard drops.
+`tests/metrics.rs` serializes its window tests with a file-local guard,
+`hold_anthropic_reading()`, which clears it through the public
+`providers::anthropic::clear_anthropic_rate_limits_for_tests()` on entry and
+on drop.
 
 ## What the Codex subscription actually meters
 

@@ -32,8 +32,8 @@ pub use usage::{
 use usage::{ClosedFields, UsageDelta, apply_closing, apply_opening, quality_of};
 
 use crate::metrics::{
-    GaugeReading, InFlight, MissCause, Outcome, RequestMetrics, SettledRequest, SettledUsage,
-    TokenCount,
+    GaugeReading, InFlight, MissCause, Outcome, PauseResult, RequestMetrics, SettledRequest,
+    SettledUsage, TokenCount,
 };
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
@@ -1644,6 +1644,7 @@ impl MonitorStore {
             .and_then(|at| at.duration_since(record.started_at).ok());
         let usage = record.counts_tokens().then(|| {
             let quality = record.quality();
+            let buckets = cache_write_quality(&record.cache);
             let count = |tokens: Option<u64>, quality: UsageQuality| {
                 tokens.map(|tokens| TokenCount {
                     tokens,
@@ -1655,6 +1656,8 @@ impl MonitorStore {
                 cache_read: count(record.cache.read_tokens, quality.cache_read),
                 cache_write: count(record.cache.write_tokens, quality.cache_write),
                 output: count(record.output_tokens, quality.output),
+                cache_write_5m: count(record.cache.write_5m_tokens, buckets.ephemeral_5m),
+                cache_write_1h: count(record.cache.write_1h_tokens, buckets.ephemeral_1h),
                 measured_prompt: record
                     .prompt_is_measured()
                     .then(|| record.prompt_tokens())
@@ -1811,7 +1814,9 @@ impl MonitorStore {
             .as_deref()
             .is_some_and(is_side_conversation);
         let judged = judge && !superseded && !side;
-        let miss = previous.filter(|_| judged).and_then(|lane| {
+        // The time since the baseline started and, when the request was
+        // compared with it, whether that comparison found a miss.
+        let judging = previous.filter(|_| judged).and_then(|lane| {
             // It was sent before the previous response began, so the entries
             // that response wrote were not readable yet.
             if started_at < lane.readable_from {
@@ -1829,8 +1834,12 @@ impl MonitorStore {
             // The previous request's entries decide whether this one could
             // still read them.
             let ttl = lane.ttl.or(cache.ttl).or(default_cache_ttl(&key.provider));
-            detect_cache_miss(lane.prompt_tokens, prompt, cache_read, gap, ttl)
+            Some((
+                gap,
+                detect_cache_miss(lane.prompt_tokens, prompt, cache_read, gap, ttl),
+            ))
         });
+        let miss = judging.and_then(|(_, miss)| miss);
         // A prompt that shrank past the noise floor was rewritten by the
         // client; the lane only takes it as its new baseline.
         let rewrite = !superseded
@@ -1891,11 +1900,23 @@ impl MonitorStore {
                 Some(&key.provider),
                 metric_label.as_deref(),
                 miss_cause(miss.cause),
+                miss.missed_tokens,
             );
         }
         if rewrite {
             self.metrics
                 .context_rewrite(Some(&key.provider), metric_label.as_deref());
+        }
+        if let Some((gap, miss)) = judging
+            && !rewrite
+        {
+            let result = if miss.is_some() {
+                PauseResult::Miss
+            } else {
+                PauseResult::Hit
+            };
+            self.metrics
+                .pause_observed(Some(&key.provider), metric_label.as_deref(), gap, result);
         }
 
         self.ledger.note_cache_evaluation(request_id, miss);
@@ -6822,7 +6843,17 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 1"
                 .to_owned(),
         );
-        assert_eq!(request_lines(&monitor), expected);
+        expected.insert(
+            "ccmux_cache_missed_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 30000"
+                .to_owned(),
+        );
+        expected.extend(pause_series_lines(
+            "provider=\"codex\",model=\"gpt-5.6-sol\",result=\"miss\"",
+            0,
+        ));
+        let (lines, sum) = without_pause_sum(request_lines(&monitor));
+        assert!((0.0..60.0).contains(&sum), "pause sum {sum}");
+        assert_eq!(lines, expected);
     }
 
     /// A prompt that shrank past the noise floor was rewritten by the client:
@@ -7031,5 +7062,524 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         monitor.request_completed("r1", 200, Some(100), Some(10));
         assert!(monitor.gauge_reading().in_flight.is_empty());
         assert!(gauge_lines(&monitor, "ccmux_requests_in_flight").is_empty());
+    }
+
+    fn cache_write_lines(monitor: &MonitorHandle) -> BTreeSet<String> {
+        lines_with_prefix(&request_lines(monitor), "ccmux_cache_write_tokens_total")
+    }
+
+    /// One anthropic request on `model` that reports `usage` and completes.
+    fn run_anthropic_request(
+        monitor: &MonitorHandle,
+        request_id: &str,
+        model: &str,
+        usage: UsageReport,
+    ) {
+        start_anthropic_request(monitor, request_id, model);
+        monitor.model_resolved(request_id, model);
+        monitor.usage_reported(request_id, usage);
+        monitor.request_completed(request_id, 200, None, None);
+    }
+
+    /// Each lifetime bucket counts what the backend reported for it, whether
+    /// or not the buckets add up to the aggregate write.
+    #[test]
+    fn a_settled_request_counts_distinct_values_in_both_buckets() {
+        let monitor = MonitorHandle::new(10);
+        run_anthropic_request(
+            &monitor,
+            "o1",
+            "claude-opus-5",
+            cache_creation_usage(Some(900), Some(300), Some(600)),
+        );
+        run_anthropic_request(
+            &monitor,
+            "n1",
+            "claude-sonnet-5",
+            cache_creation_usage(Some(900), None, Some(500)),
+        );
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_cache_write_tokens_total"),
+            line_set(&[
+                "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-opus-5\",ttl=\"5m\",quality=\"exact\"} 300",
+                "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-opus-5\",ttl=\"1h\",quality=\"exact\"} 600",
+                "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-sonnet-5\",ttl=\"1h\",quality=\"exact\"} 500",
+            ])
+        );
+        assert_eq!(
+            lines_with_prefix(
+                &lines,
+                "ccmux_tokens_total{provider=\"anthropic\",model=\"claude-sonnet-5\",kind=\"cache_write\""
+            ),
+            line_set(&[
+                "ccmux_tokens_total{provider=\"anthropic\",model=\"claude-sonnet-5\",kind=\"cache_write\",quality=\"exact\"} 900",
+            ])
+        );
+    }
+
+    /// Codex reports no lifetime split, and a prompt estimate or a local
+    /// answer belongs to no token total; a bucket reported as zero is a count.
+    #[test]
+    fn codex_count_tokens_and_local_requests_count_no_cache_write_bucket() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "c1", "main");
+        monitor.usage_reported("c1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("c1", 200, None, None);
+        monitor.request_started(
+            "count",
+            Some("s1".to_string()),
+            None,
+            EndpointKind::CountTokens,
+        );
+        monitor.provider_selected("count", "anthropic", "claude-opus-5", None);
+        monitor.usage_reported(
+            "count",
+            cache_creation_usage(Some(900), Some(300), Some(600)),
+        );
+        monitor.request_completed("count", 200, None, None);
+        monitor.request_started(
+            "local",
+            Some("s1".to_string()),
+            None,
+            EndpointKind::Messages,
+        );
+        monitor.conversation_resolved("local", "agent-1", None);
+        monitor.provider_selected("local", LOCAL_PROVIDER, "gpt-5.6-sol", None);
+        monitor.usage_reported(
+            "local",
+            cache_creation_usage(Some(900), Some(300), Some(600)),
+        );
+        monitor.request_completed("local", 200, None, None);
+        assert!(cache_write_lines(&monitor).is_empty());
+
+        run_anthropic_request(
+            &monitor,
+            "o1",
+            "claude-opus-5",
+            cache_creation_usage(Some(0), Some(0), None),
+        );
+        assert_eq!(
+            cache_write_lines(&monitor),
+            line_set(&[
+                "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-opus-5\",ttl=\"5m\",quality=\"exact\"} 0",
+            ])
+        );
+    }
+
+    /// A bucket only an opening report named settles as an estimate, and a
+    /// report after the terminal event changes no sample of it.
+    #[test]
+    fn an_opening_bucket_settles_as_an_estimate_and_late_reports_do_not_move_it() {
+        let monitor = MonitorHandle::new(10);
+        run_anthropic_request(
+            &monitor,
+            "o1",
+            "claude-opus-5",
+            UsageReport {
+                opening: UsageFields {
+                    cache_write_tokens: Some(700),
+                    cache_write_5m_tokens: Some(700),
+                    ..UsageFields::default()
+                },
+                ..UsageReport::default()
+            },
+        );
+        let settled = line_set(&[
+            "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-opus-5\",ttl=\"5m\",quality=\"estimate\"} 700",
+        ]);
+        assert_eq!(cache_write_lines(&monitor), settled);
+
+        monitor.usage_reported("o1", cache_creation_usage(Some(800), Some(800), Some(0)));
+        let cache = recent_by_id(&monitor.snapshot(), "o1").cache;
+        assert_eq!(cache.write_5m_tokens, Some(800));
+        assert_eq!(cache.write_1h_tokens, Some(0));
+        assert_eq!(cache_write_lines(&monitor), settled);
+    }
+
+    #[test]
+    fn a_closed_and_an_opening_bucket_settle_with_their_own_quality() {
+        let monitor = MonitorHandle::new(10);
+        run_anthropic_request(
+            &monitor,
+            "o1",
+            "claude-opus-5",
+            UsageReport {
+                opening: UsageFields {
+                    cache_write_1h_tokens: Some(600),
+                    ..UsageFields::default()
+                },
+                closing: UsageFields {
+                    cache_write_5m_tokens: Some(300),
+                    ..UsageFields::default()
+                },
+                ..UsageReport::default()
+            },
+        );
+
+        assert_eq!(
+            cache_write_lines(&monitor),
+            line_set(&[
+                "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-opus-5\",ttl=\"5m\",quality=\"exact\"} 300",
+                "ccmux_cache_write_tokens_total{provider=\"anthropic\",model=\"claude-opus-5\",ttl=\"1h\",quality=\"estimate\"} 600",
+            ])
+        );
+    }
+
+    /// A miss adds the part of the expected cached prefix it did not read,
+    /// under the labels its miss counts under.
+    #[test]
+    fn a_judged_miss_counts_its_missed_tokens() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(50_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+        // 52 000 prompt tokens, 10 000 of them read from the cache: 40 000 of
+        // the expected 50 000 were not.
+        start_codex_request(&monitor, "r2", "main");
+        monitor.usage_reported("r2", closing_usage(42_000, 10_000, 0, 40));
+        monitor.request_completed("r2", 200, None, None);
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_cache_missed_tokens_total"),
+            line_set(&[
+                "ccmux_cache_missed_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 40000",
+            ])
+        );
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_cache_misses_total"),
+            line_set(&[
+                "ccmux_cache_misses_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 1",
+            ])
+        );
+    }
+
+    #[test]
+    fn hits_superseded_side_and_rewritten_requests_count_no_missed_tokens() {
+        let monitor = MonitorHandle::new(20);
+        let run = |request_id: &str, conversation: &str, usage: UsageReport| {
+            start_codex_request(&monitor, request_id, conversation);
+            monitor.usage_reported(request_id, usage);
+            monitor.request_completed(request_id, 200, None, None);
+        };
+        // A hit: 1 000 tokens of the prefix unread, under the threshold.
+        run("h1", "main", closing_usage(30_000, 0, 0, 50));
+        run("h2", "main", closing_usage(2_000, 29_000, 0, 40));
+        // Side calls are never judged.
+        run("w1", "main/side", closing_usage(40_000, 0, 0, 20));
+        run("w2", "main/side", closing_usage(41_000, 0, 0, 20));
+        // A rewrite: the prompt shrank past the noise floor.
+        run("a1", "agent-1", closing_usage(30_000, 0, 0, 50));
+        run("a2", "agent-1", closing_usage(28_975, 0, 0, 40));
+        // Superseded: it started before the baseline that finished first.
+        start_codex_request(&monitor, "b1", "agent-2");
+        advance_clock(&monitor, Duration::from_secs(1));
+        run("b2", "agent-2", closing_usage(30_000, 0, 0, 50));
+        monitor.usage_reported("b1", closing_usage(31_000, 0, 0, 40));
+        monitor.request_completed("b1", 200, None, None);
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_context_rewrites_total"),
+            line_set(&["ccmux_context_rewrites_total{provider=\"codex\",model=\"gpt-5.6-sol\"} 1"])
+        );
+        assert!(lines_with_prefix(&lines, "ccmux_cache_misses_total").is_empty());
+        assert!(lines_with_prefix(&lines, "ccmux_cache_missed_tokens_total").is_empty());
+    }
+
+    #[test]
+    fn a_miss_judged_by_a_late_report_adds_its_missed_tokens_once() {
+        let monitor = MonitorHandle::new(10);
+        start_codex_request(&monitor, "r1", "main");
+        monitor.usage_reported("r1", closing_usage(30_000, 0, 0, 50));
+        monitor.request_completed("r1", 200, None, None);
+        start_codex_request(&monitor, "r2", "main");
+        monitor.request_completed("r2", 200, None, None);
+        monitor.usage_reported("r2", closing_usage(31_000, 0, 0, 40));
+        monitor.usage_reported("r2", closing_usage(31_000, 0, 0, 45));
+
+        assert_eq!(
+            lines_with_prefix(&request_lines(&monitor), "ccmux_cache_missed_tokens_total"),
+            line_set(&[
+                "ccmux_cache_missed_tokens_total{provider=\"codex\",model=\"gpt-5.6-sol\",cause=\"within_ttl\"} 30000",
+            ])
+        );
+    }
+
+    /// The text-format upper bounds of `ccmux_request_pause_seconds`.
+    const PAUSE_LE: [&str; 14] = [
+        "60", "300", "600", "1200", "1800", "2700", "3600", "7200", "14400", "28800", "43200",
+        "86400", "259200", "+Inf",
+    ];
+
+    const CODEX_HIT: &str = "provider=\"codex\",model=\"gpt-5.6-sol\",result=\"hit\"";
+    const CODEX_MISS: &str = "provider=\"codex\",model=\"gpt-5.6-sol\",result=\"miss\"";
+
+    /// The bucket and count lines of one pause series holding one
+    /// observation, whose first bucket is `PAUSE_LE[first]`. The `_sum` holds
+    /// real time and is read apart.
+    fn pause_series_lines(labels: &str, first: usize) -> BTreeSet<String> {
+        let mut lines: BTreeSet<String> = PAUSE_LE
+            .iter()
+            .enumerate()
+            .map(|(index, le)| {
+                let count = u8::from(index >= first);
+                format!("ccmux_request_pause_seconds_bucket{{{labels},le=\"{le}\"}} {count}")
+            })
+            .collect();
+        lines.insert(format!("ccmux_request_pause_seconds_count{{{labels}}} 1"));
+        lines
+    }
+
+    /// `lines` without its one pause `_sum` line, and the value of that line.
+    fn without_pause_sum(lines: BTreeSet<String>) -> (BTreeSet<String>, f64) {
+        let sum = sample_value(&lines, "ccmux_request_pause_seconds_sum");
+        let lines = lines
+            .into_iter()
+            .filter(|line| !line.starts_with("ccmux_request_pause_seconds_sum"))
+            .collect();
+        (lines, sum)
+    }
+
+    fn pause_lines(monitor: &MonitorHandle) -> BTreeSet<String> {
+        lines_with_prefix(&request_lines(monitor), "ccmux_request_pause_seconds")
+    }
+
+    fn run_codex_request(
+        monitor: &MonitorHandle,
+        request_id: &str,
+        conversation: &str,
+        usage: UsageReport,
+    ) {
+        start_codex_request(monitor, request_id, conversation);
+        monitor.usage_reported(request_id, usage);
+        monitor.request_completed(request_id, 200, None, None);
+    }
+
+    /// A request compared with its lane's baseline that read the prefix
+    /// observes the time between the two starts under `hit`.
+    #[test]
+    fn a_hit_observes_one_pause_under_hit() {
+        let monitor = MonitorHandle::new(10);
+        run_codex_request(&monitor, "r1", "main", closing_usage(30_000, 0, 0, 50));
+        advance_clock(&monitor, Duration::from_secs(90));
+        // 1 000 tokens of the prefix unread, under the threshold.
+        run_codex_request(&monitor, "r2", "main", closing_usage(2_000, 29_000, 0, 40));
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            sample_value(
+                &lines,
+                &format!("ccmux_request_pause_seconds_count{{{CODEX_HIT}}}")
+            ),
+            1.0
+        );
+        assert!(lines_with_prefix(&lines, "ccmux_cache_misses_total").is_empty());
+        let (pause, sum) =
+            without_pause_sum(lines_with_prefix(&lines, "ccmux_request_pause_seconds"));
+        assert!((90.0..150.0).contains(&sum), "pause sum {sum}");
+        assert_eq!(pause, pause_series_lines(CODEX_HIT, 1));
+    }
+
+    /// The pause runs from the baseline request's start, not from the moment
+    /// its response began, and an expired miss observes it under `miss`.
+    #[test]
+    fn an_expired_miss_observes_its_pause_from_the_request_start() {
+        let monitor = MonitorHandle::new(10);
+        start_anthropic_request(&monitor, "o1", "claude-opus-5");
+        monitor.model_resolved("o1", "claude-opus-5");
+        advance_clock(&monitor, Duration::from_secs(200));
+        monitor.generation_started("o1");
+        monitor.usage_reported("o1", cache_creation_usage(Some(40_000), Some(40_000), None));
+        monitor.request_completed("o1", 200, None, None);
+        advance_clock(&monitor, Duration::from_secs(200));
+        run_anthropic_request(
+            &monitor,
+            "o2",
+            "claude-opus-5",
+            cache_creation_usage(Some(40_100), Some(40_100), None),
+        );
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_cache_misses_total"),
+            line_set(&[
+                "ccmux_cache_misses_total{provider=\"anthropic\",model=\"claude-opus-5\",cause=\"expired\"} 1",
+            ])
+        );
+        let (pause, sum) =
+            without_pause_sum(lines_with_prefix(&lines, "ccmux_request_pause_seconds"));
+        assert!((400.0..460.0).contains(&sum), "pause sum {sum}");
+        assert_eq!(
+            pause,
+            pause_series_lines(
+                "provider=\"anthropic\",model=\"claude-opus-5\",result=\"miss\"",
+                2
+            )
+        );
+    }
+
+    /// Codex caches without being asked and reports no cache write, so a lane
+    /// whose reports never read from cache is still compared.
+    #[test]
+    fn a_codex_lane_without_reported_cache_activity_observes_its_pause() {
+        let monitor = MonitorHandle::new(10);
+        let without_write = |input: u64| UsageReport {
+            closing: UsageFields {
+                input_tokens: Some(input),
+                cache_read_tokens: Some(0),
+                output_tokens: Some(40),
+                ..UsageFields::default()
+            },
+            ..UsageReport::default()
+        };
+        run_codex_request(&monitor, "r1", "main", without_write(30_000));
+        run_codex_request(&monitor, "r2", "main", without_write(31_000));
+
+        let (pause, sum) = without_pause_sum(pause_lines(&monitor));
+        assert!((0.0..60.0).contains(&sum), "pause sum {sum}");
+        assert_eq!(pause, pause_series_lines(CODEX_MISS, 0));
+    }
+
+    /// A request whose cache read closes only after its terminal event is
+    /// judged then, and its pause is observed once.
+    #[test]
+    fn a_pause_first_judged_on_a_late_report_is_observed_once() {
+        let monitor = MonitorHandle::new(10);
+        run_codex_request(&monitor, "r1", "main", closing_usage(30_000, 0, 0, 50));
+        start_codex_request(&monitor, "r2", "main");
+        monitor.usage_reported("r2", UsageReport::opening(Some(31_000), Some(10)));
+        monitor.request_completed("r2", 200, None, None);
+        assert!(pause_lines(&monitor).is_empty());
+
+        monitor.usage_reported("r2", closing_usage(2_000, 29_000, 0, 40));
+        let (pause, sum) = without_pause_sum(pause_lines(&monitor));
+        assert!((0.0..60.0).contains(&sum), "pause sum {sum}");
+        assert_eq!(pause, pause_series_lines(CODEX_HIT, 0));
+
+        // A further report for the same request observes nothing more.
+        monitor.usage_reported("r2", closing_usage(2_000, 29_000, 0, 45));
+        let (pause, sum) = without_pause_sum(pause_lines(&monitor));
+        assert!((0.0..60.0).contains(&sum), "pause sum {sum}");
+        assert_eq!(pause, pause_series_lines(CODEX_HIT, 0));
+    }
+
+    /// Dropping an idle session drops its lanes: the next request has no
+    /// baseline to be compared with, and the one after is compared with it.
+    #[test]
+    fn a_session_dropped_and_started_again_measures_from_its_new_baseline() {
+        let monitor = MonitorHandle::new(10);
+        run_codex_request(&monitor, "r1", "main", closing_usage(30_000, 0, 0, 50));
+        advance_clock(&monitor, Duration::from_secs(25 * 3600));
+        run_codex_request(&monitor, "r2", "main", closing_usage(31_000, 0, 0, 40));
+        assert!(pause_lines(&monitor).is_empty());
+
+        advance_clock(&monitor, Duration::from_secs(120));
+        // 500 tokens of the 31 000 expected unread: a hit.
+        run_codex_request(&monitor, "r3", "main", closing_usage(1_000, 30_500, 0, 40));
+        let (pause, sum) = without_pause_sum(pause_lines(&monitor));
+        assert!((120.0..180.0).contains(&sum), "pause sum {sum}");
+        assert_eq!(pause, pause_series_lines(CODEX_HIT, 1));
+    }
+
+    #[test]
+    fn requests_the_judging_skips_observe_no_pause() {
+        let monitor = MonitorHandle::new(40);
+        // The first request of a lane has nothing to be compared with.
+        run_codex_request(&monitor, "f1", "main", closing_usage(30_000, 0, 0, 50));
+        // A prompt estimate on that lane runs no model.
+        monitor.request_started(
+            "count",
+            Some("s1".to_string()),
+            None,
+            EndpointKind::CountTokens,
+        );
+        monitor.conversation_resolved("count", "main", None);
+        monitor.provider_selected("count", "codex", "gpt-5.6-sol", None);
+        monitor.usage_reported("count", closing_usage(31_000, 0, 0, 0));
+        monitor.request_completed("count", 200, None, None);
+        // Nor does a local answer, though the second one reads from cache on a
+        // prompt that grew and would otherwise be judged a hit.
+        for (request_id, usage) in [
+            ("l1", closing_usage(30_000, 0, 0, 50)),
+            ("l2", closing_usage(2_000, 29_000, 0, 40)),
+        ] {
+            monitor.request_started(
+                request_id,
+                Some("s1".to_string()),
+                None,
+                EndpointKind::Messages,
+            );
+            monitor.conversation_resolved(request_id, "agent-9", None);
+            monitor.provider_selected(request_id, LOCAL_PROVIDER, "gpt-5.6-sol", None);
+            monitor.usage_reported(request_id, usage);
+            monitor.request_completed(request_id, 200, None, None);
+        }
+        // Side calls are never judged.
+        run_codex_request(&monitor, "w1", "main/side", closing_usage(40_000, 0, 0, 20));
+        run_codex_request(&monitor, "w2", "main/side", closing_usage(41_000, 0, 0, 20));
+        // Superseded: it started before the baseline that finished first.
+        start_codex_request(&monitor, "b1", "agent-2");
+        advance_clock(&monitor, Duration::from_secs(1));
+        run_codex_request(&monitor, "b2", "agent-2", closing_usage(30_000, 0, 0, 50));
+        monitor.usage_reported("b1", closing_usage(31_000, 0, 0, 40));
+        monitor.request_completed("b1", 200, None, None);
+        // A rewrite: the prompt shrank past the noise floor.
+        run_codex_request(&monitor, "a1", "agent-1", closing_usage(30_000, 0, 0, 50));
+        run_codex_request(&monitor, "a2", "agent-1", closing_usage(28_975, 0, 0, 40));
+        // A cache read that never closed.
+        run_codex_request(&monitor, "t1", "agent-3", closing_usage(30_000, 0, 0, 50));
+        run_codex_request(&monitor, "t2", "agent-3", total_only_usage(31_000, 40));
+        // Sent before the baseline's response began.
+        start_anthropic_request(&monitor, "o1", "claude-opus-5");
+        monitor.model_resolved("o1", "claude-opus-5");
+        advance_clock(&monitor, Duration::from_secs(5));
+        start_anthropic_request(&monitor, "o2", "claude-opus-5");
+        monitor.model_resolved("o2", "claude-opus-5");
+        advance_clock(&monitor, Duration::from_secs(5));
+        monitor.generation_started("o1");
+        monitor.usage_reported("o1", cache_creation_usage(Some(40_000), Some(40_000), None));
+        monitor.request_completed("o1", 200, None, None);
+        monitor.usage_reported("o2", cache_creation_usage(Some(40_100), Some(40_100), None));
+        monitor.request_completed("o2", 200, None, None);
+        // An Anthropic lane that never showed cache activity.
+        run_anthropic_request(
+            &monitor,
+            "n1",
+            "claude-sonnet-5",
+            closing_usage(30_000, 0, 0, 50),
+        );
+        run_anthropic_request(
+            &monitor,
+            "n2",
+            "claude-sonnet-5",
+            closing_usage(31_000, 0, 0, 40),
+        );
+
+        let lines = request_lines(&monitor);
+        assert_eq!(
+            lines_with_prefix(&lines, "ccmux_context_rewrites_total"),
+            line_set(&["ccmux_context_rewrites_total{provider=\"codex\",model=\"gpt-5.6-sol\"} 1"])
+        );
+        assert!(lines_with_prefix(&lines, "ccmux_request_pause_seconds").is_empty());
+    }
+
+    /// A request judged on its first closing report observes nothing more on
+    /// the reports that follow, before or after its terminal event.
+    #[test]
+    fn a_second_report_observes_no_second_pause() {
+        let monitor = MonitorHandle::new(10);
+        run_codex_request(&monitor, "r1", "main", closing_usage(30_000, 0, 0, 50));
+        start_codex_request(&monitor, "r2", "main");
+        monitor.usage_reported("r2", closing_usage(2_000, 29_000, 0, 40));
+        monitor.usage_reported("r2", closing_usage(2_000, 29_000, 0, 45));
+        monitor.request_completed("r2", 200, None, None);
+        monitor.usage_reported("r2", closing_usage(2_500, 29_000, 0, 50));
+
+        let (pause, sum) = without_pause_sum(pause_lines(&monitor));
+        assert!((0.0..60.0).contains(&sum), "pause sum {sum}");
+        assert_eq!(pause, pause_series_lines(CODEX_HIT, 0));
     }
 }

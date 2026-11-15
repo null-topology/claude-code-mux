@@ -16,8 +16,8 @@ pub use process::{
 };
 pub use render::{Format, RenderInput, content_type, format_for_accept, render};
 pub use request::{
-    CodexWindow, CodexWindows, GaugeReading, InFlight, MissCause, Outcome, RequestMetrics,
-    SettledRequest, SettledUsage, TokenCount,
+    AnthropicWindow, AnthropicWindows, CodexWindow, CodexWindows, GaugeReading, InFlight,
+    MissCause, Outcome, PauseResult, RequestMetrics, SettledRequest, SettledUsage, TokenCount,
 };
 
 /// Upper bounds of `ccmux_request_duration_seconds`, in seconds.
@@ -47,6 +47,13 @@ pub const PROMPT_TOKEN_BUCKETS: [f64; 13] = [
     1_000_000.0,
 ];
 
+/// Upper bounds of `ccmux_request_pause_seconds`, in seconds: one minute up
+/// to three days.
+pub const PAUSE_BUCKETS_SECONDS: [f64; 13] = [
+    60.0, 300.0, 600.0, 1200.0, 1800.0, 2700.0, 3600.0, 7200.0, 14400.0, 28800.0, 43200.0, 86400.0,
+    259200.0,
+];
+
 /// A provider or model label longer than this many bytes puts its pair under
 /// (`other`, `other`).
 pub const MAX_LABEL_BYTES: usize = 120;
@@ -58,3 +65,9 @@ pub const MAX_MODEL_SERIES: usize = 200;
 /// Distinct label sets of `ccmux_log_events_total`; a new one past that is
 /// counted under `service="other"` and `event="other"`.
 pub const MAX_LOG_EVENT_SERIES: usize = 512;
+
+/// Longest Anthropic window id exported as a label.
+pub const MAX_WINDOW_ID_BYTES: usize = 16;
+
+/// Most Anthropic windows exported per scrape.
+pub const MAX_ANTHROPIC_WINDOWS: usize = 8;

@@ -880,9 +880,14 @@ transcripts; only the terminal monitor does.
 | `ccmux_cache_hit_basis_tokens_total` | counter | `provider`, `model`, `kind` | The `input`, `cache_read` and `cache_write` tokens of the requests that carried conversation history, the basis the monitor's hit % is read from. It is a part of `ccmux_tokens_total`; never add the two. |
 | `ccmux_cache_misses_total` | counter | `provider`, `model`, `cause` | Cache misses as the monitor judges them (see [Prompt cache](#prompt-cache)), by `cause`: `within_ttl`, `expired`, or `unknown_ttl` when the backend's cache lifetime is not known. |
 | `ccmux_context_rewrites_total` | counter | `provider`, `model` | Requests whose measured prompt is more than 1024 tokens below the previous request of the same conversation and model: a client rewrite such as compaction, clear or rewind. Side calls and a request that started before that previous one are not counted. A rewrite is not a cache miss. |
+| `ccmux_cache_write_tokens_total` | counter | `provider`, `model`, `ttl`, `quality` | Cache write tokens per cache lifetime, `ttl` `5m` or `1h`, as the backend reported that split. `quality` is read as in `ccmux_tokens_total`, for each lifetime on its own. A lifetime the backend did not report adds nothing and creates no series; a reported zero does create one. The backend reports the split apart from the total write, so the two lifetimes need not add up to `ccmux_tokens_total{kind="cache_write"}`. Of the backends the proxy serves, only Anthropic reports the split, so the other providers have no series here. |
+| `ccmux_cache_missed_tokens_total` | counter | `provider`, `model`, `cause` | Tokens not read from cache by the misses that `ccmux_cache_misses_total` counts, under the same labels: for each miss, the expected cached prefix less what the request read from cache. A shortfall below the miss threshold is not a miss and adds nothing. |
+| `ccmux_request_pause_seconds` | histogram | `provider`, `model`, `result` | For each request the monitor compares with the previous request of its conversation on the same model to judge a cache miss, the time from the start of that previous request to the start of this one, by `result`: `miss` when the comparison found a miss, else `hit`. A context rewrite is in neither, and a request that is not compared (see [Prompt cache](#prompt-cache)) is not observed. |
 | `ccmux_codex_refusals_total` | counter | `class` | Codex refusals the proxy answered to `/v1/messages` requests served by Codex, once per answer to the client, by `class`: `usage_limit` (a spent window), `quota_exceeded`, `usage_not_included`, `rejected`, `context_overflow`, `throttled`, `overloaded`, `model_not_found`, `permission_denied`. A refusal that arrives after output started counts too. An unclassified 429 or 5xx is not counted here; it shows in `ccmux_requests_total`. |
 | `ccmux_codex_window_used_ratio` | gauge | `window` | Utilization of the held Codex allowance window, `5h` or `7d`, as a fraction; it can pass 1.0. No sample until Codex has reported a reading, and none for a window whose reset has passed. No account id is exported. |
 | `ccmux_codex_window_reset_timestamp_seconds` | gauge | `window` | When that window resets, in Unix seconds. |
+| `ccmux_anthropic_window_used_ratio` | gauge | `window` | Share of each Anthropic allowance window already used, as the response states it; it can pass 1.0. It is read from the `anthropic-ratelimit-unified-<window>-utilization` and `-<window>-reset` headers of the responses the Claude route relays, which reach the client unchanged. One sample per window the backend reports, labelled with the id from the header name, such as `7d`; other windows appear when the backend sends them. An id is 1 to 16 lowercase letters, digits or `_`. No sample until a relayed response has carried a window, and none for a window whose reset has passed. No organization id is exported. |
+| `ccmux_anthropic_window_reset_timestamp_seconds` | gauge | `window` | When that window resets, in Unix seconds. |
 | `ccmux_sessions` | gauge | `state` | Sessions the monitor holds: `active` (shown) and `idle` (hidden after an hour with nothing in flight and no activity). Both states are present whenever the gauge is. |
 | `ccmux_sessions_started_total` | counter | none | Sessions started since the process began. A session dropped after a day idle and started again under the same id counts again. |
 | `ccmux_log_events_total` | counter | `service`, `level`, `event` | Log events per logger `service`, `level` (`debug`, `info`, `warn`, `error`) and `event`, which is the log message, a fixed text at every call site. No log field is exported. |
@@ -895,10 +900,12 @@ transcripts; only the terminal monitor does.
 else the model it was routed to, else `unknown`. `endpoint` is one of `messages`, `count_tokens`,
 `responses`, `chat_completions`, `images`, `transcriptions`. A `count_tokens`
 request and a `local` answer count in `ccmux_requests_total` and
-`ccmux_request_duration_seconds` but add no tokens and no prompt size.
+`ccmux_request_duration_seconds` but add no tokens and no prompt size, and
+nothing to `ccmux_cache_write_tokens_total`, `ccmux_cache_missed_tokens_total`
+or `ccmux_request_pause_seconds`.
 
-Histogram buckets, upper bounds in seconds for the two durations and in tokens
-for the prompt (`+Inf` is added):
+Histogram buckets, upper bounds in seconds for the two durations and the pause
+and in tokens for the prompt (`+Inf` is added):
 
 - `ccmux_request_duration_seconds`: 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60,
   120, 300, 600, 1200, 1800.
@@ -906,6 +913,8 @@ for the prompt (`+Inf` is added):
   300.
 - `ccmux_request_prompt_tokens`: 1000, 2000, 5000, 10000, 20000, 50000, 100000,
   150000, 200000, 300000, 500000, 750000, 1000000.
+- `ccmux_request_pause_seconds`: 60, 300, 600, 1200, 1800, 2700, 3600, 7200,
+  14400, 28800, 43200, 86400, 259200.
 
 A metric with no sample is left out of the answer, and a gauge with nothing to
 report emits no sample rather than a zero.
@@ -917,8 +926,9 @@ label sets, a new log event is counted under `service="other"`,
 `event="other"` with its own level.
 
 **What it exposes.** `/metrics` shows provider and model names, counts, the
-names of log events and the Codex window utilization. It shows no session id,
-project, title, account id, request id, prompt, error text or log field. The
+names of log events, the Codex window utilization and the Anthropic window
+utilization and reset times. It shows no session id, project, title, account
+or organization id, request id, prompt, error text or log field. The
 proxy binds `127.0.0.1` by default and has no inbound authentication on any
 route, so a wider bind address exposes `/metrics` with the rest.
 `CCP_METRICS=off` removes the route.
@@ -958,11 +968,13 @@ histogram_quantile(0.95,
 ### Limits
 
 - A request's figures are fixed when it ends. A usage report that arrives
-  later corrects the monitor and changes none of the request, duration, prompt
-  or token metrics, and there is no counter of late reports. Summing
-  `ccmux_tokens_total` over `quality` can therefore differ from the monitor's
-  totals, which take those late corrections. A late report can still complete a request's
-  pending cache judgement, which then counts a miss or a rewrite as usual.
+  later corrects the monitor and changes none of the request, duration or
+  prompt metrics and no token counter other than
+  `ccmux_cache_missed_tokens_total`, and there is no counter of late reports.
+  Summing `ccmux_tokens_total` over `quality` can therefore differ from the
+  monitor's totals, which take those late corrections. A late report can still
+  complete a request's pending cache judgement, which then counts a miss with
+  the tokens it did not read, a rewrite, or a pause sample as usual.
 - A Codex stream that ended holding only the whole-prompt estimate exports it
   as `input` under `quality="estimate"`.
 - Time to first token differs by backend. Codex and Grok send a signal when
@@ -984,6 +996,36 @@ histogram_quantile(0.95,
   request with no usage, and so does one whose relay ends on an error chunk:
   its usage is read only once the body ends. A streamed answer whose relay
   ends that way keeps the usage it reported before the error chunk.
+- The Anthropic window rows depend on headers Anthropic does not document. A
+  header that is renamed or cannot be parsed updates nothing: a window held
+  from earlier stays until its reset, then both window metrics are absent. A
+  value whose scale or meaning changes upstream is exported as sent,
+  utilization above 1 included; there is no plausibility bound.
+- Each Anthropic window is the last usable value for the organization the
+  reading follows, kept until its reset passes, a later response replaces it
+  or the cap of 8 windows drops it. A client that talks to Anthropic directly,
+  not through the proxy, does not update it.
+- The latest response to arrive wins: concurrent responses read in another
+  order than the backend produced them can leave an older value held until
+  the next response.
+- With several organizations through one proxy, the reading follows the last
+  response that named another organization or carried windows without naming
+  one.
+- At most 8 window labels per scrape. Every id ever exported still leaves its
+  own series in a Prometheus server over time.
+- `ccmux_cache_write_tokens_total` shows what the backend wrote under each
+  lifetime, not what every request asked for.
+- `ccmux_request_pause_seconds` shows judged outcomes by pause, not how long
+  the cache actually lives. The pause includes the previous request's run
+  time, and above 259200 seconds it lands in `+Inf`. A pause over a day is
+  possible while the session has not been dropped, which activity on any
+  conversation of the session, this one included, or a request in flight
+  prevents; a request whose final prompt size never arrives does not replace
+  the previous request a later one is compared with.
+- `hit` includes partial reads below the miss threshold; a context rewrite is
+  in neither `hit` nor `miss`.
+- A request that ends with no usage, such as the Claude answers of the 4 MiB
+  limit above, adds nothing to `ccmux_cache_write_tokens_total` either.
 
 ## HTTP API
 
@@ -1543,8 +1585,9 @@ from them upstream and writes no name to `proxy.log`. A traffic capture can
 still contain a title, as part of a recorded title reply.
 
 `/metrics`, on by default, shows provider and model names, counts, the names of
-log events and the Codex window utilization, and no session id, project,
-title, account id, request id, prompt, error text or log field. No route has
+log events, the Codex window utilization and the Anthropic window utilization
+and reset times, and no session id, project, title, account or organization
+id, request id, prompt, error text or log field. No route has
 inbound authentication, so binding wider than `127.0.0.1` exposes `/metrics`
 with the rest; `CCP_METRICS=off` removes it.
 
