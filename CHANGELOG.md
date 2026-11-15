@@ -1,4 +1,4 @@
-## Unreleased
+## v0.21.0 (2026-11-15)
 
 - `/metrics` exports five more series. `ccmux_anthropic_window_used_ratio`
   and `ccmux_anthropic_window_reset_timestamp_seconds` give the utilization
