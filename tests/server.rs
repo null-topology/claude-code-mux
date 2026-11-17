@@ -4886,6 +4886,47 @@ async fn the_advisor_never_reaches_a_translated_provider() {
     }
 }
 
+/// A `tool_choice` that names the removed advisor goes too, as it would name a
+/// tool the request no longer declares; any other choice arrives as sent.
+#[tokio::test]
+async fn a_tool_choice_naming_the_advisor_does_not_reach_a_translated_provider() {
+    for (choice, expected) in [
+        (json!({"type": "tool", "name": "advisor"}), None),
+        (json!({"type": "auto"}), Some(json!({"type": "auto"}))),
+    ] {
+        let mut body: Value = serde_json::from_str(&advisor_request("gpt-5.5")).unwrap();
+        body["tool_choice"] = choice.clone();
+        let (app, captured) = body_capture_app("codex", "gpt-5.5", AliasProvider::Codex);
+        let response = post_json(app, "/v1/messages", Body::from(body.to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK, "{choice}");
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1, "{choice}");
+        let (received, _) = &captured[0];
+        assert_eq!(received.get("tool_choice"), expected.as_ref(), "{choice}");
+        assert_eq!(received["tools"], json!([read_tool()]), "{choice}");
+    }
+}
+
+/// The strip follows the provider a request ends on, not the model's name: a
+/// Claude id routed to Codex, as `CCP_ALIAS_PROVIDER=codex` does, arrives
+/// without the advisor.
+#[tokio::test]
+async fn a_claude_model_routed_off_anthropic_loses_the_advisor() {
+    let (app, captured) = body_capture_app("codex", "gpt-5.5", AliasProvider::Codex);
+    let response = post_json(
+        app,
+        "/v1/messages",
+        Body::from(advisor_request("claude-opus-5")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let (received, _) = &captured[0];
+    assert_eq!(received["tools"], json!([read_tool()]));
+    assert_eq!(received["messages"], history_without_advisor());
+}
+
 /// Anthropic runs the advisor, so its route keeps the tool and the history
 /// blocks: the provider gets them in its parsed body and in the bytes the
 /// client sent, and the passthrough relays those bytes unchanged.
