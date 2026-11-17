@@ -4969,19 +4969,21 @@ async fn the_anthropic_route_keeps_the_advisor() {
     }
 }
 
-/// Through the real Grok provider, whose translator refuses a
-/// `server_tool_use` it cannot run. Its token count runs that translator and
-/// counts locally, with no login and no upstream call, so once advisor
-/// blocks in the history no longer reach it the count succeeds.
+/// Through the real Grok provider, whose translator refuses a tool entry
+/// that carries a `type`, the advisor's included, and a `server_tool_use` it
+/// cannot run. Its token count runs that translator and counts locally, with
+/// no login and no upstream call, so once neither the advisor tool nor its
+/// blocks in the history reach it the count succeeds.
 #[tokio::test]
-async fn a_grok_token_count_with_advisor_history_passes_the_translator() {
+async fn a_grok_token_count_with_the_advisor_passes_the_translator() {
     let _no_logins = NoSavedLogins::install();
-    // The Grok translator refuses any tool entry that carries a `type`, the
-    // advisor's included, so this request keeps to the history.
     let body = json!({
         "model": "grok-4.5",
         "max_tokens": 64,
-        "tools": [read_tool()],
+        "tools": [
+            read_tool(),
+            {"type": "advisor_20260301", "name": "advisor", "model": "claude-fable-5-2"}
+        ],
         "messages": advisor_history()
     });
     let response = post_json(
