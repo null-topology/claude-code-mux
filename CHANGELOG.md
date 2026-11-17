@@ -1,4 +1,4 @@
-## Unreleased
+## v0.21.1 (2026-11-17)
 
 - On Codex, Kimi, Grok and Cursor models the proxy now removes Claude Code's
   advisor tool, a `tool_choice` that names it, and the advisor calls and
