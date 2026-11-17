@@ -4708,3 +4708,297 @@ async fn a_threaded_label_is_not_rerouted_off_anthropic() {
     assert_eq!(seen.as_deref(), Some(sent.as_bytes()));
     assert!(codex_models.is_empty());
 }
+
+/// What a [`BodyCaptureProvider`] received: the parsed body, serialized again,
+/// and the bytes the client sent.
+type CapturedBody = (Value, Option<axum::body::Bytes>);
+
+/// A provider under a name of the test's choosing that keeps every request it
+/// gets, Messages and `count_tokens` alike, and answers 200.
+struct BodyCaptureProvider {
+    name: &'static str,
+    model: &'static str,
+    captured: Arc<Mutex<Vec<CapturedBody>>>,
+}
+
+impl BodyCaptureProvider {
+    fn capture(&self, body: MessagesRequest, ctx: RequestContext) -> axum::response::Response {
+        let raw = ctx.passthrough.map(|passthrough| passthrough.raw_body);
+        self.captured
+            .lock()
+            .unwrap()
+            .push((serde_json::to_value(&body).unwrap(), raw));
+        (StatusCode::OK, "captured").into_response()
+    }
+}
+
+#[async_trait]
+impl Provider for BodyCaptureProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        vec![self.model.to_string()]
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+    ) -> axum::response::Response {
+        self.capture(body, ctx)
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+    ) -> axum::response::Response {
+        self.capture(body, ctx)
+    }
+}
+
+/// An app whose only provider is a [`BodyCaptureProvider`] named `name` that
+/// serves `model`, with what it captures.
+fn body_capture_app(
+    name: &'static str,
+    model: &'static str,
+    alias: AliasProvider,
+) -> (axum::Router, Arc<Mutex<Vec<CapturedBody>>>) {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(BodyCaptureProvider {
+        name,
+        model,
+        captured: captured.clone(),
+    }) as Arc<dyn Provider>;
+    (
+        app(Arc::new(Registry::from_providers(alias, [provider]))),
+        captured,
+    )
+}
+
+fn read_tool() -> Value {
+    json!({
+        "name": "Read",
+        "description": "Read a file.",
+        "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+    })
+}
+
+/// The history of a session that consulted the advisor on a Claude model:
+/// the advisor call and its result sit between two text blocks.
+fn advisor_history() -> Value {
+    json!([
+        {"role": "user", "content": [{"type": "text", "text": "Plan the change."}]},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Let me ask."},
+            {"type": "server_tool_use", "id": "srvtoolu_01", "name": "advisor", "input": {}},
+            {
+                "type": "advisor_tool_result",
+                "tool_use_id": "srvtoolu_01",
+                "content": {"type": "advisor_result", "text": "Split it in two."}
+            },
+            {"type": "text", "text": "Here is the plan."}
+        ]},
+        {"role": "user", "content": [{"type": "text", "text": "Go on."}]}
+    ])
+}
+
+/// [`advisor_history`] without the advisor's blocks.
+fn history_without_advisor() -> Value {
+    json!([
+        {"role": "user", "content": [{"type": "text", "text": "Plan the change."}]},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Let me ask."},
+            {"type": "text", "text": "Here is the plan."}
+        ]},
+        {"role": "user", "content": [{"type": "text", "text": "Go on."}]}
+    ])
+}
+
+/// A request as Claude Code sends it with an advisor configured: the advisor
+/// tool beside a client tool, and the advisor's blocks in the history.
+fn advisor_request(model: &str) -> String {
+    json!({
+        "model": model,
+        "max_tokens": 64,
+        "tools": [
+            read_tool(),
+            {
+                "type": "advisor_20260301",
+                "name": "advisor",
+                "model": "claude-fable-5-2",
+                "defer_loading": true
+            }
+        ],
+        "messages": advisor_history()
+    })
+    .to_string()
+}
+
+/// Only Anthropic's servers can run the advisor. On any other route its tool
+/// and its history blocks are gone before the provider sees the request, for
+/// Messages and `count_tokens` alike, and everything else arrives intact.
+#[tokio::test]
+async fn the_advisor_never_reaches_a_translated_provider() {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let codex = Arc::new(IdentityCaptureProvider {
+        captured: Default::default(),
+        bodies: bodies.clone(),
+    }) as Arc<dyn Provider>;
+    let response = post_json(
+        app(Arc::new(Registry::from_providers(
+            AliasProvider::Codex,
+            [codex],
+        ))),
+        "/v1/messages",
+        Body::from(advisor_request("gpt-5.5")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let received = serde_json::to_value(&bodies.lock().unwrap()[0]).unwrap();
+    assert_eq!(received["tools"], json!([read_tool()]));
+    assert_eq!(received["messages"], history_without_advisor());
+
+    for (name, model, requested, uri) in [
+        ("codex", "gpt-5.5", "gpt-5.5", "/v1/messages/count_tokens"),
+        ("kimi", "kimi-k2.6", "kimi-k2.6", "/v1/messages"),
+        ("grok", "grok-4.5", "grok-4.5", "/v1/messages"),
+        ("cursor", "cursor", "cursor:gpt-5.5", "/v1/messages"),
+    ] {
+        let (app, captured) = body_capture_app(name, model, AliasProvider::Kimi);
+        let response = post_json(app, uri, Body::from(advisor_request(requested))).await;
+        assert_eq!(response.status(), StatusCode::OK, "{name} {uri}");
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1, "{name} {uri}");
+        let (received, _) = &captured[0];
+        assert_eq!(received["tools"], json!([read_tool()]), "{name} {uri}");
+        assert_eq!(
+            received["messages"],
+            history_without_advisor(),
+            "{name} {uri}"
+        );
+    }
+}
+
+/// A `tool_choice` that names the removed advisor goes too, as it would name a
+/// tool the request no longer declares; any other choice arrives as sent.
+#[tokio::test]
+async fn a_tool_choice_naming_the_advisor_does_not_reach_a_translated_provider() {
+    for (choice, expected) in [
+        (json!({"type": "tool", "name": "advisor"}), None),
+        (json!({"type": "auto"}), Some(json!({"type": "auto"}))),
+    ] {
+        let mut body: Value = serde_json::from_str(&advisor_request("gpt-5.5")).unwrap();
+        body["tool_choice"] = choice.clone();
+        let (app, captured) = body_capture_app("codex", "gpt-5.5", AliasProvider::Codex);
+        let response = post_json(app, "/v1/messages", Body::from(body.to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK, "{choice}");
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1, "{choice}");
+        let (received, _) = &captured[0];
+        assert_eq!(received.get("tool_choice"), expected.as_ref(), "{choice}");
+        assert_eq!(received["tools"], json!([read_tool()]), "{choice}");
+    }
+}
+
+/// The strip follows the provider a request ends on, not the model's name: a
+/// Claude id routed to Codex, as `CCP_ALIAS_PROVIDER=codex` does, arrives
+/// without the advisor.
+#[tokio::test]
+async fn a_claude_model_routed_off_anthropic_loses_the_advisor() {
+    let (app, captured) = body_capture_app("codex", "gpt-5.5", AliasProvider::Codex);
+    let response = post_json(
+        app,
+        "/v1/messages",
+        Body::from(advisor_request("claude-opus-5")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let (received, _) = &captured[0];
+    assert_eq!(received["tools"], json!([read_tool()]));
+    assert_eq!(received["messages"], history_without_advisor());
+}
+
+/// Anthropic runs the advisor, so its route keeps the tool and the history
+/// blocks: the provider gets them in its parsed body and in the bytes the
+/// client sent, and the passthrough relays those bytes unchanged.
+#[tokio::test]
+async fn the_anthropic_route_keeps_the_advisor() {
+    // Spacing and key order no serializer would produce, so a rewrite shows.
+    let sent = r#"{ "model":"claude-opus-5", "max_tokens":64,
+  "tools":[{"name":"Read","input_schema":{"type":"object"}},
+    {"type":"advisor_20260301","name":"advisor","model":"claude-fable-5-2"}],
+  "messages":[{"role":"user","content":[{"type":"text","text":"Plan the change."}]},
+    {"role":"assistant","content":[{"type":"text","text":"Let me ask."},
+      {"type":"server_tool_use","id":"srvtoolu_01","name":"advisor","input":{}},
+      {"type":"advisor_tool_result","tool_use_id":"srvtoolu_01","content":{"type":"advisor_result","text":"Split it in two."}},
+      {"type":"text","text":"Here is the plan."}]},
+    {"role":"user","content":[{"type":"text","text":"Go on."}]}] }"#;
+    let client: Value = serde_json::from_str(sent).unwrap();
+
+    for uri in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let (app, captured) =
+            body_capture_app("anthropic", "claude-opus-5", AliasProvider::Anthropic);
+        let response = post_json(app, uri, Body::from(sent)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        {
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.len(), 1, "{uri}");
+            let (received, raw) = &captured[0];
+            assert_eq!(received["tools"], client["tools"], "{uri}");
+            assert_eq!(received["messages"], client["messages"], "{uri}");
+            assert_eq!(raw.as_deref(), Some(sent.as_bytes()), "{uri}");
+        }
+
+        let (address, seen) = recording_upstream().await;
+        let response = post_json(anthropic_app(address), uri, Body::from(sent)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some(sent.as_bytes()),
+            "{uri}"
+        );
+    }
+}
+
+/// Through the real Grok provider, whose translator refuses a tool entry
+/// that carries a `type`, the advisor's included, and a `server_tool_use` it
+/// cannot run. Its token count runs that translator and counts locally, with
+/// no login and no upstream call, so once neither the advisor tool nor its
+/// blocks in the history reach it the count succeeds.
+#[tokio::test]
+async fn a_grok_token_count_with_the_advisor_passes_the_translator() {
+    let _no_logins = NoSavedLogins::install();
+    let body = json!({
+        "model": "grok-4.5",
+        "max_tokens": 64,
+        "tools": [
+            read_tool(),
+            {"type": "advisor_20260301", "name": "advisor", "model": "claude-fable-5-2"}
+        ],
+        "messages": advisor_history()
+    });
+    let response = post_json(
+        app(Arc::new(Registry::with_default_alias())),
+        "/v1/messages/count_tokens",
+        Body::from(body.to_string()),
+    )
+    .await;
+    let status = response.status();
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert!(value["input_tokens"].as_u64().unwrap_or(0) > 0, "{value}");
+}

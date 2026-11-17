@@ -173,7 +173,14 @@ Request path:
    refusal calls `provider_selected` for the monitor and records no session
    state. A threaded request whose model routes to anthropic is never
    rerouted (`apply_auto_review_model` and the `upstream` label route skip
-   it) and is relayed untouched. Every response `dispatch_request`
+   it) and is relayed untouched. On a final provider other than anthropic,
+   `advisor_tool::strip_advisor` then removes Claude Code's advisor server
+   tool (`tools` entries whose `type` starts with `advisor_`), a
+   `tool_choice` that only a removed tool could satisfy, and the advisor's
+   `server_tool_use` / `advisor_tool_result` history blocks, dropping a
+   message the strip leaves empty, for Messages and `count_tokens` alike;
+   only Anthropic runs the advisor. On the Anthropic route neither the
+   parsed body nor the passthrough's raw bytes change. Every response `dispatch_request`
    returns, early rejections and the local agent-summary answer (with
    `CCP_AGENT_SUMMARY=local`) included,
    carries a `request-id` header with the proxy's `req_id` unless the upstream

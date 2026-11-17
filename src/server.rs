@@ -2449,6 +2449,13 @@ async fn dispatch_request(
         return with_request_id(response, &req_id);
     }
 
+    // The advisor is a server tool only Anthropic runs. Elsewhere the provider
+    // gets no advisor tool and no advisor blocks in the history; the Anthropic
+    // route keeps the request as the client sent it.
+    if provider.name() != "anthropic" {
+        crate::advisor_tool::strip_advisor(&mut body);
+    }
+
     // A label sent to Codex, whichever model answers it, must come back as
     // text: the client asks in prose only, and measured on the ChatGPT backend
     // Codex models often answered a label with a tool call the client
