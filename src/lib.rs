@@ -1,3 +1,4 @@
+pub mod advisor_tool;
 pub mod agent_summary;
 pub mod anthropic;
 pub mod auth;
