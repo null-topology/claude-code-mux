@@ -4970,10 +4970,12 @@ async fn the_anthropic_route_keeps_the_advisor() {
 }
 
 /// Through the real Grok provider, whose translator refuses a
-/// `server_tool_use` it cannot run. Advisor blocks in the history no longer
-/// reach it; the request may still fail later, for the missing login.
+/// `server_tool_use` it cannot run. Its token count runs that translator and
+/// counts locally, with no login and no upstream call, so once advisor
+/// blocks in the history no longer reach it the count succeeds.
 #[tokio::test]
-async fn a_grok_request_with_advisor_history_passes_the_translator() {
+async fn a_grok_token_count_with_advisor_history_passes_the_translator() {
+    let _no_logins = NoSavedLogins::install();
     // The Grok translator refuses any tool entry that carries a `type`, the
     // advisor's included, so this request keeps to the history.
     let body = json!({
@@ -4984,13 +4986,17 @@ async fn a_grok_request_with_advisor_history_passes_the_translator() {
     });
     let response = post_json(
         app(Arc::new(Registry::with_default_alias())),
-        "/v1/messages",
+        "/v1/messages/count_tokens",
         Body::from(body.to_string()),
     )
     .await;
-    let message = error_message(response).await;
-    assert!(
-        !message.contains("unsupported server tool use"),
-        "{message}"
-    );
+    let status = response.status();
+    let value: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert!(value["input_tokens"].as_u64().unwrap_or(0) > 0, "{value}");
 }
