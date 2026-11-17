@@ -1,3 +1,14 @@
+## Unreleased
+
+- On Codex, Kimi, Grok and Cursor models the proxy now removes Claude Code's
+  advisor tool, a `tool_choice` that names it, and the advisor calls and
+  answers in the conversation history before the request reaches the
+  backend, because only Anthropic can run the advisor. Before, a Codex model
+  could call the advisor and get `No such tool available: advisor` back, and
+  a Grok request whose history held an advisor call was refused with
+  `unsupported server tool use`. Claude models keep the advisor as before.
+  There is no setting to restore the old behaviour.
+
 ## v0.21.0 (2026-11-15)
 
 - `/metrics` exports five more series. `ccmux_anthropic_window_used_ratio`

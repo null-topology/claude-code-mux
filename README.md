@@ -1622,6 +1622,7 @@ backend was contacted.
 | Codex quota as rate-limit headers | `usage_limit_reached` answered once with `x-should-retry: false`, status, reset and claim; no utilization on healthy responses | not recognized | the same spent-window answer, plus `-5h-*` / `-7d-*` utilization and `-surpassed-threshold` on every healthy response |
 | Codex retries | a live stream and an empty completion retried up to 10 times each, the buffered transport up to 3 | same | one attempt; the client owns the retry policy |
 | Deferred tool loading | `tool_reference` blocks dropped in the grok translator | same | mapped onto Codex's native tool search |
+| Claude Code's advisor tool | not handled | not handled | removed, with a `tool_choice` naming it and its history blocks, on every route but anthropic; Claude models keep it |
 | Subagent progress label | not handled | not handled | forwarded natively by default; answered locally or sent to a junior model on request |
 | Prompt-cache scope per subagent | the bare session id, so a subagent shares the main thread's scope and routing bucket | same | a derived id per conversation, sent as the request's `prompt_cache_key` and in the `session-id` and `thread-id` headers |
 | Responses lane policy | compiled-in table only | same | `CCP_CODEX_LANE_POLICY` / `CCP_CODEX_FULL_LANE`, with the backend listing able to decide |
