@@ -1,13 +1,16 @@
 ## Unreleased
 
-- Every Codex request now carries Claude Code's system prompt as the first
-  item of `input`, a `developer` message, instead of the top-level
-  `instructions` field, on every Codex model and lane. GPT-6.2 models
-  append `instructions` after the input and bill them at the uncached rate,
-  so the system prompt was never part of the cached prompt prefix there; it
-  now is. A request with no system prompt gets no such message. The native
-  `/v1/responses` relay still passes on the client's own `instructions`.
-  There is no setting to restore the old placement.
+- Requests that `/v1/messages` sends to Codex now carry Claude Code's system
+  prompt as a leading `developer` message in `input`: the first item, or the
+  first after the tool list on the Responses Lite lane. On the default full
+  lane this replaces the top-level `instructions` field; the Responses Lite
+  lane already sent it this way. GPT-6.2 models place `instructions` after
+  the input, so the system prompt was never part of the cached prompt prefix
+  there; now it can be cached. A request whose system prompt is empty or
+  only whitespace gets no such message, and the opt-in server compaction
+  call still sends none. The native `/v1/responses` relay still passes on
+  the client's own `instructions`. There is no setting to restore the old
+  placement.
 
 ## v0.21.1 (2026-11-17)
 

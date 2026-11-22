@@ -727,9 +727,10 @@ fn translate_request_inner(
 
     // The system text goes out as a leading developer message on both lanes,
     // never as the top-level `instructions` field: first in `input`, or right
-    // after the lite lane's `additional_tools` item.
+    // after the lite lane's `additional_tools` item. Text that is blank once
+    // trimmed adds no item; the text that is sent is never trimmed.
     if let Some(text) = system_text
-        && !text.is_empty()
+        && !text.trim().is_empty()
     {
         prefix.push(ResponsesInputItem::Message {
             role: "developer".to_string(),
@@ -3174,6 +3175,8 @@ mod tests {
             Some(json!("")),
             Some(json!([])),
             Some(json!([{"type":"text", "text":""}])),
+            Some(json!([{"type":"text", "text":""}, {"type":"text", "text":""}])),
+            Some(json!(" \n\t ")),
             Some(json!([{"type":"text", "text":"x-anthropic-billing-header: cc_version=1.0.0"}])),
         ] {
             for use_responses_lite in [false, true] {
@@ -3194,6 +3197,19 @@ mod tests {
                     "{system:?}"
                 );
             }
+        }
+
+        // Text that is not blank goes out exactly as flattened, untrimmed.
+        for use_responses_lite in [false, true] {
+            let out = translate_request(
+                &system_prompt_request(Some(json!("  padded system text\n"))),
+                system_lane_opts(use_responses_lite),
+            )
+            .unwrap();
+            assert_eq!(
+                developer_texts(&out),
+                vec!["  padded system text\n".to_string()]
+            );
         }
     }
 
@@ -3245,6 +3261,30 @@ mod tests {
                 .map(|item| serde_json::to_string(item).unwrap())
                 .collect();
             assert_eq!(later_items[..earlier_items.len()], earlier_items[..]);
+
+            // The shared leading item is the developer system message: first
+            // on the full lane, right after `additional_tools` on lite.
+            let system_index = usize::from(use_responses_lite);
+            if use_responses_lite {
+                assert!(matches!(
+                    later.input[0],
+                    ResponsesInputItem::AdditionalTools { .. }
+                ));
+            }
+            let expected = json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "You are a coding agent."}]
+            });
+            assert_eq!(
+                serde_json::to_value(&earlier.input[system_index]).unwrap(),
+                expected
+            );
+            assert_eq!(
+                serde_json::to_value(&later.input[system_index]).unwrap(),
+                expected
+            );
+            assert_eq!(developer_texts(&later).len(), 1);
         }
     }
 

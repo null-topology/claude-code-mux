@@ -4800,6 +4800,132 @@ async fn smoke_codex_websocket_previous_response_id_sends_delta_on_second_turn()
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
+async fn smoke_codex_websocket_continuation_keeps_the_developer_system_message_in_the_prefix() {
+    let _guard = env_lock();
+    let config = TempDir::new().unwrap();
+    let _codex_auth = write_codex_auth(config.path());
+    clear_codex_websocket_pool_for_tests();
+    clear_all_continuations_for_tests();
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream = spawn_websocket_sequence_upstream(captured.clone()).await;
+
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
+    let _base_url_env = EnvGuard::set("CCP_CODEX_BASE_URL", &upstream);
+    let _transport_env = EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket");
+    let _previous_response_env = EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "1");
+
+    let first = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "system": "You are Claude Code.",
+        "messages": [{"role":"user","content":"one"}]
+    }))
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "system": "You are Claude Code.",
+        "messages": [
+            {"role":"user","content":"one"},
+            {"role":"assistant","content":"first"},
+            {"role":"user","content":"two"}
+        ]
+    }))
+    .await;
+    let second_status = second.status();
+    let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        second_status,
+        StatusCode::OK,
+        "second response body: {}",
+        String::from_utf8_lossy(&second_body)
+    );
+
+    // Same history appended again, but a different system prompt.
+    let third = call_messages_body(json!({
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "system": "You are Claude Code, with a changed prompt.",
+        "messages": [
+            {"role":"user","content":"one"},
+            {"role":"assistant","content":"first"},
+            {"role":"user","content":"two"},
+            {"role":"assistant","content":"second"},
+            {"role":"user","content":"three"}
+        ]
+    }))
+    .await;
+    let third_status = third.status();
+    let third_body = axum::body::to_bytes(third.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        third_status,
+        StatusCode::OK,
+        "third response body: {}",
+        String::from_utf8_lossy(&third_body)
+    );
+
+    let developer_message = |text: &str| {
+        json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": text}]
+        })
+    };
+    let guard = captured.lock().unwrap();
+    assert_eq!(guard.len(), 3, "expected three upstream websocket requests");
+    for request in guard.iter() {
+        assert!(request.get("instructions").is_none());
+    }
+
+    assert!(guard[0].get("previous_response_id").is_none());
+    assert_eq!(
+        guard[0]["input"][0],
+        developer_message("You are Claude Code.")
+    );
+    assert_eq!(guard[0]["input"][1]["role"], "user");
+
+    assert_eq!(guard[1]["previous_response_id"], "resp_1");
+    let delta = guard[1]["input"].as_array().unwrap();
+    assert!(
+        !delta.iter().any(|item| item["role"] == "developer"),
+        "the delta must not resend the system message: {delta:?}"
+    );
+    assert_eq!(delta.len(), 1);
+    assert_eq!(delta[0]["role"], "user");
+    assert_eq!(delta[0]["content"][0]["text"], "two");
+
+    assert!(
+        guard[2].get("previous_response_id").is_none(),
+        "a changed system prompt must resend the full context"
+    );
+    let full = guard[2]["input"].as_array().unwrap();
+    assert_eq!(
+        full[0],
+        developer_message("You are Claude Code, with a changed prompt.")
+    );
+    assert_eq!(
+        full.iter()
+            .filter(|item| item["role"] == "developer")
+            .count(),
+        1
+    );
+    assert_eq!(full[1]["role"], "user");
+    assert_eq!(full[1]["content"][0]["text"], "one");
+    assert_eq!(full.last().unwrap()["content"][0]["text"], "three");
+
+    clear_all_continuations_for_tests();
+    clear_codex_websocket_pool_for_tests();
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
 async fn smoke_codex_websocket_traffic_capture_writes_upstream_artifacts() {
     let _guard = env_lock();
     let config = TempDir::new().unwrap();
