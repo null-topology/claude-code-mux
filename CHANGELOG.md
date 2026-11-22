@@ -1,4 +1,4 @@
-## Unreleased
+## v0.21.2 (2026-11-22)
 
 - Requests that `/v1/messages` sends to Codex now carry Claude Code's system
   prompt as a leading `developer` message in `input`: the first item, or the
