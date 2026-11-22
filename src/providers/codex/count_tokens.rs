@@ -180,6 +180,44 @@ mod tests {
     }
 
     #[test]
+    fn system_text_is_counted_once_as_the_leading_developer_message() {
+        use crate::anthropic::schema::MessagesRequest;
+        use crate::providers::codex::translate::request::{TranslateOptions, translate_request};
+
+        let system = "You are a coding agent. Follow the repository conventions.";
+        let request = |with_system: bool| {
+            let mut body = json!({
+                "model": "gpt-6.2-sol",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{"name": "search", "input_schema": {"type": "object"}}],
+            });
+            if with_system {
+                body["system"] = json!(system);
+            }
+            serde_json::from_value::<MessagesRequest>(body).unwrap()
+        };
+        for use_responses_lite in [false, true] {
+            let opts = || TranslateOptions {
+                session_id: None,
+                service_tier: None,
+                model: "gpt-6.2-sol".to_string(),
+                use_responses_lite,
+            };
+            let with = translate_request(&request(true), opts()).unwrap();
+            let without = translate_request(&request(false), opts()).unwrap();
+            assert!(with.instructions.is_none());
+            assert_eq!(with.input.len(), without.input.len() + 1);
+
+            // The developer message adds its text once plus the per-item
+            // framing, and nothing else.
+            assert_eq!(
+                count_translated_tokens(&with) - count_translated_tokens(&without),
+                approx_token_count(system) + 4
+            );
+        }
+    }
+
+    #[test]
     fn count_request_with_tools() {
         let req: ResponsesRequest = serde_json::from_value(json!({
             "model": "gpt-5.5",

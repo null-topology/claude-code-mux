@@ -8,7 +8,6 @@ use super::translate::request::{
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CodexRequestSizeSummary {
     pub body_json_bytes: u64,
-    pub instructions_bytes: u64,
     pub input_json_bytes: u64,
     pub tools_json_bytes: u64,
     pub text_json_bytes: u64,
@@ -204,7 +203,6 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
 
     CodexRequestSizeSummary {
         body_json_bytes: byte_length(&body_json),
-        instructions_bytes: body.instructions.as_ref().map_or(0, |s| byte_length(s)),
         input_json_bytes: json_bytes(Some(&serde_json::to_value(&body.input).unwrap_or_default())),
         tools_json_bytes: match &body.tools {
             Some(tools) => json_bytes(Some(&serde_json::to_value(tools).unwrap_or_default())),
