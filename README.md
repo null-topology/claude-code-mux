@@ -698,7 +698,7 @@ Marks that carry meaning:
 
 ### What the monitor counts
 
-Every count carries how well it is known. The four counts a request costs —
+Every count carries how well it is known. The four counts of a request —
 uncached input, cache read, cache write, output — are each `missing` until
 something reports them, `opening` while they hold a provisional value, and
 `exact` once a final report closes them. The Codex translator estimates the
@@ -743,7 +743,7 @@ between the others.
 
 One kind of number is kept beside those four instead of folded into them. When
 a backend reports the whole prompt without saying how much of it came from
-cache, that total is kept as the prompt size and not as a fifth cost.
+cache, that total is kept as the prompt size and not as a fifth category.
 Anthropic's five-minute and one-hour cache-creation buckets are a breakdown of
 the cache write rather than tokens beside it: they are held apart only as
 evidence and remain part of the write total. Neither is inferred from the write
@@ -785,21 +785,20 @@ row is gone says `(selection reset)` in its title.
 
 ### Prompt cache
 
-Both backends cache the growing prefix of a conversation, and a cached token
-costs a fraction of a fresh one. The monitor shows how much of each prompt came
-from the cache and when it did not, for Claude models (read from the relayed
-response without changing it) and for Codex models.
+Both backends cache the growing prefix of a conversation. The monitor shows how
+much of each prompt came from the cache and when it did not, for Claude models
+(read from the relayed response without changing it) and for Codex models.
 
-- **In** is the part of the prompt the backend processed at full price, as
-  Anthropic reports `input_tokens`. Cache reads and cache writes are counted
-  separately; the prompt size is the sum of the three, unless the backend
-  reported a full prompt total of its own, which takes precedence over the sum.
+- **In** is the part of the prompt that was neither read from the cache nor
+  written to it, as Anthropic reports `input_tokens`. Cache reads and cache
+  writes are counted separately; the prompt size is the sum of the three,
+  unless the backend reported a full prompt total of its own, which takes
+  precedence over the sum.
 - **Hit** is the share of the prompt served from the cache.
 - **Ctx** is the prompt size of the session's latest main-conversation request,
-  with the peak in the session detail. Every request re-reads the whole
-  context, so a large context is paid for on every turn even when fully
-  cached, and a cache miss on it reprocesses all of it. The session detail
-  also shows how long that context's cache should stay warm.
+  with the peak in the session detail. The backend reads the whole context
+  on every request, and a cache miss on it processes all of it afresh. The
+  session detail also shows how long that context's cache should stay warm.
 - **Miss** counts the requests whose cache read fell short of what the
   previous request of the same conversation and model left behind, with the
   tokens that were processed again. See below for what counts.
@@ -1125,9 +1124,8 @@ Only `ANTHROPIC_BASE_URL` is required. Restart Claude Code after changing it.
 | `ENABLE_TOOL_SEARCH` | Claude Code disables lazy tool loading behind a non-Anthropic base URL. Set to `true`: requests shrink considerably. Claude models get the tool references untouched; on Codex models loading a tool uses the backend's own tool search, so the cached prompt prefix survives the load. |
 | `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` | Behind a non-Anthropic base URL Claude Code budgets every model at 200k tokens, even the ones its catalog marks as native 1M, and auto-compacts against that. Set to `1`: the passthrough is byte-exact, so the built-in rows keep their 1M window through the proxy, and `modelPicker` rows get the window of their `behavesAs` model. |
 
-Context window: Claude Code computes it on the client, per model id. Measured
-with `claude -p --model <id> "/context"` through the proxy on Claude Code
-2.1.268:
+Context window: Claude Code computes it on the client, per model id, and
+`claude -p --model <id> "/context"` prints it. On Claude Code 2.1.268:
 
 | model | without the flag | with the flag |
 | --- | --- | --- |
@@ -1164,9 +1162,9 @@ Haiku slot at `gpt-6-luna`, Sonnet at `gpt-5.6-terra`, Opus at `gpt-6-sol`
 and Fable at `gpt-6-astra`. That assignment is an example of mapping by role,
 not a recommendation: check what your login actually lists
 (`claude-code-mux models`) before copying it, and check the variable names
-against the Claude Code you run. `..._FABLE_MODEL` was read out of the CLI
-binary (2.1.269, still present in 2.1.270). This setup has not been exercised
-live against a client without Claude credentials. A request that still names a
+against the Claude Code you run: `..._FABLE_MODEL` exists from 2.1.269 on.
+This setup has not been exercised live against a client without Claude
+credentials. A request that still names a
 `claude-*` id keeps going to Anthropic: the proxy relays whatever Anthropic
 answers an unauthenticated call, unchanged, rather than quietly substituting
 another model.
@@ -1225,7 +1223,7 @@ This is the complete list of variables the proxy reads.
 | `CLAUDE_CONFIG_DIR` | `$HOME/.claude` | Claude Code's own configuration directory, read the way Claude Code reads it. The monitor looks for session transcripts under its `projects` directory to name sessions. Separate from `CCP_CONFIG_DIR`. |
 | `CCP_ALIAS_PROVIDER` | `anthropic` | Backend for the Claude aliases: `anthropic`, `codex` or `kimi`. Leave it alone unless you want `opus` to stop meaning Claude. |
 | `CCP_AUTO_REVIEW_MODEL` | unset | Model for Claude Code's background security classifier. Unset, the classifier goes to `gpt-6-luna` only when it would have reached Codex anyway; set, it applies on any route. |
-| `CCP_AGENT_SUMMARY` | `native` | Claude Code periodically asks for a short progress label for each running background subagent and resends that subagent's whole context with it. The proxy recognizes the prompt, also when trailing system messages follow it, and only when the `x-claude-code-request-class` header is absent or says `auxiliary`; any other class rules the request out. The header alone is not enough, because Claude Code sends `auxiliary` on every side request. `native` routes and relays the request like any other for its model, so the client sees its real usage; like any request it can fail (429, 5xx, a spent Codex window). On the Codex route, in `native` and `upstream` mode both, the label goes out with `tool_choice` set to `none` and its tools kept: the client only asks in prose not to use tools, and Codex models often answered a label with a tool call, which the client discards. Measured on the ChatGPT backend, every listed Codex model accepts and enforces it, and the cached prefix is unaffected. The Anthropic route is untouched, because a `tool_choice` change invalidates Anthropic's messages cache and the passthrough relays the client's bytes as they are. `local` answers it from the transcript, built from the last tool call; the monitor shows provider `local` and the usage reports zero input. `upstream` (`model` and `remote` do the same) pins the provider's junior model at `effort: low`, or `CCP_AGENT_SUMMARY_MODEL` when set; on the Anthropic route the relayed bytes stay the client's own, so the request Anthropic receives is unchanged and only the proxy's own record names the junior model. Values are trimmed and case-sensitive: exactly `native`, `local`, `upstream`, `model` or `remote`. An empty or unrecognized value is skipped, so the setting falls back to `agentSummary` in `config.json`, then to `native`. `proxy.log` records `agent_summary_forwarded` or `agent_summary_answered_locally` for the first two modes, and `agent_summary_routed` only when `upstream` picked a model; on a backend with no junior model and no `CCP_AGENT_SUMMARY_MODEL` the request keeps its own model and none of the three is logged. |
+| `CCP_AGENT_SUMMARY` | `native` | Claude Code periodically asks for a short progress label for each running background subagent and resends that subagent's whole context with it. The proxy recognizes the prompt, also when trailing system messages follow it, and only when the `x-claude-code-request-class` header is absent or says `auxiliary`; any other class rules the request out. The header alone is not enough, because Claude Code sends `auxiliary` on every side request. `native` routes and relays the request like any other for its model, so the client sees its real usage; like any request it can fail (429, 5xx, a spent Codex window). On the Codex route, in `native` and `upstream` mode both, the label goes out with `tool_choice` set to `none` and its tools kept: the client only asks in prose not to use tools, and Codex models often answer a label with a tool call, which the client discards. On the ChatGPT backend every listed Codex model accepts and enforces it, and the cached prefix is unaffected. The Anthropic route is untouched, because a `tool_choice` change invalidates Anthropic's messages cache and the passthrough relays the client's bytes as they are. `local` answers it from the transcript, built from the last tool call; the monitor shows provider `local` and the usage reports zero input. `upstream` (`model` and `remote` do the same) pins the provider's junior model at `effort: low`, or `CCP_AGENT_SUMMARY_MODEL` when set; on the Anthropic route the relayed bytes stay the client's own, so the request Anthropic receives is unchanged and only the proxy's own record names the junior model. Values are trimmed and case-sensitive: exactly `native`, `local`, `upstream`, `model` or `remote`. An empty or unrecognized value is skipped, so the setting falls back to `agentSummary` in `config.json`, then to `native`. `proxy.log` records `agent_summary_forwarded` or `agent_summary_answered_locally` for the first two modes, and `agent_summary_routed` only when `upstream` picked a model; on a backend with no junior model and no `CCP_AGENT_SUMMARY_MODEL` the request keeps its own model and none of the three is logged. |
 | `CCP_AGENT_SUMMARY_MODEL` | the provider's junior model | Which model answers a label in `upstream` mode. Without it: `claude-sonnet-5` on Anthropic, `gpt-6-luna` on Codex, and the request's own model on a backend with no entry. Ignored in `native` and `local`. |
 | `CCP_USER_AGENT` | per backend | Fallback `User-Agent` for the Codex and Kimi backends when neither has its own override. |
 
@@ -1449,10 +1447,10 @@ setting are listed under [Configuration file](#configuration-file).
 A request carrying the hosted `web_search_20250305` tool goes on the full lane
 whatever the policy says, because the Lite lane only accepts function and
 custom tools. On `gpt-5.6-luna` such a request is currently sent as
-`gpt-5.6-sol` instead, and on `gpt-6-luna` as `gpt-6-sol`. The 404 that this
-substitution was written for did not reproduce when ordinary full-lane requests
-were rechecked, and the substitution itself has not been retested; the gpt-6
-pair follows the same rule without a check of its own. A request whose
+`gpt-5.6-sol` instead, and on `gpt-6-luna` as `gpt-6-sol`. Whether a Luna
+model refuses such a request on the full lane is not established, and the
+substitution has not been retested; the gpt-6 pair follows the same rule
+without a check of its own. A request whose
 `tool_choice` pins the hosted `web_search` tool takes a separate path that
 builds its own search request and keeps the requested model, a Luna model
 included.
@@ -1609,8 +1607,8 @@ with the rest; `CCP_METRICS=off` removes it.
 
 ## How this compares with the upstream projects
 
-Read from the source of each checkout. Nothing here was built or run, and no
-backend was contacted.
+The table compares the source of the three projects, not their behaviour at
+run time.
 
 | Dimension | raine/claude-code-proxy | fcakyon/claude-code-with-codex | this fork |
 | --- | --- | --- | --- |

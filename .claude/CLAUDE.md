@@ -841,14 +841,12 @@ presence marks the Lite lane, and never to the handshake.
 `codex_upstream_request_started` logs `newTurn` and `turnStateSent`, never the
 value. What the backend does with the echo is not established.
 
-On the ChatGPT Codex backend the session header (then `session_id`) drives cache affinity:
-byte-identical requests repeated 5 seconds apart hit the cache 4 times out of 4
-with it and 1 time out of 4 without it (measured 2026-09-11). Even with it,
-some re-sends miss at random. With gpt-5.6-sol, re-sends missed after 2, 6,
-29 and 61 minutes and hit after 11, 20, 21 and 35 minutes, and after 45
-minutes when read again at 20. With gpt-5.5 they hit at 6, 11, 21 and 35
-minutes. A single Codex miss inside the lifetime
-is not proof that the prompt changed.
+On the ChatGPT Codex backend the older `session_id` header drives cache
+affinity: byte-identical requests repeated a few seconds apart read the cache
+far more often with it than without it. Even with it, some re-sends miss at
+random, after a few minutes as well as after an hour, while one after a
+longer pause can still hit. A single Codex miss inside the lifetime is not
+proof that the prompt changed.
 Explicit cache controls (`prompt_cache_breakpoint`, `prompt_cache_retention`)
 are rejected by the subscription backend for GPT-5.6 models (openai/codex
 #35300, #39397).
@@ -1045,42 +1043,25 @@ poison and clears the reading on entry and again when its guard drops.
 `providers::anthropic::clear_anthropic_rate_limits_for_tests()` on entry and
 on drop.
 
-## What the Codex subscription actually meters
+## What moves a Codex allowance window
 
 Read the allowance window, never assume it. A `codex.rate_limits` event opens
 every healthy Codex stream and names its own windows, and
 `GET /backend-api/wham/usage` reports the same thing. Which slot holds which
-window varies by plan: a weekly window (`window_minutes: 10080`,
-`limit_window_seconds: 604800`) has been seen as `primary` with `secondary:
-null`, and a 5h/weekly pair has been seen too. Match on the window length, not
+window varies by plan: a plan can report a weekly window (`window_minutes:
+10080`, `limit_window_seconds: 604800`) as `primary` with `secondary: null`,
+or a five-hour and a weekly window together. Match on the window length, not
 on the slot. On the stream only the wire spelling `reset_at` /
 `reset_after_seconds` occurs; `resets_at` / `resets_in_seconds` is a Codex CLI
 log reserialization of the same data.
 
-What the meter counts, fitted over a capture corpus of roughly 680 requests
-against the integer `used_percent` readings that open each stream:
+No general relationship between token counts and a point of a window is
+established here. Read utilization from the windows the backend reports and
+never derive it from token counts; a figure of tokens per point is comparable
+only within one model. How a cached token counts against a window is not
+established either.
 
-- **Total input, with cached tokens billed rather than free.** A model in which
-  cached input costs nothing fits this corpus badly. How much cheaper a cached
-  token is than an uncached one is not pinned down: the corpus is uniformly
-  cached, so the two terms are barely separable and the fitted ratio spans from
-  a large discount to none at all. Treat the discount as unmeasured; separating
-  the terms needs traffic with a deliberately low hit rate.
-- **A per-model weight, which is the largest single factor.** Normalised on
-  `gpt-5.6-sol` = 1.00, `gpt-5.6-terra` fits near 0.7 and `gpt-6-astra` near
-  3.5-3.9. A fit that ignores this returns nonsense, so any further measurement
-  has to model it first.
-- **Output and reasoning were negligible in this corpus** beside input, a
-  fraction of a percent of the billed total and not separately resolvable.
-  That is what these captures show, not a guarantee about how the meter bills.
-
-For example, at one observed model mix a single percentage point of the weekly
-window cost on the order of 5-6M input tokens counted this way.
-
-So the cost tracks context size times request count times the model's weight.
-Which model to run stays the user's choice, and keeping a stable cached prefix
-is still a legitimate lever: this corpus prices neither a hit nor a miss, so
-nothing here says cache stability is worthless. The proxy preserves cache
+Which model to run stays the user's choice. The proxy preserves cache
 stability and avoids redundant model requests.
 
 `src/agent_summary.rs` handles the progress label Claude Code asks for
@@ -1115,8 +1096,8 @@ a request out, and the header alone is not enough because Claude Code sends
 search call); an absent header stays eligible. A label routed to codex, in
 native and upstream mode both, gets `tool_choice: {"type": "none"}`
 (`forbid_tool_calls`, applied in `dispatch_request` once the provider is
-known) with its tools kept: the client only asks in prose, and measured on the
-ChatGPT backend Codex models often answered a label with a tool call;
+known) with its tools kept: the client only asks in prose, and Codex models
+often answer a label with a tool call;
 `none` is accepted and enforced by every listed Codex model and cache-neutral
 because the tools stay. The Anthropic route is untouched: a `tool_choice`
 change invalidates Anthropic's messages cache and the passthrough is
@@ -1337,7 +1318,7 @@ headers; a buffered answer has none. Tests that touch the reading take
 it with `clear_codex_rate_limits_for_tests`.
 The representative claim is published only for a window duration that
 `claimable_window` in `rate_limits.rs` recognises (around 300 minutes for the
-five hour window, around 10080 for the weekly one; Codex has reported 299),
+five hour window, around 10080 for the weekly one; Codex can report 299),
 and an ambiguous reset clock yields neither a substituted header clock nor a
 claim. `Retry-After` is deliberately not sent
 because clients sleep for its full value, which here is hours. Healthy
@@ -1747,10 +1728,10 @@ http_response_body`) and is not sent again. The rewrite rests on no reproducible
 Luna refusal on the full lane, and no live capability check has been run
 either way.
 
-Verified live 2026-09-11: the call answers 200 with the proxy's own
-`originator`, with or without `ChatGPT-Account-Id`, and while the weekly
-window is at 100% (`/backend-api/wham/usage` reported `limit_reached`); it
-answers 400 without `client_version`. The version comes from
+The model listing call answers 200 with the proxy's own `originator`, with or
+without `ChatGPT-Account-Id`, and while the weekly window is spent
+(`/backend-api/wham/usage` reporting `limit_reached`); it answers 400 without
+`client_version`. The version comes from
 `CCP_CODEX_CLIENT_VERSION`, else `codex.clientVersion` in `config.json`, else
 the Codex CLI's `models_cache.json` next to `auth.json`, else
 `CODEX_CLIENT_VERSION` in `auth/constants.rs`.
@@ -1891,17 +1872,17 @@ currently serves, including `visibility` and `use_responses_lite` per model.
   `tool_search_call`, its result a `tool_search_output` carrying the loaded
   tools' specs, and deferred tools a search loaded stay out of the tools head.
   Putting a loaded tool into the head instead changes the first bytes of the
-  prompt and costs a full prompt-cache miss on every load (measured: 0 cached
-  tokens on the request after a load, versus the whole prefix with the native
-  mapping). The mapping is derived from the request alone, so it is
+  prompt and costs a full prompt-cache miss on every load: no cached tokens on
+  the request after a load, against the whole prefix with the native
+  mapping. The mapping is derived from the request alone, so it is
   byte-stable turn to turn. A deferred tool no search in the history names
   (the placeholder, or a tool whose search a compaction or a context manager
   removed) stays out of the head too, as Anthropic leaves it out of the
   prompt; only a deferred tool a directed `tool_choice` names goes in
-  (`ToolSearchPlan::keeps_in_head`). Measured live on gpt-5.6-sol: the backend
-  accepts a `function_call` in the history for a tool absent from `tools`, and
-  a request whose search pair was replaced by a summary kept 9216 of 12834
-  prompt tokens cached this way, against 0 when the orphan went into the head.
+  (`ToolSearchPlan::keeps_in_head`). On `gpt-5.6-sol` the backend accepts a
+  `function_call` in the history for a tool absent from `tools`, and a request
+  whose search pair was replaced by a summary keeps most of its prompt cached
+  this way, against none of it when the orphan goes into the head.
 - Claude Code's web search is a client-side `WebSearch` function tool. The
   hosted `web_search_20250305` tool only appears inside an isolated, history-free
   inner call, so its `server_tool_use` and `web_search_tool_result` blocks never
