@@ -659,7 +659,7 @@ fn translate_request_inner(
     opts: TranslateOptions,
     apply_codex_config: bool,
 ) -> Result<ResponsesRequest, anyhow::Error> {
-    let instructions = flatten_system_text(req.extra.get("system"));
+    let system_text = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
     let tool_search_plan = tool_search::plan(req);
     let input = build_input(req, tool_search_plan.as_ref());
@@ -678,7 +678,7 @@ fn translate_request_inner(
 
     let mut out = ResponsesRequest {
         model: opts.model,
-        instructions,
+        instructions: None,
         input,
         store: false,
         stream: true,
@@ -693,6 +693,7 @@ fn translate_request_inner(
         reasoning: None,
     };
 
+    let mut prefix = Vec::new();
     if opts.use_responses_lite {
         out.client_metadata = Some(std::collections::HashMap::from([(
             "ws_request_header_x_openai_internal_codex_responses_lite".to_string(),
@@ -705,7 +706,6 @@ fn translate_request_inner(
         // leaving the lane, which is what `codex.fullLane` does.
         out.parallel_tool_calls = false;
 
-        let mut prefix = Vec::new();
         if let Some(ref tools) = tools
             && !tools.is_empty()
         {
@@ -719,22 +719,27 @@ fn translate_request_inner(
                 tools,
             });
         }
-        if let Some(instructions) = out.instructions.take()
-            && !instructions.is_empty()
-        {
-            prefix.push(ResponsesInputItem::Message {
-                role: "developer".to_string(),
-                content: vec![ResponsesContentPart::InputText { text: instructions }],
-            });
-        }
-        if !prefix.is_empty() {
-            prefix.extend(out.input);
-            out.input = prefix;
-        }
     } else if let Some(tools) = tools
         && !tools.is_empty()
     {
         out.tools = Some(tools);
+    }
+
+    // The system text goes out as a leading developer message on both lanes,
+    // never as the top-level `instructions` field: first in `input`, or right
+    // after the lite lane's `additional_tools` item. Text that is blank once
+    // trimmed adds no item; the text that is sent is never trimmed.
+    if let Some(text) = system_text
+        && !text.trim().is_empty()
+    {
+        prefix.push(ResponsesInputItem::Message {
+            role: "developer".to_string(),
+            content: vec![ResponsesContentPart::InputText { text }],
+        });
+    }
+    if !prefix.is_empty() {
+        prefix.extend(out.input);
+        out.input = prefix;
     }
 
     // Never force a web_search tool_choice the request didn't register —
@@ -1478,6 +1483,25 @@ mod tests {
         }
     }
 
+    /// The text of every developer message in `input`, in wire order.
+    fn developer_texts(out: &ResponsesRequest) -> Vec<String> {
+        out.input
+            .iter()
+            .filter_map(|item| match item {
+                ResponsesInputItem::Message { role, content } if role == "developer" => Some(
+                    content
+                        .iter()
+                        .filter_map(|part| match part {
+                            ResponsesContentPart::InputText { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn tier_choice(
         tier: Option<ServiceTier>,
         source: Option<ServiceTierSource>,
@@ -1786,6 +1810,7 @@ mod tests {
             Some(&["example.com".to_string()][..])
         );
         assert!(out.instructions.is_none());
+        assert!(developer_texts(&out).is_empty());
     }
 
     #[test]
@@ -1817,6 +1842,7 @@ mod tests {
             Some(&["spam.example".to_string()][..])
         );
         assert!(out.instructions.is_none());
+        assert!(developer_texts(&out).is_empty());
     }
 
     #[test]
@@ -1847,7 +1873,11 @@ mod tests {
             filters.blocked_domains.as_deref(),
             Some(&["spam.example".to_string()][..])
         );
-        assert_eq!(out.instructions.as_deref(), Some("Be brief."));
+        assert!(out.instructions.is_none());
+        assert_eq!(developer_texts(&out), vec!["Be brief.".to_string()]);
+        assert!(
+            matches!(&out.input[0], ResponsesInputItem::Message { role, .. } if role == "developer")
+        );
         assert!(matches!(
             out.tool_choice,
             Some(ResponsesToolChoice::AllowedTools { .. })
@@ -1873,6 +1903,7 @@ mod tests {
             assert!(tool.external_web_access);
             assert!(tool.filters.is_none());
             assert!(out.instructions.is_none());
+            assert!(developer_texts(&out).is_empty());
         }
     }
 
@@ -3074,6 +3105,187 @@ mod tests {
         } else {
             panic!("expected developer message");
         }
+        assert_eq!(developer_texts(&out), vec!["be helpful".to_string()]);
+    }
+
+    fn system_prompt_request(system: Option<Value>) -> MessagesRequest {
+        let mut body = json!({
+            "model": "gpt-6.2-sol",
+            "messages": [
+                {"role":"user", "content":"hello"},
+                {"role":"assistant", "content":"hi"},
+                {"role":"user", "content":"next"}
+            ],
+            "tools": [{"name":"test","input_schema":{"type":"object"}}]
+        });
+        if let Some(system) = system {
+            body["system"] = system;
+        }
+        serde_json::from_value(body).unwrap()
+    }
+
+    fn system_lane_opts(use_responses_lite: bool) -> TranslateOptions {
+        TranslateOptions {
+            model: "gpt-6.2-sol".to_string(),
+            use_responses_lite,
+            ..opts()
+        }
+    }
+
+    #[test]
+    fn full_lane_sends_system_text_as_leading_developer_message() {
+        let req = system_prompt_request(Some(json!([
+            {"type":"text", "text":"x-anthropic-billing-header: cc_version=1.0.0; cch=abc"},
+            {"type":"text", "text":"You are a coding agent."},
+            {"type":"text", "text":"Work carefully.", "cache_control":{"type":"ephemeral"}}
+        ])));
+        let out = translate_request(&req, system_lane_opts(false)).unwrap();
+
+        assert!(out.instructions.is_none());
+        assert!(out.client_metadata.is_none());
+        let wire = serde_json::to_value(&out).unwrap();
+        assert!(wire.get("instructions").is_none());
+        assert_eq!(
+            wire["input"][0],
+            json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{
+                    "type": "input_text",
+                    "text": "You are a coding agent.\n\nWork carefully."
+                }]
+            })
+        );
+        assert_eq!(wire["input"][1]["role"], "user");
+        assert_eq!(out.input.len(), 4);
+        assert_eq!(developer_texts(&out).len(), 1);
+        let tools = out.tools.as_ref().expect("full lane keeps top-level tools");
+        assert!(matches!(&tools[0], ResponsesTool::Function(tool) if tool.name == "test"));
+        assert!(
+            !out.input
+                .iter()
+                .any(|item| matches!(item, ResponsesInputItem::AdditionalTools { .. }))
+        );
+    }
+
+    #[test]
+    fn empty_system_adds_no_developer_message() {
+        for system in [
+            None,
+            Some(json!("")),
+            Some(json!([])),
+            Some(json!([{"type":"text", "text":""}])),
+            Some(json!([{"type":"text", "text":""}, {"type":"text", "text":""}])),
+            Some(json!(" \n\t ")),
+            Some(json!([{"type":"text", "text":"x-anthropic-billing-header: cc_version=1.0.0"}])),
+        ] {
+            for use_responses_lite in [false, true] {
+                let out = translate_request(
+                    &system_prompt_request(system.clone()),
+                    system_lane_opts(use_responses_lite),
+                )
+                .unwrap();
+                assert!(out.instructions.is_none(), "{system:?}");
+                assert!(developer_texts(&out).is_empty(), "{system:?}");
+                let conversation_start = usize::from(use_responses_lite);
+                assert_eq!(out.input.len(), 3 + conversation_start, "{system:?}");
+                assert!(
+                    matches!(
+                        &out.input[conversation_start],
+                        ResponsesInputItem::Message { role, .. } if role == "user"
+                    ),
+                    "{system:?}"
+                );
+            }
+        }
+
+        // Text that is not blank goes out exactly as flattened, untrimmed.
+        for use_responses_lite in [false, true] {
+            let out = translate_request(
+                &system_prompt_request(Some(json!("  padded system text\n"))),
+                system_lane_opts(use_responses_lite),
+            )
+            .unwrap();
+            assert_eq!(
+                developer_texts(&out),
+                vec!["  padded system text\n".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn system_message_is_byte_identical_across_translations() {
+        let system = json!([{"type":"text", "text":"You are a coding agent."}]);
+        for use_responses_lite in [false, true] {
+            let first = serde_json::to_string(
+                &translate_request(
+                    &system_prompt_request(Some(system.clone())),
+                    system_lane_opts(use_responses_lite),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let second = serde_json::to_string(
+                &translate_request(
+                    &system_prompt_request(Some(system.clone())),
+                    system_lane_opts(use_responses_lite),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(first, second);
+
+            // A later turn of the same conversation keeps the same leading
+            // items, so its input starts with the same bytes.
+            let mut later = system_prompt_request(Some(system.clone()));
+            later.messages.push(
+                serde_json::from_value(json!({"role":"assistant", "content":"done"})).unwrap(),
+            );
+            later
+                .messages
+                .push(serde_json::from_value(json!({"role":"user", "content":"more"})).unwrap());
+            let earlier = translate_request(
+                &system_prompt_request(Some(system.clone())),
+                system_lane_opts(use_responses_lite),
+            )
+            .unwrap();
+            let later = translate_request(&later, system_lane_opts(use_responses_lite)).unwrap();
+            let earlier_items: Vec<String> = earlier
+                .input
+                .iter()
+                .map(|item| serde_json::to_string(item).unwrap())
+                .collect();
+            let later_items: Vec<String> = later
+                .input
+                .iter()
+                .map(|item| serde_json::to_string(item).unwrap())
+                .collect();
+            assert_eq!(later_items[..earlier_items.len()], earlier_items[..]);
+
+            // The shared leading item is the developer system message: first
+            // on the full lane, right after `additional_tools` on lite.
+            let system_index = usize::from(use_responses_lite);
+            if use_responses_lite {
+                assert!(matches!(
+                    later.input[0],
+                    ResponsesInputItem::AdditionalTools { .. }
+                ));
+            }
+            let expected = json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "You are a coding agent."}]
+            });
+            assert_eq!(
+                serde_json::to_value(&earlier.input[system_index]).unwrap(),
+                expected
+            );
+            assert_eq!(
+                serde_json::to_value(&later.input[system_index]).unwrap(),
+                expected
+            );
+            assert_eq!(developer_texts(&later).len(), 1);
+        }
     }
 
     #[test]
@@ -3289,8 +3501,9 @@ mod tests {
         let before_items = items_json(&before);
         let after_items = items_json(&after);
 
-        // The additional_tools head and the instructions do not change, so the
-        // prompt prefix cached for the first request still matches.
+        // The additional_tools head and the developer system message do not
+        // change, so the prompt prefix cached for the first request still
+        // matches.
         assert_eq!(before_items[0], after_items[0]);
         assert_eq!(before_items[1], after_items[1]);
 
@@ -3358,14 +3571,22 @@ mod tests {
             serde_json::to_value(&before.tools).unwrap(),
             serde_json::to_value(&after.tools).unwrap()
         );
-        assert_eq!(before.instructions, after.instructions);
+        assert!(before.instructions.is_none());
+        assert!(after.instructions.is_none());
+        assert_eq!(items_json(&before)[0], items_json(&after)[0]);
+        assert_eq!(items_json(&after)[0]["role"], "developer");
         let types: Vec<String> = items_json(&after)
             .iter()
             .map(|item| item["type"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(
             types,
-            vec!["message", "tool_search_call", "tool_search_output"]
+            vec![
+                "message",
+                "message",
+                "tool_search_call",
+                "tool_search_output"
+            ]
         );
     }
 
@@ -3575,18 +3796,16 @@ mod tests {
             .collect()
     }
 
-    /// The prompt prefix a cache hit depends on: the tools head plus the system
-    /// text, wherever the lane puts them.
+    /// The prompt prefix a cache hit depends on: the tools head plus the
+    /// developer system message, which both lanes put in the input.
     fn head_prefix(out: &ResponsesRequest) -> String {
+        assert!(out.instructions.is_none());
         let tools = serde_json::to_string(&head_tools(out)).unwrap();
-        let text = match out.instructions {
-            Some(ref instructions) => instructions.clone(),
-            None => items_json(out)
-                .into_iter()
-                .find(|item| item["type"] == "message" && item["role"] == "developer")
-                .map(|item| item["content"].to_string())
-                .unwrap_or_default(),
-        };
+        let text = items_json(out)
+            .into_iter()
+            .find(|item| item["type"] == "message" && item["role"] == "developer")
+            .map(|item| item["content"].to_string())
+            .unwrap_or_default();
         format!("{tools}\n{text}")
     }
 
