@@ -1,3 +1,14 @@
+## Unreleased
+
+- Every Codex request now carries Claude Code's system prompt as the first
+  item of `input`, a `developer` message, instead of the top-level
+  `instructions` field, on every Codex model and lane. GPT-6.2 models
+  append `instructions` after the input and bill them at the uncached rate,
+  so the system prompt was never part of the cached prompt prefix there; it
+  now is. A request with no system prompt gets no such message. The native
+  `/v1/responses` relay still passes on the client's own `instructions`.
+  There is no setting to restore the old placement.
+
 ## v0.21.1 (2026-11-17)
 
 - On Codex, Kimi, Grok and Cursor models the proxy now removes Claude Code's
